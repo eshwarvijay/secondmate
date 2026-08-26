@@ -13,6 +13,10 @@ description: >
 
 # fm-loop — maker/checker loop hardening
 
+**Setup:** run `/fm-doctor` once — it detects and installs the harness + companions (herdr, ponytail,
+loop-task, adhd) and reports what's missing; the human only approves each action. Cross-model checking
+additionally needs a second model family + credentials, which only the human can supply.
+
 Scripts live in `${CLAUDE_PLUGIN_ROOT}/bin/` (a `${CLAUDE_PLUGIN_ROOT}/bin/reason.sh` etc.).
 If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plugin's install dir
 (under `~/.claude/plugins/marketplaces/fm-loop` or your skills dir). All scripts carry `--selfcheck`/

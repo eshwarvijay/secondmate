@@ -38,15 +38,30 @@ claude plugin marketplace add eshwarvijay/fm-loop
 claude plugin install fm-loop@fm-loop
 ```
 
-Restart Claude Code (or `/plugin`) to load it.
+Restart Claude Code (or `/plugin`) to load it, then run **`/fm-doctor`** — it detects and installs
+everything below (harness, git/gh/python, and the companions), asking you only to approve each action.
+You never have to run manual setup.
 
 ## Requirements
 
 - **git** and **gh** (worktrees + PR flow).
 - A **checker harness CLI** that accepts `--provider/--model/--thinking/--exclude-tools/--append-system-prompt`
-  and a headless `-p` mode. Defaults target [`pi`](https://github.com/badlogic/pi-mono); any harness with the
-  same flags works via the env vars below.
+  and a headless `-p` mode. Defaults target [`pi`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent);
+  any harness with the same flags works via the env vars below.
 - **python3** (for `hold.py` / `verdict.py`).
+
+### Companions (recommended — `/fm-doctor` installs these too)
+
+| Companion | What it adds | Install |
+|---|---|---|
+| **pi** | default checker + reasoning harness (multi-model) | `npm install -g @earendil-works/pi-coding-agent` |
+| **herdr** | visible multi-pane maker/checker orchestration | `brew install herdr` |
+| **ponytail** | complexity / over-engineering lens | `claude plugin install ponytail@ponytail` |
+| **loop-task** | maker/checker loop driver skill | *(set your distribution source in `bin/doctor.sh`)* |
+| **adhd** | divergent ideation for open-ended triage | *(set your distribution source in `bin/doctor.sh`)* |
+
+`/fm-doctor` self-heals: it runs each install for you and you just approve — it never hands you a manual checklist.
+Cross-model checking additionally needs a **second model family + credentials** for your harness (only you can supply those).
 
 ## Config (env vars — all optional, sane defaults)
 
@@ -70,7 +85,8 @@ The default checker/reasoning model IDs are Amazon Bedrock inference-profile IDs
 
 ```sh
 bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --selfcheck \
-  && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck && echo ALL_OK
+  && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
+  && bin/doctor.sh --selfcheck && echo ALL_OK
 claude plugin validate .
 ```
 
