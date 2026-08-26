@@ -4,11 +4,11 @@
 #   loop-guard.sh round                                   # bump round+spawn counters; exit 4 = budget exhausted
 #   loop-guard.sh reset                                   # clear all state (human interjection / new task)
 #   loop-guard.sh selfcheck
-# State: $FM_LOOP_STATE or ./.secondmate . Tunables (env): ABORT_REPEATS(10) MAX_ROUNDS(256) MAX_SPAWNS(1000).
+# State: $SM_LOOP_STATE or ./.secondmate . Tunables (env): ABORT_REPEATS(10) MAX_ROUNDS(256) MAX_SPAWNS(1000).
 # Counts FAILED/denied actions too (dsh repeat-tool-reminder), and exhaustion is NEVER reported as success (Ralph).
 set -euo pipefail
 
-state="${FM_LOOP_STATE:-.secondmate}"
+state="${SM_LOOP_STATE:-.secondmate}"
 ABORT_REPEATS="${ABORT_REPEATS:-10}"; MAX_ROUNDS="${MAX_ROUNDS:-256}"; MAX_SPAWNS="${MAX_SPAWNS:-1000}"
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
@@ -41,16 +41,16 @@ case "$cmd" in
     rm -rf "$state"; echo "loop state cleared"; exit 0;;
   selfcheck)
     tmp="$(mktemp -d)"; r=0
-    FM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
-    FM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
-    o3="$(FM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same 2>&1 || true)"
+    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
+    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
+    o3="$(SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same 2>&1 || true)"
     echo "$o3" | grep -q HYGIENE || { echo "FAIL: no reminder at 3rd repeat"; r=1; }
-    if FM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1; then echo "FAIL: should abort at 4th"; r=1; fi
-    FM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key other >/dev/null 2>&1 || true
+    if SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1; then echo "FAIL: should abort at 4th"; r=1; fi
+    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key other >/dev/null 2>&1 || true
     [ "$(cat "$tmp/action.count" 2>/dev/null)" = "1" ] || { echo "FAIL: new key should reset count"; r=1; }
-    FM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
-    FM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
-    if FM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1; then echo "FAIL: round cap not enforced"; r=1; fi
+    SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
+    SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
+    if SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1; then echo "FAIL: round cap not enforced"; r=1; fi
     rm -rf "$tmp"; [ "$r" = 0 ] && echo ok; exit "$r";;
   *) echo "usage: loop-guard.sh action --key K | round | reset | selfcheck" >&2; exit 2;;
 esac

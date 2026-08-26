@@ -15,4 +15,4 @@ Method:
 
 Do not rewrite the code, do not propose large refactors, and do not comment on style unless it causes a bug.
 
-> This is the shipped default. Point FM_CHECKER_PROMPT at your own tuned discipline file to override it.
+> This is the shipped default. Point SM_CHECKER_PROMPT at your own tuned discipline file to override it.

@@ -7,12 +7,12 @@
   hold.py open                                           -> lists unanswered (RUN AT SUPERVISOR START)
   hold.py selfcheck                                      -> asserts the open-fold is correct
 
-Ledger path: $FM_HOLD_LEDGER, else ./decisions.jsonl in the CWD (per-orchestration-repo, like firstmate's per-home state).
+Ledger path: $SM_HOLD_LEDGER, else ./decisions.jsonl in the CWD (per-orchestration-repo, like firstmate's per-home state).
 Nothing falls through a restart: `hold.py open` reconciles from disk, never from chat memory.
 """
 import json, sys, os, time, argparse, pathlib, hashlib
 
-LEDGER = pathlib.Path(os.environ.get("FM_HOLD_LEDGER", "decisions.jsonl"))
+LEDGER = pathlib.Path(os.environ.get("SM_HOLD_LEDGER", "decisions.jsonl"))
 
 
 def _recs():

@@ -3,7 +3,7 @@
 # burn its own context on root-cause / triage / plan-review / pre-mortem analysis.
 #   reason.sh [--model r1|gpt|sonnet|<id>] [--thinking high|xhigh|off] [--context FILE ...] ["question"]
 #   echo "question" | reason.sh --context diff.txt ;  reason.sh --dry-run ... ;  reason.sh --selfcheck
-# Env: FM_REASON_HARNESS(pi) FM_REASON_PROVIDER(amazon-bedrock) FM_REASON_MODEL(default alias when no --model)
+# Env: SM_REASON_HARNESS(pi) SM_REASON_PROVIDER(amazon-bedrock) SM_REASON_MODEL(default alias when no --model)
 set -euo pipefail
 
 resolve_model() {
@@ -16,8 +16,8 @@ resolve_model() {
 }
 
 reason() {
-  local model_alias="${FM_REASON_MODEL:-r1}" thinking="high" dry=0 question=""
-  local harness="${FM_REASON_HARNESS:-pi}" provider="${FM_REASON_PROVIDER:-amazon-bedrock}"
+  local model_alias="${SM_REASON_MODEL:-r1}" thinking="high" dry=0 question=""
+  local harness="${SM_REASON_HARNESS:-pi}" provider="${SM_REASON_PROVIDER:-amazon-bedrock}"
   local -a contexts=()
   while [ $# -gt 0 ]; do case "$1" in
     --model) model_alias="$2"; shift 2;;
@@ -50,7 +50,7 @@ reason() {
 }
 
 if [ "${1:-}" = "--selfcheck" ]; then
-  unset FM_REASON_MODEL FM_REASON_HARNESS FM_REASON_PROVIDER
+  unset SM_REASON_MODEL SM_REASON_HARNESS SM_REASON_PROVIDER
   tmp="$(mktemp)"; printf 'DIFF-CONTENT-XYZ' >"$tmp"; r=0
   out="$(reason --dry-run --model gpt --thinking xhigh --context "$tmp" "why does login fail?")"
   echo "$out" | grep -q -- '--no-tools'        || { echo "FAIL: missing --no-tools"; r=1; }

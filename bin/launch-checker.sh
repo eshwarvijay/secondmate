@@ -3,16 +3,16 @@
 # checker can never mutate the maker's work. Injects the base checker discipline + the verdict-envelope
 # contract, then your per-task addendum. Harness/provider/model/prompt are env-configurable for portability.
 #   launch-checker.sh --addendum FILE | --addendum-text "..."  [--model M|terra|sol|luna] [--thinking L] -- [extra args]
-# Env: FM_CHECKER_HARNESS(pi) FM_CHECKER_PROVIDER(amazon-bedrock) FM_CHECKER_MODEL(global.openai.gpt-5.6-terra)
-#      FM_CHECKER_THINKING(high) FM_CHECKER_PROMPT(<plugin>/bin/checker-prompt.md)
+# Env: SM_CHECKER_HARNESS(pi) SM_CHECKER_PROVIDER(amazon-bedrock) SM_CHECKER_MODEL(global.openai.gpt-5.6-terra)
+#      SM_CHECKER_THINKING(high) SM_CHECKER_PROMPT(<plugin>/bin/checker-prompt.md)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-harness="${FM_CHECKER_HARNESS:-pi}"
-provider="${FM_CHECKER_PROVIDER:-amazon-bedrock}"
-model="${FM_CHECKER_MODEL:-global.openai.gpt-5.6-terra}"
-thinking="${FM_CHECKER_THINKING:-high}"
-base_prompt="${FM_CHECKER_PROMPT:-$SCRIPT_DIR/checker-prompt.md}"
+harness="${SM_CHECKER_HARNESS:-pi}"
+provider="${SM_CHECKER_PROVIDER:-amazon-bedrock}"
+model="${SM_CHECKER_MODEL:-global.openai.gpt-5.6-terra}"
+thinking="${SM_CHECKER_THINKING:-high}"
+base_prompt="${SM_CHECKER_PROMPT:-$SCRIPT_DIR/checker-prompt.md}"
 addendum_file="" addendum_text=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,7 +25,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -f "$base_prompt" ] || { echo "missing base checker discipline: $base_prompt (set FM_CHECKER_PROMPT)" >&2; exit 1; }
+[ -f "$base_prompt" ] || { echo "missing base checker discipline: $base_prompt (set SM_CHECKER_PROMPT)" >&2; exit 1; }
 addendum=""
 if [ -n "$addendum_file" ]; then
   [ -f "$addendum_file" ] || { echo "addendum file not found: $addendum_file" >&2; exit 1; }

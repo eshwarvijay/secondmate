@@ -9,6 +9,20 @@ guards (stuck-loop abort, timeout + idle watchdog, round/spawn caps) and read-on
 Harness-neutral. Patterns stolen from [firstmate](https://github.com/kunchenguid/firstmate) and
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness); the plugin ships the contracts, not their runtimes.
 
+## Quick start
+
+```sh
+claude plugin marketplace add eshwarvijay/secondmate
+claude plugin install secondmate@secondmate
+# restart Claude Code, then let it set itself up — you just approve each step:
+/secondmate-doctor
+```
+
+Then run any change through the loop with **`/loop-task <goal>`**: secondmate spawns the maker in an
+isolated worktree, runs a **different model** as an edit-locked checker, gates on its `{verdict}` plus a
+clean `verify-gate`, and asks you before anything merges. Ask a reasoning model anything read-only with
+`/secondmate-reason <question>`.
+
 ## What it gives you
 
 | Component | What it does |
@@ -24,7 +38,7 @@ Harness-neutral. Patterns stolen from [firstmate](https://github.com/kunchenguid
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
-| commands | `/secondmate-reason`, `/secondmate-verify` |
+| commands | `/secondmate-doctor`, `/secondmate-reason`, `/secondmate-verify`, `/loop-task` |
 
 ## Install
 
@@ -67,17 +81,17 @@ Cross-model checking additionally needs a **second model family + credentials** 
 
 | Var | Default | Purpose |
 |---|---|---|
-| `FM_CHECKER_HARNESS` | `pi` | checker CLI |
-| `FM_CHECKER_PROVIDER` | `amazon-bedrock` | checker provider |
-| `FM_CHECKER_MODEL` | `global.openai.gpt-5.6-terra` | checker model (a **different family** than the maker) |
-| `FM_CHECKER_THINKING` | `high` | checker reasoning effort |
-| `FM_CHECKER_PROMPT` | `bin/checker-prompt.md` | base checker discipline (point at your own tuned file to override) |
-| `FM_REASON_HARNESS` | `pi` | reasoning CLI |
-| `FM_REASON_PROVIDER` | `amazon-bedrock` | reasoning provider |
-| `FM_REASON_MODEL` | `r1` | default reasoning model alias (`r1`/`gpt`/`sonnet`/full id) |
-| `FM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger path |
-| `FM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
-| `FM_WT_ROOT` | `~/.fm-worktrees` | where maker worktrees are created |
+| `SM_CHECKER_HARNESS` | `pi` | checker CLI |
+| `SM_CHECKER_PROVIDER` | `amazon-bedrock` | checker provider |
+| `SM_CHECKER_MODEL` | `global.openai.gpt-5.6-terra` | checker model (a **different family** than the maker) |
+| `SM_CHECKER_THINKING` | `high` | checker reasoning effort |
+| `SM_CHECKER_PROMPT` | `bin/checker-prompt.md` | base checker discipline (point at your own tuned file to override) |
+| `SM_REASON_HARNESS` | `pi` | reasoning CLI |
+| `SM_REASON_PROVIDER` | `amazon-bedrock` | reasoning provider |
+| `SM_REASON_MODEL` | `r1` | default reasoning model alias (`r1`/`gpt`/`sonnet`/full id) |
+| `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger path |
+| `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
+| `SM_WT_ROOT` | `~/.fm-worktrees` | where maker worktrees are created |
 
 The default checker/reasoning model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 

@@ -5,7 +5,7 @@
 #
 #   new-worktree.sh --repo PATH --task ID [--base main]
 # Prints:  <worktree-path> <branch>
-# Worktrees live under $FM_WT_ROOT (default ~/.fm-worktrees).
+# Worktrees live under $SM_WT_ROOT (default ~/.fm-worktrees).
 set -euo pipefail
 
 repo="" task="" base="main"
@@ -23,7 +23,7 @@ repo="$(cd "$repo" && pwd)"
 git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repo: $repo" >&2; exit 1; }
 primary="$(git -C "$repo" rev-parse --show-toplevel)"
 
-wt_root="${FM_WT_ROOT:-$HOME/.fm-worktrees}"
+wt_root="${SM_WT_ROOT:-$HOME/.fm-worktrees}"
 wt="$wt_root/$(basename "$primary")-$task"
 branch="fm/$task"
 

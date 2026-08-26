@@ -25,7 +25,7 @@ add() { # status name category fix
 }
 
 detect() {
-  local h="${FM_CHECKER_HARNESS:-pi}"
+  local h="${SM_CHECKER_HARNESS:-pi}"
   # CORE — the loop's non-model machinery
   for t in git gh python3; do have "$t" && add OK "$t" core "" || add MISSING "$t" core "$(brewable "$t")"; done
   # CHECKER RUNTIME — cross-model check + reasoning one-shots
@@ -59,7 +59,7 @@ emit_table() {
   done <<< "$ROWS"
   echo "----------------------------------------------------------------------"
   echo "note: cross-model checking also needs a 2nd model family + credentials for your harness"
-  echo "      (defaults: amazon-bedrock GPT-5.6 / DeepSeek-R1). Set FM_CHECKER_* / FM_REASON_* to yours."
+  echo "      (defaults: amazon-bedrock GPT-5.6 / DeepSeek-R1). Set SM_CHECKER_* / SM_REASON_* to yours."
   if [ "$core_missing" -eq 0 ] && [ "$checker_missing" -eq 0 ]; then echo "STATUS: ready (core + checker present)"
   else echo "STATUS: not ready ($core_missing core, $checker_missing checker missing) — run: doctor.sh --heal"; fi
 }
@@ -68,7 +68,7 @@ heal() {
   local yes="$1"
   while IFS='|' read -r st name cat fix; do
     [ "$st" = MISSING ] || continue
-    if [ -z "$fix" ]; then echo "SKIP  $name — no known auto-fix; provide its source (see README) and set the matching FM_* var"; continue; fi
+    if [ -z "$fix" ]; then echo "SKIP  $name — no known auto-fix; provide its source (see README) and set the matching SM_* var"; continue; fi
     if [ "$yes" = 1 ]; then echo ">> healing $name: $fix"; bash -c "$fix" || echo "   (failed — do it manually: $fix)"
     else
       printf 'Fix %s via: %s\n  proceed? [y/N] ' "$name" "$fix"; read -r ans
