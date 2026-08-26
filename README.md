@@ -1,4 +1,4 @@
-# fm-loop
+# secondmate
 
 A Claude Code plugin that hardens the **maker/checker loop** for shipping verified code changes: a maker
 implements in an isolated worktree, a **different-model, edit-locked checker** reviews the diff and emits a
@@ -13,7 +13,7 @@ Harness-neutral. Patterns stolen from [firstmate](https://github.com/kunchenguid
 
 | Component | What it does |
 |---|---|
-| `fm-loop` skill | The maker/checker SOP the supervisor follows (triage → spawn → check → gate → hold → integrate) |
+| `secondmate` skill | The maker/checker SOP the supervisor follows (triage → spawn → check → gate → hold → integrate) |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
@@ -30,12 +30,12 @@ Harness-neutral. Patterns stolen from [firstmate](https://github.com/kunchenguid
 
 ```sh
 # from a local clone
-claude plugin marketplace add /path/to/fm-loop
-claude plugin install fm-loop@fm-loop
+claude plugin marketplace add /path/to/secondmate
+claude plugin install secondmate@secondmate
 
 # or from GitHub once published
-claude plugin marketplace add eshwarvijay/fm-loop
-claude plugin install fm-loop@fm-loop
+claude plugin marketplace add eshwarvijay/secondmate
+claude plugin install secondmate@secondmate
 ```
 
 Restart Claude Code (or `/plugin`) to load it, then run **`/fm-doctor`** — it detects and installs
@@ -76,7 +76,7 @@ Cross-model checking additionally needs a **second model family + credentials** 
 | `FM_REASON_PROVIDER` | `amazon-bedrock` | reasoning provider |
 | `FM_REASON_MODEL` | `r1` | default reasoning model alias (`r1`/`gpt`/`sonnet`/full id) |
 | `FM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger path |
-| `FM_LOOP_STATE` | `./.fm-loop` | loop-guard state dir |
+| `FM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `FM_WT_ROOT` | `~/.fm-worktrees` | where maker worktrees are created |
 
 The default checker/reasoning model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.

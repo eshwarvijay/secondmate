@@ -1,8 +1,8 @@
 ---
-description: Run the fm-loop pre-integration gate on a maker's worktree — clean tree, non-empty diff, exact-SHA match, tests — before merging.
+description: Run the secondmate pre-integration gate on a maker's worktree — clean tree, non-empty diff, exact-SHA match, tests — before merging.
 ---
 
-Run the fm-loop verify-gate and report PASS or the exact REFUSE reasons. Do NOT integrate/merge unless it PASSes.
+Run the secondmate verify-gate and report PASS or the exact REFUSE reasons. Do NOT integrate/merge unless it PASSes.
 
 Arguments (worktree path, base branch, and the SHA the checker reviewed): $ARGUMENTS
 

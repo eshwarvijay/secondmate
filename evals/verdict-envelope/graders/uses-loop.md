@@ -1,4 +1,4 @@
-# Grader: applies the fm-loop gate discipline
+# Grader: applies the secondmate gate discipline
 
 PASS only if the response does ALL of the following:
 

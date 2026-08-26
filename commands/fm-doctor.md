@@ -1,8 +1,8 @@
 ---
-description: Check and auto-fix fm-loop's requirements (checker/reason harness, git/gh/python, and companions herdr/ponytail/loop-task/adhd). Installs what's missing — the human only approves each action.
+description: Check and auto-fix secondmate's requirements (checker/reason harness, git/gh/python, and companions herdr/ponytail/loop-task/adhd). Installs what's missing — the human only approves each action.
 ---
 
-Set up fm-loop end to end. YOU (the agent) run every fix so the human only approves it via the normal
+Set up secondmate end to end. YOU (the agent) run every fix so the human only approves it via the normal
 permission prompt — never make the human hunt for install steps.
 
 1. Detect: `bash "${CLAUDE_PLUGIN_ROOT}/bin/doctor.sh" --json`

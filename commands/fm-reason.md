@@ -1,8 +1,8 @@
 ---
-description: Ask a read-only reasoning model (via fm-loop) a hard analysis question — root-cause, triage, plan review, pre-mortem — without spending this session's context.
+description: Ask a read-only reasoning model (via secondmate) a hard analysis question — root-cause, triage, plan review, pre-mortem — without spending this session's context.
 ---
 
-Run the fm-loop reasoning one-shot and relay the model's answer verbatim, then add your own one-line take.
+Run the secondmate reasoning one-shot and relay the model's answer verbatim, then add your own one-line take.
 
 Question / task: $ARGUMENTS
 

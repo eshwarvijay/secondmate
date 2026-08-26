@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# doctor.sh -- fm-loop preflight + self-heal. Detects every requirement and (with --heal) installs the ones
+# doctor.sh -- secondmate preflight + self-heal. Detects every requirement and (with --heal) installs the ones
 # it knows how to; the human only APPROVES each action, never hunts for setup steps.
 #   doctor.sh            # report; exit 0 only if CORE + a checker harness are present
 #   doctor.sh --json     # machine-readable status (consumed by /fm-doctor)
@@ -50,7 +50,7 @@ emit_json() {
 }
 
 emit_table() {
-  echo "fm-loop doctor"
+  echo "secondmate doctor"
   echo "----------------------------------------------------------------------"
   while IFS='|' read -r st name cat fix; do
     [ -z "$name" ] && continue

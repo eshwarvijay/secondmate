@@ -1,5 +1,5 @@
 ---
-name: fm-loop
+name: secondmate
 description: >
   Maker/checker loop for shipping a verified code change: triage → isolated
   worktree → maker implements → cross-model edit-locked checker emits a
@@ -11,7 +11,7 @@ description: >
   edits or read-only questions.
 ---
 
-# fm-loop — maker/checker loop hardening
+# secondmate — maker/checker loop hardening
 
 **Setup:** run `/fm-doctor` once — it detects and installs the harness + companions (herdr, ponytail,
 adhd) and reports what's missing; the human only approves each action. The `/loop-task` command ships
@@ -20,7 +20,7 @@ additionally needs a second model family + credentials, which only the human can
 
 Scripts live in `${CLAUDE_PLUGIN_ROOT}/bin/` (a `${CLAUDE_PLUGIN_ROOT}/bin/reason.sh` etc.).
 If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plugin's install dir
-(under `~/.claude/plugins/marketplaces/fm-loop` or your skills dir). All scripts carry `--selfcheck`/
+(under `~/.claude/plugins/marketplaces/secondmate` or your skills dir). All scripts carry `--selfcheck`/
 `selfcheck` and are harness-neutral; the checker/reasoning harness + model are set by env
 (see the Config section of the plugin README). You (the supervisor) invoke these — the user does not.
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "fm-loop",
+  "name": "secondmate",
   "description": "Maker/checker loop hardening toolkit for coding agents.",
   "owner": {
     "name": "Eshwar Vijay",
@@ -8,7 +8,7 @@
   },
   "plugins": [
     {
-      "name": "fm-loop",
+      "name": "secondmate",
       "description": "Durable holds, a cross-model edit-locked checker with a verdict envelope, a verify-gate, loop guards, and reasoning one-shots.",
       "source": "./",
       "category": "productivity"

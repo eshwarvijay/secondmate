@@ -1,11 +1,11 @@
 {
-  "name": "fm-loop",
+  "name": "secondmate",
   "version": "0.1.0",
   "description": "Maker/checker loop hardening: durable human-gate decisions, a cross-model edit-locked checker with a machine-branchable verdict envelope, a pre-integration verify-gate, stuck-loop + timeout guards, and read-only reasoning one-shots. Harness-neutral; steals from firstmate + deepseek-harness.",
   "author": {
     "name": "Eshwar Vijay",
     "url": "https://github.com/eshwarvijay"
   },
-  "homepage": "https://github.com/eshwarvijay/fm-loop",
+  "homepage": "https://github.com/eshwarvijay/secondmate",
   "keywords": ["maker-checker", "code-review", "cross-model", "orchestration", "verification", "loop"]
 }
