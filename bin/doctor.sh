@@ -34,8 +34,8 @@ detect() {
   # COMPANIONS — recommended; enhance the workflow (edit fixes to match what you distribute)
   have herdr && add OK "herdr (multi-pane orchestration)" companion "" || add MISSING "herdr (multi-pane orchestration)" companion "brew install herdr"
   plugin_present ponytail && add OK "ponytail (complexity lens plugin)" companion "" || add MISSING "ponytail (complexity lens plugin)" companion "claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail --yes"
-  skill_present loop-task && add OK "loop-task (skill)" companion "" || add MISSING "loop-task (skill)" companion ""
-  skill_present adhd && add OK "adhd (skill)" companion "" || add MISSING "adhd (skill)" companion ""
+  # loop-task ships bundled with this plugin (commands/loop-task.md) — no external install needed.
+  skill_present adhd && add OK "adhd (divergent ideation)" companion "" || add MISSING "adhd (divergent ideation)" companion "claude plugin marketplace add UditAkhourii/adhd && claude plugin install adhd@adhd --yes"
 }
 
 emit_json() {

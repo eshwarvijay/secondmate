@@ -57,8 +57,8 @@ You never have to run manual setup.
 | **pi** | default checker + reasoning harness (multi-model) | `npm install -g @earendil-works/pi-coding-agent` |
 | **herdr** | visible multi-pane maker/checker orchestration | `brew install herdr` |
 | **ponytail** | complexity / over-engineering lens | `claude plugin install ponytail@ponytail` |
-| **loop-task** | maker/checker loop driver skill | *(set your distribution source in `bin/doctor.sh`)* |
-| **adhd** | divergent ideation for open-ended triage | *(set your distribution source in `bin/doctor.sh`)* |
+| **loop-task** | maker/checker loop driver command | **bundled — ships with this plugin** |
+| **adhd** | divergent ideation for open-ended triage | `claude plugin marketplace add UditAkhourii/adhd && claude plugin install adhd@adhd` |
 
 `/fm-doctor` self-heals: it runs each install for you and you just approve — it never hands you a manual checklist.
 Cross-model checking additionally needs a **second model family + credentials** for your harness (only you can supply those).

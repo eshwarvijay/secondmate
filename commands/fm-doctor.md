@@ -8,7 +8,7 @@ permission prompt — never make the human hunt for install steps.
 1. Detect: `bash "${CLAUDE_PLUGIN_ROOT}/bin/doctor.sh" --json`
 2. For each item with `"status":"MISSING"` and a non-empty `"fix"`, RUN that fix command yourself (the human
    approves via the permission prompt). Order: CORE (git/gh/python3) → CHECKER harness → COMPANIONS
-   (herdr, ponytail, loop-task, adhd).
+   (herdr, ponytail, adhd; `/loop-task` is bundled with this plugin).
 3. For a MISSING item with an empty `"fix"` (a companion whose source isn't wired in), tell the human the one
    concrete thing to provide (the marketplace or URL for that skill) and set the matching `FM_*` env var — do
    not block the rest on it.
