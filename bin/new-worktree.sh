@@ -5,7 +5,7 @@
 #
 #   new-worktree.sh --repo PATH --task ID [--base main]
 # Prints:  <worktree-path> <branch>
-# Worktrees live under $SM_WT_ROOT (default ~/.fm-worktrees).
+# Worktrees live under $SM_WT_ROOT (default ~/.secondmate-worktrees).
 set -euo pipefail
 
 repo="" task="" base="main"
@@ -23,9 +23,9 @@ repo="$(cd "$repo" && pwd)"
 git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repo: $repo" >&2; exit 1; }
 primary="$(git -C "$repo" rev-parse --show-toplevel)"
 
-wt_root="${SM_WT_ROOT:-$HOME/.fm-worktrees}"
+wt_root="${SM_WT_ROOT:-$HOME/.secondmate-worktrees}"
 wt="$wt_root/$(basename "$primary")-$task"
-branch="fm/$task"
+branch="sm/$task"
 
 # ponytail: the isolation assertion -- refuse if the worktree would land on the primary checkout.
 [ "$wt" != "$primary" ] || { echo "isolation assertion failed: worktree == primary checkout" >&2; exit 1; }
