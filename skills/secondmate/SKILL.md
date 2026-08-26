@@ -13,7 +13,7 @@ description: >
 
 # secondmate — maker/checker loop hardening
 
-**Setup:** run `/fm-doctor` once — it detects and installs the harness + companions (herdr, ponytail,
+**Setup:** run `/secondmate-doctor` once — it detects and installs the harness + companions (herdr, ponytail,
 adhd) and reports what's missing; the human only approves each action. The `/loop-task` command ships
 with this plugin. Cross-model checking
 additionally needs a second model family + credentials, which only the human can supply.

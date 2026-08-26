@@ -24,7 +24,7 @@ Harness-neutral. Patterns stolen from [firstmate](https://github.com/kunchenguid
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
-| commands | `/fm-reason`, `/fm-verify` |
+| commands | `/secondmate-reason`, `/secondmate-verify` |
 
 ## Install
 
@@ -38,7 +38,7 @@ claude plugin marketplace add eshwarvijay/secondmate
 claude plugin install secondmate@secondmate
 ```
 
-Restart Claude Code (or `/plugin`) to load it, then run **`/fm-doctor`** — it detects and installs
+Restart Claude Code (or `/plugin`) to load it, then run **`/secondmate-doctor`** — it detects and installs
 everything below (harness, git/gh/python, and the companions), asking you only to approve each action.
 You never have to run manual setup.
 
@@ -50,7 +50,7 @@ You never have to run manual setup.
   any harness with the same flags works via the env vars below.
 - **python3** (for `hold.py` / `verdict.py`).
 
-### Companions (recommended — `/fm-doctor` installs these too)
+### Companions (recommended — `/secondmate-doctor` installs these too)
 
 | Companion | What it adds | Install |
 |---|---|---|
@@ -60,7 +60,7 @@ You never have to run manual setup.
 | **loop-task** | maker/checker loop driver command | **bundled — ships with this plugin** |
 | **adhd** | divergent ideation for open-ended triage | `claude plugin marketplace add UditAkhourii/adhd && claude plugin install adhd@adhd` |
 
-`/fm-doctor` self-heals: it runs each install for you and you just approve — it never hands you a manual checklist.
+`/secondmate-doctor` self-heals: it runs each install for you and you just approve — it never hands you a manual checklist.
 Cross-model checking additionally needs a **second model family + credentials** for your harness (only you can supply those).
 
 ## Config (env vars — all optional, sane defaults)
