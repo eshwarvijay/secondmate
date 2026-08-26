@@ -57,6 +57,8 @@ flowchart LR
     H -- merge --> D[ship]
 ```
 
+> Deeper dive: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — roles, the guarantee behind every stage, and the full component map.
+
 ## 🧰 What's inside
 
 | Component | What it does |
