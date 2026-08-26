@@ -17,12 +17,16 @@
 
 ---
 
-**secondmate** hardens the maker/checker loop for shipping code with an agent. A maker implements in an
-isolated worktree, a **different-model, edit-locked checker** reviews the diff and returns a machine-readable
-`{verdict}`, a **verify-gate** re-checks ground truth against the exact reviewed commit, and every risky
-decision becomes a **durable hold** that survives a restart. Plus stuck-loop + timeout guards and read-only
-reasoning one-shots. Harness-neutral, works with any coding-agent CLI that speaks `--provider` / `--model` /
-`--exclude-tools` / `--append-system-prompt`.
+**secondmate** is a Claude Code plugin that makes your AI coding agent check its own work with a second opinion.
+
+When an agent writes code, the *same* agent usually reviews it, so it misses its own mistakes. secondmate
+splits the job in two: one agent **writes** the change (the **maker**), a **different AI model reviews** it
+(the **checker**), and nothing gets merged until the checker passes it, the change clears an automated safety
+gate, and you give the final OK.
+
+Because the checker is a *different model* than the maker, it catches bugs the maker is blind to. secondmate
+also keeps long runs from going off the rails, remembers your decisions across restarts, and can hand hard
+analysis to a reasoning model on the side. Works with any coding-agent CLI.
 
 ## ⚡ Quick start
 
