@@ -42,6 +42,13 @@ envelope="$SCRIPT_DIR/checker-envelope.md"
 envelope_arg=()
 [ -f "$envelope" ] && envelope_arg=(--append-system-prompt "$(cat "$envelope")")
 
+# No harness installed? Signal the supervisor to use the in-session Claude checker fallback (see the skill),
+# instead of crashing with a raw "command not found". Exit 3 is the fallback signal.
+if ! command -v "$harness" >/dev/null 2>&1; then
+  echo "SM_NO_CHECKER_HARNESS: '$harness' not found. Fall back to an in-session checker: spawn a Claude sub-agent on a DIFFERENT model than the maker, review-only, with $base_prompt plus the verdict envelope plus the diff, then run its output through verdict.py. For a stronger cross-vendor check install a harness: npm install -g @earendil-works/pi-coding-agent" >&2
+  exit 3
+fi
+
 # --exclude-tools edit,write is NOT optional: it makes the checker physically read-only.
 exec "$harness" --provider "$provider" --model "$model" \
   --thinking "$thinking" --exclude-tools edit,write \

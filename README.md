@@ -85,10 +85,14 @@ flowchart LR
 
 ## 📦 Requirements
 
-`git`, `gh`, `python3`, and a **checker harness CLI** (defaults to [`pi`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)).
-Just run **`/secondmate-doctor`** — it detects and installs everything, asking only for your approval; it never
-hands you a manual checklist. Cross-model checking additionally needs a **second model family + credentials**
-for your harness (only you can supply those).
+`git`, `gh`, `python3`, and (recommended) a **checker harness CLI** (defaults to [`pi`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)).
+Just run **`/secondmate-doctor`**: it detects and installs everything, asking only for your approval, and never
+hands you a manual checklist.
+
+**No harness? You still get a cross-model check.** secondmate falls back to a **second Claude model** as the
+checker, in-session, so the maker is still not the checker. An external harness like pi gives a stronger
+*cross-vendor* check (a different vendor, not just a different Claude model). Either way, the models need
+credentials only you can supply.
 
 <details>
 <summary><b>Companions</b> — installed by <code>/secondmate-doctor</code></summary>

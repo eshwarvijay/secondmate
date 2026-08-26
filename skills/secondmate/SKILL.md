@@ -28,7 +28,9 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
 - **Supervisor** (you) — triage, adjudicate, gate, integrate. Never write project code yourself.
 - **Maker** — implements in an isolated worktree (e.g. a Claude `/loop-task`).
 - **Checker** — a *different* model, edit-locked, that reviews the diff and emits a verdict. Its blind
-  spots must not correlate with the maker's, so run a different model family than the maker.
+  spots must not correlate with the maker's, so run a different model family than the maker. If no external
+  harness is installed, the fallback is a different-model Claude sub-agent (same vendor, weaker, but maker is
+  still not the checker) — see the Check step.
 
 ## The loop (run these yourself; the user invokes nothing)
 
@@ -51,6 +53,13 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
    - `${CLAUDE_PLUGIN_ROOT}/bin/prune-output.sh` on big command output before feeding it in.
    - `${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --addendum-text "TASK/HAMMER: ..." -- -p "<review prompt + diff>"`
      — edit-locked (`--exclude-tools edit,write`), with the verdict-envelope contract injected automatically.
+   - **No harness? The cross-model check stays intact via a fallback.** If `launch-checker.sh` exits with
+     `SM_NO_CHECKER_HARNESS` (or `/secondmate-doctor` reports no checker harness), spawn the checker as a Claude
+     sub-agent via the Agent tool on a **different model than the maker**, tell it review-only (no edits, no
+     state-changing commands), paste in `${CLAUDE_PLUGIN_ROOT}/bin/checker-prompt.md` +
+     `${CLAUDE_PLUGIN_ROOT}/bin/checker-envelope.md` + the diff, and require it to end with the `{verdict}`
+     envelope. It is weaker than a cross-vendor harness (same model family) but keeps maker ≠ checker and the
+     deterministic verdict. Capture its final message and treat it exactly like harness output below.
    - Branch on the verdict deterministically, NOT on the checker's prose:
      `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused. On fail/error, hand back to the maker.
 

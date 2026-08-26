@@ -84,7 +84,9 @@ Each stage exists to close a specific failure mode.
    {"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"..."}
    ```
    `verdict.py` parses it and exits `0` / `1` / `2`. The supervisor branches on the exit code, never on the
-   checker's prose.
+   checker's prose. If no checker harness is installed, `launch-checker.sh` signals `SM_NO_CHECKER_HARNESS` and
+   the supervisor falls back to a second Claude model as the checker, in-session: weaker (same vendor) but the
+   maker is still not the checker, and the verdict is still machine-read.
    *Guards against:* correlated blind spots (different model); a checker that mutates the code (edit-locked);
    non-deterministic adjudication (structured verdict vs reading vibes).
 

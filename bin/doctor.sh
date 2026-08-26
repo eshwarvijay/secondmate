@@ -60,8 +60,9 @@ emit_table() {
   echo "----------------------------------------------------------------------"
   echo "note: cross-model checking also needs a 2nd model family + credentials for your harness"
   echo "      (defaults: amazon-bedrock GPT-5.6 / DeepSeek-R1). Set SM_CHECKER_* / SM_REASON_* to yours."
-  if [ "$core_missing" -eq 0 ] && [ "$checker_missing" -eq 0 ]; then echo "STATUS: ready (core + checker present)"
-  else echo "STATUS: not ready ($core_missing core, $checker_missing checker missing) — run: doctor.sh --heal"; fi
+  if [ "$core_missing" -gt 0 ]; then echo "STATUS: not ready. $core_missing core missing. Run: doctor.sh --heal"
+  elif [ "$checker_missing" -gt 0 ]; then echo "STATUS: ready via in-session Claude fallback. No external checker harness found; install one (doctor.sh --heal) for a stronger cross-vendor check."
+  else echo "STATUS: ready (core plus checker harness present)"; fi
 }
 
 heal() {
@@ -92,4 +93,4 @@ case "${1:-}" in
   ""|--report) emit_table;;
   *) echo "usage: doctor.sh [--json|--heal [--yes]|--selfcheck]" >&2; exit 2;;
 esac
-[ "$core_missing" -eq 0 ] && [ "$checker_missing" -eq 0 ]
+[ "$core_missing" -eq 0 ]
