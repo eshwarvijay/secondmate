@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ponytail: brace-scan + json.loads — no jq dependency, no schema lib.
-"""verdict.py -- read a checker's output, extract its JSON verdict envelope, branch deterministically (dsh steal #1).
+"""verdict.py -- read a checker's output, extract its JSON verdict envelope, branch deterministically.
 
   verdict.py [FILE]   # FILE or stdin = checker output; prints the verdict word
                       # exit: 0=pass  1=fail  2=error/refused/malformed

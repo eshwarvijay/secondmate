@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# loop-guard.sh -- loop safety for the maker/checker loop (dsh steals #2 stuck-loop + #3 bounded/runaway).
+# loop-guard.sh -- loop safety for the maker/checker loop: stuck-loop detection + bounded iteration.
 #   loop-guard.sh action --key "<canonical action/diff>"  # consecutive-identical detection; exit 3 = abort (no progress)
 #   loop-guard.sh round                                   # bump round+spawn counters; exit 4 = budget exhausted
 #   loop-guard.sh reset                                   # clear all state (human interjection / new task)
 #   loop-guard.sh selfcheck
 # State: $SM_LOOP_STATE or ./.secondmate . Tunables (env): ABORT_REPEATS(10) MAX_ROUNDS(256) MAX_SPAWNS(1000).
-# Counts FAILED/denied actions too (dsh repeat-tool-reminder), and exhaustion is NEVER reported as success (Ralph).
+# Counts FAILED/denied actions too, and exhaustion is NEVER reported as success.
 set -euo pipefail
 
 state="${SM_LOOP_STATE:-.secondmate}"

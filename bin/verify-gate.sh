@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify-gate.sh -- pre-integration gate for the maker/checker loop (steals #2 + #3, from firstmate).
+# verify-gate.sh -- pre-integration gate for the maker/checker loop.
 #   #3 state-reconciliation: don't trust the maker's "done" -- re-derive ground truth from the worktree.
 #   #2 exact-SHA gate:       refuse if the head moved since the checker's verdict (stale approval).
 # Run this BEFORE the supervisor integrates/merges a maker's branch. Fail-closed: reports EVERY failing

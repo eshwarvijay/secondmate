@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # ponytail: append-only JSONL ledger. Move to sqlite only if you ever get concurrent supervisor writers.
-"""hold.py -- durable human-gate decisions for the maker/checker loop (steal #1, from firstmate fm-captain-hold.sh).
+"""hold.py -- durable human-gate decisions for the maker/checker loop.
 
   hold.py hold --task T --q "question" [--opts "a|b|c"]  -> prints new id, records an OPEN decision
   hold.py answer ID --a "the decision"                   -> closes it
   hold.py open                                           -> lists unanswered (RUN AT SUPERVISOR START)
   hold.py selfcheck                                      -> asserts the open-fold is correct
 
-Ledger path: $SM_HOLD_LEDGER, else ./decisions.jsonl in the CWD (per-orchestration-repo, like firstmate's per-home state).
+Ledger path: $SM_HOLD_LEDGER, else ./decisions.jsonl in the CWD (one ledger per orchestration repo).
 Nothing falls through a restart: `hold.py open` reconciles from disk, never from chat memory.
 """
 import json, sys, os, time, argparse, pathlib, hashlib

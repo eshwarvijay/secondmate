@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# prune-output.sh -- deterministic head/tail truncation of oversized output (dsh steal #5, tool-result-pruner).
+# prune-output.sh -- deterministic head/tail truncation of oversized output.
 # Keeps the first HEAD and last TAIL chars, drops the middle. Model-free; run BEFORE feeding a log to a maker/checker.
 #   prune-output.sh [FILE]        # FILE or stdin -> pruned text on stdout
 #   prune-output.sh --selfcheck

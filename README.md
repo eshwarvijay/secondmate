@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/secondmate.jpg" alt="secondmate" width="360" />
+</p>
+
 # secondmate
 
 A Claude Code plugin that hardens the **maker/checker loop** for shipping verified code changes: a maker
@@ -6,8 +10,8 @@ machine-branchable `{verdict}` envelope, a **verify-gate** re-checks ground trut
 commit, and every human-gate decision becomes a **durable hold** that survives a restart. Plus loop-safety
 guards (stuck-loop abort, timeout + idle watchdog, round/spawn caps) and read-only **reasoning one-shots**.
 
-Harness-neutral. Patterns stolen from [firstmate](https://github.com/kunchenguid/firstmate) and
-[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness); the plugin ships the contracts, not their runtimes.
+Harness-neutral: works with any coding-agent CLI that accepts the standard `--provider` / `--model` /
+`--exclude-tools` / `--append-system-prompt` flags.
 
 ## Quick start
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run-round.sh -- run one maker/checker invocation with a wall-clock timeout, an idle (no-output-growth)
-# watchdog, and a paired audit record even on kill (dsh steals #4: timeout-policy + idleWatchdog + endStrandedAgents).
+# watchdog, and a paired audit record even on kill.
 # macOS ships no timeout(1), so this polls itself.
 #   run-round.sh --label NAME [--log F] [--timeout 600] [--idle 120] [--audit F] -- <cmd...>
 #   run-round.sh selfcheck

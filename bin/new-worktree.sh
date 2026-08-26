@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# new-worktree.sh -- isolated worktree per maker (steal #5, from firstmate fm-spawn.sh's isolation assertion).
+# new-worktree.sh -- isolated git worktree per maker, asserting it is never the primary checkout.
 # Each maker pane works in its own git worktree so parallel makers on one repo never collide, and the
 # supervisor's primary checkout is never mutated by a worker.
 #
