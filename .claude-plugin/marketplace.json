@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
   "name": "secondmate",
-  "description": "Maker/checker loop hardening toolkit for coding agents.",
+  "description": "Your coding agent's second-in-command: a rival model reviews every diff, gates stop the sloppy ones, and nothing merges without your word.",
   "owner": {
     "name": "Eshwar Vijay",
     "url": "https://github.com/eshwarvijay"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "secondmate",
-      "description": "Durable holds, a cross-model edit-locked checker with a verdict envelope, a verify-gate, loop guards, and reasoning one-shots.",
+      "description": "Cross-model review that ships only what survives: an edit-locked checker with a verdict envelope, a verify-gate, durable holds, loop guards, and reasoning one-shots.",
       "source": "./",
       "category": "productivity"
     }

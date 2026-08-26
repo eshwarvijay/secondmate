@@ -1,7 +1,7 @@
 {
   "name": "secondmate",
   "version": "0.1.0",
-  "description": "Maker/checker loop hardening: durable human-gate decisions, a cross-model edit-locked checker with a machine-branchable verdict envelope, a pre-integration verify-gate, stuck-loop + timeout guards, and read-only reasoning one-shots. Harness-neutral; steals from firstmate + deepseek-harness.",
+  "description": "Your agent writes the code, a different model tries to break it, and only what survives ships. Cross-model, edit-locked review with a machine-readable verdict, gated merges, durable decisions, stuck-loop and timeout guards, and read-only reasoning one-shots. Harness-neutral.",
   "author": {
     "name": "Eshwar Vijay",
     "url": "https://github.com/eshwarvijay"
