@@ -59,6 +59,8 @@ flowchart LR
 
 > Deeper dive: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — roles, the guarantee behind every stage, and the full component map.
 
+> 💡 **Best with herdr.** Run secondmate inside herdr (a tmux-backed terminal multiplexer for coding agents) and the maker and the cross-model checker each get their own live pane you can watch and jump into: the whole loop, visible. It's how I run it, on herdr + tmux. Anywhere else it falls back to in-process sub-agents, same guards and all.
+
 ## 🧰 What's inside
 
 | Component | What it does |
