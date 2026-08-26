@@ -5,7 +5,7 @@
 <h1 align="center">secondmate</h1>
 
 <p align="center">
-  <em>One agent makes the change. A different model checks it.<br/>Nothing merges until it passes — and you say so.</em>
+  <em>One agent makes the change. A different model checks it.<br/>Nothing merges until it passes and you say so.</em>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 isolated worktree, a **different-model, edit-locked checker** reviews the diff and returns a machine-readable
 `{verdict}`, a **verify-gate** re-checks ground truth against the exact reviewed commit, and every risky
 decision becomes a **durable hold** that survives a restart. Plus stuck-loop + timeout guards and read-only
-reasoning one-shots. Harness-neutral — works with any coding-agent CLI that speaks `--provider` / `--model` /
+reasoning one-shots. Harness-neutral  works with any coding-agent CLI that speaks `--provider` / `--model` /
 `--exclude-tools` / `--append-system-prompt`.
 
 ## ⚡ Quick start
