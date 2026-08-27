@@ -2,7 +2,8 @@
 # launch-checker.sh -- always edit-locked cross-model checker. --exclude-tools edit,write is hardcoded so a
 # checker can never mutate the maker's work. Injects the base checker discipline + the verdict-envelope
 # contract, then your per-task addendum. Harness/provider/model/prompt are env-configurable for portability.
-#   launch-checker.sh --addendum FILE | --addendum-text "..."  [--model M|terra|sol|luna] [--thinking L] -- [extra args]
+#   launch-checker.sh --addendum FILE | --addendum-text "..."  [--lens redteam,qa,...] [--model M|terra|sol|luna] [--thinking L] -- [extra args]
+#   --lens NAME[,NAME] (repeatable): layer specialized role disciplines from bin/lenses/<NAME>.md on top of the base checker.
 # Env: SM_CHECKER_HARNESS(pi) SM_CHECKER_PROVIDER(amazon-bedrock) SM_CHECKER_MODEL(global.openai.gpt-5.6-terra)
 #      SM_CHECKER_THINKING(high) SM_CHECKER_PROMPT(<plugin>/bin/checker-prompt.md)
 set -euo pipefail
@@ -13,11 +14,12 @@ provider="${SM_CHECKER_PROVIDER:-amazon-bedrock}"
 model="${SM_CHECKER_MODEL:-global.openai.gpt-5.6-terra}"
 thinking="${SM_CHECKER_THINKING:-high}"
 base_prompt="${SM_CHECKER_PROMPT:-$SCRIPT_DIR/checker-prompt.md}"
-addendum_file="" addendum_text=""
+addendum_file="" addendum_text=""; lenses=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --addendum) addendum_file="$2"; shift 2;;
     --addendum-text) addendum_text="$2"; shift 2;;
+    --lens) lenses+=("$2"); shift 2;;
     --model) case "$2" in terra|sol|luna) model="global.openai.gpt-5.6-$2";; *) model="$2";; esac; shift 2;;
     --thinking) thinking="$2"; shift 2;;
     --) shift; break;;
@@ -42,6 +44,19 @@ envelope="$SCRIPT_DIR/checker-envelope.md"
 envelope_arg=()
 [ -f "$envelope" ] && envelope_arg=(--append-system-prompt "$(cat "$envelope")")
 
+# Optional role lenses (--lens redteam,qa,...): specialized checker disciplines from bin/lenses/, layered
+# on top of the base correctness discipline. Fail loud on an unknown lens.
+lens_args=()
+for _l in "${lenses[@]:-}"; do
+  [ -n "$_l" ] || continue
+  IFS=',' read -ra _names <<< "$_l"
+  for _n in "${_names[@]}"; do
+    _lf="$SCRIPT_DIR/lenses/$_n.md"
+    [ -f "$_lf" ] || { echo "unknown lens: $_n (looked for $_lf). Available: $( (cd "$SCRIPT_DIR/lenses" 2>/dev/null && find . -name '*.md' ! -name 'ROUTER.md' | sed 's|^\./||;s|\.md$||') | tr '\n' ' ')" >&2; exit 2; }
+    lens_args+=(--append-system-prompt "$(cat "$_lf")")
+  done
+done
+
 # No harness installed? Signal the supervisor to use the in-session Claude checker fallback (see the skill),
 # instead of crashing with a raw "command not found". Exit 3 is the fallback signal.
 if ! command -v "$harness" >/dev/null 2>&1; then
@@ -53,6 +68,7 @@ fi
 exec "$harness" --provider "$provider" --model "$model" \
   --thinking "$thinking" --exclude-tools edit,write \
   --append-system-prompt "$(cat "$base_prompt")" \
+  "${lens_args[@]}" \
   "${envelope_arg[@]}" \
   --append-system-prompt "$addendum" \
   "$@"

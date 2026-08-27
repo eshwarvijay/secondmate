@@ -53,13 +53,21 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
    - `${CLAUDE_PLUGIN_ROOT}/bin/prune-output.sh` on big command output before feeding it in.
    - `${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --addendum-text "TASK/HAMMER: ..." -- -p "<review prompt + diff>"`
      — edit-locked (`--exclude-tools edit,write`), with the verdict-envelope contract injected automatically.
+   - **Pick specialized lenses by task — load only what the diff touches.** Beyond the base correctness
+     discipline, choose the role(s) that fit: `redteam` (security-sensitive), `qa` (tests/behavior),
+     `reverse-engineer` (unfamiliar/obfuscated/third-party code), `research` (novel/uncertain design, possible
+     hallucinated APIs). Read that role's router `${CLAUDE_PLUGIN_ROOT}/bin/lenses/<role>/ROUTER.md` to select
+     the specific sub-lenses the diff can reach, then inject them:
+     `launch-checker.sh --lens redteam/injection --lens qa/coverage -- -p "..."`. Do NOT dump a whole role;
+     load only the sub-lenses that apply — focused context is the point.
    - **No harness? The cross-model check stays intact via a fallback.** If `launch-checker.sh` exits with
      `SM_NO_CHECKER_HARNESS` (or `/secondmate-doctor` reports no checker harness), spawn the checker as a Claude
      sub-agent via the Agent tool on a **different model than the maker**, tell it review-only (no edits, no
      state-changing commands), paste in `${CLAUDE_PLUGIN_ROOT}/bin/checker-prompt.md` +
-     `${CLAUDE_PLUGIN_ROOT}/bin/checker-envelope.md` + the diff, and require it to end with the `{verdict}`
-     envelope. It is weaker than a cross-vendor harness (same model family) but keeps maker ≠ checker and the
-     deterministic verdict. Capture its final message and treat it exactly like harness output below.
+     `${CLAUDE_PLUGIN_ROOT}/bin/checker-envelope.md` + the selected `bin/lenses/<role>/<sub>.md` files + the
+     diff, and require it to end with the `{verdict}` envelope. It is weaker than a cross-vendor harness (same
+     model family) but keeps maker ≠ checker and the deterministic verdict. Capture its final message and
+     treat it exactly like harness output below.
    - Branch on the verdict deterministically, NOT on the checker's prose:
      `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused. On fail/error, hand back to the maker.
 

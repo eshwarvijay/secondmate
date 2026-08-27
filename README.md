@@ -83,6 +83,23 @@ flowchart LR
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 
+## 🔎 Specialized review lenses
+
+The checker isn't one generic reviewer. Per task, secondmate loads **only the specialized disciplines the
+diff actually needs** — a router → sub-skill design (progressive disclosure), so the checker gets focused
+context instead of a generic dump. Lenses live in `bin/lenses/<role>/`; the supervisor reads each role's
+`ROUTER.md`, matches the diff, and injects just the matching sub-lenses
+(`--lens redteam/injection --lens qa/coverage`).
+
+| Role | Sub-lenses |
+|---|---|
+| **redteam** (security) | injection · access-control · server-side-requests · deserialization · secrets-supply-chain · llm |
+| **qa** (tests / behavior) | test-reality · coverage · risk-flagging · behavioral-contracts |
+| **reverse-engineer** (unfamiliar / third-party code) | dataflow · hidden-behavior · intent-vs-impl · unknown-code |
+| **research** (groundedness) | groundedness · prior-art · assumption-audit |
+
+Add your own: drop `bin/lenses/<role>/<name>.md` (a lean, specialized discipline) and list it in that role's `ROUTER.md`.
+
 ## 📦 Requirements
 
 `git`, `gh`, `python3`, and (recommended) a **checker harness CLI** (defaults to [`pi`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)).
