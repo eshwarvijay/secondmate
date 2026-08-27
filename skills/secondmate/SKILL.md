@@ -51,8 +51,15 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
 
 4. **Check** — after the maker commits, trim bulky logs then run the cross-model checker:
    - `${CLAUDE_PLUGIN_ROOT}/bin/prune-output.sh` on big command output before feeding it in.
-   - `${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --addendum-text "TASK/HAMMER: ..." -- -p "<review prompt + diff>"`
-     — edit-locked (`--exclude-tools edit,write`), with the verdict-envelope contract injected automatically.
+   - `${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --addendum-text "TASK/SPEC/HAMMER/INVARIANTS ..." --diff-base <base-ref> --repo <wt> --live-text "<what changed this round + what to focus on>" -- -p "review the change described in the LIVE block"`
+     — edit-locked (`--exclude-tools edit,write`), verdict-envelope injected automatically. **Layered, freshest LAST:** (1) static
+     eval-tuned discipline, (2) optional lenses, (3) envelope, (4) your **standing** per-task addendum (TASK/SPEC/HAMMER/INVARIANTS —
+     stable across the task's rounds), (5) the **LIVE** layer for THIS round. The addendum is the *standard*; the live layer rides *on top* as fresh, current context.
+   - **Keep the checker alive, not stale — regenerate the LIVE layer every round.** `--diff-base <ref>` auto-injects the real
+     `git diff <ref>..HEAD` (pruned) so the checker always sees exactly what changed NOW — never a pasted, stale diff. After each round,
+     save the checker's output to `$SM_LAST_VERDICT` (default `$SM_LOOP_STATE/last-verdict.md`); `launch-checker.sh` auto-injects it the
+     next round as "prior verdict — resolve or re-confirm", giving the checker round-to-round memory. Put this round's one-line focus
+     (what you just changed, what to hammer now) in `--live-text`. Set the addendum ONCE per task; refresh `--diff-base` / `--live-text` / the saved verdict EACH round.
    - **Pick specialized lenses by task — load only what the diff touches.** Beyond the base correctness
      discipline, choose the role(s) that fit: `redteam` (security-sensitive), `qa` (tests/behavior),
      `reverse-engineer` (unfamiliar/obfuscated/third-party code), `research` (novel/uncertain design, possible
