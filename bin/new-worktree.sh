@@ -8,6 +8,17 @@
 # Worktrees live under $SM_WT_ROOT (default ~/.secondmate-worktrees).
 set -euo pipefail
 
+if [ "${1:-}" = "--selfcheck" ]; then
+  t="$(mktemp -d)"; git init -q -b main "$t/proj" >/dev/null
+  git -C "$t/proj" config user.email a@a; git -C "$t/proj" config user.name a
+  echo x > "$t/proj/f"; git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init
+  fails=0
+  rc=0; "$0" --repo "$t/proj" --task 'x/../../escape' >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: traversal task not rejected ($rc)"; fails=1; }
+  rc=0; out="$(SM_WT_ROOT="$t/wts" "$0" --repo "$t/proj" --task good 2>/dev/null)" || rc=$?
+  { [ "$rc" = 0 ] && [ -d "$t/wts/proj-good" ]; } || { echo "FAIL: normal spawn ($rc)"; fails=1; }
+  rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
+fi
+
 repo="" task="" base="main"
 while [ $# -gt 0 ]; do
   case "$1" in

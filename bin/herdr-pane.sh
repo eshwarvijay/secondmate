@@ -42,6 +42,15 @@ start_agent() { # name kind pane [-- agent args...]
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   check) usable || { echo "not usable: need HERDR_ENV=1 and herdr on PATH (fall back to headless)" >&2; exit 1; };;
+  --selfcheck)
+    fails=0
+    rc=0; "$0" bogusverb >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown verb exit $rc (want 2)"; fails=1; }
+    if usable; then  # validate-before-mutate: delegate w/o --prompt must exit 2 and create NO pane
+      count() { herdr pane list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["result"]["panes"]))' 2>/dev/null || echo 0; }
+      b="$(count)"; rc=0; "$0" delegate --name _sc --kind pi >/dev/null 2>&1 || rc=$?; a="$(count)"
+      { [ "$rc" = 2 ] && [ "$b" = "$a" ]; } || { echo "FAIL: delegate validate-before-split (rc=$rc panes $b->$a)"; fails=1; }
+    fi
+    [ "$fails" = 0 ] && echo ok; exit "$fails";;
   split)
     usable || { echo "not inside herdr" >&2; exit 1; }
     do_split "${1:-right}" "$PWD";;

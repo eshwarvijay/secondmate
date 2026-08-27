@@ -26,6 +26,7 @@ add() { # status name category fix
 
 detect() {
   local h="${SM_CHECKER_HARNESS:-pi}"
+  h="$(printf '%s' "$h" | tr '\n\r|' '   ')"   # finding #9: no newline/pipe can inject/forge rows before JSON encoding
   # CORE — the loop's non-model machinery
   for t in git gh python3; do have "$t" && add OK "$t" core "" || add MISSING "$t" core "$(brewable "$t")"; done
   # CHECKER RUNTIME — cross-model check + reasoning one-shots

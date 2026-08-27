@@ -9,6 +9,14 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [ "${1:-}" = "--selfcheck" ]; then
+  fails=0
+  rc=0; "$0" -- -p q >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: no-addendum exit $rc (want 2)"; fails=1; }
+  rc=0; "$0" --addendum-text x --lens __nope__ -- -p q >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown-lens exit $rc (want 2)"; fails=1; }
+  rc=0; SM_CHECKER_PROMPT=/nonexistent-xyz "$0" --addendum-text x -- -p q >/dev/null 2>&1 || rc=$?; [ "$rc" = 1 ] || { echo "FAIL: missing-prompt exit $rc (want 1)"; fails=1; }
+  [ "$fails" = 0 ] && echo ok; exit "$fails"
+fi
+
 harness="${SM_CHECKER_HARNESS:-pi}"
 provider="${SM_CHECKER_PROVIDER:-amazon-bedrock}"
 model="${SM_CHECKER_MODEL:-global.openai.gpt-5.6-terra}"

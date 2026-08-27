@@ -48,6 +48,8 @@ gate() {  # gate <worktree> <base> <checked_sha> <test_cmd> ; prints PASS/REFUSE
     ( cd "$wt" && bash -c "$tcmd" ) >/dev/null 2>&1 || fail+=("test failed against current head: $tcmd")
     local head_after; head_after="$(git -C "$wt" rev-parse HEAD)"
     [ "$head_after" = "$head" ] || fail+=("--test moved HEAD ($head -> $head_after) — approval is stale (RE-RUN THE CHECKER)")
+    # finding #4: a test that writes non-ignored artifacts leaves the tree dirty; don't report PASS: clean.
+    [ -z "$(git -C "$wt" status --porcelain)" ] || fail+=("--test left the worktree dirty (uncommitted artifacts) — gitignore them or clean up")
   fi
   if [ "${#fail[@]}" -eq 0 ]; then
     echo "PASS: head=$head clean, non-empty vs $base, checker-current${tcmd:+, tests green}"

@@ -13,12 +13,29 @@ Nothing falls through a restart: `hold.py open` reconciles from disk, never from
 import json, sys, os, time, argparse, pathlib, hashlib
 
 LEDGER = pathlib.Path(os.environ.get("SM_HOLD_LEDGER", "decisions.jsonl"))
+_BAD = 0  # count of malformed/incomplete ledger lines seen by the last _recs()
 
 
 def _recs():
+    # finding #6: parse tolerantly — skip malformed/incomplete lines but COUNT them, so `open` warns
+    # (fail-closed) instead of a partial write silently hiding a pending decision.
+    global _BAD
+    _BAD = 0
+    recs = []
     if not LEDGER.exists():
-        return []
-    return [json.loads(l) for l in LEDGER.read_text().splitlines() if l.strip()]
+        return recs
+    for line in LEDGER.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            _BAD += 1; continue
+        if isinstance(o, dict) and "ev" in o and "id" in o:
+            recs.append(o)
+        else:
+            _BAD += 1
+    return recs
 
 
 def _append(rec):
@@ -62,10 +79,13 @@ def main(argv):
         _append({"ev": "answer", "id": args.id, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "a": args.a})
     elif args.cmd == "open":
         rows = open_decisions()
-        if not rows:
+        if not rows and _BAD == 0:
             print("(no open decisions)", file=sys.stderr)  # stderr: keeps SessionStart-hook stdout clean when empty
         for r in rows:
-            print(f"[{r['id']}] ({r['task']}) {r['q']}" + (f"   opts: {', '.join(r['opts'])}" if r["opts"] else ""))
+            opts = r.get("opts") or []
+            print(f"[{r['id']}] ({r.get('task', '?')}) {r.get('q', '?')}" + (f"   opts: {', '.join(opts)}" if opts else ""))
+        if _BAD:  # surface corruption on stdout so the SessionStart hook shows it — never fail open
+            print(f"WARNING: {_BAD} malformed line(s) in {LEDGER} — ledger may be corrupt; reconcile manually.")
     elif args.cmd == "selfcheck":
         recs = [{"ev": "hold", "id": "a", "task": "t", "q": "q1", "opts": []},
                 {"ev": "hold", "id": "b", "task": "t", "q": "q2", "opts": []},
