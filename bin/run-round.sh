@@ -23,7 +23,13 @@ run() {
   audit_line start
   local status=0 reason="" start last_size=0 last_change now sz pid
   : >"$log"
-  "$@" >"$log" 2>&1 &
+  # C-fix: run the command as a session/process-group leader so a timeout kills its whole tree,
+  # not just the top process (macOS has no setsid(1); python3 os.setsid does it portably).
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" >"$log" 2>&1 &
+  else
+    "$@" >"$log" 2>&1 &   # no python3: fall back to single-process (descendants may survive a timeout)
+  fi
   pid=$!
   trap 'audit_line killed-trap 2>/dev/null || true' EXIT   # paired end-record even if WE are killed
   start=$(date +%s); last_change=$start
@@ -35,7 +41,10 @@ run() {
     if [ $((now - last_change)) -ge "$idle_s" ]; then reason=IDLE; break; fi
   done
   if [ -n "$reason" ]; then
-    kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null || true
+    # negative pid = the whole process group (the setsid tree); fall back to the bare pid if it isn't a leader.
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     case "$reason" in TIMEOUT) audit_line wall-timeout; status=124;; IDLE) audit_line idle-timeout; status=125;; esac
   else
@@ -55,6 +64,11 @@ if [ "${1:-}" = "selfcheck" ]; then
   POLL=1 run --label t3 --log "$tmp/l3" --audit "$tmp/a" --timeout 5 -- sh -c 'echo hi'; c=$? || true
   [ "$c" = "0" ] || { echo "FAIL: ok expected 0 got $c"; rc=1; }
   grep -q '"event":"exit-0"' "$tmp/a" || { echo "FAIL: missing exit-0 audit record"; rc=1; }
+  # C-fix: a wall-timeout must kill the whole process tree. Launch a backgrounded grandchild, record its
+  # pid, time out the parent, then assert the grandchild is dead (it survives if we only killed the leader).
+  POLL=1 run --label t4 --log "$tmp/l4" --audit "$tmp/a" --timeout 1 --idle 30 -- sh -c 'sleep 30 & echo $! > '"$tmp"'/gpid; wait' >/dev/null 2>&1 || true
+  sleep 1; gp="$(cat "$tmp/gpid" 2>/dev/null || echo)"
+  if [ -n "$gp" ] && kill -0 "$gp" 2>/dev/null; then echo "FAIL: descendant $gp survived timeout"; kill -KILL "$gp" 2>/dev/null || true; rc=1; fi
   rm -rf "$tmp"; [ "$rc" = 0 ] && echo ok; exit "$rc"
 fi
 

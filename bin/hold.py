@@ -10,7 +10,11 @@
 Ledger path: $SM_HOLD_LEDGER, else ./decisions.jsonl in the CWD (one ledger per orchestration repo).
 Nothing falls through a restart: `hold.py open` reconciles from disk, never from chat memory.
 """
-import json, sys, os, time, argparse, pathlib, hashlib
+import json, sys, os, time, argparse, pathlib, hashlib, contextlib
+try:
+    import fcntl
+except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
+    fcntl = None
 
 LEDGER = pathlib.Path(os.environ.get("SM_HOLD_LEDGER", "decisions.jsonl"))
 _BAD = 0  # count of malformed/incomplete ledger lines seen by the last _recs()
@@ -45,6 +49,20 @@ def _append(rec):
         f.write(json.dumps(rec) + "\n")
 
 
+@contextlib.contextmanager
+def _ledger_lock():
+    # C-fix: serialize concurrent mutations (esp. answer's read-check-append) with an exclusive OS lock.
+    if fcntl is None:
+        yield; return
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(LEDGER) + ".lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
 def open_decisions(recs=None):
     recs = _recs() if recs is None else recs
     answered = {r["id"] for r in recs if r["ev"] == "answer"}
@@ -65,20 +83,22 @@ def main(argv):
     args = p.parse_args(argv)
 
     if args.cmd == "hold":
-        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-        did = _mkid(args.task, args.q, ts)
-        _append({"ev": "hold", "id": did, "ts": ts, "task": args.task, "q": args.q,
-                 "opts": [o for o in args.opts.split("|") if o]})
+        with _ledger_lock():
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            did = _mkid(args.task, args.q, ts)
+            _append({"ev": "hold", "id": did, "ts": ts, "task": args.task, "q": args.q,
+                     "opts": [o for o in args.opts.split("|") if o]})
         print(did)
     elif args.cmd == "answer":
-        recs = _recs()
-        holds = {r["id"] for r in recs if r["ev"] == "hold"}
-        answered = {r["id"] for r in recs if r["ev"] == "answer"}
-        if args.id not in holds:
-            sys.exit(f"no decision with id {args.id}")
-        if args.id in answered:  # finding #12: don't append a contradictory answer to a closed decision
-            sys.exit(f"decision {args.id} is already answered")
-        _append({"ev": "answer", "id": args.id, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "a": args.a})
+        with _ledger_lock():   # C-fix: read-check-append is atomic vs concurrent answers
+            recs = _recs()
+            holds = {r["id"] for r in recs if r["ev"] == "hold"}
+            answered = {r["id"] for r in recs if r["ev"] == "answer"}
+            if args.id not in holds:
+                sys.exit(f"no decision with id {args.id}")
+            if args.id in answered:  # finding #12: don't append a contradictory answer to a closed decision
+                sys.exit(f"decision {args.id} is already answered")
+            _append({"ev": "answer", "id": args.id, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "a": args.a})
     elif args.cmd == "open":
         rows = open_decisions()
         if not rows and _BAD == 0:

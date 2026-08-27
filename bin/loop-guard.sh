@@ -11,6 +11,12 @@ set -euo pipefail
 state="${SM_LOOP_STATE:-.secondmate}"
 ABORT_REPEATS="${ABORT_REPEATS:-10}"; MAX_ROUNDS="${MAX_ROUNDS:-256}"; MAX_SPAWNS="${MAX_SPAWNS:-1000}"
 
+# C-fix: mkdir is an atomic, cross-platform lock (macOS has no flock). Serializes the counter
+# read-modify-write when parallel makers share one $SM_LOOP_STATE. The trap releases on any exit
+# except SIGKILL; a kill in the ~microsecond critical section is self-healed by `reset`.
+_unlock() { rmdir "$state/.lock" 2>/dev/null || true; }
+_lock() { local i=0; until mkdir "$state/.lock" 2>/dev/null; do i=$((i + 1)); [ "$i" -ge 40 ] && return 1; sleep 0.05; done; trap _unlock EXIT; }
+
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 
 case "$cmd" in
@@ -20,6 +26,7 @@ case "$cmd" in
     [ -n "$key" ] || { echo "need --key" >&2; exit 2; }
     mkdir -p "$state"
     h="$(printf '%s' "$key" | shasum -a 256 | cut -d' ' -f1)"
+    _lock || echo "loop-guard: lock busy, counting unlocked" >&2
     prev="$(cat "$state/action.key" 2>/dev/null || true)"
     n="$(cat "$state/action.count" 2>/dev/null || echo 0)"
     if [ "$h" = "$prev" ]; then n=$((n + 1)); else n=1; printf '%s' "$h" >"$state/action.key"; fi
@@ -32,6 +39,7 @@ case "$cmd" in
     exit 0;;
   round)
     mkdir -p "$state"
+    _lock || echo "loop-guard: lock busy, counting unlocked" >&2
     r="$(cat "$state/rounds" 2>/dev/null || echo 0)"; r=$((r + 1)); echo "$r" >"$state/rounds"
     s="$(cat "$state/spawns" 2>/dev/null || echo 0)"; s=$((s + 1)); echo "$s" >"$state/spawns"
     if [ "$s" -gt "$MAX_SPAWNS" ]; then echo "budget-limited: spawn cap $MAX_SPAWNS reached"; exit 4; fi
@@ -40,6 +48,7 @@ case "$cmd" in
   reset)
     # finding #3: delete ONLY the files we create, never `rm -rf` the caller's $SM_LOOP_STATE wholesale.
     rm -f "$state/action.key" "$state/action.count" "$state/rounds" "$state/spawns" 2>/dev/null || true
+    rmdir "$state/.lock" 2>/dev/null || true   # clear a stale lock from a SIGKILL'd critical section
     rmdir "$state" 2>/dev/null || true
     echo "loop state cleared"; exit 0;;
   selfcheck)
@@ -54,6 +63,9 @@ case "$cmd" in
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
     if SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1; then echo "FAIL: round cap not enforced"; r=1; fi
-    rm -rf "$tmp"; [ "$r" = 0 ] && echo ok; exit "$r";;
+    # C-fix: 8 concurrent increments must all land (atomic lock, no lost updates).
+    tmp2="$(mktemp -d)"; for _ in 1 2 3 4 5 6 7 8; do SM_LOOP_STATE="$tmp2" ABORT_REPEATS=99 "$0" action --key k >/dev/null 2>&1 & done; wait
+    [ "$(cat "$tmp2/action.count" 2>/dev/null || echo 0)" = "8" ] || { echo "FAIL: concurrent count lost updates ($(cat "$tmp2/action.count" 2>/dev/null))"; r=1; }
+    rm -rf "$tmp" "$tmp2"; [ "$r" = 0 ] && echo ok; exit "$r";;
   *) echo "usage: loop-guard.sh action --key K | round | reset | selfcheck" >&2; exit 2;;
 esac
