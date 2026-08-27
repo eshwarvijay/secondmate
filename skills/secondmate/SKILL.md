@@ -82,5 +82,36 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
 
 7. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
 
+## Visible orchestration in herdr (when HERDR_ENV=1)
+
+By default the maker and checker run headless (in-process sub-agent + background scripts) — the captain can't
+watch them. Inside herdr, run the loop in VISIBLE side-by-side panes. You stay in your pane and drive the
+others via the herdr CLI. First check: `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` (if it fails, use the
+headless path). Every split uses `--no-focus` so the captain's focus never moves.
+
+- **Maker pane** — a live agent the captain watches work:
+  ```
+  mk=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split right)
+  herdr agent start sm-maker --kind claude --pane "$mk" -- --model <maker-model>
+  herdr agent prompt sm-maker "/loop-task <goal> — implement in <worktree>" --wait --timeout 600000
+  ```
+- **Checker pane** — the edit-locked checker, run headless IN the pane so it's visible AND capturable, with
+  only the lenses the diff needs:
+  ```
+  ck=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split down)
+  herdr pane run "$ck" '${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --lens redteam/injection --addendum-text "..." -- -p "Review this diff and give your verdict:
+  <diff>" ; echo ___SM_DONE_$?'
+  herdr pane wait-output "$ck" --regex "___SM_DONE_[0-9]" --timeout 240000   # match the RESOLVED marker, not the command echo
+  herdr pane read "$ck" --source recent-unwrapped --lines 200 > /tmp/sm-checker.out
+  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py /tmp/sm-checker.out                    # branch on exit code, as always
+  ```
+- **Watch + integrate from your pane** — `herdr agent get/read sm-maker`, `herdr pane read "$ck"`; then the
+  usual verify-gate + hold. You can't answer another pane's live prompt, so run any gated command yourself
+  in the supervisor context (still a separate context, so maker ≠ checker holds).
+- **Clean up ONLY the panes you created**: `herdr pane close "$mk"`, `herdr pane close "$ck"`.
+
+Not in herdr (`HERDR_ENV != 1`)? Use the headless path — in-process maker sub-agent + `run-round.sh`-wrapped
+checker. Same loop, same guards, just not visible.
+
 ## Not for
 Trivial one-shot edits, read-only questions, or work with no verifiable result — do those directly.
