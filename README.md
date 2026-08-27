@@ -80,7 +80,7 @@ flowchart LR
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
-| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): run the maker + checker in visible side-by-side panes you can watch |
+| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): spawn/`delegate` the maker + checker into visible side-by-side panes (race-proof) you can watch |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 

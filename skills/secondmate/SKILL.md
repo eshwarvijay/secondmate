@@ -89,12 +89,15 @@ watch them. Inside herdr, run the loop in VISIBLE side-by-side panes. You stay i
 others via the herdr CLI. First check: `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` (if it fails, use the
 headless path). Every split uses `--no-focus` so the captain's focus never moves.
 
-- **Maker pane** — a live agent the captain watches work:
+- **Maker pane** — a live agent the captain watches work, in one race-proof call:
   ```
-  mk=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split right)
-  herdr agent start sm-maker --kind claude --pane "$mk" -- --model <maker-model>
-  herdr agent prompt sm-maker "/loop-task <goal> — implement in <worktree>" --wait --timeout 600000
+  ${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh delegate --name sm-maker --kind claude --dir right \
+    --cwd <worktree> --prompt "/loop-task <goal>" --timeout 600000 -- --permission-mode acceptEdits
   ```
+  `delegate` = split + wait-for-shell (fixes the "pane not an available shell" race) + start + prompt + wait +
+  harvest. Use `spawn` (same flags, no `--prompt`) to drive the maker step-by-step instead. If Claude shows a
+  one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-maker enter`. The maker's output is
+  its file edits — read them with `git -C <worktree> diff`, not from the pane.
 - **Checker pane** — the edit-locked checker, run headless IN the pane so it's visible AND capturable, with
   only the lenses the diff needs:
   ```

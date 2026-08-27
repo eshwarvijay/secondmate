@@ -1,23 +1,70 @@
 #!/usr/bin/env bash
-# herdr-pane.sh -- helper for VISIBLE side-by-side orchestration when running inside herdr.
-# Splits from the CURRENT (supervisor) pane, preserves the user's focus and cwd, and prints the new pane id.
-# Requires HERDR_ENV=1 and the `herdr` CLI. Used by the skill's visible-orchestration path; headless otherwise.
-#   herdr-pane.sh check              -> exit 0 if usable (inside herdr + herdr on PATH), else 1
-#   herdr-pane.sh split [right|down] -> print the new pane_id (default: right)
-set -euo pipefail
+# herdr-pane.sh -- helpers for VISIBLE side-by-side orchestration inside herdr.
+# Splits from the CURRENT (supervisor) pane, preserves the user's focus (--no-focus) and cwd.
+# Requires HERDR_ENV=1 and the `herdr` CLI.
+#
+#   herdr-pane.sh check                 -> exit 0 if usable (inside herdr + herdr on PATH)
+#   herdr-pane.sh split [right|down]    -> print the new pane_id
+#   herdr-pane.sh spawn    --name N --kind K [--dir right|down] [--cwd DIR] [-- <agent args...>]
+#         split a pane, WAIT until its shell is ready (race-proof), start a live agent -> prints "<name> <pane_id>"
+#   herdr-pane.sh delegate --name N --kind K [--dir right|down] [--cwd DIR] --prompt TEXT [--timeout MS] [-- <agent args...>]
+#         spawn, send the prompt, wait for the agent to settle, then print its harvested output
+#
+# KINDS: claude pi codex gemini cursor grok kimi opencode ... (herdr agent start --kind).
+# Note: a live MAKER writes files (read the diff via git — no output parsing needed). For a CHECKER whose
+# {verdict} you must PARSE, prefer the headless-in-pane recipe (launch-checker ... -- -p) for clean stdout.
+set -uo pipefail
 
-cmd="${1:-}"; dir="${2:-right}"
 usable() { [ "${HERDR_ENV:-}" = 1 ] && command -v herdr >/dev/null 2>&1; }
+pane_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])'; }
 
+do_split() { # dir cwd -> pane_id
+  case "$1" in right|down) ;; *) echo "direction must be right|down" >&2; return 2;; esac
+  herdr pane split --current --direction "$1" --cwd "$2" --no-focus | pane_id
+}
+
+# Start a live agent in <pane>, retrying until the pane's shell is actually ready. This fixes the
+# "not an available shell" / agent_pane_busy race on a freshly-split pane (no manual sleep needed).
+start_agent() { # name kind pane [-- agent args...]
+  local name="$1" kind="$2" pane="$3"; shift 3
+  local i out
+  for i in $(seq 1 20); do
+    if [ "$#" -gt 0 ]; then out="$(herdr agent start "$name" --kind "$kind" --pane "$pane" -- "$@" 2>&1)" || true
+    else out="$(herdr agent start "$name" --kind "$kind" --pane "$pane" 2>&1)" || true; fi
+    case "$out" in
+      *'"agent_started"'*|*'"agent_info"'*|*already*|*exists*|*duplicate*) return 0;;
+      *) sleep 1;;   # busy / not-yet-a-shell / transient — keep trying within the ~20s window
+    esac
+  done
+  echo "agent start failed after retries: $out" >&2; return 1
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
-  check)
-    usable || { echo "not usable: need HERDR_ENV=1 and herdr on PATH (fall back to headless orchestration)" >&2; exit 1; }
-    ;;
+  check) usable || { echo "not usable: need HERDR_ENV=1 and herdr on PATH (fall back to headless)" >&2; exit 1; };;
   split)
-    usable || { echo "not inside herdr (HERDR_ENV != 1) or herdr missing" >&2; exit 1; }
-    case "$dir" in right|down) ;; *) echo "direction must be right|down" >&2; exit 2;; esac
-    out="$(herdr pane split --current --direction "$dir" --cwd "$PWD" --no-focus)" || { echo "herdr pane split failed" >&2; exit 1; }
-    printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])'
-    ;;
-  *) echo "usage: herdr-pane.sh check | split [right|down]" >&2; exit 2;;
+    usable || { echo "not inside herdr" >&2; exit 1; }
+    do_split "${1:-right}" "$PWD";;
+  spawn|delegate)
+    usable || { echo "not inside herdr" >&2; exit 1; }
+    name="" kind="" dir="right" cwd="$PWD" prompt="" timeout=600000; args=()
+    while [ $# -gt 0 ]; do case "$1" in
+      --name) name="$2"; shift 2;; --kind) kind="$2"; shift 2;;
+      --dir) dir="$2"; shift 2;; --cwd) cwd="$2"; shift 2;;
+      --prompt) prompt="$2"; shift 2;; --timeout) timeout="$2"; shift 2;;
+      --) shift; args=("$@"); break;;
+      *) echo "unknown arg: $1" >&2; exit 2;;
+    esac; done
+    [ -n "$name" ] && [ -n "$kind" ] || { echo "need --name and --kind" >&2; exit 2; }
+    pane="$(do_split "$dir" "$cwd")" || exit 1
+    if [ "${#args[@]}" -gt 0 ]; then start_agent "$name" "$kind" "$pane" "${args[@]}" || exit 1
+    else start_agent "$name" "$kind" "$pane" || exit 1; fi
+    if [ "$cmd" = spawn ]; then
+      echo "$name $pane"
+    else
+      [ -n "$prompt" ] || { echo "delegate needs --prompt" >&2; exit 2; }
+      herdr agent prompt "$name" "$prompt" --wait --timeout "$timeout" >/dev/null 2>&1 || true
+      herdr agent read "$name" --source recent-unwrapped --lines 400
+    fi;;
+  *) echo "usage: herdr-pane.sh check | split [right|down] | spawn --name N --kind K [...] | delegate --name N --kind K --prompt T [...]" >&2; exit 2;;
 esac
