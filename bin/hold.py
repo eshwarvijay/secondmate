@@ -24,14 +24,14 @@ def _recs():
     recs = []
     if not LEDGER.exists():
         return recs
-    for line in LEDGER.read_text().splitlines():
+    for line in LEDGER.read_text(errors="replace").splitlines():   # finding #5: tolerate invalid UTF-8
         if not line.strip():
             continue
         try:
             o = json.loads(line)
         except ValueError:
             _BAD += 1; continue
-        if isinstance(o, dict) and o.get("ev") in ("hold", "answer") and "id" in o:
+        if isinstance(o, dict) and o.get("ev") in ("hold", "answer") and isinstance(o.get("id"), str):  # #5: id must be a hashable string
             if o["ev"] == "answer" and "a" not in o:   # finding #1: an incomplete answer must not close a hold
                 _BAD += 1; continue
             recs.append(o)

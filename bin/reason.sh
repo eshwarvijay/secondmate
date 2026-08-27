@@ -26,7 +26,7 @@ reason() {
     --dry-run) dry=1; shift;;
     --) shift; question="$*"; break;;
     -*) echo "unknown arg: $1" >&2; return 2;;
-    *) question="$1"; shift;;
+    *) question="${question:+$question }$1"; shift;;   # finding #4: accumulate unquoted multiword questions
   esac; done
 
   if [ -z "$question" ] && [ ! -t 0 ]; then question="$(cat)"; fi
@@ -61,6 +61,8 @@ if [ "${1:-}" = "--selfcheck" ]; then
   out2="$(reason --dry-run --thinking off "q")"
   if echo "$out2" | grep -q -- '--thinking'; then echo "FAIL: off should omit --thinking"; r=1; fi
   echo "$out2" | grep -q 'deepseek.r1'          || { echo "FAIL: default model should be r1"; r=1; }
+  out3="$(reason --dry-run why does login fail)"   # #4: unquoted multiword question must keep all words
+  { echo "$out3" | grep -q why && echo "$out3" | grep -q login; } || { echo "FAIL: unquoted multiword question dropped words"; r=1; }
   rm -f "$tmp"; [ "$r" = 0 ] && echo ok; exit "$r"
 fi
 

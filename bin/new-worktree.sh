@@ -40,10 +40,11 @@ wt_root="${SM_WT_ROOT:-$HOME/.secondmate-worktrees}"
 wt="$wt_root/$(basename "$primary")-$task"
 branch="sm/$task"
 
-# ponytail: the isolation assertion -- refuse if the worktree would land on the primary checkout.
+mkdir -p "$wt_root"
+# isolation assertion: the worktree root must live OUTSIDE the primary checkout, not merely differ (finding #1).
+wt_root_abs="$(cd "$wt_root" && pwd -P)"   # physical path, to match git's canonical --show-toplevel
+case "$wt_root_abs/" in "$primary"/*) echo "isolation failed: SM_WT_ROOT ($wt_root_abs) is inside the primary checkout $primary" >&2; exit 1;; esac
 [ "$wt" != "$primary" ] || { echo "isolation assertion failed: worktree == primary checkout" >&2; exit 1; }
 [ -e "$wt" ] && { echo "worktree already exists: $wt" >&2; exit 1; }
-
-mkdir -p "$wt_root"
 git -C "$repo" worktree add -b "$branch" "$wt" "$base" >&2
 echo "$wt $branch"
