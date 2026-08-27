@@ -20,8 +20,8 @@ reason() {
   local harness="${SM_REASON_HARNESS:-pi}" provider="${SM_REASON_PROVIDER:-amazon-bedrock}"
   local -a contexts=()
   while [ $# -gt 0 ]; do case "$1" in
-    --model) model_alias="$2"; shift 2;;
-    --thinking) thinking="$2"; shift 2;;
+    --model) model_alias="${2:?value required for $1}"; shift 2;;
+    --thinking) thinking="${2:?value required for $1}"; shift 2;;
     --context) contexts+=("$2"); shift 2;;
     --dry-run) dry=1; shift;;
     --) shift; question="$*"; break;;

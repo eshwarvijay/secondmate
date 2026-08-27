@@ -31,7 +31,9 @@ def _recs():
             o = json.loads(line)
         except ValueError:
             _BAD += 1; continue
-        if isinstance(o, dict) and "ev" in o and "id" in o:
+        if isinstance(o, dict) and o.get("ev") in ("hold", "answer") and "id" in o:
+            if o["ev"] == "answer" and "a" not in o:   # finding #1: an incomplete answer must not close a hold
+                _BAD += 1; continue
             recs.append(o)
         else:
             _BAD += 1

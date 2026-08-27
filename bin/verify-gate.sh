@@ -12,10 +12,10 @@ set -euo pipefail
 worktree="" base="main" checked_sha="" test_cmd="" selfcheck=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --worktree) worktree="$2"; shift 2;;
-    --base) base="$2"; shift 2;;
-    --checked-sha) checked_sha="$2"; shift 2;;
-    --test) test_cmd="$2"; shift 2;;
+    --worktree) worktree="${2:?value required for $1}"; shift 2;;
+    --base) base="${2:?value required for $1}"; shift 2;;
+    --checked-sha) checked_sha="${2:?value required for $1}"; shift 2;;
+    --test) test_cmd="${2:?value required for $1}"; shift 2;;
     --selfcheck) selfcheck=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -74,4 +74,6 @@ if [ "$selfcheck" -eq 1 ]; then
 fi
 
 [ -n "$worktree" ] || { echo "need --worktree PATH (or --selfcheck)" >&2; exit 2; }
+# finding #4: the exact-SHA guarantee is only real if a checked SHA is supplied — fail closed if omitted.
+[ -n "$checked_sha" ] || { echo "need --checked-sha (the exact commit the checker reviewed); refusing to gate without it" >&2; exit 2; }
 gate "$worktree" "$base" "$checked_sha" "$test_cmd"

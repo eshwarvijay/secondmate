@@ -49,18 +49,24 @@ def _valid_verdicts(text):
 
 
 def read_verdict(text):
-    # 1) prefer verdicts inside fenced code blocks (the instructed envelope format)
-    verdicts = []
-    for block in re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL):
-        verdicts += _valid_verdicts(block)
-    # 2) fall back to top-level objects anywhere in the text
-    if not verdicts:
-        verdicts = _valid_verdicts(text)
-    if not verdicts:
+    # The checker is instructed to END with a fenced ```json envelope as its FINAL output, so the real
+    # verdict is the LAST json-fenced block; example envelopes quoted earlier in the findings are ignored
+    # (finding #3: a `{"verdict":"pass"}` example inside a finding must not be mistaken for the verdict).
+    for pattern in (r"```json\s*\n(.*?)```", r"```\s*\n(.*?)```"):
+        blocks = re.findall(pattern, text, re.DOTALL)
+        for block in reversed(blocks):                 # last matching block wins
+            vs = _valid_verdicts(block)
+            if vs:
+                if len(set(vs)) > 1:                    # one block, conflicting verdicts -> fail closed
+                    return "ambiguous", EXIT["ambiguous"]
+                return vs[-1], EXIT[vs[-1]]
+    # no fenced block at all: fall back to top-level objects; conflicting bare verdicts fail closed
+    vs = _valid_verdicts(text)
+    if not vs:
         return "malformed", EXIT["malformed"]
-    if len(set(verdicts)) > 1:               # conflicting envelopes -> fail closed
+    if len(set(vs)) > 1:
         return "ambiguous", EXIT["ambiguous"]
-    return verdicts[-1], EXIT[verdicts[-1]]
+    return vs[-1], EXIT[vs[-1]]
 
 
 def main(argv):
@@ -71,8 +77,9 @@ def main(argv):
         assert rv('no json at all') == ("malformed", 2)
         assert rv('{"verdict":"bogus"}') == ("malformed", 2)
         assert rv('{"report":{"verdict":"pass"}}')[1] == 2                        # #8 nested, not an envelope
-        assert rv('{"verdict":"fail"} bare {"verdict":"pass"}') == ("ambiguous", 2)  # #7 conflict -> fail closed
-        assert rv('```json\n{"verdict":"fail"}\n```\n```json\n{"verdict":"pass"}\n```') == ("ambiguous", 2)
+        assert rv('finding: `{"verdict":"pass"}` example\n```json\n{"verdict":"fail","findings":[]}\n```') == ("fail", 1)  # #3 example ignored
+        assert rv('```json\n{"verdict":"pass"}\n```\n```json\n{"verdict":"fail"}\n```') == ("fail", 1)  # last json block wins
+        assert rv('{"verdict":"fail"} bare {"verdict":"pass"}') == ("ambiguous", 2)  # no fence + conflict -> fail closed
         assert rv('prose "{not json}" then\n```json\n{"verdict":"pass"}\n```') == ("pass", 0)  # braces in strings
         print("ok"); return
     text = open(argv[0]).read() if argv else sys.stdin.read()

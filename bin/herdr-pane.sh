@@ -58,9 +58,9 @@ case "$cmd" in
     usable || { echo "not inside herdr" >&2; exit 1; }
     name="" kind="" dir="right" cwd="$PWD" prompt="" timeout=600000; args=()
     while [ $# -gt 0 ]; do case "$1" in
-      --name) name="$2"; shift 2;; --kind) kind="$2"; shift 2;;
-      --dir) dir="$2"; shift 2;; --cwd) cwd="$2"; shift 2;;
-      --prompt) prompt="$2"; shift 2;; --timeout) timeout="$2"; shift 2;;
+      --name) name="${2:?value required for $1}"; shift 2;; --kind) kind="${2:?value required for $1}"; shift 2;;
+      --dir) dir="${2:?value required for $1}"; shift 2;; --cwd) cwd="${2:?value required for $1}"; shift 2;;
+      --prompt) prompt="${2:?value required for $1}"; shift 2;; --timeout) timeout="${2:?value required for $1}"; shift 2;;
       --) shift; args=("$@"); break;;
       *) echo "unknown arg: $1" >&2; exit 2;;
     esac; done
@@ -74,7 +74,9 @@ case "$cmd" in
       echo "$name $pane"
     else
       [ -n "$prompt" ] || { echo "delegate needs --prompt" >&2; exit 2; }
-      herdr agent prompt "$name" "$prompt" --wait --timeout "$timeout" >/dev/null 2>&1 || true
+      # finding #7: do NOT mask a failed/timed-out prompt — otherwise stale `agent read` output looks like success.
+      herdr agent prompt "$name" "$prompt" --wait --timeout "$timeout" >/dev/null 2>&1 \
+        || { echo "delegate: prompt to $name failed or timed out" >&2; exit 1; }
       herdr agent read "$name" --source recent-unwrapped --lines 400
     fi;;
   *) echo "usage: herdr-pane.sh check | split [right|down] | spawn --name N --kind K [...] | delegate --name N --kind K --prompt T [...]" >&2; exit 2;;

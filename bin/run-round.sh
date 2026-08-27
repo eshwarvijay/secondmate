@@ -10,15 +10,16 @@ set -uo pipefail
 run() {
   local label="round" log="round.log" timeout_s=600 idle_s=120 audit="audit.jsonl" poll="${POLL:-5}"
   while [ $# -gt 0 ]; do case "$1" in
-    --label) label="$2"; shift 2;; --log) log="$2"; shift 2;;
-    --timeout) timeout_s="$2"; shift 2;; --idle) idle_s="$2"; shift 2;;
-    --audit) audit="$2"; shift 2;; --) shift; break;;
+    --label) label="${2:?value required for $1}"; shift 2;; --log) log="${2:?value required for $1}"; shift 2;;
+    --timeout) timeout_s="${2:?value required for $1}"; shift 2;; --idle) idle_s="${2:?value required for $1}"; shift 2;;
+    --audit) audit="${2:?value required for $1}"; shift 2;; --) shift; break;;
     *) echo "unknown arg: $1" >&2; return 2;; esac; done
   [ $# -gt 0 ] || { echo "need -- <cmd...>" >&2; return 2; }
 
   # finding #8: JSON-encode the label + event (python) so a crafted --label can't forge audit records.
   audit_line() { python3 -c 'import json,sys; print(json.dumps({"label":sys.argv[1],"event":sys.argv[2],"ts":int(sys.argv[3])},separators=(",",":")))' "$label" "$1" "$(date +%s)" >>"$audit"; }
 
+  mkdir -p "$(dirname "$audit")" 2>/dev/null || true   # finding #5: ensure the audit dir exists so records actually land
   audit_line start
   local status=0 reason="" start last_size=0 last_change now sz pid
   : >"$log"
