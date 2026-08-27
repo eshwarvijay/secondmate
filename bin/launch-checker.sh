@@ -25,11 +25,11 @@ base_prompt="${SM_CHECKER_PROMPT:-$SCRIPT_DIR/checker-prompt.md}"
 addendum_file="" addendum_text=""; lenses=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --addendum) addendum_file="${2:?value required for $1}"; shift 2;;
-    --addendum-text) addendum_text="${2:?value required for $1}"; shift 2;;
-    --lens) lenses+=("$2"); shift 2;;
-    --model) case "$2" in terra|sol|luna) model="global.openai.gpt-5.6-$2";; *) model="$2";; esac; shift 2;;
-    --thinking) thinking="${2:?value required for $1}"; shift 2;;
+    --addendum) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; addendum_file="$2"; shift 2;;
+    --addendum-text) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; addendum_text="$2"; shift 2;;
+    --lens) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; lenses+=("$2"); shift 2;;
+    --model) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; case "$2" in terra|sol|luna) model="global.openai.gpt-5.6-$2";; *) model="$2";; esac; shift 2;;
+    --thinking) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; thinking="$2"; shift 2;;
     --) shift; break;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac

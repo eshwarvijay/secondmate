@@ -10,9 +10,9 @@ set -uo pipefail
 run() {
   local label="round" log="round.log" timeout_s=600 idle_s=120 audit="audit.jsonl" poll="${POLL:-5}"
   while [ $# -gt 0 ]; do case "$1" in
-    --label) label="${2:?value required for $1}"; shift 2;; --log) log="${2:?value required for $1}"; shift 2;;
-    --timeout) timeout_s="${2:?value required for $1}"; shift 2;; --idle) idle_s="${2:?value required for $1}"; shift 2;;
-    --audit) audit="${2:?value required for $1}"; shift 2;; --) shift; break;;
+    --label) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; label="$2"; shift 2;; --log) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; log="$2"; shift 2;;
+    --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout_s="$2"; shift 2;; --idle) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; idle_s="$2"; shift 2;;
+    --audit) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; audit="$2"; shift 2;; --) shift; break;;
     *) echo "unknown arg: $1" >&2; return 2;; esac; done
   [ $# -gt 0 ] || { echo "need -- <cmd...>" >&2; return 2; }
 

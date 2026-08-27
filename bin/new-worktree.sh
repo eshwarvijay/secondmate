@@ -22,9 +22,9 @@ fi
 repo="" task="" base="main"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --repo) repo="${2:?value required for $1}"; shift 2;;
-    --task) task="${2:?value required for $1}"; shift 2;;
-    --base) base="${2:?value required for $1}"; shift 2;;
+    --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; repo="$2"; shift 2;;
+    --task) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; task="$2"; shift 2;;
+    --base) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; base="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done

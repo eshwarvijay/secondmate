@@ -16,7 +16,7 @@ cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   action)
     key=""
-    while [ $# -gt 0 ]; do case "$1" in --key) key="${2:?value required for $1}"; shift 2;; *) shift;; esac; done
+    while [ $# -gt 0 ]; do case "$1" in --key) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; key="$2"; shift 2;; *) shift;; esac; done
     [ -n "$key" ] || { echo "need --key" >&2; exit 2; }
     mkdir -p "$state"
     h="$(printf '%s' "$key" | shasum -a 256 | cut -d' ' -f1)"

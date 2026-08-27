@@ -58,9 +58,9 @@ case "$cmd" in
     usable || { echo "not inside herdr" >&2; exit 1; }
     name="" kind="" dir="right" cwd="$PWD" prompt="" timeout=600000; args=()
     while [ $# -gt 0 ]; do case "$1" in
-      --name) name="${2:?value required for $1}"; shift 2;; --kind) kind="${2:?value required for $1}"; shift 2;;
-      --dir) dir="${2:?value required for $1}"; shift 2;; --cwd) cwd="${2:?value required for $1}"; shift 2;;
-      --prompt) prompt="${2:?value required for $1}"; shift 2;; --timeout) timeout="${2:?value required for $1}"; shift 2;;
+      --name) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; name="$2"; shift 2;; --kind) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; kind="$2"; shift 2;;
+      --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
+      --prompt) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; prompt="$2"; shift 2;; --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
       --) shift; args=("$@"); break;;
       *) echo "unknown arg: $1" >&2; exit 2;;
     esac; done

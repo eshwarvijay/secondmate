@@ -12,10 +12,10 @@ set -euo pipefail
 worktree="" base="main" checked_sha="" test_cmd="" selfcheck=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --worktree) worktree="${2:?value required for $1}"; shift 2;;
-    --base) base="${2:?value required for $1}"; shift 2;;
-    --checked-sha) checked_sha="${2:?value required for $1}"; shift 2;;
-    --test) test_cmd="${2:?value required for $1}"; shift 2;;
+    --worktree) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; worktree="$2"; shift 2;;
+    --base) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; base="$2"; shift 2;;
+    --checked-sha) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; checked_sha="$2"; shift 2;;
+    --test) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; test_cmd="$2"; shift 2;;
     --selfcheck) selfcheck=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
