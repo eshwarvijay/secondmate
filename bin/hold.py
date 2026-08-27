@@ -33,7 +33,8 @@ def open_decisions(recs=None):
 
 
 def _mkid(task, q, ts):
-    return hashlib.sha1(f"{task}{q}{ts}".encode()).hexdigest()[:8]
+    # finding #11: a random nonce so two identical holds in the same second get distinct ids.
+    return hashlib.sha1(f"{task}{q}{ts}{os.urandom(4).hex()}".encode()).hexdigest()[:8]
 
 
 def main(argv):
@@ -51,8 +52,13 @@ def main(argv):
                  "opts": [o for o in args.opts.split("|") if o]})
         print(did)
     elif args.cmd == "answer":
-        if not any(r["ev"] == "hold" and r["id"] == args.id for r in _recs()):
-            sys.exit(f"no open decision with id {args.id}")
+        recs = _recs()
+        holds = {r["id"] for r in recs if r["ev"] == "hold"}
+        answered = {r["id"] for r in recs if r["ev"] == "answer"}
+        if args.id not in holds:
+            sys.exit(f"no decision with id {args.id}")
+        if args.id in answered:  # finding #12: don't append a contradictory answer to a closed decision
+            sys.exit(f"decision {args.id} is already answered")
         _append({"ev": "answer", "id": args.id, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "a": args.a})
     elif args.cmd == "open":
         rows = open_decisions()

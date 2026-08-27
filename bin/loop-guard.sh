@@ -38,7 +38,10 @@ case "$cmd" in
     if [ "$r" -gt "$MAX_ROUNDS" ]; then echo "budget-limited: round cap $MAX_ROUNDS reached"; exit 4; fi
     echo "round=$r spawns=$s"; exit 0;;
   reset)
-    rm -rf "$state"; echo "loop state cleared"; exit 0;;
+    # finding #3: delete ONLY the files we create, never `rm -rf` the caller's $SM_LOOP_STATE wholesale.
+    rm -f "$state/action.key" "$state/action.count" "$state/rounds" "$state/spawns" 2>/dev/null || true
+    rmdir "$state" 2>/dev/null || true
+    echo "loop state cleared"; exit 0;;
   selfcheck)
     tmp="$(mktemp -d)"; r=0
     SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true

@@ -56,6 +56,8 @@ case "$cmd" in
       *) echo "unknown arg: $1" >&2; exit 2;;
     esac; done
     [ -n "$name" ] && [ -n "$kind" ] || { echo "need --name and --kind" >&2; exit 2; }
+    # finding #2: validate ALL required args BEFORE mutating (splitting a pane), so a bad call leaves nothing behind.
+    if [ "$cmd" = delegate ] && [ -z "$prompt" ]; then echo "delegate needs --prompt" >&2; exit 2; fi
     pane="$(do_split "$dir" "$cwd")" || exit 1
     if [ "${#args[@]}" -gt 0 ]; then start_agent "$name" "$kind" "$pane" "${args[@]}" || exit 1
     else start_agent "$name" "$kind" "$pane" || exit 1; fi

@@ -16,7 +16,8 @@ run() {
     *) echo "unknown arg: $1" >&2; return 2;; esac; done
   [ $# -gt 0 ] || { echo "need -- <cmd...>" >&2; return 2; }
 
-  audit_line() { printf '{"label":"%s","event":"%s","ts":%s}\n' "$label" "$1" "$(date +%s)" >>"$audit"; }
+  # finding #8: JSON-encode the label + event (python) so a crafted --label can't forge audit records.
+  audit_line() { python3 -c 'import json,sys; print(json.dumps({"label":sys.argv[1],"event":sys.argv[2],"ts":int(sys.argv[3])},separators=(",",":")))' "$label" "$1" "$(date +%s)" >>"$audit"; }
 
   audit_line start
   local status=0 reason="" start last_size=0 last_change now sz pid

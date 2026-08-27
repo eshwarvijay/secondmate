@@ -18,6 +18,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$repo" ] && [ -n "$task" ] || { echo "need --repo PATH --task ID" >&2; exit 2; }
+# finding #5: a task with '/' or '..' would escape SM_WT_ROOT via git worktree add. Require a simple slug.
+case "$task" in */*|*..*) echo "invalid --task '$task': use a simple slug (no '/' or '..')" >&2; exit 2;; esac
 
 repo="$(cd "$repo" && pwd)"
 git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git repo: $repo" >&2; exit 1; }

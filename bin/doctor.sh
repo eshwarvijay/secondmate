@@ -39,14 +39,15 @@ detect() {
 }
 
 emit_json() {
-  printf '['; local first=1
-  while IFS='|' read -r st name cat fix; do
-    [ -z "$name" ] && continue
-    [ $first -eq 0 ] && printf ','; first=0
-    fix=${fix//\\/\\\\}; fix=${fix//\"/\\\"}
-    printf '{"name":"%s","status":"%s","category":"%s","fix":"%s"}' "$name" "$st" "$cat" "$fix"
-  done <<< "$ROWS"
-  printf ']\n'
+  # finding #1: build JSON with python so control chars (e.g. a newline in $SM_CHECKER_HARNESS) are escaped.
+  printf '%s' "$ROWS" | python3 -c 'import json,sys
+out=[]
+for line in sys.stdin.read().splitlines():
+    if not line.strip(): continue
+    parts=(line.split("|",3)+["","","",""])[:4]
+    st,name,cat,fix=parts
+    out.append({"name":name,"status":st,"category":cat,"fix":fix})
+print(json.dumps(out,separators=(",",":")))'
 }
 
 emit_table() {

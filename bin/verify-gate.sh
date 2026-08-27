@@ -41,9 +41,13 @@ gate() {  # gate <worktree> <base> <checked_sha> <test_cmd> ; prints PASS/REFUSE
   if [ -n "$checked" ] && [ "$checked" != "$head" ]; then
     fail+=("head moved since checker verdict: checked=$checked now=$head (RE-RUN THE CHECKER)")
   fi
-  # #3c: re-run the test against the current head
+  # #3c: re-run the test against the current head. --test is a TRUSTED, supervisor-supplied command by
+  # design (it's "run this test"); run it via `bash -c`. THEN re-read HEAD: if the test moved it (e.g. it
+  # committed), the exact-SHA approval is now stale -> refuse (finding #10).
   if [ -n "$tcmd" ]; then
-    ( cd "$wt" && eval "$tcmd" ) >/dev/null 2>&1 || fail+=("test failed against current head: $tcmd")
+    ( cd "$wt" && bash -c "$tcmd" ) >/dev/null 2>&1 || fail+=("test failed against current head: $tcmd")
+    local head_after; head_after="$(git -C "$wt" rev-parse HEAD)"
+    [ "$head_after" = "$head" ] || fail+=("--test moved HEAD ($head -> $head_after) — approval is stale (RE-RUN THE CHECKER)")
   fi
   if [ "${#fail[@]}" -eq 0 ]; then
     echo "PASS: head=$head clean, non-empty vs $base, checker-current${tcmd:+, tests green}"
