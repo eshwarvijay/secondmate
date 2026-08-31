@@ -124,10 +124,11 @@ Each stage exists to close a specific failure mode.
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here.
 
-8. **Audit trail.** After integration, append `flow.md` (orchestration: maker path, models, rounds, outcome)
-   and `decision.md` (what the maker decided, checker findings, gates auto-approved or escalated) to the
-   **primary checkout** — not the worktree, so no commit advances the checked SHA and invalidates the gate.
-   Commit these separately. Skip for trivial one-shot edits.
+8. **Audit trail.** After integration, append to `audit/flow.md` (orchestration: maker path, models, rounds,
+   outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
+   escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
+   Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
+   Commit separately. Skip for trivial one-shot edits.
 
 ## Invariants that make it trustworthy
 

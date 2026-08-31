@@ -138,10 +138,11 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 8. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
 
-9. **Audit trail** — after integration, append to git-versioned files in the **primary checkout** (not the worktree):
-   - `flow.md` — which maker path was chosen and why, planner model list if committee ran, round count, outcome.
-   - `decision.md` — what the maker decided, what the checker found, every gate auto-approved or escalated and why.
-   Append, never rewrite. Commit these separately in the primary repo — they do not touch the worktree and cannot stale the checked SHA. Skip for trivial one-shot edits.
+9. **Audit trail** — after integration, append to `audit/flow.md` and `audit/decision.md` in the **primary checkout** (not the worktree):
+   - `audit/flow.md` — which maker path was chosen and why, planner model list if committee ran, round count, outcome.
+   - `audit/decision.md` — what the maker decided, what the checker found, every gate auto-approved or escalated and why.
+   Append, never rewrite. Commit separately in the primary repo — they do not touch the worktree and cannot stale the checked SHA.
+   Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as context. Skip for trivial one-shot edits.
 
 ## Visible orchestration in herdr (when HERDR_ENV=1)
 

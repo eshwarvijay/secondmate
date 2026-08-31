@@ -1,5 +1,10 @@
 # secondmate — project instructions
 
+## Audit trail (auto-loaded each session)
+
+@audit/flow.md
+@audit/decision.md
+
 ## Docs must stay in sync with code
 
 Before every `git push`, update `README.md` and `docs/ARCHITECTURE.md` to reflect any changes to:
