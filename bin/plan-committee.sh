@@ -49,6 +49,17 @@ while [ $# -gt 0 ]; do case "$1" in
     [ "$rc" = 2 ] || { echo "FAIL: no-task exit $rc (want 2)"; fails=1; }
     rc=0; "$0" --task x --timeout nope >/dev/null 2>&1 || rc=$?
     [ "$rc" = 2 ] || { echo "FAIL: non-numeric timeout exit $rc (want 2)"; fails=1; }
+    rc=0; "$0" --task x --timeout 0 >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 2 ] || { echo "FAIL: zero timeout exit $rc (want 2)"; fails=1; }
+    # static PLANNERS contract: 6 entries, 4 pipe-delimited fields each, valid thinking value
+    count=0
+    for entry in "${PLANNERS[@]}"; do
+      count=$((count + 1))
+      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
+      [ -n "$_lbl" ] && [ -n "$_mid" ] || { echo "FAIL: empty label or model in entry: $entry"; fails=1; }
+      case "$_th" in off|high) ;; *) echo "FAIL: invalid thinking '$_th' in entry: $entry"; fails=1;; esac
+    done
+    [ "$count" = 6 ] || { echo "FAIL: expected 6 planners, got $count"; fails=1; }
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   *) echo "unknown arg: $1" >&2; exit 2;;
 esac; done
