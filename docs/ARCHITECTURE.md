@@ -23,27 +23,35 @@ Two principles run through every component:
 | Role | Who | Job | Constraint |
 |---|---|---|---|
 | **Captain** | you (human) | state intent, approve risky actions | the only merge authority |
-| **Supervisor** | Claude Code | triage, orchestrate, adjudicate, integrate | never writes project code itself |
-| **Maker** | Claude (or any harness) | implement the change in an isolated worktree | works only in its own worktree |
-| **Checker** | a *different* model (e.g. GPT-5.6) | review the diff adversarially | physically read-only |
+| **Supervisor** | Claude Code (Sonnet) | plan, triage, orchestrate, adjudicate, integrate | never writes project code itself |
+| **Planners** | 6 open-weight models via pi | each covers one dimension of the task in parallel | headless, read-only, no tools |
+| **Maker** | Claude or pi + Qwen3-Coder | implement the change in an isolated worktree | works only in its own worktree |
+| **Checker** | a *different* model (GPT-5.6-Terra) | review the diff adversarially | physically read-only, edit-locked |
 
 The separation is the point: **maker is not checker, and they run different model families** so their
-failure modes do not overlap. The supervisor is deliberately kept out of the workshop: it commands, it does
-not build, so its attention scales.
+failure modes do not overlap. Planners are also a different family from both — genuine model diversity, not simulated.
+The supervisor is deliberately kept out of the workshop: it commands, it does not build, so its attention scales.
 
 ## The loop
 
 ```mermaid
 flowchart TD
-    Cap([Captain]) -->|goal| SUP[Supervisor: Claude Code]
-    SUP --> TRI{Triage: ship or scout, full or fast}
+    Cap([Captain]) -->|goal| SUP[Supervisor: Claude Code + ponytail]
+    SUP -->|complex task| PC[plan-committee.sh<br/>6 models in parallel]
+    PC --> SYN[Supervisor synthesizes<br/>consolidated plan]
+    SYN --> ROUTE{Route maker}
+    ROUTE -->|needs judgment / MCP| MKC[Claude maker]
+    ROUTE -->|well-specified / pure code| MKQ[pi + Qwen3-Coder maker]
+    SUP -->|trivial task| TRI
+    MKC --> TRI{Triage: ship or scout, full or fast}
+    MKQ --> TRI
     TRI -->|reasoning one-shot| RS[reason.sh: different model, read-only]
     RS --> TRI
     TRI -->|spawn| WT[new-worktree.sh: isolated worktree]
     WT --> MK[Maker: implements]
     MK -. guarded by .-> GD[loop-guard.sh plus run-round.sh]
     MK -->|commit diff| PR[prune-output.sh: trim logs]
-    PR --> CH[launch-checker.sh: different model, edit-locked]
+    PR --> CH[launch-checker.sh: gpt-terra, edit-locked]
     CH --> EV[/verdict envelope JSON/]
     EV --> VD{verdict.py}
     VD -->|fail or error| MK
@@ -58,6 +66,15 @@ flowchart TD
 ## Stage by stage
 
 Each stage exists to close a specific failure mode.
+
+0. **Plan Committee** *(optional — complex and ambiguous tasks only).*
+   `plan-committee.sh` spawns 6 headless pi planners in parallel (DeepSeek-R1, Qwen3-Next-80B,
+   Qwen3-Coder-Next, Kimi-K2-Thinking, Mistral-Large-3, GLM-5), each covering one dimension of the task.
+   The supervisor also runs `/adhd` as a Claude sub-agent for rapid cognitive-frame divergence.
+   All outputs land in `.secondmate/planning/`. The supervisor reads them, synthesizes a single
+   consolidated plan (with ponytail active — speculative ideas get cut), and routes to the right maker.
+   *Guards against:* a single model's blind spots dominating the plan; over-engineered implementations
+   from a single perspective.
 
 1. **Triage.** Classify the task `ship` (produces a diff) vs `scout` (report only), and a rigor tier `full`
    vs `fast`. If the answer needs hard reasoning with no tools (root-cause, plan review, pre-mortem), delegate
@@ -136,8 +153,9 @@ Each stage exists to close a specific failure mode.
 |---|---|
 | `skills/secondmate/SKILL.md` | the SOP the supervisor follows |
 | `hooks/hooks.json` | SessionStart hold-surfacing |
+| `bin/plan-committee.sh` | 6 parallel pi planners → `.secondmate/planning/<label>.md` |
 | `bin/new-worktree.sh` | isolated worktree per maker |
-| `bin/run-round.sh` | timeout + idle watchdog + audit |
+| `bin/run-round.sh` | timeout + idle watchdog + audit (used by planners + maker + checker) |
 | `bin/loop-guard.sh` | stuck-loop abort + round/spawn caps |
 | `bin/launch-checker.sh` + `bin/checker-envelope.md` | edit-locked cross-model checker + verdict contract |
 | `bin/verdict.py` | deterministic pass/fail/error branching |

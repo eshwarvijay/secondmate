@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.0-4C8BF5?style=flat-square" alt="version 0.1.0" />
+  <img src="https://img.shields.io/badge/version-0.1.3-4C8BF5?style=flat-square" alt="version 0.1.3" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -51,8 +51,10 @@ read-only analysis? `/secondmate-reason why does this test flake only in CI?`
 
 ```mermaid
 flowchart LR
-    A[loop-task: goal] --> M[maker<br/>isolated worktree]
-    M --> C[checker<br/>different model, read-only]
+    A[loop-task: goal] --> P[plan-committee<br/>6 models in parallel]
+    P --> S[supervisor: Sonnet<br/>synthesizes plan]
+    S --> M[maker<br/>Claude or pi+Qwen]
+    M --> C[checker<br/>gpt-terra, read-only]
     C --> V{verdict}
     V -- fail --> M
     V -- pass --> G{verify-gate}
@@ -60,6 +62,8 @@ flowchart LR
     G -- pass --> H{{your approval}}
     H -- merge --> D[ship]
 ```
+
+> The planning committee is optional — skip it for trivial edits. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi-K2, Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. Sonnet synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder** for well-specified pure-code tasks.
 
 > Deeper dive: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — roles, the guarantee behind every stage, and the full component map.
 
@@ -69,7 +73,8 @@ flowchart LR
 
 | Component | What it does |
 |---|---|
-| `secondmate` skill | The maker/checker SOP: triage → spawn → check → gate → hold → integrate |
+| `secondmate` skill | The full SOP: plan-committee → triage → spawn → check → gate → hold → integrate |
+| `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
@@ -142,6 +147,8 @@ credentials only you can supply.
 | `SM_REASON_HARNESS` | `pi` | reasoning CLI |
 | `SM_REASON_PROVIDER` | `amazon-bedrock` | reasoning provider |
 | `SM_REASON_MODEL` | `r1` | default reasoning model alias (`r1` / `gpt` / `sonnet` / full id) |
+| `SM_COMMITTEE_PROVIDER` | `amazon-bedrock` | planner provider for `plan-committee.sh` |
+| `SM_COMMITTEE_TIMEOUT` | `300` | per-planner wall-clock timeout in seconds |
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
@@ -163,7 +170,7 @@ claude plugin install secondmate@secondmate
 # verify everything
 bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --selfcheck \
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
-  && bin/doctor.sh --selfcheck && echo ALL_OK
+  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && echo ALL_OK
 claude plugin validate .
 ```
 
