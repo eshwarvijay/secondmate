@@ -166,29 +166,33 @@ watch them. Inside herdr, run the loop in VISIBLE side-by-side panes. You stay i
 others via the herdr CLI. First check: `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` (if it fails, use the
 headless path). Every split uses `--no-focus` so the captain's focus never moves.
 
-- **Maker pane** — a live agent the captain watches work. Use the task-scoped name `sm-<task-id>`:
+- **Maker pane** — use `spawn` (not `delegate`) to capture the pane ID for cleanup, then drive via `agent prompt`:
+  ```bash
+  read mk mk_pane < <(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh spawn \
+    --name sm-<task-id> --kind claude --dir right --cwd <worktree> -- --permission-mode acceptEdits)
+  herdr agent prompt sm-<task-id> "/loop-task <goal>" --wait --timeout 600000
   ```
-  ${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh delegate --name sm-<task-id> --kind claude --dir right \
-    --cwd <worktree> --prompt "/loop-task <goal>" --timeout 600000 -- --permission-mode acceptEdits
-  ```
-  `delegate` = split + wait-for-shell (fixes the "pane not an available shell" race) + start + prompt + wait +
-  harvest. Use `spawn` (same flags, no `--prompt`) to drive the maker step-by-step instead. If Claude shows a
-  one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
+  `spawn` returns `<name> <pane_id>` — `$mk_pane` is needed for cleanup. If Claude shows a one-time
+  folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
-- **Checker pane** — the edit-locked checker, run headless IN the pane so it's visible AND capturable, with
-  only the lenses the diff needs. Use a unique per-round marker to avoid matching stale buffer output:
-  ```
+- **Checker pane** — the edit-locked checker, run headless IN the pane so it's visible AND capturable.
+  **Must include `--diff-base` and `--repo` so the checker sees the actual diff.** Use a unique per-round
+  marker (R1, R2, R3…) to avoid matching stale buffer output from prior rounds:
+  ```bash
   ck=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split down)
-  herdr pane run "$ck" '${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --lens redteam/injection --addendum-text "..." -- -p "Review this diff." ; echo ___SM_R<N>_DONE_$?'
+  herdr pane run "$ck" "${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh \
+    --lens qa/coverage --addendum-text '...' \
+    --diff-base <base-ref> --repo <wt> \
+    --live-text '<what changed this round>' \
+    -- -p 'Review the change.' ; echo ___SM_R<N>_DONE_\$?"
   herdr pane wait-output "$ck" --regex "___SM_R<N>_DONE_[0-9]+" --timeout 600000
   herdr pane read "$ck" --source recent-unwrapped --lines 400 > /tmp/sm-checker.out
-  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py /tmp/sm-checker.out                    # branch on exit code, as always
+  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py /tmp/sm-checker.out
   ```
-  Increment `<N>` each round (R1, R2, R3…) so `pane wait-output` never matches a prior round's stale marker.
 - **Watch + integrate from your pane** — `herdr agent get/read sm-<task-id>`, `herdr pane read "$ck"`; then the
   usual verify-gate + hold. You can't answer another pane's live prompt, so run any gated command yourself
   in the supervisor context (still a separate context, so maker ≠ checker holds).
-- **Clean up ONLY the panes you created**: `herdr pane close "$mk"`, `herdr pane close "$ck"`.
+- **Clean up ONLY the panes you created**: `herdr pane close "$mk_pane"`, `herdr pane close "$ck"`.
 
 Not in herdr (`HERDR_ENV != 1`)? Use the headless path — in-process maker sub-agent + `run-round.sh`-wrapped
 checker. Same loop, same guards, just not visible.
