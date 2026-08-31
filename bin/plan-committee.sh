@@ -43,6 +43,15 @@ while [ $# -gt 0 ]; do case "$1" in
   --task)    [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; task="$2"; shift 2;;
   --out-dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; out_dir="$2"; shift 2;;
   --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
+  --dry-run)
+    printf "%-15s %-45s %-6s %s\n" "LABEL" "MODEL" "THINK" "DIMENSION"
+    printf "%-15s %-45s %-6s %s\n" "-----" "-----" "-----" "---------"
+    for entry in "${PLANNERS[@]}"; do
+      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
+      printf "%-15s %-45s %-6s %s\n" "$_lbl" "$_mid" "$_th" "$_dim"
+      printf "  cmd: pi --provider %s --model %s --thinking %s --no-tools -p \"<task>\"\n" "$PROVIDER" "$_mid" "$_th"
+    done
+    exit 0;;
   --list-models)
     printf "%-15s %-45s %-6s %s\n" "LABEL" "MODEL" "THINK" "DIMENSION"
     printf "%-15s %-45s %-6s %s\n" "-----" "-----" "-----" "---------"
@@ -59,6 +68,9 @@ while [ $# -gt 0 ]; do case "$1" in
     [ "$rc" = 2 ] || { echo "FAIL: non-numeric timeout exit $rc (want 2)"; fails=1; }
     rc=0; "$0" --task x --timeout 0 >/dev/null 2>&1 || rc=$?
     [ "$rc" = 2 ] || { echo "FAIL: zero timeout exit $rc (want 2)"; fails=1; }
+    _dr="$("$0" --dry-run 2>/dev/null)"
+    echo "$_dr" | grep -q "^deepseek-r1" || { echo "FAIL: --dry-run missing planner row"; fails=1; }
+    echo "$_dr" | grep -q "cmd: pi" || { echo "FAIL: --dry-run missing cmd line"; fails=1; }
     _lm="$("$0" --list-models 2>/dev/null)"
     echo "$_lm" | grep -q "^deepseek-r1" || { echo "FAIL: --list-models missing expected row"; fails=1; }
     [ "$(echo "$_lm" | wc -l)" -ge 7 ] || { echo "FAIL: --list-models fewer than 7 lines (header+6)"; fails=1; }
