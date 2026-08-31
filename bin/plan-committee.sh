@@ -54,6 +54,7 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 [ -n "$task" ] || { echo "need --task TEXT" >&2; exit 2; }
 case "$timeout" in ''|*[!0-9]*) echo "--timeout must be a positive integer (seconds)" >&2; exit 2;; esac
+[ "$timeout" -gt 0 ] || { echo "--timeout must be a positive integer (seconds)" >&2; exit 2; }
 
 mkdir -p "$out_dir"
 

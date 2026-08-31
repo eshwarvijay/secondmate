@@ -44,8 +44,8 @@ Invoke `/adhd` as a Claude sub-agent; save its winning branch to `.secondmate/pl
 ```
 ${CLAUDE_PLUGIN_ROOT}/bin/plan-committee.sh --task "<task description>" [--timeout 300]
 ```
-Spawns 6 headless pi planners in parallel (DeepSeek-R1 → failure modes; Qwen3-235B → architecture;
-Qwen3-Coder-480B → implementation; Kimi-K2-Thinking → holistic risk; Mistral-Large-3 → security;
+Spawns 6 headless pi planners in parallel (DeepSeek-R1 → failure modes; Qwen3-Next-80B → architecture;
+Qwen3-Coder-Next → implementation; Kimi-K2-Thinking → holistic risk; Mistral-Large-3 → security;
 GLM-5 → requirements/product). Outputs: `.secondmate/planning/<label>.md`.
 
 **0c — synthesize (you, the supervisor):**
@@ -57,7 +57,10 @@ produce ONE consolidated plan. This is the spec the maker receives.
   `herdr-pane.sh delegate --name sm-maker --kind claude --cwd <wt> --prompt "/loop-task <goal>" -- --permission-mode acceptEdits`
   Plan can be higher-level; Claude resolves ambiguity itself.
 - **Simple** (well-specified, pure code, no external deps) → pi maker (headless, tools enabled):
-  `run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off -p "<plan>"`
+  ```
+  cd <wt> && run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off -p "<plan>"
+  ```
+  The `cd <wt>` is required — `run-round.sh` does not set CWD; without it the maker edits the primary checkout instead of the isolated worktree.
   Plan must be fully concrete: exact file paths, function signatures, no branching, step-by-step.
 
   Note: routing happens at step 2 (Spawn), not before triage. Steps 0a–0c produce the plan; steps 1–2 create the worktree; step 0d's maker command runs in that worktree.
