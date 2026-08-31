@@ -84,10 +84,11 @@ while [ $# -gt 0 ]; do case "$1" in
     echo "$_v" | grep -q '\.' || { echo "FAIL: --version output missing a dot"; fails=1; }
     _pjson="$SCRIPT_DIR/../.claude-plugin/plugin.json"
     _pjson_bak="$(mktemp)"; cp "$_pjson" "$_pjson_bak"
-    trap "cp '$_pjson_bak' '$_pjson'; rm -f '$_pjson_bak'" EXIT
+    _restore_pjson() { cp "$_pjson_bak" "$_pjson"; rm -f "$_pjson_bak"; }
+    trap _restore_pjson EXIT
     echo '{"version":null}' > "$_pjson"
     rc=0; "$0" --version >/dev/null 2>&1 || rc=$?
-    trap - EXIT; cp "$_pjson_bak" "$_pjson"; rm -f "$_pjson_bak"
+    trap - EXIT; _restore_pjson
     [ "$rc" = 1 ] || { echo "FAIL: --version null version should exit 1, got $rc"; fails=1; }
     # static PLANNERS contract: 6 entries, 4 pipe-delimited fields each, valid thinking value
     count=0
