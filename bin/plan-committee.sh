@@ -59,6 +59,9 @@ while [ $# -gt 0 ]; do case "$1" in
     [ "$rc" = 2 ] || { echo "FAIL: non-numeric timeout exit $rc (want 2)"; fails=1; }
     rc=0; "$0" --task x --timeout 0 >/dev/null 2>&1 || rc=$?
     [ "$rc" = 2 ] || { echo "FAIL: zero timeout exit $rc (want 2)"; fails=1; }
+    _lm="$("$0" --list-models 2>/dev/null)"
+    echo "$_lm" | grep -q "^deepseek-r1" || { echo "FAIL: --list-models missing expected row"; fails=1; }
+    [ "$(echo "$_lm" | wc -l)" -ge 7 ] || { echo "FAIL: --list-models fewer than 7 lines (header+6)"; fails=1; }
     # static PLANNERS contract: 6 entries, 4 pipe-delimited fields each, valid thinking value
     count=0
     for entry in "${PLANNERS[@]}"; do
