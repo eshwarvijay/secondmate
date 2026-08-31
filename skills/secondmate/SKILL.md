@@ -57,14 +57,18 @@ produce ONE consolidated plan. This is the spec the maker receives.
   `herdr-pane.sh delegate --name sm-maker --kind claude --cwd <wt> --prompt "/loop-task <goal>" -- --permission-mode acceptEdits`
   Plan can be higher-level; Claude resolves ambiguity itself.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
-  ```
-  herdr-pane.sh spawn --name sm-maker-qwen --kind pi --dir right --cwd <wt> \
+  ```bash
+  # Use the root_pane returned by herdr worktree create — do NOT split from the caller workspace
+  herdr agent start sm-maker-qwen --kind pi --pane <root_pane_id> \
     -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off
   herdr agent prompt sm-maker-qwen "<plan>" --wait --timeout 600000
   ```
-  Pi runs as a lifecycle-tracked herdr agent: `blocked` surfaces mid-execution stalls (supervisor handles
-  them and resumes), `agent_prompt_stalled` fires immediately if pi doesn't start within 5s instead of
-  waiting the full idle timeout. Maker output is always read from `git diff <wt>`, not pi's terminal.
+  `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2).
+  Do NOT use `herdr-pane.sh spawn` here — it splits from the caller's workspace, orphaning the worktree workspace.
+  Pi runs as a lifecycle-tracked herdr agent: if `blocked` (approval/question UI), inspect `herdr agent get/read`
+  before deciding what to send — do not advance to Check while the maker is blocked. If `agent_prompt_stalled`
+  (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
+  Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
   `cd <wt> && run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off -p "<plan>"`
   Plan must be fully concrete: exact file paths, function signatures, no branching, step-by-step.
@@ -132,12 +136,12 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
    `${CLAUDE_PLUGIN_ROOT}/bin/hold.py answer <id> --a "..."`. The plugin's SessionStart hook surfaces open holds
    each session, so a restart never drops a pending gate — reconcile any it reports before new work.
 
-7. **Audit trail** — before integrating, append to git-versioned files at the repo root:
-   - `flow.md` — how the orchestration went: which maker path was chosen and why, planner model list if committee ran, dependency order, round count, outcome.
-   - `decision.md` — what the maker decided + what the checker found + every gate you auto-approved or escalated to the human, and why.
-   Append, never rewrite. Commit alongside the feature diff — these are the audit trail for autonomous sub-agent work. Skip for trivial one-shot edits.
-
 8. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
+
+9. **Audit trail** — after integration, append to git-versioned files in the **primary checkout** (not the worktree):
+   - `flow.md` — which maker path was chosen and why, planner model list if committee ran, round count, outcome.
+   - `decision.md` — what the maker decided, what the checker found, every gate auto-approved or escalated and why.
+   Append, never rewrite. Commit these separately in the primary repo — they do not touch the worktree and cannot stale the checked SHA. Skip for trivial one-shot edits.
 
 ## Visible orchestration in herdr (when HERDR_ENV=1)
 
