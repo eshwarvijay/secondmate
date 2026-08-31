@@ -10,3 +10,10 @@ Append one entry per task. Format: date, task id, maker path chosen, planner mod
 - **Planner committee:** skipped (small well-specified task)
 - **Rounds:** 5 checker rounds (pi bugs caught by gpt-terra: cwd-relative path, null acceptance, selfcheck cwd, SIGTERM trap quoting)
 - **Outcome:** merged to main at `275c523`
+
+---
+## 2026-09-01 — skill: thinking medium + loop-back contract
+
+- **Change type:** skill-only (no bin/ changes) — 7 checker rounds via herdr pane
+- **Checker:** gpt-terra, qa/coverage + research/assumption-audit lenses
+- **Outcome:** clean pass at round 7. Pushed `7c27799`
