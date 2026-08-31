@@ -60,17 +60,19 @@ produce ONE consolidated plan. This is the spec the maker receives.
   ```bash
   # Use the root_pane returned by herdr worktree create — do NOT split from the caller workspace
   herdr agent start sm-maker-qwen --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off
+    -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium
   herdr agent prompt sm-maker-qwen "<plan>" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2).
   Do NOT use `herdr-pane.sh spawn` here — it splits from the caller's workspace, orphaning the worktree workspace.
+  Use `--thinking medium` (not `off`) — Qwen's reasoning catches edge cases (null guards, trap safety,
+  portability) that pure token prediction misses. Use `--thinking high` for security-sensitive or complex logic.
   Pi runs as a lifecycle-tracked herdr agent: if `blocked` (approval/question UI), inspect `herdr agent get/read`
   before deciding what to send — do not advance to Check while the maker is blocked. If `agent_prompt_stalled`
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
-  `cd <wt> && run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off -p "<plan>"`
+  `cd <wt> && run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium -p "<plan>"`
   Plan must be fully concrete: exact file paths, function signatures, no branching, step-by-step.
 
   Note: routing happens at step 2 (Spawn). Steps 0a–0c produce the plan; steps 1–2 create the worktree; step 0d's maker command runs in that worktree.
@@ -125,7 +127,16 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      model family) but keeps maker ≠ checker and the deterministic verdict. Capture its final message and
      treat it exactly like harness output below.
    - Branch on the verdict deterministically, NOT on the checker's prose:
-     `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused. On fail/error, hand back to the maker.
+     `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused.
+   - **On fail/error — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
+     findings, synthesizes a concrete fix plan, then sends it to the maker agent:
+     ```bash
+     herdr agent prompt sm-maker-qwen "<fix plan: what to change, why, exact locations>" --wait --timeout 600000
+     ```
+     If the maker agent is no longer running (`done` state after a completed session), re-start it in the same
+     pane: `herdr agent start sm-maker-qwen --kind pi --pane <root_pane_id> -- <same args>` then prompt.
+     The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
+     Every fix round goes through the same Check step with an updated `--live-text` and incremented unique marker.
 
 5. **Gate** — before integrating anything:
    `${CLAUDE_PLUGIN_ROOT}/bin/verify-gate.sh --worktree <wt> --base <branch> --checked-sha <the exact sha the checker reviewed> [--test "<cmd>"]`
