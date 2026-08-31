@@ -43,6 +43,14 @@ while [ $# -gt 0 ]; do case "$1" in
   --task)    [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; task="$2"; shift 2;;
   --out-dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; out_dir="$2"; shift 2;;
   --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
+  --version)
+    version=$(jq -r '.version' .claude-plugin/plugin.json 2>/dev/null)
+    if [ -z "$version" ]; then
+      echo "FAIL: could not read version from .claude-plugin/plugin.json" >&2
+      exit 1
+    fi
+    echo "$version"
+    exit 0;;
   --dry-run)
     printf "%-15s %-45s %-6s %s\n" "LABEL" "MODEL" "THINK" "DIMENSION"
     printf "%-15s %-45s %-6s %s\n" "-----" "-----" "-----" "---------"
@@ -74,6 +82,8 @@ while [ $# -gt 0 ]; do case "$1" in
     _lm="$("$0" --list-models 2>/dev/null)"
     echo "$_lm" | grep -q "^deepseek-r1" || { echo "FAIL: --list-models missing expected row"; fails=1; }
     [ "$(echo "$_lm" | wc -l)" -ge 7 ] || { echo "FAIL: --list-models fewer than 7 lines (header+6)"; fails=1; }
+    _v="$($0 --version 2>/dev/null)"
+    echo "$_v" | grep -q '\.' || { echo "FAIL: --version output missing a dot"; fails=1; }
     # static PLANNERS contract: 6 entries, 4 pipe-delimited fields each, valid thinking value
     count=0
     for entry in "${PLANNERS[@]}"; do
