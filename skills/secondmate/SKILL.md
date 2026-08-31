@@ -32,6 +32,38 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
   harness is installed, the fallback is a different-model Claude sub-agent (same vendor, weaker, but maker is
   still not the checker) — see the Check step.
 
+## Plan Committee (pre-triage, complex and ambiguous tasks only)
+
+Before triaging, run the planning committee to gather independent perspectives from multiple models.
+**Skip for trivial edits, known-root-cause bugs, or mechanical changes — earns its cost only on open-ended or high-stakes tasks.**
+
+**0a — adhd subagent (Claude cognitive frames, you run this):**
+Invoke `/adhd` as a Claude sub-agent; save its winning branch to `.secondmate/planning/adhd.md`.
+
+**0b — multi-model planners (parallel, 6 models):**
+```
+${CLAUDE_PLUGIN_ROOT}/bin/plan-committee.sh --task "<task description>" [--timeout 300]
+```
+Spawns 6 headless pi planners in parallel (DeepSeek-R1 → failure modes; Qwen3-235B → architecture;
+Qwen3-Coder-480B → implementation; Kimi-K2-Thinking → holistic risk; Mistral-Large-3 → security;
+GLM-5 → requirements/product). Outputs: `.secondmate/planning/<label>.md`.
+
+**0c — synthesize (you, the supervisor):**
+Read all `.secondmate/planning/` files. Extract best signal from each, discard weak/overlapping,
+produce ONE consolidated plan. This is the spec the maker receives.
+
+**0d — route the maker:**
+- **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
+  `herdr-pane.sh delegate --name sm-maker --kind claude --cwd <wt> --prompt "/loop-task <goal>" -- --permission-mode acceptEdits`
+  Plan can be higher-level; Claude resolves ambiguity itself.
+- **Simple** (well-specified, pure code, no external deps) → pi maker (headless, tools enabled):
+  `run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-480b-a35b-v1:0 --thinking off -p "<plan>"`
+  Plan must be fully concrete: exact file paths, function signatures, no branching, step-by-step.
+
+After either maker path completes, **always proceed to step 4 (Check)** — same pi checker regardless of which maker ran:
+`launch-checker.sh --addendum-text "..." --diff-base <base> --repo <wt> -- -p "review the change"` → `verdict.py`.
+Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker ≠ checker invariant holds regardless of which maker path is chosen.
+
 ## The loop (run these yourself; the user invokes nothing)
 
 1. **Triage** — classify the task `ship` (produces a diff) vs `scout` (report only; skip the checker and
