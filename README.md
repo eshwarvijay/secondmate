@@ -67,7 +67,7 @@ flowchart LR
 
 > Deeper dive: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — roles, the guarantee behind every stage, and the full component map.
 
-> 💡 **Best with [herdr](https://herdr.dev/).** Run secondmate inside herdr (a tmux-backed terminal multiplexer for coding agents) and the maker and the cross-model checker each get their own live pane you can watch and jump into: the whole loop, visible. It's how I run it, on herdr + tmux. Anywhere else it falls back to in-process sub-agents, same guards and all.
+> 💡 **Best with [herdr](https://herdr.dev/).** Inside herdr the full loop runs natively: `herdr worktree create` spawns the maker worktree + workspace in one call; the pi maker runs as a lifecycle-tracked `herdr agent` (blocked recovery, stall detection); the checker runs via `herdr pane run` + `pane wait-output` — no timeout caps, no silent failures. Anywhere else secondmate falls back to headless sub-agents with the same guards.
 
 ## 🧰 What's inside
 
@@ -85,7 +85,7 @@ flowchart LR
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
-| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): spawn/`delegate` the maker + checker into visible side-by-side panes (race-proof) you can watch |
+| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `delegate` the Claude maker into a visible pane; `spawn` starts the pi maker as a lifecycle-tracked agent in the worktree's root pane; checker runs via `herdr pane run` + `pane wait-output` |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 

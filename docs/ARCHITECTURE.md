@@ -47,7 +47,7 @@ flowchart TD
     MKQ --> TRI
     TRI -->|reasoning one-shot| RS[reason.sh: different model, read-only]
     RS --> TRI
-    TRI -->|spawn| WT[new-worktree.sh: isolated worktree]
+    TRI -->|spawn: herdr worktree create OR new-worktree.sh| WT[isolated worktree + pane]
     WT --> MK[Maker: implements]
     MK -. guarded by .-> GD[loop-guard.sh plus run-round.sh]
     MK -->|commit diff| PR[prune-output.sh: trim logs]
@@ -81,8 +81,10 @@ Each stage exists to close a specific failure mode.
    a **reasoning one-shot** (`reason.sh`) on a reasoning model so the supervisor does not burn its own context.
    *Guards against:* heavyweight review on trivial edits; spending the expensive supervisor model on pure analysis.
 
-2. **Spawn.** `new-worktree.sh` creates a fresh git worktree on an `sm/<task>` branch and asserts it is not
-   the primary checkout. The maker runs there.
+2. **Spawn.** Two paths: `new-worktree.sh` (headless / not in herdr) or `herdr worktree create` (inside herdr)
+   — creates a fresh git worktree on an `sm/<task>` branch. `herdr worktree create` additionally opens a
+   dedicated herdr workspace/tab/pane; `.result.root_pane.pane_id` is used directly to start the pi maker
+   agent, keeping it in its own workspace rather than the supervisor's.
    *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo.
 
 3. **Implement (guarded).** The maker works, wrapped by two deterministic guards:
@@ -121,6 +123,11 @@ Each stage exists to close a specific failure mode.
 
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here.
+
+8. **Audit trail.** After integration, append `flow.md` (orchestration: maker path, models, rounds, outcome)
+   and `decision.md` (what the maker decided, checker findings, gates auto-approved or escalated) to the
+   **primary checkout** — not the worktree, so no commit advances the checked SHA and invalidates the gate.
+   Commit these separately. Skip for trivial one-shot edits.
 
 ## Invariants that make it trustworthy
 
