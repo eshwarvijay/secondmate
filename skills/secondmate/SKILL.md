@@ -54,7 +54,8 @@ produce ONE consolidated plan. This is the spec the maker receives.
 
 **0d — route the maker** (after step 2 Spawn has created `<wt>`):
 - **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
-  `herdr-pane.sh delegate --name sm-maker --kind claude --cwd <wt> --prompt "/loop-task <goal>" -- --permission-mode acceptEdits`
+  `herdr-pane.sh delegate --name sm-<task-id> --kind claude --cwd <wt> --prompt "/loop-task <goal>" -- --permission-mode acceptEdits`
+  Use the same `<task-id>` slug as the worktree branch so loop-back targets the correct agent.
   Plan can be higher-level; Claude resolves ambiguity itself.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
   ```bash

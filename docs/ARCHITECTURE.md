@@ -54,7 +54,9 @@ flowchart TD
     PR --> CH[launch-checker.sh: gpt-terra, edit-locked]
     CH --> EV[/verdict envelope JSON/]
     EV --> VD{verdict.py}
-    VD -->|fail or error| MK
+    VD -->|fail| S3[Supervisor: synthesize fix plan]
+    S3 --> MK
+    VD -->|error or refused| STOP2([escalate / fix checker])
     VD -->|pass| GT{verify-gate.sh: clean, exact-SHA, tests}
     GT -->|refuse| MK
     GT -->|pass| HD{hold.py: your approval}

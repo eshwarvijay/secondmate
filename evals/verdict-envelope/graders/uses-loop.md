@@ -3,8 +3,9 @@
 PASS only if the response does ALL of the following:
 
 1. Branches on the checker's **verdict** deterministically — references parsing the `{verdict}` envelope
-   (e.g. `verdict.py`), not just reading the checker's prose. It must treat `fail`/`error` as "hand back
-   to the maker", not merge.
+   (e.g. `verdict.py`), not just reading the checker's prose.
+   - `fail` → supervisor synthesizes a fix plan and sends it to the task-scoped maker (never fixes inline).
+   - `error` or `refused` → fix the checker invocation or escalate to human; do NOT loop back to the maker.
 2. Runs a **pre-integration gate before merging** — references `verify-gate.sh` (or equivalently: clean
    tree, non-empty diff, tests, and re-checking the **exact commit the checker reviewed** / `--checked-sha`).
 3. Requires a **human decision / hold** before the actual merge — it does NOT merge autonomously.
