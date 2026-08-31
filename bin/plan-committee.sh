@@ -43,6 +43,14 @@ while [ $# -gt 0 ]; do case "$1" in
   --task)    [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; task="$2"; shift 2;;
   --out-dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; out_dir="$2"; shift 2;;
   --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
+  --list-models)
+    printf "%-15s %-45s %-6s %s\n" "LABEL" "MODEL" "THINK" "DIMENSION"
+    printf "%-15s %-45s %-6s %s\n" "-----" "-----" "-----" "---------"
+    for entry in "${PLANNERS[@]}"; do
+      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
+      printf "%-15s %-45s %-6s %s\n" "$_lbl" "$_mid" "$_th" "$_dim"
+    done
+    exit 0;;
   --selfcheck)
     fails=0
     rc=0; "$0" >/dev/null 2>&1 || rc=$?
