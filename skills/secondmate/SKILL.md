@@ -52,13 +52,15 @@ GLM-5 → requirements/product). Outputs: `.secondmate/planning/<label>.md`.
 Read all `.secondmate/planning/` files. Extract best signal from each, discard weak/overlapping,
 produce ONE consolidated plan. This is the spec the maker receives.
 
-**0d — route the maker:**
+**0d — route the maker** (after step 2 Spawn has created `<wt>` via `new-worktree.sh`):
 - **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
   `herdr-pane.sh delegate --name sm-maker --kind claude --cwd <wt> --prompt "/loop-task <goal>" -- --permission-mode acceptEdits`
   Plan can be higher-level; Claude resolves ambiguity itself.
 - **Simple** (well-specified, pure code, no external deps) → pi maker (headless, tools enabled):
-  `run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-480b-a35b-v1:0 --thinking off -p "<plan>"`
+  `run-round.sh --label sm-maker -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking off -p "<plan>"`
   Plan must be fully concrete: exact file paths, function signatures, no branching, step-by-step.
+
+  Note: routing happens at step 2 (Spawn), not before triage. Steps 0a–0c produce the plan; steps 1–2 create the worktree; step 0d's maker command runs in that worktree.
 
 After either maker path completes, **always proceed to step 4 (Check)** — same pi checker regardless of which maker ran:
 `launch-checker.sh --addendum-text "..." --diff-base <base> --repo <wt> -- -p "review the change"` → `verdict.py`.

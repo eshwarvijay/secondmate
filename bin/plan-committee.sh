@@ -15,9 +15,9 @@ PROVIDER="${SM_COMMITTEE_PROVIDER:-amazon-bedrock}"
 # label|dimension|model-id|thinking-level
 # ponytail: thinking=high only for native reasoning models (R1, Kimi-K2), off for others
 PLANNERS=(
-  "deepseek-r1|Failure modes, edge cases, and what can go wrong|deepseek.r1-v1:0|high"
-  "qwen3-235b|Technical architecture and system design trade-offs|qwen.qwen3-235b-a22b-2507-v1:0|off"
-  "qwen3-coder|Implementation feasibility and concrete code path|qwen.qwen3-coder-480b-a35b-v1:0|off"
+  "deepseek-r1|Failure modes, edge cases, and what can go wrong|us.deepseek.r1-v1:0|high"
+  "qwen3-80b|Technical architecture and system design trade-offs|qwen.qwen3-next-80b-a3b|off"
+  "qwen3-coder|Implementation feasibility and concrete code path|qwen.qwen3-coder-next|off"
   "kimi-k2|Holistic long-context risk and integration review|moonshot.kimi-k2-thinking|high"
   "mistral-large3|Security surface, adversarial gaps, and attack vectors|mistral.mistral-large-3-675b-instruct|off"
   "glm5|Structured requirements, product angle, and user-facing concerns|zai.glm-5|off"
@@ -44,12 +44,16 @@ while [ $# -gt 0 ]; do case "$1" in
   --out-dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; out_dir="$2"; shift 2;;
   --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
   --selfcheck)
+    fails=0
     rc=0; "$0" >/dev/null 2>&1 || rc=$?
-    [ "$rc" = 2 ] || { echo "FAIL: no-task exit $rc (want 2)"; exit 1; }
-    echo ok; exit 0;;
+    [ "$rc" = 2 ] || { echo "FAIL: no-task exit $rc (want 2)"; fails=1; }
+    rc=0; "$0" --task x --timeout nope >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 2 ] || { echo "FAIL: non-numeric timeout exit $rc (want 2)"; fails=1; }
+    [ "$fails" = 0 ] && echo ok; exit "$fails";;
   *) echo "unknown arg: $1" >&2; exit 2;;
 esac; done
 [ -n "$task" ] || { echo "need --task TEXT" >&2; exit 2; }
+case "$timeout" in ''|*[!0-9]*) echo "--timeout must be a positive integer (seconds)" >&2; exit 2;; esac
 
 mkdir -p "$out_dir"
 
