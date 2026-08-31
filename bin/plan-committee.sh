@@ -80,8 +80,13 @@ while [ $# -gt 0 ]; do case "$1" in
     _lm="$("$0" --list-models 2>/dev/null)"
     echo "$_lm" | grep -q "^deepseek-r1" || { echo "FAIL: --list-models missing expected row"; fails=1; }
     [ "$(echo "$_lm" | wc -l)" -ge 7 ] || { echo "FAIL: --list-models fewer than 7 lines (header+6)"; fails=1; }
-    _v="$($0 --version 2>/dev/null)"
+    _v="$("$0" --version 2>/dev/null)"
     echo "$_v" | grep -q '\.' || { echo "FAIL: --version output missing a dot"; fails=1; }
+    _pjson="$SCRIPT_DIR/../.claude-plugin/plugin.json"
+    _backup="$(cat "$_pjson")"; echo '{"version":null}' > "$_pjson"
+    rc=0; "$0" --version >/dev/null 2>&1 || rc=$?
+    echo "$_backup" > "$_pjson"
+    [ "$rc" = 1 ] || { echo "FAIL: --version null version should exit 1, got $rc"; fails=1; }
     # static PLANNERS contract: 6 entries, 4 pipe-delimited fields each, valid thinking value
     count=0
     for entry in "${PLANNERS[@]}"; do
