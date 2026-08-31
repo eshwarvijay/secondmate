@@ -57,10 +57,12 @@ produce ONE consolidated plan. This is the spec the maker receives.
   ```bash
   read mk mk_pane < <(herdr-pane.sh spawn --name sm-<task-id> --kind claude --dir right \
     --cwd <wt> -- --permission-mode acceptEdits)
+  [ -n "$mk_pane" ] || { echo "spawn failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "/loop-task <goal>" --wait --timeout 600000
   ```
-  Use `spawn` (not `delegate`) to capture `$mk_pane` for cleanup. Same `<task-id>` slug as the worktree branch.
-  Plan can be higher-level; Claude resolves ambiguity itself.
+  Use `spawn` (not `delegate`) to capture `$mk_pane` for cleanup. Guard on `$mk_pane` before prompting —
+  if spawn fails (Herdr unavailable, split error), abort rather than routing to a stale agent.
+  Same `<task-id>` slug as the worktree branch. Plan can be higher-level; Claude resolves ambiguity itself.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
   ```bash
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
@@ -174,10 +176,11 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
   ```bash
   read mk mk_pane < <(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh spawn \
     --name sm-<task-id> --kind claude --dir right --cwd <worktree> -- --permission-mode acceptEdits)
+  [ -n "$mk_pane" ] || { echo "spawn failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "/loop-task <goal>" --wait --timeout 600000
   ```
-  `spawn` returns `<name> <pane_id>` — `$mk_pane` is needed for cleanup. If Claude shows a one-time
-  folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
+  `spawn` returns `<name> <pane_id>` — guard on `$mk_pane` before prompting to avoid routing to a stale
+  agent if spawn fails. If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
 - **Checker pane** — the edit-locked checker, run headless IN the pane so it's visible AND capturable.
   **Must include `--diff-base` and `--repo` so the checker sees the actual diff.** Use a unique per-round
