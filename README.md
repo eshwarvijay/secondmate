@@ -53,17 +53,20 @@ read-only analysis? `/secondmate-reason why does this test flake only in CI?`
 flowchart LR
     A[loop-task: goal] --> P[plan-committee<br/>6 models in parallel]
     P --> S[supervisor: Sonnet<br/>synthesizes plan]
-    S --> M[maker<br/>Claude or pi+Qwen]
+    S --> M[maker<br/>Claude or pi+Qwen --thinking medium]
     M --> C[checker<br/>gpt-terra, read-only]
     C --> V{verdict}
-    V -- fail --> M
+    V -- fail --> S2[supervisor<br/>synthesizes fix plan]
+    S2 --> M
     V -- pass --> G{verify-gate}
     G -- refuse --> M
     G -- pass --> H{{your approval}}
     H -- merge --> D[ship]
 ```
 
-> The planning committee is optional — skip it for trivial edits. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi-K2, Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. Sonnet synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder** for well-specified pure-code tasks.
+> The planning committee is optional — skip it for trivial edits. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi-K2, Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. Sonnet synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder (`--thinking medium`)** for well-specified pure-code tasks.
+>
+> On a checker `fail`, the supervisor synthesizes a fix plan and hands it back to the **same maker** (task-scoped agent name, same worktree) — never fixes inline. The supervisor never writes project code.
 
 > Deeper dive: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — roles, the guarantee behind every stage, and the full component map.
 

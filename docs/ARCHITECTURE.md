@@ -98,6 +98,10 @@ Each stage exists to close a specific failure mode.
 
 4. **Check.** The diff is trimmed with `prune-output.sh` (model-free head/tail truncation), then
    `launch-checker.sh` runs the cross-model, edit-locked checker with the verdict-envelope contract injected.
+   On `fail`: the supervisor reads findings, synthesizes a concrete fix plan, and routes it to the
+   **task-scoped maker agent** (`sm-pi-<task-id>` or `sm-<task-id>`) — never fixes inline. The supervisor
+   never writes project code. On `error`/`refused`: fix the checker invocation or escalate; do not loop back
+   to the maker. Every fix round re-runs Check with refreshed `--live-text` and a unique round marker.
    The checker must end with a machine-readable block:
    ```json
    {"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"..."}
