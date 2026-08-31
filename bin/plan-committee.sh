@@ -44,11 +44,9 @@ while [ $# -gt 0 ]; do case "$1" in
   --out-dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; out_dir="$2"; shift 2;;
   --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
   --version)
-    version=$(jq -r '.version' .claude-plugin/plugin.json 2>/dev/null)
-    if [ -z "$version" ]; then
-      echo "FAIL: could not read version from .claude-plugin/plugin.json" >&2
-      exit 1
-    fi
+    _pjson="$SCRIPT_DIR/../.claude-plugin/plugin.json"
+    version=$(jq -r '.version // empty' "$_pjson" 2>/dev/null)
+    [ -n "$version" ] || { echo "could not read version from $_pjson" >&2; exit 1; }
     echo "$version"
     exit 0;;
   --dry-run)
