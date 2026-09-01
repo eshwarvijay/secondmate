@@ -49,8 +49,22 @@ Qwen3-Coder-Next → implementation; Kimi-K2-Thinking → holistic risk; Mistral
 GLM-5 → requirements/product). Outputs: `.secondmate/planning/<label>.md`.
 
 **0c — synthesize (you, the supervisor):**
-Read all `.secondmate/planning/` files. Extract best signal from each, discard weak/overlapping,
-produce ONE consolidated plan. This is the spec the maker receives.
+Read all `.secondmate/planning/` files in order:
+
+1. **Collect probes.** Every planner ends with a `### Probes for Supervisor` section — 2-3 questions
+   it raised but could not answer (planners are headless, no tools). List them all before writing anything.
+
+2. **Answer every probe.** For each probe, resolve it using your session context: read the relevant file,
+   grep the codebase, check the package manifest. If a probe requires a file read, do it now.
+   A probe left unanswered is a decision deferred to the maker — that is the supervisor's failure, not the maker's job.
+
+3. **Extract signal, discard noise.** Weak analysis, duplicate findings, and generic advice go.
+   Keep only concrete, task-specific findings from each dimension.
+
+4. **Write ONE consolidated plan.** Bind the probe answers into the plan so the maker gets a
+   spec that is already resolved — no open questions, no "figure it out" gaps.
+
+This is the spec the maker receives.
 
 **0d — route the maker** (after step 2 Spawn has created `<wt>`):
 - **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
