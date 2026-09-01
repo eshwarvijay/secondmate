@@ -17,3 +17,11 @@ Append one entry per task. Format: date, task id, maker path chosen, planner mod
 - **Change type:** skill-only (no bin/ changes) — 7 checker rounds via herdr pane
 - **Checker:** gpt-terra, qa/coverage + research/assumption-audit lenses
 - **Outcome:** clean pass at round 7. Pushed `7c27799`
+
+---
+## 2026-09-01 — plan-committee: checker-lens-quality planner prompts
+
+- **Change type:** bin/plan-committee.sh + skills SKILL.md — 4 checker rounds via herdr pane
+- **Checker:** gpt-terra, qa/coverage + qa/test-reality + research/assumption-audit lenses
+- **Rounds:** 4 (generic selfcheck markers → dimension-specific markers → table-header substring → pass)
+- **Outcome:** merged to main at `c63ed32`

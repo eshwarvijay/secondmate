@@ -17,3 +17,10 @@ Append one entry per task. Format: date, task id, what the maker decided, checke
 - **Decisions:** (1) pi maker `--thinking off` → `medium`; (2) checker fail → supervisor synthesizes plan → task-scoped maker, never inline fix; (3) refused/error → escalate not loop; (4) all maker agent names task-scoped (`sm-<task-id>`); (5) visible recipe: spawn not delegate, guard on mk_pane before prompt; (6) checker recipe: --diff-base required; (7) unique round markers per checker run
 - **Bugs caught by checker:** stale global agent name, README not updated, eval grader stale, hardcoded sm-maker in visible recipe, missing --diff-base in checker recipe, delegate returns no pane_id, spawn guard missing
 - **Escalations:** none
+
+---
+## 2026-09-01 — plan-committee: checker-lens-quality planner prompts
+
+- **Decisions:** (1) Replaced single generic SCHEMA with 6 per-planner functions; (2) each prompt uses outcome block (directional-prompting) + named probe categories + classification scales + Probes-for-Supervisor (STORM); (3) selfcheck uses dimension-specific markers per planner; (4) deepseek-r1 table schema marker must be table-header substring not bare word; (5) SKILL.md step 0c now requires answering all probes or escalating unanswerable ones to human
+- **Bugs caught by checker:** generic selfcheck markers passed on swapped bodies → dimension-specific markers; bare-word Justification matched prose → table-header substring; SKILL.md had no escalation path for non-repo probes
+- **Escalations:** none
