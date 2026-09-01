@@ -178,7 +178,16 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 8. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
 
-9. **Audit trail** — after integration, append to `audit/flow.md` and `audit/decision.md` in the **primary checkout** (not the worktree):
+9. **Teardown** — immediately after integration, close everything created for this task:
+   ```bash
+   herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
+   git branch -d sm/<task-id>                          # delete the merged branch
+   herdr pane close "$mk_pane"                         # maker pane (if visible path was used)
+   herdr pane close "$ck"                              # checker pane (if visible path was used)
+   ```
+   A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+
+10. **Audit trail** — after teardown, append to `audit/flow.md` and `audit/decision.md` in the **primary checkout**:
    - `audit/flow.md` — which maker path was chosen and why, planner model list if committee ran, round count, outcome.
    - `audit/decision.md` — what the maker decided, what the checker found, every gate auto-approved or escalated and why.
    Append, never rewrite. Commit separately in the primary repo — they do not touch the worktree and cannot stale the checked SHA.
