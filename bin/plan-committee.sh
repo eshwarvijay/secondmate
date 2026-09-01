@@ -73,9 +73,9 @@ This dimension produces failure scenarios and edge cases. It does not propose so
 Do NOT write "this might fail" -- name the trigger and the consequence.
 
 ### Failure Scenarios
-| # | Category | Specific Trigger | Consequence | Severity |
-|---|----------|-----------------|-------------|----------|
-(minimum 4 rows; CRITICAL = data loss or security breach; MODERATE = incorrect output; LOW = degraded UX)
+| # | Category | Specific Trigger | Consequence | Severity | Justification |
+|---|----------|-----------------|-------------|----------|---------------|
+(minimum 4 rows; CRITICAL = data loss or security breach; MODERATE = incorrect output; LOW = degraded UX; Justification = one-line reason for severity rating)
 
 ### Most Dangerous Assumption
 One sentence: the single assumption the naive implementation will make that is most likely to be false in production.
@@ -517,7 +517,15 @@ while [ $# -gt 0 ]; do case "$1" in
       case "$_th" in off|high) ;; *) echo "FAIL: invalid thinking '$_th' in entry: $entry"; fails=1;; esac
     done
     [ "$count" = 6 ] || { echo "FAIL: expected 6 planners, got $count"; fails=1; }
-    # _planner_prompt contract: each label returns non-empty output containing task text, Goal: block, and Probes section
+    # _planner_prompt contract: common structure AND dimension-specific markers (bash 3 compatible)
+    _dim_markers() { case "$1" in
+      deepseek-r1)    echo "Failure Scenarios|Most Dangerous Assumption|Input boundaries" ;;
+      qwen3-80b)      echo "Rabbit hole|Scorecard|Appetite" ;;
+      qwen3-coder)    echo "Do Not Hand-Roll|Hardest Step|Error Handling Contract" ;;
+      kimi-k2)        echo "Integration Surface|Silent Changes|Rollback Assessment" ;;
+      mistral-large3) echo "Attack Surface|Most Exploitable Vector|Design Controls" ;;
+      glm5)           echo "Requirements Grading|Non-Goals|Success Metrics" ;;
+    esac; }
     for entry in "${PLANNERS[@]}"; do
       IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
       _pp="$(_planner_prompt "$_lbl" "test-task-xyz")"
@@ -525,6 +533,10 @@ while [ $# -gt 0 ]; do case "$1" in
       echo "$_pp" | grep -q "test-task-xyz" || { echo "FAIL: _planner_prompt missing task text for label: $_lbl"; fails=1; }
       echo "$_pp" | grep -q "Goal:" || { echo "FAIL: _planner_prompt missing Goal: block for label: $_lbl"; fails=1; }
       echo "$_pp" | grep -q "Probes for Supervisor" || { echo "FAIL: _planner_prompt missing Probes for Supervisor for label: $_lbl"; fails=1; }
+      IFS='|' read -r _m1 _m2 _m3 <<< "$(_dim_markers "$_lbl")"
+      echo "$_pp" | grep -q "$_m1" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m1'"; fails=1; }
+      echo "$_pp" | grep -q "$_m2" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m2'"; fails=1; }
+      echo "$_pp" | grep -q "$_m3" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m3'"; fails=1; }
     done
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   *) echo "unknown arg: $1" >&2; exit 2;;

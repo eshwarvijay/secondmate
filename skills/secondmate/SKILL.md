@@ -52,17 +52,22 @@ GLM-5 → requirements/product). Outputs: `.secondmate/planning/<label>.md`.
 Read all `.secondmate/planning/` files in order:
 
 1. **Collect probes.** Every planner ends with a `### Probes for Supervisor` section — 2-3 questions
-   it raised but could not answer (planners are headless, no tools). List them all before writing anything.
+   it raised but could not answer (planners are headless, no tools). Read the six `<label>.md` files
+   (skip `audit.jsonl` and any stale outputs). List all probes before writing anything.
 
-2. **Answer every probe.** For each probe, resolve it using your session context: read the relevant file,
-   grep the codebase, check the package manifest. If a probe requires a file read, do it now.
-   A probe left unanswered is a decision deferred to the maker — that is the supervisor's failure, not the maker's job.
+2. **Answer every probe.** For each probe, resolve it using your session context: read the relevant
+   file, grep the codebase, check the package manifest. If a probe requires a file read, do it now.
+   - **If a probe is answerable from the repository:** answer it and record the evidence.
+   - **If a probe requires a business, legal, or product decision not in the repo:** record it as an
+     OPEN DECISION, escalate to the human before proceeding, and do not invent an answer.
+   A probe left unanswered without escalation is a supervisor failure — the maker must not receive it.
 
 3. **Extract signal, discard noise.** Weak analysis, duplicate findings, and generic advice go.
    Keep only concrete, task-specific findings from each dimension.
 
 4. **Write ONE consolidated plan.** Bind the probe answers into the plan so the maker gets a
-   spec that is already resolved — no open questions, no "figure it out" gaps.
+   spec that is already resolved — no open questions, no "figure it out" gaps. OPEN DECISIONs that
+   were escalated are excluded from the plan until the human answers them.
 
 This is the spec the maker receives.
 
