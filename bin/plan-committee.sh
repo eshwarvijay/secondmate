@@ -519,7 +519,7 @@ while [ $# -gt 0 ]; do case "$1" in
     [ "$count" = 6 ] || { echo "FAIL: expected 6 planners, got $count"; fails=1; }
     # _planner_prompt contract: common structure AND dimension-specific markers (bash 3 compatible)
     _dim_markers() { case "$1" in
-      deepseek-r1)    echo "Failure Scenarios|Most Dangerous Assumption|Input boundaries" ;;
+      deepseek-r1)    echo "Failure Scenarios|Most Dangerous Assumption|Justification" ;;
       qwen3-80b)      echo "Rabbit hole|Scorecard|Appetite" ;;
       qwen3-coder)    echo "Do Not Hand-Roll|Hardest Step|Error Handling Contract" ;;
       kimi-k2)        echo "Integration Surface|Silent Changes|Rollback Assessment" ;;
