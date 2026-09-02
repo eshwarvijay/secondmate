@@ -81,7 +81,8 @@ This is the spec the maker receives.
   ```
   Use `spawn` (not `delegate`) to capture `$mk_pane` for cleanup. Guard on `$mk_pane` before prompting —
   if spawn fails (Herdr unavailable, split error), abort rather than routing to a stale agent.
-  Same `<task-id>` slug as the worktree branch. Plan can be higher-level; Claude resolves ambiguity itself.
+  Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning
+  resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
   ```bash
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
@@ -101,7 +102,19 @@ This is the spec the maker receives.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
   `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium -p "<plan>"`
-  Plan must be fully concrete: exact file paths, function signatures, no branching, step-by-step.
+
+  **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
+  A good plan gives:
+  - **What** to achieve (goal + success condition the checker will verify)
+  - **Key constraints** (must not break X, must handle Y edge case, must be idempotent)
+  - **Scope boundary** (what's in, what's explicitly out of this increment)
+
+  A good plan does NOT give:
+  - Exact file paths or line numbers (the maker reads the repo)
+  - Step-by-step execution order (the maker's thinking handles this)
+  - Every error-handling case spelled out (that's what `--thinking` is for)
+
+  Pre-specifying every detail replaces the maker's reasoning with yours, which is weaker and wastes the model's thinking budget. The checker is the safety net — trust it.
 
   Note: routing happens at step 2 (Spawn). Steps 0a–0c produce the plan; steps 1–2 create the worktree; step 0d's maker command runs in that worktree.
 
