@@ -1,17 +1,23 @@
 {
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume|clear|compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/session-holds.sh\"",
-            "timeout": 10,
-            "statusMessage": "secondmate: checking open decisions..."
-          }
+    "hooks": {
+        "SessionStart": [
+            {
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/session-activate.sh\"",
+                        "timeout": 5,
+                        "statusMessage": "secondmate: loading supervisor invariants..."
+                    },
+                    {
+                        "type": "command",
+                        "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/session-holds.sh\"",
+                        "timeout": 10,
+                        "statusMessage": "secondmate: checking open decisions..."
+                    }
+                ]
+            }
         ]
-      }
-    ]
-  }
+    }
 }
