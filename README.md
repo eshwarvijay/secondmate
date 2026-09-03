@@ -95,11 +95,7 @@ flowchart LR
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 
-> ⚠️ **Scope guard covers Claude Code makers and pi makers equally** — both use the same heuristic Bash checks.
-> `scope-guard.py` is wired via `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. `scope-guard-extension.ts`
-> uses pi's `tool_call` extension event. Both activate via the same `mark-maker.sh` marker convention and enforce
-> the same confinement rules. **Neither provides OS-level sandboxing.** A deliberately adversarial user can
-> always find an encoding that bypasses string-heuristic checks. See docs/SCOPE-GUARD-PI.md for full details.
+> ⚠️ **Scope guard for pi makers requires an explicit --extension flag at launch time** — there is no auto-discovery.
 >
 > Both implementations share the same permanent limitations: they recognize literal patterns only, not a shell parser,
 > not data-flow analysis, not an OS sandbox. They will **not** be extended further to chase new bypasses — every round

@@ -84,7 +84,7 @@ This is the spec the maker receives.
   # Prerequisite: step 2 must have called mark-maker.sh after herdr worktree create (see step 2 for the full sequence)
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium
+    -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
   herdr agent prompt sm-pi-<task-id> "<plan>" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
