@@ -75,7 +75,7 @@ This is the spec the maker receives.
 - **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
   After step 2 Spawn creates `<wt>`, start the Claude maker directly on the root_pane from `herdr worktree create`:
   ```bash
-  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits
+  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits || { echo "herdr agent start failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop." --wait --timeout 600000
   ```
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
@@ -211,7 +211,7 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
 
 - **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
-  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits
+  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits || { echo "herdr agent start failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop." --wait --timeout 600000
   ```
   If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is

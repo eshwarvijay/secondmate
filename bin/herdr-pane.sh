@@ -54,11 +54,17 @@ case "$cmd" in
   --selfcheck)
     fails=0
     rc=0; "$0" bogusverb >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown verb exit $rc (want 2)"; fails=1; }
-    if usable; then  # validate-before-mutate: delegate w/o --prompt must exit 2 and create NO pane
+    if usable; then
+      # validate-before-mutate: delegate w/o --prompt must exit 2 and create NO pane
       count() { herdr pane list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["result"]["panes"]))' 2>/dev/null || echo 0; }
       b="$(count)"; rc=0; "$0" delegate --name _sc --kind pi >/dev/null 2>&1 || rc=$?; a="$(count)"
       { [ "$rc" = 2 ] && [ "$b" = "$a" ]; } || { echo "FAIL: delegate validate-before-split (rc=$rc panes $b->$a)"; fails=1; }
     fi
+    # Test arg parsing (herdr not required for this)
+    rc=0; "$0" split >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split without args (rc=$rc)"; fails=1; }
+    rc=0; "$0" split down >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with bare down (rc=$rc)"; fails=1; }
+    rc=0; "$0" split --dir right >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --dir (rc=$rc)"; fails=1; }
+    rc=0; "$0" split --pane test-id --dir up >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: split with invalid dir should exit 2"; fails=1; }
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   split)
     usable || { echo "not inside herdr" >&2; exit 1; }
@@ -68,6 +74,8 @@ case "$cmd" in
         --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; pane_id="$2"; shift 2;;
         --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;;
         --) shift; break;;
+        # bare positional direction (backward compat: no --dir flag required)
+        right|down) dir="$1"; shift;;
         *) echo "unknown arg: $1" >&2; exit 2;;
       esac
     done
