@@ -156,19 +156,18 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # verify version line is present in table output
   echo "$symlink_table" | grep -q "^  \[ok\] version " || { echo "FAIL: symlink regression test failed - version not resolved when invoked via symlink"; exit 1; }
   
-  # two-hop relative symlink chain test (exercises the fallback loop directly)
+  # two-hop relative symlink chain test (exercises the fallback loop directly via _resolve_symlink)
   tmpdir2=$(mktemp -d)
-  mkdir -p "$tmpdir2/a/sub" "$tmpdir2/b"
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  # a/sub/doctor -> ../../bin/doctor.sh (relative to a/sub/)
-  ln -sf "../../bin/doctor.sh" "$tmpdir2/a/sub/doctor"
-  # b/hop -> ../a/sub/doctor (relative to b/), creating a two-hop chain
-  ln -sf "../a/sub/doctor" "$tmpdir2/b/hop"
-  # invoke through the two-hop chain: b/hop -> a/sub/doctor -> bin/doctor.sh
-  hop_table="$($tmpdir2/b/hop)"
+  mkdir -p "$tmpdir2/a/sub" "$tmpdir2/b" "$tmpdir2/r/bin"
+  touch "$tmpdir2/r/bin/doctor.sh"  # stand-in target file
+  # create two-hop chain: a/sub/doctor -> ../../b/hop -> ../r/bin/doctor.sh
+  ln -sf "../../b/hop" "$tmpdir2/a/sub/doctor"
+  ln -sf "../r/bin/doctor.sh" "$tmpdir2/b/hop"
+  # capture expected resolved path BEFORE rm -rf
+  expected="$tmpdir2/r/bin/doctor.sh"
+  resolved=$(_resolve_symlink "$tmpdir2/a/sub/doctor")
   rm -rf "$tmpdir2"
-  # verify version resolves correctly through both hops
-  echo "$hop_table" | grep -q "^  \[ok\] version " || { echo "FAIL: two-hop symlink regression test failed"; exit 1; }
+  [ "$resolved" = "$expected" ] || { echo "FAIL: two-hop symlink regression test failed - got '$resolved', expected '$expected'"; exit 1; }
   echo ok; exit 0
 fi
 
