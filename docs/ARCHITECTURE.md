@@ -42,6 +42,8 @@ flowchart TD
     SYN --> ROUTE{Route maker}
     ROUTE -->|needs judgment / MCP| MKC[Claude maker]
     ROUTE -->|well-specified / pure code| MKQ[pi + Qwen3-Coder maker]
+    MKC --> TRI{Triage: ship or scout, full or fast}
+    MKQ --> TRI
     TRI -->|reasoning one-shot| RS[reason.sh: different model, read-only]
     RS --> TRI
     TRI -->|spawn: herdr worktree create OR new-worktree.sh| WT[isolated worktree + pane]
@@ -133,7 +135,7 @@ Each stage exists to close a specific failure mode.
    outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
    escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
    Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
-   Commit separately.
+   Commit separately. Skip for trivial one-shot edits.
 
 ## Scope guard
 

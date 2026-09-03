@@ -7,7 +7,8 @@ description: >
   the user wants a change made AND independently verified before it lands, asks
   to "run the maker/checker loop", "review with a cross-model checker", gate a
   merge, or run a long iterative edit→check loop safely. Also exposes a read-only
-  reasoning one-shot for root-cause/triage/plan-review.
+  reasoning one-shot for root-cause/triage/plan-review. Skip for trivial one-shot
+  edits or read-only questions.
 ---
 
 # secondmate — maker/checker loop hardening
