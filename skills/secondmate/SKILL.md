@@ -7,8 +7,7 @@ description: >
   the user wants a change made AND independently verified before it lands, asks
   to "run the maker/checker loop", "review with a cross-model checker", gate a
   merge, or run a long iterative edit→check loop safely. Also exposes a read-only
-  reasoning one-shot for root-cause/triage/plan-review. Skip for trivial one-shot
-  edits or read-only questions.
+  reasoning one-shot for root-cause/triage/plan-review.
 ---
 
 # secondmate — maker/checker loop hardening
@@ -32,10 +31,9 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
   harness is installed, the fallback is a different-model Claude sub-agent (same vendor, weaker, but maker is
   still not the checker) — see the Check step.
 
-## Plan Committee (pre-triage, complex and ambiguous tasks only)
+## Plan Committee (pre-triage, unconditionally for every task)
 
 Before triaging, run the planning committee to gather independent perspectives from multiple models.
-**Skip for trivial edits, known-root-cause bugs, or mechanical changes — earns its cost only on open-ended or high-stakes tasks.**
 
 **0a — adhd subagent (Claude cognitive frames, you run this):**
 Invoke `/adhd` as a Claude sub-agent; save its winning branch to `.secondmate/planning/adhd.md`.

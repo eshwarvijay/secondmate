@@ -64,7 +64,7 @@ flowchart LR
     H -- merge --> D[ship]
 ```
 
-> The planning committee is optional — skip it for trivial edits. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi-K2, Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. Sonnet synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder (`--thinking medium`)** for well-specified pure-code tasks.
+> The planning committee runs unconditionally for every task. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi-K2, Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. Sonnet synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder (`--thinking medium`)** for well-specified pure-code tasks.
 >
 > On a checker `fail`, the supervisor synthesizes a fix plan and hands it back to the **same maker** (task-scoped agent name, same worktree) — never fixes inline. The supervisor never writes project code.
 
