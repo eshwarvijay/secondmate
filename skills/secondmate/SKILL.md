@@ -89,7 +89,7 @@ This is the spec the maker receives.
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2).
   `<task-id>` is the same slug used in the worktree branch (e.g. `add-version-flag`). A task-scoped name
   prevents loop-back fix plans from being routed to a stale agent in a different worktree.
-  Do NOT use `herdr-pane.sh spawn` here — it splits from the caller's workspace, orphaning the worktree workspace.
+  Do NOT use `herdr-pane.sh spawn` here — without --pane, it splits from the caller's current pane (potentially in a different workspace); with --pane, it splits from the supplied pane's workspace.
   Use `--thinking medium` (not `off`) — Qwen's reasoning catches edge cases (null guards, trap safety,
   portability) that pure token prediction misses. Use `--thinking high` for security-sensitive or complex logic.
   Pi runs as a lifecycle-tracked herdr agent: if `blocked` (approval/question UI), inspect `herdr agent get/read`
