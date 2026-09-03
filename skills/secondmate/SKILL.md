@@ -100,7 +100,7 @@ This is the spec the maker receives.
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium -p "<plan>"`
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan>"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
   A good plan gives:

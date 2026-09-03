@@ -21,6 +21,9 @@
  *   - Does NOT catch: direct redirections (`cat</etc/passwd`), deferred execution (`find -exec` with path),
  *     interpreter exec() calls (`os.system()` inside python -c), or truly adversarial command encoding
  *
+ *   Shell whitespace variations: The tokenization heuristic only splits on plain spaces; tabs/other whitespace
+ *   characters are not guaranteed to be caught as word separators. This is a documented, accepted limitation.
+ *
  * DOCUMENTATION: This is a best-effort deterrent, not a sandbox. See bin/scope-guard.py for full details.
  */
 
@@ -38,6 +41,56 @@ const _SHELL_C_WRAPPERS = ["sh", "bash", "zsh", "env"];
 const _MAX_NESTED_DEPTH = 4;
 const _EMBEDDED_PATH_RE = /~?\/[^\s'"()]+|~[^\s'"()]*/g;
 
+// Resolve symlinks like Python's os.path.realpath: follow symlinks through existing path
+// components, and for non-existent components, pass them through unresolved.
+function resolveSymlinks(filepath: string, baseDir: string): string {
+  const resolved = require("path").resolve(baseDir, filepath);
+  const parts = resolved.split(require("path").sep).filter(p => p);
+
+  if (parts.length === 0) {
+    return resolved.startsWith(require("path").sep) ? resolved : "/";
+  }
+
+  // Start with the root
+  const sep = require("path").sep;
+  let current = resolved.startsWith(sep) ? sep : "/";
+
+  for (const part of parts) {
+    const candidate = require("path").join(current, part);
+
+    try {
+      // Use lstat to check if it's a symlink without following it
+      const stat = require("fs").lstatSync(candidate);
+
+      if (stat.isSymbolicLink()) {
+        // Resolve the symlink target
+        const target = require("fs").readlinkSync(candidate);
+        const resolvedTarget = require("path").isAbsolute(target) ? target : require("path").join(current, target);
+
+        // Now we need to continue with the resolved target + remaining parts
+        const remainingParts = parts.slice(parts.indexOf(part) + 1);
+        if (remainingParts.length > 0) {
+          const remainingPath = require("path").join(...remainingParts);
+          const fullPath = require("path").join(resolvedTarget, remainingPath);
+          // Recursively resolve the full path
+          return resolveSymlinks(fullPath, "/");
+        } else {
+          return resolvedTarget;
+        }
+      } else {
+        // Not a symlink, just continue
+        current = candidate;
+      }
+    } catch (e) {
+      // Component doesn't exist yet, or some other error
+      // Just continue building the path (this handles new files that don't exist yet)
+      current = require("path").join(current, part);
+    }
+  }
+
+  return current;
+}
+
 function _marker_root(): string {
   return process.env.SM_MARKER_ROOT || `${process.env.HOME || process.env.USERPROFILE}/.secondmate-markers`;
 }
@@ -49,10 +102,19 @@ function _marker_path_for(root: string): string {
 }
 
 function _is_path_candidate(tok: string): boolean {
+  // Only treat as path candidate if it looks like a path (not flags, subcommands, etc.)
+  // This prevents crashes on commands like 'ls -la', 'git status', 'mkdir newdir'
+  // Must contain a path separator or be a relative filename (not starting with -)
   if (tok.startsWith("/") || tok.startsWith("~") || tok.includes("$HOME")) return true;
   if (tok.includes("$")) return true;
   if (tok.includes("$(") || tok.includes("`")) return true;
-  return tok.split("/").includes("..");
+  if (tok.split("/").includes("..")) return true;
+  // Also catch tokens that contain a path separator (relative paths like 'src/file.ts')
+  if (tok.includes("/")) return true;
+  // Relative filenames without path separator: these could be valid paths
+  // But NOT flags (starting with -) or multi-word tokens
+  if (!tok.startsWith("-") && tok.length > 0) return true;
+  return false;
 }
 
 function _has_unresolvable_ref(tok: string): boolean {
@@ -77,7 +139,8 @@ function _resolve_token(tok: string, cwd: string): string {
   if (!t.startsWith("/")) {
     t = `${cwd}/${t}`;
   }
-  return require("path").resolve(t);
+  // Use resolveSymlinks to handle symlinks and non-existent paths like Python's os.path.realpath(p)
+  return resolveSymlinks(t, "/");
 }
 
 function _within_root(path: string, root: string): boolean {
@@ -86,8 +149,9 @@ function _within_root(path: string, root: string): boolean {
 
 function _is_path_violation(pathValue: string | undefined, cwd: string, root: string): { valid: boolean; reason: string } {
   if (!pathValue) return { valid: false, reason: "missing path" };
-  // Resolve relative paths against cwd (worktree root), not homedir
-  let resolved = require("path").resolve(cwd, pathValue as string);
+  // Resolve relative paths against cwd (worktree root), then follow symlinks with resolveSymlinks
+  // Matching scope-guard.py's: p = os.path.join(cwd, p); resolved = os.path.realpath(p)
+  let resolved = resolveSymlinks(pathValue as string, cwd);
   if (_within_root(resolved, root)) return { valid: true, reason: "" };
   return { valid: false, reason: `'${pathValue}' resolves to ${resolved}, outside the maker's worktree (${root})` };
 }
