@@ -140,13 +140,11 @@ Each stage exists to close a specific failure mode.
 
 ## Scope guard
 
-> **⚠️ Claude Code makers only — pi makers get NONE of this, today.** `scope-guard.py` is wired via
-> `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. A **pi maker** (SKILL.md step 0d's default
-> "Simple task" route) never loads `hooks.json` and is never subject to this hook — no worktree boundary,
-> no credential denylist, no Bash pattern checks, nothing below applies to it. **Routing a
-> security-sensitive or otherwise high-risk task to a pi maker gets zero of these protections** until a
-> pi-side mechanism exists (what can pi's `--extension` hooks actually intercept? — an open question, and a
-> deliberately deferred follow-up, not something this hook does).
+> **⚠️ Scope guard covers both Claude Code makers and pi makers equally — both use the same heuristic Bash checks.**
+> `scope-guard.py` is a Claude Code PreToolUse hook (wired via `hooks/hooks.json`). `scope-guard-extension.ts` is
+> a pi extension using the `tool_call` event. Both activate via the same `mark-maker.sh` marker convention and enforce
+> the same confinement rules. **Neither provides OS-level sandboxing.** A deliberately adversarial user can always
+> find an encoding that bypasses string-heuristic checks. See docs/SCOPE-GUARD-PI.md for full details.
 
 A real incident: a maker did ordinary-looking things — `gh pr view`, `cat` a file it assumed was local —
 that touched credentials and unrelated files outside its intended scope in a different repo.
@@ -226,9 +224,7 @@ than trusting the maker's judgment **— for Claude Code maker sessions only** (
 - **Restart is a non-event.** Decisions, loop state, and audit trails are on disk (`decisions.jsonl`,
   `.secondmate/`, `audit.jsonl`); nothing lives only in chat.
 - **Human owns risk.** Autonomy is explicit and scoped; merges and destructive actions always escalate.
-- **A maker cannot leave its own worktree.** `scope-guard.py` denies any file/command touch outside it and
-  any credential-store command, activated only by an unspoofable marker — the supervisor's own session is
-  never affected.
+- **A maker cannot leave its own worktree.** Both `scope-guard.py` (Claude) and `scope-guard-extension.ts` (pi) deny any file/command touch outside the worktree and any credential-store command, activated only by an unspoofable marker — the supervisor's own session is never affected.
 
 ## Failure modes it defends against
 
@@ -243,7 +239,7 @@ than trusting the maker's judgment **— for Claude Code maker sessions only** (
 | Checker silently mutates the code | edit-locked checker |
 | Context bloats over a long run | prune-output + reasoning one-shots off the supervisor |
 | Ambiguous adjudication | machine-readable verdict envelope |
-| Maker touches files/credentials outside its scope | scope-guard.py PreToolUse hook, marker-activated |
+| Maker touches files/credentials outside its scope | scope-guard.py (Claude) and scope-guard-extension.ts (pi), both marker-activated |
 
 ## Component map
 
@@ -252,7 +248,8 @@ than trusting the maker's judgment **— for Claude Code maker sessions only** (
 | `skills/secondmate/SKILL.md` | the SOP the supervisor follows |
 | `hooks/hooks.json` | SessionStart hold-surfacing + PreToolUse scope guard |
 | `bin/scope-guard.py` | confines a marker-activated maker session to its own worktree; denies credential-store commands and common Bash evasions |
-| `bin/mark-maker.sh` | the one shared call that drops the scope-guard marker (outside the worktree) — called by every maker-launch site |
+| `bin/mark-maker.sh` | the one shared call that drops the scope-guard marker (outside the worktree) — called by every maker-launch site; same convention for Claude and pi |
+| `bin/scope-guard-extension.ts` | pi extension version of scope-guard.py — uses `tool_call` event instead of PreToolUse, same enforcement rules |
 | `bin/plan-committee.sh` | 6 parallel pi planners → `.secondmate/planning/<label>.md` |
 | `bin/new-worktree.sh` | isolated worktree per maker; marks it via `mark-maker.sh` |
 | `bin/run-round.sh` | timeout + idle watchdog + audit (used by planners + maker + checker) |

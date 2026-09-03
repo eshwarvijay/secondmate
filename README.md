@@ -80,7 +80,8 @@ flowchart LR
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
 | `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`/`eval`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, any pipeline ending in a shell interpreter); recognizes literal patterns only — see the limitation callout below for what it permanently does not catch; no-op for the supervisor's primary checkout |
-| `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, refusing to mark anything but an isolated linked worktree (never the primary checkout) |
+| `bin/scope-guard-extension.ts` | **pi extension equivalent** of scope-guard.py — denies the same tool calls and patterns for pi maker sessions; uses pi's `tool_call` event instead of Claude's PreToolUse hook; activated by same `mark-maker.sh` convention; same heuristic limitations Apply |
+| `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, keyed by the worktree's realpath; refuses to mark anything but an isolated linked worktree (never the primary checkout) |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract |
@@ -94,25 +95,21 @@ flowchart LR
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 
-> ⚠️ **Scope guard covers Claude Code makers only — pi makers have ZERO scope confinement today.**
-> `scope-guard.py` is wired via `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. A **pi maker**
-> (the default "Simple task" route) never loads `hooks.json` and is never subject to this hook — no
-> worktree boundary, no credential-store denylist, no Bash pattern checks apply to it at all. **Routing a
-> security-sensitive or otherwise high-risk task to a pi maker gets none of the protections above.**
-> Confining pi makers needs its own mechanism (what can pi's `--extension` hooks actually intercept?) and
-> is a deliberately deferred follow-up — not something built here.
-
-> ⚠️ **The Bash guard is a permanent limitation, not a punch list — it recognizes literal patterns only.**
-> `check_bash()` matches a fixed vocabulary of shell tokens against the literal text of the command string.
-> It is not a shell parser, not data-flow analysis, not an OS sandbox, and it will **not** be extended
-> further to chase new bypasses — every round of "found one, patched it" converges on the same wall. It
-> does not reliably catch: **(a)** alternate redirection syntax with no space before the operator (e.g.
-> `cat</etc/passwd`, `>/etc/foo`); **(b)** indirect/deferred execution where the program invoked arrives as
-> *data* at runtime rather than a literal token (e.g. `find . -exec cat /etc/passwd \;`,
-> `... | xargs -0 sh -c 'cat "$0"'`); **(c)** interpreter code that shells out via a library call instead of
-> visible path text (e.g. `python3 -c "import os; os.system('cat /etc/passwd')"`, Node's `child_process`,
-> Ruby/Perl backticks). These are representative examples of permanent gaps, not a todo list — closing them
-> for real needs OS-level sandboxing (chroot/seccomp/containers), which is explicitly out of scope here.
+> ⚠️ **Scope guard covers Claude Code makers and pi makers equally** — both use the same heuristic Bash checks.
+> `scope-guard.py` is wired via `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. `scope-guard-extension.ts`
+> uses pi's `tool_call` extension event. Both activate via the same `mark-maker.sh` marker convention and enforce
+> the same confinement rules. **Neither provides OS-level sandboxing.** A deliberately adversarial user can
+> always find an encoding that bypasses string-heuristic checks. See docs/SCOPE-GUARD-PI.md for full details.
+>
+> Both implementations share the same permanent limitations: they recognize literal patterns only, not a shell parser,
+> not data-flow analysis, not an OS sandbox. They will **not** be extended further to chase new bypasses — every round
+> of "found one, patched it" converges on the same wall. They do not reliably catch: **(a)** alternate redirection syntax
+> with no space before the operator (e.g. `cat</etc/passwd`, `>/etc/foo`); **(b)** indirect/deferred execution where the
+> program invoked arrives as *data* at runtime rather than a literal token (e.g. `find . -exec cat /etc/passwd \;`,
+> `... | xargs -0 sh -c 'cat "$0"'`); **(c)** interpreter code that shells out via a library call instead of visible path
+> text (e.g. `python3 -c "import os; os.system('cat /etc/passwd')"`, Node's `child_process`, Ruby/Perl backticks).
+> These are representative examples of permanent gaps, not a todo list — closing them for real needs OS-level
+> sandboxing (chroot/seccomp/containers), which is explicitly out of scope here.
 
 ## 🔎 Specialized review lenses
 
