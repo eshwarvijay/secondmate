@@ -220,6 +220,12 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
    - **On `error` or `refused`** — do not retry via the maker. Inspect the checker output, fix the checker
      invocation (bad args, missing context) or escalate to the human. `refused` always escalates.
+   - **Log the round.** After every checker verdict (pass, fail, error, or refused), append a metrics
+     record: `${CLAUDE_PLUGIN_ROOT}/bin/log-round.sh --task <id> --round <N> --maker claude|pi --verdict <verdict> [--tag <finding-category>]... [--cost <n>] [--duration <n>]`.
+     Supply one `--tag` per recurring finding category you'd tag it with in `audit/decision.md` anyway
+     (e.g. `real-bug`, `scope-creep`, `fake-test`, `not-committed`) — this is structured data alongside the
+     prose audit trail, not a replacement for it. `--cost`/`--duration` are optional, only if already at
+     hand (e.g. from a herdr pane's own cost/elapsed display) — never scrape or parse for them.
 
 5. **Gate** — before integrating anything:
    `${CLAUDE_PLUGIN_ROOT}/bin/verify-gate.sh --worktree <wt> --base <branch> --checked-sha <the exact sha the checker reviewed> [--test "<cmd>"]`
