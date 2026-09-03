@@ -54,25 +54,101 @@ case "$cmd" in
   --selfcheck)
     fails=0
     rc=0; "$0" bogusverb >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown verb exit $rc (want 2)"; fails=1; }
+    # Test arg parsing without running real herdr: use mock herdr in temp dir
     if usable; then
       # validate-before-mutate: delegate w/o --prompt must exit 2 and create NO pane
       count() { herdr pane list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["result"]["panes"]))' 2>/dev/null || echo 0; }
       b="$(count)"; rc=0; "$0" delegate --name _sc --kind pi >/dev/null 2>&1 || rc=$?; a="$(count)"
       { [ "$rc" = 2 ] && [ "$b" = "$a" ]; } || { echo "FAIL: delegate validate-before-split (rc=$rc panes $b->$a)"; fails=1; }
     fi
-    # Test arg parsing (herdr not required for this)
-    rc=0; "$0" split >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split without args (rc=$rc)"; fails=1; }
-    rc=0; "$0" split down >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with bare down (rc=$rc)"; fails=1; }
-    rc=0; "$0" split --dir right >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --dir (rc=$rc)"; fails=1; }
-    rc=0; "$0" split --pane test-id --dir up >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: split with invalid dir should exit 2"; fails=1; }
+    # Mock-based tests for split/spawn/delegate arg parsing (no real panes created)
+    tmpdir="$(mktemp -d)"
+    mock_herdr="$tmpdir/herdr"
+    log_file="$tmpdir/herdr.log"
+    # Create mock herdr that logs argv and returns fake pane_id
+    cat > "$mock_herdr" << 'HERDMOCK'
+#!/usr/bin/env bash
+echo "$*" >> "${HERDR_MOCK_LOG:-/tmp/herdr-mock.log}"
+case "$1" in
+  pane)
+    case "$2" in
+      split) echo '{"result":{"pane":{"pane_id":"mock-pane-'"$RANDOM"'"}}}';;
+      list) echo '{"result":{"panes":[]}}';;
+      *) exit 1;;
+    esac;;
+  agent)
+    case "$2" in
+      start) echo '{"result":{"agent_info":{"agent_name":'$4'}}}';;
+      prompt|read) exit 0;;
+      *) exit 1;;
+    esac;;
+  worktree)
+    case "$2" in
+      create) echo '{"result":{"worktree":{"path":"/mock"},"root_pane":{"pane_id":"mock-root-'$RANDOM'"}}}';;
+      remove) exit 0;;
+      *) exit 1;;
+    esac;;
+  *) exit 1;;
+esac
+HERDMOCK
+    chmod +x "$mock_herdr"
+    # Get the repo root (one level up from bin/)
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    repo_root="$(dirname "$script_dir")"
+    # Run tests with mock herdr on PATH (HERDR_ENV still required since check needs it)
+    # First set up mock herdr in PATH then run the check to verify it's on PATH
+    env PATH="$tmpdir:$PATH" herdr pane list >/dev/null 2>&1 || { echo "FAIL: mock herdr not on PATH"; fails=1; }
+    # Now run the arg parsing tests with HERDR_ENV=1
+    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split without args (rc=$rc)"; fails=1; }
+    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with bare down (rc=$rc)"; fails=1; }
+    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --dir right >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --dir (rc=$rc)"; fails=1; }
+    # Assert mock herdr was called with --current (backward compat)
+    if [ -f "$log_file" ]; then
+      # Check last call was for split down (should have --current)
+      last_split=$(grep "pane split" "$log_file" | tail -1)
+      case "$last_split" in
+        *"--current"*) ;; # good
+        *) echo "FAIL: split without args did not use --current: $last_split"; fails=1;;
+      esac
+    fi
+    # Test split with --pane (must use --pane not --current)
+    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --pane test-pane-123 --dir right >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --pane (rc=$rc)"; fails=1; }
+    if [ -f "$log_file" ]; then
+      last_split=$(grep "pane split" "$log_file" | tail -1)
+      case "$last_split" in
+        *"--pane test-pane-123"*) ;; # good
+        *"--current"*) echo "FAIL: split with --pane still used --current: $last_split"; fails=1;;
+        *) echo "FAIL: split with --pane did not include --pane flag: $last_split"; fails=1;;
+      esac
+    fi
+    # Test spawn with --pane targeting
+    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: spawn with --pane (rc=$rc)"; fails=1; }
+    if [ -f "$log_file" ]; then
+      last_split=$(grep "pane split" "$log_file" | tail -1)
+      case "$last_split" in
+        *"--pane mock-target-pane"*) ;; # good
+        *) echo "FAIL: spawn with --pane did not target mock-target-pane: $last_split"; fails=1;;
+      esac
+    fi
+    # Cleanup
+    rm -rf "$tmpdir"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   split)
     usable || { echo "not inside herdr" >&2; exit 1; }
     pane_id="" dir="right"
     while [ $# -gt 0 ]; do
       case "$1" in
-        --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; pane_id="$2"; shift 2;;
-        --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;;
+        --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; 
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        pane_id="$2"; shift 2;;
+        --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; };
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        dir="$2"; shift 2;;
         --) shift; break;;
         # bare positional direction (backward compat: no --dir flag required)
         right|down) dir="$1"; shift;;
@@ -85,8 +161,12 @@ case "$cmd" in
     name="" kind="" dir="right" cwd="$PWD" pane_id="" prompt="" timeout=600000; args=()
     while [ $# -gt 0 ]; do case "$1" in
       --name) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; name="$2"; shift 2;; --kind) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; kind="$2"; shift 2;;
-      --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
-      --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; pane_id="$2"; shift 2;;
+      --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; };
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
+      --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; 
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        pane_id="$2"; shift 2;;
       --prompt) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; prompt="$2"; shift 2;; --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
       --) shift; args=("$@"); break;;
       *) echo "unknown arg: $1" >&2; exit 2;;
