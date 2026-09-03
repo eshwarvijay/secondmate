@@ -18,6 +18,18 @@
                     }
                 ]
             }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "Bash|Read|Edit|Write|NotebookEdit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/scope-guard.py\"",
+                        "timeout": 5
+                    }
+                ]
+            }
         ]
     }
 }

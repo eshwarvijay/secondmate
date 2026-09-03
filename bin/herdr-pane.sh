@@ -23,6 +23,17 @@ do_split() { # dir cwd -> pane_id
   herdr pane split --current --direction "$1" --cwd "$2" --no-focus | pane_id
 }
 
+# `spawn` is secondmate's Claude-maker launch path (see SKILL.md 0d) -- mark $cwd as a maker session so
+# scope-guard.py's PreToolUse hook activates in it, same marker new-worktree.sh drops. Covers the case where
+# the worktree came from `herdr worktree create` (not new-worktree.sh). No-op (and harmless) if $cwd isn't a
+# git worktree yet. Lives in git's per-worktree admin dir, never the working tree.
+mark_maker() { # cwd
+  local cwd="$1"
+  git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  local marker; marker="$(git -C "$cwd" rev-parse --git-path secondmate-maker.marker 2>/dev/null)" || return 0
+  mkdir -p "$(dirname "$marker")"; printf 'spawned-by=herdr-pane.sh\n' > "$marker"
+}
+
 # Start a live agent in <pane>, retrying until the pane's shell is actually ready. This fixes the
 # "not an available shell" / agent_pane_busy race on a freshly-split pane (no manual sleep needed).
 start_agent() { # name kind pane [-- agent args...]
@@ -68,6 +79,7 @@ case "$cmd" in
     # finding #2: validate ALL required args BEFORE mutating (splitting a pane), so a bad call leaves nothing behind.
     if [ "$cmd" = delegate ] && [ -z "$prompt" ]; then echo "delegate needs --prompt" >&2; exit 2; fi
     pane="$(do_split "$dir" "$cwd")" || exit 1
+    [ "$cmd" = spawn ] && mark_maker "$cwd"   # mark BEFORE the agent starts so its first tool call is guarded
     if [ "${#args[@]}" -gt 0 ]; then start_agent "$name" "$kind" "$pane" "${args[@]}" || exit 1
     else start_agent "$name" "$kind" "$pane" || exit 1; fi
     if [ "$cmd" = spawn ]; then

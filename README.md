@@ -79,6 +79,7 @@ flowchart LR
 | `secondmate` skill | The full SOP: plan-committee → triage → spawn → check → gate → hold → integrate |
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
+| `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it and Bash commands reading credential stores (Keychain, `gh auth`); no-op for the supervisor's primary checkout |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract |
@@ -88,7 +89,7 @@ flowchart LR
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
-| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
+| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 
@@ -155,6 +156,7 @@ credentials only you can supply.
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
+| `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 
@@ -173,7 +175,7 @@ claude plugin install secondmate@secondmate
 # verify everything
 bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --selfcheck \
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
-  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && echo ALL_OK
+  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck && echo ALL_OK
 claude plugin validate .
 ```
 

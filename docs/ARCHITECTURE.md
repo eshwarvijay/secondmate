@@ -87,6 +87,8 @@ Each stage exists to close a specific failure mode.
    — creates a fresh git worktree on an `sm/<task>` branch. `herdr worktree create` additionally opens a
    dedicated herdr workspace/tab/pane; `.result.root_pane.pane_id` is used directly to start the pi maker
    agent, keeping it in its own workspace rather than the supervisor's.
+   `new-worktree.sh` (and `herdr-pane.sh spawn`, for the Claude-maker path) also drops a maker marker — see
+   **Scope guard** below.
    *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo.
 
 3. **Implement (guarded).** The maker works, wrapped by two deterministic guards:
@@ -136,6 +138,29 @@ Each stage exists to close a specific failure mode.
    Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
    Commit separately. Skip for trivial one-shot edits.
 
+## Scope guard
+
+A real incident: a maker touched credentials and unrelated files outside its intended scope in a different
+repo. `bin/scope-guard.py`, wired as a `PreToolUse` hook in `hooks/hooks.json`, closes this structurally
+rather than trusting the maker's judgment:
+
+- **Activation is explicit, not inferred.** `new-worktree.sh` and `herdr-pane.sh spawn` — the two places a
+  maker's worktree/session comes to life — drop a `secondmate-maker.marker` file in that worktree's
+  per-worktree git admin dir (`git rev-parse --git-path`), never in the tracked working tree. The hook is a
+  no-op unless that marker is present, so the supervisor's primary checkout, and any worktree secondmate
+  didn't create, are completely unaffected. A stray file drop can't spoof it — it lives inside git's own
+  internals, not somewhere an ordinary write would land.
+- **Scope check.** Every `Bash`/`Read`/`Edit`/`Write`/`NotebookEdit` call in a marked session has its
+  resolved path(s) checked against the worktree root (symlinks and `..` resolved via `realpath`). Outside
+  the worktree → deny. Bash commands get a token-level scan (not a full shell parser) for path-looking
+  arguments, plus a small denylist for credential-store commands with no filesystem path to catch
+  (`security`, `gh auth`) — `~/.ssh`, `~/.aws`, etc. are already denied by the general path check since they
+  resolve outside any worktree. `SM_MAKER_ALLOW_CREDS=1` is the explicit opt-in past the credential denylist.
+- **Fail-open at the activation layer, fail-closed at the decision layer.** Can't parse the hook payload, or
+  git/cwd is unavailable? Allow — a broken hook must never brick tool calls in unrelated sessions. Once a
+  session is confirmed as a maker, anything unresolvable (unbalanced quoting, an unexpanded shell variable
+  in a path-looking token) denies rather than guesses.
+
 ## Invariants that make it trustworthy
 
 - **Maker is not checker, cross-model.** Enforced by launching the checker as a different harness/model,
@@ -146,6 +171,9 @@ Each stage exists to close a specific failure mode.
 - **Restart is a non-event.** Decisions, loop state, and audit trails are on disk (`decisions.jsonl`,
   `.secondmate/`, `audit.jsonl`); nothing lives only in chat.
 - **Human owns risk.** Autonomy is explicit and scoped; merges and destructive actions always escalate.
+- **A maker cannot leave its own worktree.** `scope-guard.py` denies any file/command touch outside it and
+  any credential-store command, activated only by an unspoofable marker — the supervisor's own session is
+  never affected.
 
 ## Failure modes it defends against
 
@@ -160,15 +188,17 @@ Each stage exists to close a specific failure mode.
 | Checker silently mutates the code | edit-locked checker |
 | Context bloats over a long run | prune-output + reasoning one-shots off the supervisor |
 | Ambiguous adjudication | machine-readable verdict envelope |
+| Maker touches files/credentials outside its scope | scope-guard.py PreToolUse hook, marker-activated |
 
 ## Component map
 
 | Path | Guarantee |
 |---|---|
 | `skills/secondmate/SKILL.md` | the SOP the supervisor follows |
-| `hooks/hooks.json` | SessionStart hold-surfacing |
+| `hooks/hooks.json` | SessionStart hold-surfacing + PreToolUse scope guard |
+| `bin/scope-guard.py` | confines a marker-activated maker session to its own worktree; denies credential-store commands |
 | `bin/plan-committee.sh` | 6 parallel pi planners → `.secondmate/planning/<label>.md` |
-| `bin/new-worktree.sh` | isolated worktree per maker |
+| `bin/new-worktree.sh` | isolated worktree per maker; drops the scope-guard marker |
 | `bin/run-round.sh` | timeout + idle watchdog + audit (used by planners + maker + checker) |
 | `bin/loop-guard.sh` | stuck-loop abort + round/spawn caps |
 | `bin/launch-checker.sh` + `bin/checker-envelope.md` | edit-locked cross-model checker + verdict contract |
