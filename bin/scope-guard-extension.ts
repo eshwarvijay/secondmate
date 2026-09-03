@@ -14,6 +14,7 @@
  * FAIL-OPEN vs FAIL-CLOSED:
  *   - Can we tell if this is a maker session (no marker, git unavailable, cwd gone)? -> Fail OPEN (allow)
  *   - Given a CONFIRMED maker session, is a specific path/command in or out of scope? -> Fail CLOSED (deny)
+ *   - ANY exception during decision? -> Fail CLOSED (deny) to prevent silent bypass
  *
  * LIMITATIONS (by design, same as scope-guard.py):
  *   - String-heuristic Bash checks cannot enumerate every possible command encoding (Turing-complete-adjacent)
@@ -175,8 +176,10 @@ function _credential_command(tokens: string[]): string | null {
 
 function _embedded_code_violation(code: string | undefined, cwd: string, root: string): string | null {
   if (!code) return null;
+  // Create a fresh regex instance each call to avoid lastIndex state bleeding across calls
+  const pattern = new RegExp(_EMBEDDED_PATH_RE.source, _EMBEDDED_PATH_RE.flags);
   let match;
-  while ((match = _EMBEDDED_PATH_RE.exec(code)) !== null) {
+  while ((match = pattern.exec(code)) !== null) {
     const tok = match[0];
     if (_has_unresolvable_ref(tok)) {
       return `ambiguous path-like token '${tok}' embedded in interpreter code (unresolved shell variable/substitution)`;
@@ -218,7 +221,7 @@ function _pipeline_into_shell(tokens: string[]): string | null {
   segments.push(current);
   if (segments.length < 2) return null;
   const last = segments[segments.length - 1];
-  if (last && _SHELL_INTERPRETERS.includes(require("path").basename(last[0]))) {
+  if (last.length > 0 && _SHELL_INTERPRETERS.includes(require("path").basename(last[0]))) {
     return `pipeline's final stage is a shell interpreter ('${require("path").basename(last[0])}') -- denied by default (what a piped-in script will do can't be verified without executing it)`;
   }
   return null;
@@ -281,6 +284,10 @@ function check_bash(command: string | undefined, cwd: string, root: string, _dep
       }
       if (current.length > 0) {
         tokens.push(current);
+      }
+      // Check for unbalanced quotes - tokenizer ended while still inside a quote
+      if (inQuote) {
+        return { allowed: false, reason: "unparseable shell syntax -- ambiguous, denying" };
       }
     }
   } catch {
@@ -369,7 +376,15 @@ export default function (pi: ExtensionAPI) {
     if (!["bash", "read", "write", "edit", "notebookedit"].includes(event.toolName.toLowerCase())) return undefined;
 
     const cwd = ctx.cwd;
-    const { allowed, reason } = decide(event.toolName, event.input, cwd, root);
+    let allowed: boolean, reason: string;
+    try {
+      ({ allowed, reason } = decide(event.toolName, event.input, cwd, root));
+    } catch (e) {
+      // FAIL-CLOSED: ANY exception during decision means we deny by default
+      // This prevents any bug in the decision logic from silently bypassing confinement
+      allowed = false;
+      reason = `decision error (internal exception) -- blocked by fail-closed policy`;
+    }
 
     if (!allowed) {
       if (ctx.hasUI) {
