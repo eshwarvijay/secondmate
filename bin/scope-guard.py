@@ -9,6 +9,18 @@
   scope-guard.py selfcheck
   scope-guard.py markerpath <worktree-root>   # print where mark-maker.sh should write the marker
 
+*****************************************************************************************************
+* CLAUDE CODE MAKERS ONLY -- PI MAKERS GET NONE OF THIS. READ BEFORE ROUTING A TASK TO A PI MAKER.    *
+*                                                                                                     *
+* This hook is wired via hooks/hooks.json, a Claude Code .claude-plugin mechanism. A pi maker         *
+* (secondmate's default "Simple task" route, SKILL.md step 0d) never loads hooks.json and is NEVER    *
+* subject to this hook. A pi maker today has ZERO scope confinement: no worktree boundary, no          *
+* credential-store denylist, no Bash pattern checks -- nothing in this file applies to it. Routing a   *
+* security-sensitive or otherwise high-risk task to a pi maker gets NONE of the protections described  *
+* below. Confining pi makers needs its own mechanism (investigate what pi's --extension hooks can      *
+* actually intercept) and is a deliberately deferred follow-up, not something this file does.          *
+*****************************************************************************************************
+
 Real incident this defends against: a maker did ordinary-looking things -- `gh pr view`, `cat` a file it
 assumed was local -- that happened to touch credentials/files outside its intended scope in a different
 repo. This hook denies Bash/Read/Edit/Write/NotebookEdit calls whose resolved path(s) fall outside the
@@ -162,28 +174,15 @@ def _resolve_token(tok, cwd):
 
 # Credential-store commands that have no filesystem path argument for the general scan below to catch
 # (macOS Keychain reads via `security`, GitHub's stored token via `gh auth`). ~/.ssh, ~/.aws etc. are
-# already covered by the general path scan since they resolve outside any worktree.
+# already covered by the general path scan since they resolve outside any worktree. Nested occurrences
+# (inside sh -c / eval / etc.) are handled centrally by _nested_command_violation below, which recurses
+# through this whole check_bash pipeline rather than just this one function.
 def _credential_command(tokens):
-    """Check for credential commands at top level AND nested in sh/bash -c wrappers (finding #3)."""
     for i, tok in enumerate(tokens):
         if tok == "security":
             return "'security' reads the macOS Keychain"
         if tok == "gh" and i + 1 < len(tokens) and tokens[i + 1] == "auth":
             return "'gh auth' reads stored GitHub credentials"
-        # Finding #3: detect sh/bash -c "..." wrappers and check the nested command
-        if tok in ("sh", "bash", "zsh", "env") and i + 1 < len(tokens):
-            # Look for -c followed by a command string
-            for j in range(i + 1, len(tokens)):
-                if tokens[j] == "-c" and j + 1 < len(tokens):
-                    nested_cmd = tokens[j + 1]
-                    try:
-                        nested_tokens = shlex.split(nested_cmd)
-                        nested_cred = _credential_command(nested_tokens)
-                        if nested_cred:
-                            return f"{nested_cred} (nested in {tok} -c)"
-                    except ValueError:
-                        pass  # unparseable nested command, will be caught later
-                    break
     return None
 
 
@@ -258,7 +257,42 @@ def _pipeline_into_shell(tokens):
     return None
 
 
-def check_bash(command, cwd, root):
+# Wrappers whose argument is itself a shell command string that this hook must re-scan with the exact
+# same logic it applies at top level -- otherwise anything this hook denies directly is trivially allowed
+# just by wrapping it once. `sh`/`bash`/`zsh`/`env -c "<code>"` used to recurse for credentials only
+# (round 1, finding #3); `eval "<code>"` bypassed everything -- paths included -- because it was never
+# recognized as a wrapper at all (round 4, finding #1: `eval "cat /etc/hostname"`, `eval "security ... -w"`).
+# Both now recurse through the FULL check_bash pipeline (paths, credentials, interpreter code, pipelines),
+# not just credentials, so a fix to any check above automatically applies inside these wrappers too.
+_SHELL_C_WRAPPERS = {"sh", "bash", "zsh", "env"}
+_MAX_NESTED_DEPTH = 4  # cheap guard against pathological nesting (eval eval eval ...) -- a heuristic
+# cap, not a security boundary; arbitrarily deep obfuscation is already out of scope, see module docstring.
+
+
+def _nested_command_violation(tokens, cwd, root, depth):
+    if depth >= _MAX_NESTED_DEPTH:
+        return None
+    for i, tok in enumerate(tokens):
+        name = os.path.basename(tok)
+        nested_code, label = None, None
+        if name in _SHELL_C_WRAPPERS:
+            for j in range(i + 1, len(tokens)):
+                if tokens[j] == "-c" and j + 1 < len(tokens):
+                    nested_code, label = tokens[j + 1], f"{name} -c"
+                    break
+        elif name == "eval" and i + 1 < len(tokens):
+            # eval concatenates all its arguments with spaces and re-parses the result -- join
+            # everything after it (quoted-as-one-token or not) and re-scan that.
+            nested_code, label = " ".join(tokens[i + 1:]), "eval"
+        if nested_code is None:
+            continue
+        allowed, reason = check_bash(nested_code, cwd, root, _depth=depth + 1)
+        if not allowed:
+            return f"{reason} (nested in {label})"
+    return None
+
+
+def check_bash(command, cwd, root, _depth=0):
     try:
         tokens = shlex.split(command or "", comments=False)
     except ValueError:
@@ -285,6 +319,11 @@ def check_bash(command, cwd, root):
         resolved = _resolve_token(tok, cwd)
         if not _within_root(resolved, root):
             return False, f"'{tok}' resolves to {resolved}, outside the maker's worktree ({root})"
+
+    nested_reason = _nested_command_violation(tokens, cwd, root, _depth)
+    if nested_reason:
+        return False, nested_reason
+
     return True, ""
 
 
@@ -441,6 +480,22 @@ def _selfcheck():
               decide("Bash", {"command": "security find-generic-password -s x -w"}, root, root)[0] is True)
         check("accept: nested security with explicit opt-in",
               decide("Bash", {"command": "sh -c 'security find-generic-password -w'"}, root, root)[0] is True)
+        os.environ.pop("SM_MAKER_ALLOW_CREDS", None)
+
+        # Finding #1 (round 4): eval "<string>" bypassed everything -- neither credential detection nor
+        # the path scan ever looked inside it. Now recurses through the full check_bash pipeline like
+        # sh -c does, so it catches both out-of-worktree paths AND credential commands.
+        check("reject: eval reading an out-of-worktree file",
+              decide("Bash", {"command": "eval \"cat /etc/hostname\""}, root, root)[0] is False)
+        check("reject: security nested in eval",
+              decide("Bash", {"command": "eval \"security find-generic-password -w\""}, root, root)[0] is False)
+        check("reject: gh auth nested in eval, unquoted form",
+              decide("Bash", {"command": "eval gh auth token"}, root, root)[0] is False)
+        check("accept: eval touching only an in-worktree path",
+              decide("Bash", {"command": f"eval \"cat {os.path.join(root, 'sub', 'f.txt')}\""}, root, root)[0] is True)
+        os.environ["SM_MAKER_ALLOW_CREDS"] = "1"
+        check("accept: security nested in eval with explicit opt-in",
+              decide("Bash", {"command": "eval \"security find-generic-password -w\""}, root, root)[0] is True)
         os.environ.pop("SM_MAKER_ALLOW_CREDS", None)
 
     # --- is_maker_worktree(): real git worktree, marker presence gates activation -----------------

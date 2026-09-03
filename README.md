@@ -94,6 +94,14 @@ flowchart LR
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 
+> ⚠️ **Scope guard covers Claude Code makers only — pi makers have ZERO scope confinement today.**
+> `scope-guard.py` is wired via `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. A **pi maker**
+> (the default "Simple task" route) never loads `hooks.json` and is never subject to this hook — no
+> worktree boundary, no credential-store denylist, no Bash pattern checks apply to it at all. **Routing a
+> security-sensitive or otherwise high-risk task to a pi maker gets none of the protections above.**
+> Confining pi makers needs its own mechanism (what can pi's `--extension` hooks actually intercept?) and
+> is a deliberately deferred follow-up — not something built here.
+
 ## 🔎 Specialized review lenses
 
 The checker isn't one generic reviewer. Per task, secondmate loads **only the specialized disciplines the

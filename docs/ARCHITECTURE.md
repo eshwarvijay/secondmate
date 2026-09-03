@@ -140,10 +140,18 @@ Each stage exists to close a specific failure mode.
 
 ## Scope guard
 
+> **⚠️ Claude Code makers only — pi makers get NONE of this, today.** `scope-guard.py` is wired via
+> `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. A **pi maker** (SKILL.md step 0d's default
+> "Simple task" route) never loads `hooks.json` and is never subject to this hook — no worktree boundary,
+> no credential denylist, no Bash pattern checks, nothing below applies to it. **Routing a
+> security-sensitive or otherwise high-risk task to a pi maker gets zero of these protections** until a
+> pi-side mechanism exists (what can pi's `--extension` hooks actually intercept? — an open question, and a
+> deliberately deferred follow-up, not something this hook does).
+
 A real incident: a maker did ordinary-looking things — `gh pr view`, `cat` a file it assumed was local —
 that touched credentials and unrelated files outside its intended scope in a different repo.
 `bin/scope-guard.py`, wired as a `PreToolUse` hook in `hooks/hooks.json`, closes this structurally rather
-than trusting the maker's judgment:
+than trusting the maker's judgment **— for Claude Code maker sessions only** (see warning above):
 
 - **Activation is explicit, not inferred, and lives OUTSIDE the worktree it guards.** `bin/mark-maker.sh`
   is the single shared marking call — `new-worktree.sh`, `herdr-pane.sh spawn`, and the `herdr worktree
@@ -165,14 +173,16 @@ than trusting the maker's judgment:
 - **Scope check.** Every `Bash`/`Read`/`Edit`/`Write`/`NotebookEdit` call in a marked session has its
   resolved path(s) checked against the worktree root (symlinks and `..` resolved via `realpath`). Outside
   the worktree → deny. Bash commands get a token-level scan (not a full shell parser) that also looks inside
-  common evasions — shell variable indirection (`d=/etc; cat $d/x`), command substitution, credential
-  commands wrapped in `sh -c`, inline interpreter one-liners (`python3 -c "..."`, `node -e "..."`), and any
-  pipeline whose *final stage* is a shell interpreter (`sh`/`bash`/`zsh`/`dash`/...) — denied regardless of
-  what feeds it (`printf`, `echo`, `cat`, `base64 -d`, `curl`, anything), because what a piped-in script
-  will do can't be verified without executing it — plus a small denylist for credential-store commands with
-  no filesystem path to catch (`security`, `gh auth`), including when wrapped in `sh`/`bash`/`env -c` — `~/.ssh`,
-  `~/.aws`, etc. are already denied by the general path check since they resolve outside any worktree.
-  `SM_MAKER_ALLOW_CREDS=1` is the explicit opt-in past the credential denylist.
+  common evasions — shell variable indirection (`d=/etc; cat $d/x`), command substitution, inline
+  interpreter one-liners (`python3 -c "..."`, `node -e "..."`), and any pipeline whose *final stage* is a
+  shell interpreter (`sh`/`bash`/`zsh`/`dash`/...) — denied regardless of what feeds it (`printf`, `echo`,
+  `cat`, `base64 -d`, `curl`, anything), because what a piped-in script will do can't be verified without
+  executing it — plus a small denylist for credential-store commands with no filesystem path to catch
+  (`security`, `gh auth`). `sh`/`bash`/`zsh`/`env -c "<code>"` **and** `eval "<code>"` both recurse the
+  *entire* check (paths, credentials, interpreter code, pipelines) against the wrapped string, so wrapping
+  a denied command once doesn't launder it — `~/.ssh`, `~/.aws`, etc. are already denied by the general path
+  check since they resolve outside any worktree. `SM_MAKER_ALLOW_CREDS=1` is the explicit opt-in past the
+  credential denylist.
 - **Fail-open at the activation layer, fail-closed at the decision layer.** Can't parse the hook payload, or
   git/cwd is unavailable? Allow — a broken hook must never brick tool calls in unrelated sessions. Once a
   session is confirmed as a maker, anything unresolvable (unbalanced quoting, an unexpanded shell variable
