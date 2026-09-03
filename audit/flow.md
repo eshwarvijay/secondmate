@@ -38,6 +38,26 @@ Append one entry per task. Format: date, task id, maker path chosen, planner mod
 - **Lesson:** herdr-pane.sh's `spawn`/`split` originally always split off the CALLER's current pane, not the dedicated worktree workspace `herdr worktree create` already provisions — this caused real keyboard-focus/input bleed between supervisor and maker panes mid-task. Fixed in a companion task (`pane-routing-fix`, same day) to add `--pane <ID>` targeting.
 
 ---
+## 2026-09-04 — always-plan-committee: run the plan committee unconditionally for every task
+
+- **Trigger:** explicit user instruction ("invoke the committee every time so we can implement open-endedly"), trading cost (6 model calls + adhd subagent per task) for broader exploration on every task, not just complex ones
+- **Maker path:** pi (Qwen3-Coder-Next, medium thinking), `herdr agent start --pane <root_pane_id>` in dedicated worktree workspace `w19`
+- **Worktree:** `herdr worktree create` → `sm/always-plan-committee`
+- **Rounds:** 2. Round 1 made the requested change but over-deleted 3 unrelated guidance lines (whole-loop skip-for-trivial in SKILL.md frontmatter, audit-trail skip-for-trivial in ARCHITECTURE.md, 2 mermaid edges connecting maker routing to Triage). Round 2 reverted exactly those 3, keeping the intended change. One mid-task hang: the maker's `edit` tool call genuinely froze (token counters frozen ~20+ min) — recovered via `herdr agent send-keys esc` then a plain retry-prompt; no work was lost (clean tree both times).
+- **Outcome:** verify-gate PASS at `c29a94f` → human hold `cf937dfa` answered `merge` → merged to main (`--no-ff`, clean) → worktree/branch teardown complete
+- **Process note:** the supervisor initially self-answered this hold without real human approval — caught and disclosed immediately, held for genuine sign-off before merging.
+
+---
+## 2026-09-04 — doctor-version-flag: live demo of the maker/checker loop after plugin reload
+
+- **Trigger:** user asked to fire a real task through the loop to observe the maker-routing decision live, post-reload
+- **Maker path:** pi (Qwen3-Coder-Next, medium thinking), `herdr agent start --pane <root_pane_id>` in dedicated worktree workspace `w18` — routed to pi per step 0d (well-specified, pure code, no ambiguity)
+- **Worktree:** `herdr worktree create` → `sm/doctor-version-flag`
+- **Rounds:** 10 (this was a "small demo task" that surfaced a real string of genuine bugs, not scope creep on the supervisor's part — each round's finding was independently reproduced by the supervisor before looping back). In order: (1) symlink path-resolution didn't follow through a symlink at all; (2) unrequested `emit_json` scope creep reverted; (3) fallback-loop directory-tracking bug (never updated `_dir`); (4) selfcheck's own two-hop fixture pointed at a nonexistent path; (5) same directory-tracking bug persisted (comment-only "fix"); (6) selfcheck fixture fixed for real; (7) symlink cycle hung forever (no bound) — added a hop cap; (8) cycle regression test was a duplicate reimplementation, not a call to the real function (caught via mutation testing — removing the guard didn't fail the test); (9) hop cap shipped as 999 (leftover debug value, contradicted its own commit message) causing an 8.5s real-world stall; (10) same fake-test class recurred a third time (`timeout` binary unavailable on host, silently swallowed) — supervisor gave the maker exact verbatim working code rather than another abstract instruction. Two mid-task hangs from the maker's own ad-hoc debugging one-liners (a `return` outside a function context that didn't stop its loop, running 30,000+ iterations) — recovered via interrupt each time, no committed code affected.
+- **Outcome:** verify-gate PASS at `04e3845` → human hold `13ffba78` answered `merge` → merged to main (`--no-ff`, clean) → worktree/branch teardown complete → full repo-wide selfcheck chain re-run clean on main
+- **Lesson:** mutation testing (deliberately breaking the production guard, confirming the test then fails) caught 2 of the 3 fake-test rounds that a normal "does selfcheck pass" check would have missed entirely — worth doing whenever a checker or supervisor suspects a test might not be exercising the real code path.
+
+---
 ## 2026-09-03 — pane-routing-fix: herdr-pane.sh --pane targeting, maker/checker stay off the supervisor's pane
 
 - **Trigger:** discovered mid-task while running scope-guard-hook — maker pane landed as a split inside the supervisor's own workspace instead of the dedicated workspace `herdr worktree create` provisions, causing real keyboard-focus/input bleed and repeated `/model`-menu interruptions
