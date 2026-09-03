@@ -112,9 +112,13 @@ Each stage exists to close a specific failure mode.
    `verdict.py` parses it and exits `0` / `1` / `2`. The supervisor branches on the exit code, never on the
    checker's prose. If no checker harness is installed, `launch-checker.sh` signals `SM_NO_CHECKER_HARNESS` and
    the supervisor falls back to a second Claude model as the checker, in-session: weaker (same vendor) but the
-   maker is still not the checker, and the verdict is still machine-read.
+   maker is still not the checker, and the verdict is still machine-read. After every verdict, `log-round.sh`
+   appends one structured record (task, round, maker kind, verdict, caller-supplied finding-category tags,
+   optional cost/duration) to the append-only `audit/metrics.jsonl` — the same round the prose audit trail
+   in step 8 will also describe, but queryable across tasks instead of only readable as free text.
    *Guards against:* correlated blind spots (different model); a checker that mutates the code (edit-locked);
-   non-deterministic adjudication (structured verdict vs reading vibes).
+   non-deterministic adjudication (structured verdict vs reading vibes); round-level patterns (recurring
+   finding categories, verdict rates) only visible by re-reading prose across every past task.
 
 5. **Gate.** Before anything integrates, `verify-gate.sh` re-derives ground truth from the worktree: clean
    tree, non-empty diff vs base, tests green, and the **exact commit the checker reviewed still equals HEAD**
@@ -135,6 +139,8 @@ Each stage exists to close a specific failure mode.
    outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
    escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
    Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
+   `audit/metrics.jsonl` (via `log-round.sh`, step 4) accumulates alongside them as the structured
+   counterpart — same append-only convention, but one JSON line per round instead of prose per task.
    Commit separately. Skip for trivial one-shot edits.
 
 ## Scope guard
@@ -262,5 +268,6 @@ than trusting the maker's judgment **— for Claude Code maker sessions only** (
 | `bin/hold.py` | durable human-gate decisions |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
+| `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.
