@@ -28,11 +28,14 @@ do_split() { # dir cwd -> pane_id
 # `spawn` is secondmate's Claude-maker launch path (see SKILL.md 0d) -- mark $cwd as a maker session via
 # the one shared marking call (mark-maker.sh) so scope-guard.py's PreToolUse hook activates in it. Covers
 # the case where the worktree came from `herdr worktree create` (not new-worktree.sh). No-op (and
-# harmless) if $cwd isn't a git worktree yet.
+# harmless) if $cwd isn't a git worktree at all -- but if it IS a worktree and mark-maker.sh fails (e.g.
+# it refuses a primary checkout, or can't write the marker), that failure MUST propagate: a maker that
+# looks scoped but silently isn't is worse than one that never spawned (round 3, finding #1 -- this used
+# to swallow the failure with `|| true`).
 mark_maker() { # cwd
   local cwd="$1"
   git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
-  "$SCRIPT_DIR/mark-maker.sh" --cwd "$cwd" >/dev/null 2>&1 || true
+  "$SCRIPT_DIR/mark-maker.sh" --cwd "$cwd"
 }
 
 # Start a live agent in <pane>, retrying until the pane's shell is actually ready. This fixes the
@@ -54,6 +57,9 @@ start_agent() { # name kind pane [-- agent args...]
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   check) usable || { echo "not usable: need HERDR_ENV=1 and herdr on PATH (fall back to headless)" >&2; exit 1; };;
+  # Hidden, selfcheck-only: exercises mark_maker() directly without needing a real herdr environment
+  # (mark_maker has no herdr dependency -- it's pure git + mark-maker.sh).
+  _test-mark-maker) mark_maker "${1:-}";;
   --selfcheck)
     fails=0
     rc=0; "$0" bogusverb >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown verb exit $rc (want 2)"; fails=1; }
@@ -62,6 +68,17 @@ case "$cmd" in
       b="$(count)"; rc=0; "$0" delegate --name _sc --kind pi >/dev/null 2>&1 || rc=$?; a="$(count)"
       { [ "$rc" = 2 ] && [ "$b" = "$a" ]; } || { echo "FAIL: delegate validate-before-split (rc=$rc panes $b->$a)"; fails=1; }
     fi
+    # Finding #1 (round 3): mark_maker() must propagate mark-maker.sh's failure, not swallow it with
+    # `|| true`. Force an orthogonal failure (marker root blocked by a plain file, unrelated to the
+    # primary-checkout guard which mark-maker.sh's own --selfcheck covers) and confirm it's nonzero.
+    t="$(mktemp -d)"; git init -q -b main "$t/proj" >/dev/null 2>&1
+    git -C "$t/proj" config user.email a@a; git -C "$t/proj" config user.name a
+    echo x > "$t/proj/f"; git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init >/dev/null 2>&1
+    git -C "$t/proj" worktree add -q -b feat "$t/wt" main >/dev/null 2>&1
+    : > "$t/blocked"   # a plain FILE where the marker root's parent dir needs to be -- forces mkdir -p to fail
+    rc=0; SM_MARKER_ROOT="$t/blocked/markers" "$0" _test-mark-maker "$t/wt" >/dev/null 2>&1 || rc=$?
+    [ "$rc" != 0 ] || { echo "FAIL: mark_maker() succeeded despite mark-maker.sh's mkdir failure (swallowed the failure)"; fails=1; }
+    rm -rf "$t"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   split)
     usable || { echo "not inside herdr" >&2; exit 1; }
@@ -80,7 +97,11 @@ case "$cmd" in
     # finding #2: validate ALL required args BEFORE mutating (splitting a pane), so a bad call leaves nothing behind.
     if [ "$cmd" = delegate ] && [ -z "$prompt" ]; then echo "delegate needs --prompt" >&2; exit 2; fi
     pane="$(do_split "$dir" "$cwd")" || exit 1
-    [ "$cmd" = spawn ] && mark_maker "$cwd"   # mark BEFORE the agent starts so its first tool call is guarded
+    if [ "$cmd" = spawn ]; then
+      # mark BEFORE the agent starts so its first tool call is guarded; abort rather than start an
+      # agent that looks scoped but isn't (round 3, finding #1).
+      mark_maker "$cwd" || { echo "mark-maker failed for $cwd -- aborting spawn (activation marker not installed, pane $pane may need manual cleanup)" >&2; exit 1; }
+    fi
     if [ "${#args[@]}" -gt 0 ]; then start_agent "$name" "$kind" "$pane" "${args[@]}" || exit 1
     else start_agent "$name" "$kind" "$pane" || exit 1; fi
     if [ "$cmd" = spawn ]; then

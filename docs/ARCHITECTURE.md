@@ -156,13 +156,20 @@ than trusting the maker's judgment:
   the marked session makes against it — no separate persistence or env-var mechanism needed, and unlike an
   env var, a file on disk survives the fact that every `PreToolUse` hook invocation is a brand-new
   subprocess. The hook is a no-op unless the marker is present, so the supervisor's primary checkout, and
-  any worktree secondmate didn't create, are completely unaffected.
+  any worktree secondmate didn't create, are completely unaffected. `mark-maker.sh` itself refuses to mark
+  anything that isn't an isolated *linked* worktree — it compares `git rev-parse --git-dir` against
+  `--git-common-dir` (equal ⇒ this is the primary checkout, refuse) — so a caller can't accidentally
+  scope-guard the supervisor's own session by passing the wrong `--cwd`. And every marker-installation
+  failure propagates: `herdr-pane.sh spawn` aborts rather than starting an agent that looks scoped but
+  isn't (an earlier revision swallowed this with `|| true`).
 - **Scope check.** Every `Bash`/`Read`/`Edit`/`Write`/`NotebookEdit` call in a marked session has its
   resolved path(s) checked against the worktree root (symlinks and `..` resolved via `realpath`). Outside
   the worktree → deny. Bash commands get a token-level scan (not a full shell parser) that also looks inside
   common evasions — shell variable indirection (`d=/etc; cat $d/x`), command substitution, credential
-  commands wrapped in `sh -c`, inline interpreter one-liners (`python3 -c "..."`, `node -e "..."`), and
-  decode-into-shell pipelines (`base64 -d | sh`) — plus a small denylist for credential-store commands with
+  commands wrapped in `sh -c`, inline interpreter one-liners (`python3 -c "..."`, `node -e "..."`), and any
+  pipeline whose *final stage* is a shell interpreter (`sh`/`bash`/`zsh`/`dash`/...) — denied regardless of
+  what feeds it (`printf`, `echo`, `cat`, `base64 -d`, `curl`, anything), because what a piped-in script
+  will do can't be verified without executing it — plus a small denylist for credential-store commands with
   no filesystem path to catch (`security`, `gh auth`), including when wrapped in `sh`/`bash`/`env -c` — `~/.ssh`,
   `~/.aws`, etc. are already denied by the general path check since they resolve outside any worktree.
   `SM_MAKER_ALLOW_CREDS=1` is the explicit opt-in past the credential denylist.
@@ -171,12 +178,16 @@ than trusting the maker's judgment:
   session is confirmed as a maker, anything unresolvable (unbalanced quoting, an unexpanded shell variable
   in a path-looking token, malformed tool input like a list where a string is expected) denies rather than
   crashing or guessing — the decision logic runs inside a try/except so no exception path can skip the deny.
-- **This is a deterrent, not a sandbox.** The Bash scan is a string heuristic against the concrete patterns
-  above — accidental scope creep and the common evasions a real maker session has been observed to reach
-  for. It is explicitly not a security boundary against a deliberately adversarial process: novel encodings,
-  obscure shells, or splitting a payload across many innocuous-looking calls can still get through, and no
-  amount of pattern-matching closes that gap completely. Real isolation against an adversarial process needs
-  OS-level sandboxing (chroot/seccomp/containers), which is out of scope for this hook by design.
+- **This is a deterrent, not a sandbox — two accepted, unfixable-by-design gaps.** The Bash scan is a string
+  heuristic against the concrete patterns above — accidental scope creep and the common evasions a real
+  maker session has been observed to reach for. It is explicitly not a security boundary against a
+  deliberately adversarial process: novel encodings, obscure shells, or splitting a payload across many
+  innocuous-looking calls can still get through, and no amount of pattern-matching closes that gap
+  completely. Separately, there's a **symlink TOCTOU**: this hook approves a call *before* the tool's actual
+  file operation runs, with no way to atomically bind the check to that later operation — a symlink that
+  resolves in-root at check time could be swapped to point outside the worktree before the tool opens the
+  file. Both gaps need OS-level sandboxing (chroot/seccomp/containers) to close for real, which is out of
+  scope for this hook by design — documented here, not chased with more pattern-matching.
 
 ## Invariants that make it trustworthy
 

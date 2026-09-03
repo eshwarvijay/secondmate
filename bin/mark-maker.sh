@@ -28,6 +28,14 @@ if [ "${1:-}" = "--selfcheck" ]; then
   marker="$(SM_MARKER_ROOT="$t/markers" python3 "$SCRIPT_DIR/scope-guard.py" markerpath "$root")"
   [ -f "$marker" ] || { echo "FAIL: marker not created at $marker"; fails=1; }
   case "$marker" in "$root"/*) echo "FAIL: marker lives inside the worktree ($marker)"; fails=1;; esac
+
+  # Finding #2 (round 3): refuse to mark the PRIMARY checkout, not just linked worktrees.
+  rc=0; SM_MARKER_ROOT="$t/markers" "$0" --cwd "$t/proj" >/dev/null 2>&1 || rc=$?
+  [ "$rc" != 0 ] || { echo "FAIL: primary checkout was marked (rc=$rc, expected nonzero refusal)"; fails=1; }
+  proj_root="$(cd "$t/proj" && pwd -P)"
+  proj_marker="$(SM_MARKER_ROOT="$t/markers" python3 "$SCRIPT_DIR/scope-guard.py" markerpath "$proj_root")"
+  [ -f "$proj_marker" ] && { echo "FAIL: marker file was created for the primary checkout ($proj_marker)"; fails=1; }
+
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
@@ -38,6 +46,21 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 
 git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git worktree: $cwd" >&2; exit 1; }
+
+# finding #2 (round 3): refuse to mark the PRIMARY checkout -- only an isolated linked worktree may be
+# marked as a maker session. A linked worktree's --git-dir lives under the primary repo's
+# --git-common-dir/worktrees/<name>/; the primary checkout's --git-dir IS its --git-common-dir. Different
+# -> linked worktree, safe to mark. Equal -> this IS the primary checkout, fail loudly instead of
+# silently scope-guarding the supervisor's own session.
+git_dir="$(git -C "$cwd" rev-parse --git-dir)"; [[ "$git_dir" = /* ]] || git_dir="$cwd/$git_dir"
+common_dir="$(git -C "$cwd" rev-parse --git-common-dir)"; [[ "$common_dir" = /* ]] || common_dir="$cwd/$common_dir"
+git_dir="$(cd "$git_dir" && pwd -P)"
+common_dir="$(cd "$common_dir" && pwd -P)"
+if [ "$git_dir" = "$common_dir" ]; then
+  echo "refusing to mark the primary checkout as a maker session: $cwd is not an isolated linked worktree" >&2
+  exit 1
+fi
+
 root="$(git -C "$cwd" rev-parse --show-toplevel)" || { echo "git rev-parse --show-toplevel failed" >&2; exit 1; }
 root="$(cd "$root" && pwd -P)"  # physical/realpath -- must match scope-guard.py's os.path.realpath
 

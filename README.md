@@ -79,8 +79,8 @@ flowchart LR
 | `secondmate` skill | The full SOP: plan-committee → triage → spawn → check → gate → hold → integrate |
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
-| `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, `base64 -d \| sh`); best-effort deterrent, not a sandbox; no-op for the supervisor's primary checkout |
-| `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree (so the marked session can't reach or delete it) |
+| `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, any pipeline ending in a shell interpreter); best-effort deterrent, not a sandbox (novel encodings and symlink TOCTOU are accepted, documented limitations); no-op for the supervisor's primary checkout |
+| `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, refusing to mark anything but an isolated linked worktree (never the primary checkout) |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract |
