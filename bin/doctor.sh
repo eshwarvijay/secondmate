@@ -26,23 +26,33 @@ if [ -n "${BASH_SOURCE[0]}" ]; then
       _real_script=$(realpath "${BASH_SOURCE[0]}")
     else
       # portable fallback: follow symlinks manually
+      # each relative symlink target must be resolved relative to its parent symlink's directory
       _p="${BASH_SOURCE[0]}"
+      _dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
       while [ -L "$_p" ]; do
+        _link_dir="$_dir"
         _p=$(readlink "$_p")
-        # handle relative symlinks
+        # handle relative symlink targets: resolve relative to symlink's directory
         case "$_p" in
           /*) ;;
-          *) _p="$(dirname "${BASH_SOURCE[0]}")/$_p" ;;
+          *) _p="$_link_dir/$_p" ;;
         esac
+        _dir="$_link_dir"
       done
-      _real_script=$(cd "$(dirname "$_p")" && pwd)/$(basename "$_p")
+      _real_script=""
+      if [ -d "$(dirname "$_p")" ]; then
+        _real_script="$(cd "$(dirname "$_p")" && pwd)/$(basename "$_p")"
+      fi
     fi
   fi
 fi
 if [ -z "$_real_script" ]; then
   _real_script="${BASH_SOURCE[0]}"
 fi
-script_dir="$(cd "$(dirname "$_real_script")" && pwd)"
+script_dir=""
+if [ -d "$(dirname "$_real_script")" ]; then
+  script_dir="$(cd "$(dirname "$_real_script")" && pwd)"
+fi
 version_line=""
 # plugin.json lives in script_dir's parent (one level up from bin/)
 plugin_json="$(dirname "$script_dir")/.claude-plugin/plugin.json"
@@ -76,24 +86,7 @@ detect() {
 
 emit_json() {
   # finding #1: build JSON with python so control chars (e.g. a newline in $SM_CHECKER_HARNESS) are escaped.
-  # include version as first item if available
-  version_json=""
-  if [ -n "$version_line" ]; then
-    version_json='{"name":"version","status":"OK","category":"meta","fix":""}'
-  fi
-  # build combined JSON from version (if available) and ROWS
-  if [ -n "$version_json" ]; then
-    echo "[$version_json,$(printf '%s' "$ROWS" | python3 -c '
-import json,sys
-out=[]
-for line in sys.stdin.read().splitlines():
-    if not line.strip(): continue
-    parts=(line.split("|",3)+["","","",""])[:4]
-    st,name,cat,fix=parts
-    out.append({"name":name,"status":st,"category":cat,"fix":fix})
-print(json.dumps(out,separators=(",",":")))' | sed 's/^\[//;s/\]$//')]"
-  else
-    printf '%s' "$ROWS" | python3 -c 'import json,sys
+  printf '%s' "$ROWS" | python3 -c 'import json,sys
 out=[]
 for line in sys.stdin.read().splitlines():
     if not line.strip(): continue
@@ -101,7 +94,6 @@ for line in sys.stdin.read().splitlines():
     st,name,cat,fix=parts
     out.append({"name":name,"status":st,"category":cat,"fix":fix})
 print(json.dumps(out,separators=(",",":")))'
-  fi
 }
 
 emit_table() {
@@ -149,10 +141,10 @@ if [ "${1:-}" = "--selfcheck" ]; then
   tmpdir=$(mktemp -d)
   script_abs="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   ln -sf "$script_abs" "$tmpdir/doctor"
-  symlink_out="$($tmpdir/doctor --json)"
+  symlink_table="$($tmpdir/doctor)"
   rm -rf "$tmpdir"
-  # version must be present in JSON output
-  echo "$symlink_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); v=[x for x in d if x["name"]=="version"]; assert v and v[0]["status"]=="OK", "version line missing or not OK in symlink run"' || { echo "FAIL: symlink regression test failed - version not resolved when invoked via symlink"; exit 1; }
+  # verify version line is present in table output
+  echo "$symlink_table" | grep -q "^  \[ok\] version " || { echo "FAIL: symlink regression test failed - version not resolved when invoked via symlink"; exit 1; }
   echo ok; exit 0
 fi
 
