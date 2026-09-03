@@ -144,16 +144,25 @@ function _resolve_token(tok: string, cwd: string): string {
 }
 
 function _within_root(path: string, root: string): boolean {
-  return path === root || path.startsWith(root + require("path").sep);
+  // Resolve both paths to their real values (follows symlinks like macOS /tmp -> /private/tmp)
+  // Use resolveSymlinks-like logic to handle non-existent paths gracefully
+  try {
+    const realPath = require("fs").realpathSync(path);
+    const realRoot = require("fs").realpathSync(root);
+    return realPath === realRoot || realPath.startsWith(realRoot + require("path").sep);
+  } catch {
+    // If realpath fails (e.g., path doesn't exist), fall back to simpler comparison
+    return path === root || path.startsWith(root + require("path").sep);
+  }
 }
 
-function _is_path_violation(pathValue: string | undefined, cwd: string, root: string): { valid: boolean; reason: string } {
-  if (!pathValue) return { valid: false, reason: "missing path" };
+function _is_path_violation(pathValue: string | undefined, cwd: string, root: string): { allowed: boolean; reason: string } {
+  if (!pathValue) return { allowed: false, reason: "missing path" };
   // Resolve relative paths against cwd (worktree root), then follow symlinks with resolveSymlinks
   // Matching scope-guard.py's: p = os.path.join(cwd, p); resolved = os.path.realpath(p)
   let resolved = resolveSymlinks(pathValue as string, cwd);
-  if (_within_root(resolved, root)) return { valid: true, reason: "" };
-  return { valid: false, reason: `'${pathValue}' resolves to ${resolved}, outside the maker's worktree (${root})` };
+  if (_within_root(resolved, root)) return { allowed: true, reason: "" };
+  return { allowed: false, reason: `'${pathValue}' resolves to ${resolved}, outside the maker's worktree (${root})` };
 }
 
 function _credential_command(tokens: string[]): string | null {
