@@ -118,22 +118,46 @@ HERDMOCK
     env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --pane test-pane-123 --dir right >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
-      last_split=$(grep "pane split" "$log_file" | tail -1)
-      case "$last_split" in
-        *"--pane test-pane-123"*) ;; # good
-        *"--current"*) echo "FAIL: split with --pane still used --current: $last_split"; fails=1;;
-        *) echo "FAIL: split with --pane did not include --pane flag: $last_split"; fails=1;;
-      esac
+      # Check split with --pane test-pane-123 was called and has no --current
+      split_pane_line=$(grep -- '--pane test-pane-123' "$log_file" | grep "pane split")
+      if [ -n "$split_pane_line" ]; then
+        case "$split_pane_line" in
+          *"--current"*) echo "FAIL: split with --pane test-pane-123 also had --current: $split_pane_line"; fails=1;;
+          *) ;; # good - has --pane, no --current
+        esac
+      else
+        echo "FAIL: split with --pane test-pane-123 was not called"; fails=1
+      fi
     fi
     # Test spawn with --pane targeting
     env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: spawn with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
-      last_split=$(grep "pane split" "$log_file" | tail -1)
-      case "$last_split" in
-        *"--pane mock-target-pane"*) ;; # good
-        *) echo "FAIL: spawn with --pane did not target mock-target-pane: $last_split"; fails=1;;
-      esac
+      # Check spawn with --pane mock-target-pane was called and has no --current
+      spawn_pane_line=$(grep -- '--pane mock-target-pane' "$log_file" | grep "pane split")
+      if [ -n "$spawn_pane_line" ]; then
+        case "$spawn_pane_line" in
+          *"--current"*) echo "FAIL: spawn with --pane mock-target-pane also had --current: $spawn_pane_line"; fails=1;;
+          *) ;; # good - has --pane mock-target-pane, no --current
+        esac
+      else
+        echo "DEBUG: spawn_pane_line=[$spawn_pane_line]"; echo "FAIL: spawn with --pane mock-target-pane was not called"; fails=1
+      fi
+    fi
+    # Test delegate with --pane targeting
+    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: delegate with --pane (rc=$rc)"; fails=1; }
+    if [ -f "$log_file" ]; then
+      # Check delegate with --pane delegate-target was called and has no --current
+      delegate_pane_line=$(grep -- '--pane delegate-target' "$log_file" | grep "pane split")
+      if [ -n "$delegate_pane_line" ]; then
+        case "$delegate_pane_line" in
+          *"--current"*) echo "FAIL: delegate with --pane delegate-target also had --current: $delegate_pane_line"; fails=1;;
+          *) ;; # good - has --pane, no --current
+        esac
+      else
+        echo "FAIL: delegate with --pane delegate-target was not called"; fails=1
+      fi
     fi
     # Cleanup
     rm -rf "$tmpdir"

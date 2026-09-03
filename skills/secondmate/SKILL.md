@@ -189,10 +189,9 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 9. **Teardown** — immediately after integration, close everything created for this task:
    ```bash
+   herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
    herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
    git branch -d sm/<task-id>                          # delete the merged branch
-
-   herdr pane close "$ck"                              # checker pane (if visible path was used)
    ```
    A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
 
