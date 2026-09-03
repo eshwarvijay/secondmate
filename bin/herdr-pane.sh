@@ -159,6 +159,17 @@ HERDMOCK
         echo "FAIL: delegate with --pane delegate-target was not called"; fails=1
       fi
     fi
+    # Test empty --pane value is rejected (must not silently fall back to --current)
+    # Note: herdr-pane.sh explicitly checks for -z "$2" and rejects with exit 2
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 "$repo_root/bin/herdr-pane.sh" split --pane "" --dir down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 2 ] || { echo "FAIL: split --pane "" should exit 2, got $rc"; fails=1; }
+    
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 "$repo_root/bin/herdr-pane.sh" spawn --name _sc_empty --kind pi --pane "" --dir down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 2 ] || { echo "FAIL: spawn --pane "" should exit 2, got $rc"; fails=1; }
+    
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 "$repo_root/bin/herdr-pane.sh" delegate --name _sc_empty --kind pi --pane "" --dir down --prompt "test" >/dev/null 2>&1
+    rc=$?; [ "$rc" = 2 ] || { echo "FAIL: delegate --pane "" should exit 2, got $rc"; fails=1; }
+    
     # Cleanup
     rm -rf "$tmpdir"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
@@ -169,6 +180,7 @@ HERDMOCK
       case "$1" in
         --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; 
         if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        if [ -z "$2" ]; then echo "$1 value cannot be empty" >&2; exit 2; fi
         pane_id="$2"; shift 2;;
         --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; };
         if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
@@ -190,6 +202,7 @@ HERDMOCK
         dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
       --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; 
         if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        if [ -z "$2" ]; then echo "$1 value cannot be empty" >&2; exit 2; fi
         pane_id="$2"; shift 2;;
       --prompt) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; prompt="$2"; shift 2;; --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
       --) shift; args=("$@"); break;;
