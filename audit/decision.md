@@ -47,6 +47,16 @@ Append one entry per task. Format: date, task id, what the maker decided, checke
 - **Escalations:** none beyond the above self-correction — both merges were genuinely human-approved before integration.
 
 ---
+## 2026-09-04 — lessons-checklist + round-metrics-ledger (self-improvement pair, merged separately)
+
+- **lessons-checklist decision:** curated exactly 4 lessons from real incidents observed earlier this session (not hypothetical) — commit-before-DONE, mutation-test your own tests, stay in literal scope, avoid ad-hoc debug one-liners — and had the maker splice them into every existing maker-launch prompt site rather than inventing a new mechanism.
+- **round-metrics-ledger decision:** deliberately scoped to append-only logging only — explicitly rejected building any aggregation/report/dashboard tooling in the same task, and explicitly rejected auto-scraping cost/duration from herdr output (caller supplies it, or omits it) to keep the script simple and not fragile.
+- **Checker findings resolved:** lessons-checklist round 1 missed the headless pi-maker fallback prompt site (fixed round 2). round-metrics-ledger round 1 had a real code-injection vector in numeric validation (caller-controlled `--cost`/`--duration` interpolated into executed Python source) plus NaN/Infinity producing invalid JSON plus a selfcheck coverage gap (fixed round 2, injection payload independently re-verified blocked by the supervisor).
+- **Gates:** both verify-gate PASS, both merged `--no-ff` to main (auto-merged cleanly against each other's concurrent SKILL.md edits, no conflicts).
+- **Escalations:** none — both merges executed under the human's standing advance authorization for this task batch ("once completed, merge and push"), recorded in hold.py with that authorization cited rather than a fresh per-task approval.
+- **Supervisor process gap (caught and fixed):** both worktrees/branches were left standing after merge+push — teardown was skipped in the moment while attention was on the still-running `pi-scope-guard` task. Caught only when the human asked for a status update on these two specifically; both worktrees removed and branches deleted after the fact.
+
+---
 ## 2026-09-03 — pane-routing-fix: herdr-pane.sh --pane targeting, maker/checker stay off the supervisor's pane
 
 - **Maker (pi/Qwen3-Coder-Next, high thinking):** added `--pane <ID>` to `herdr-pane.sh`'s `split`/`spawn`/`delegate` (falling back to `--current` when omitted) and rewrote SKILL.md's maker/checker routing recipes to target the dedicated worktree's `root_pane` instead of splitting off the supervisor. Required 8 correction rounds.

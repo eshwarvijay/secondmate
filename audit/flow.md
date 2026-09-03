@@ -58,6 +58,24 @@ Append one entry per task. Format: date, task id, maker path chosen, planner mod
 - **Lesson:** mutation testing (deliberately breaking the production guard, confirming the test then fails) caught 2 of the 3 fake-test rounds that a normal "does selfcheck pass" check would have missed entirely — worth doing whenever a checker or supervisor suspects a test might not be exercising the real code path.
 
 ---
+## 2026-09-04 — lessons-checklist: standing "Known failure patterns" checklist in every maker prompt
+
+- **Trigger:** self-improvement follow-up — feed today's real recurring maker mistakes (not committing, fake tests, scope creep, hanging debug one-liners) back into the maker prompt template itself, so future makers get warned before repeating them
+- **Maker path:** pi (Qwen3-Coder-Next, medium thinking), dedicated worktree workspace `w1B`, run in parallel with `round-metrics-ledger` and `pi-scope-guard`
+- **Rounds:** 2. Round 1 added the 4-bullet checklist to 6 of 7 maker-launch prompt sites in SKILL.md (correctly kept as inline duplication per file, not a referenced block, since each site is a literal string argument) but missed the headless (`HERDR_ENV != 1`) fallback pi-maker invocation. Round 2 added it there too. Round 2's own checker returned `refused` (its file-read tool got blocked reading the 291-line SKILL.md) rather than a real defect — supervisor independently grepped the full file and confirmed exactly 7 maker-invocation sites with 7 matching checklist copies in 1:1 correspondence.
+- **Outcome:** verify-gate PASS at `27074bf` → merged to main (`--no-ff`) → worktree/branch teardown (initially missed, caught and completed after the fact)
+- **Process note:** merge/push executed under the human's explicit advance authorization for this batch of tasks, not a per-task hold answer.
+
+---
+## 2026-09-04 — round-metrics-ledger: append-only per-round metrics ledger
+
+- **Trigger:** self-improvement follow-up (same motivation as lessons-checklist) — a structured, queryable record of round counts/verdicts/finding-tags per task, complementing the free-text prose in audit/flow.md and audit/decision.md
+- **Maker path:** Claude, dedicated worktree workspace `w1C`, run in parallel with `lessons-checklist` and `pi-scope-guard`
+- **Rounds:** 2. Round 1 shipped `bin/log-round.sh` (append-only JSONL, task/round/maker/verdict/tags/optional cost+duration) — checker's first pass was killed (exit 143, transient harness issue) before producing output; supervisor independently verified 20-concurrent-append safety (no hang, no corruption) before retrying. The retry found a real code-injection vulnerability: `--cost`/`--duration` validation interpolated the caller-supplied string directly into an executed `python3 -c` command, so a crafted value executed arbitrary Python — plus NaN/Infinity accepted and emitted as invalid JSON tokens, plus a selfcheck coverage gap for special-character tags. Round 2 fixed all 3; supervisor independently reproduced the exact injection payload and confirmed it was rejected, not executed, before trusting the fix.
+- **Outcome:** verify-gate PASS at `af02788` → merged to main (`--no-ff`, auto-merged cleanly with lessons-checklist's concurrent SKILL.md edits) → worktree/branch teardown (initially missed, caught and completed after the fact)
+- **Process note:** same advance-authorization merge/push basis as lessons-checklist. Also: supervisor caught its own process gap here — merged and pushed both tasks without tearing down their worktrees/branches, an omission only caught when the human asked for a status update.
+
+---
 ## 2026-09-03 — pane-routing-fix: herdr-pane.sh --pane targeting, maker/checker stay off the supervisor's pane
 
 - **Trigger:** discovered mid-task while running scope-guard-hook — maker pane landed as a split inside the supervisor's own workspace instead of the dedicated workspace `herdr worktree create` provisions, causing real keyboard-focus/input bleed and repeated `/model`-menu interruptions
