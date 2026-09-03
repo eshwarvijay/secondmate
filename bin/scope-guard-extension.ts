@@ -248,17 +248,16 @@ function decide(
   cwd: string,
   root: string,
 ): { allowed: boolean; reason: string } {
-  if (toolName === "Bash") {
+  // Use lowercase tool names (what pi actually emits)
+  if (toolName === "bash") {
     const command = (toolInput["command"] as string | undefined) ?? "";
     return check_bash(command, cwd, root);
   }
 
-  const pathFields = ["file_path", "notebook_path"] as const;
-  for (const field of pathFields) {
-    if (field in toolInput) {
-      const pathValue = toolInput[field] as string | undefined;
-      return _is_path_violation(pathValue, cwd, root);
-    }
+  // Use 'path' (not 'file_path' or 'notebook_path') - what pi's built-in tools actually use
+  if (toolName === "read" || toolName === "write" || toolName === "edit" || toolName === "notebookedit") {
+    const pathValue = (toolInput["path"] as string | undefined);
+    return _is_path_violation(pathValue, cwd, root);
   }
 
   // Tool outside this extension's scope
@@ -287,30 +286,14 @@ function is_maker_worktree(cwd: string): string | null {
   }
 }
 
-function is_real_git_worktree(cwd: string): boolean {
-  try {
-    const { execSync } = require("child_process");
-    const git_dir = execSync(`git -C "${cwd}" rev-parse --git-dir`, { encoding: "utf-8" }).trim();
-    const common_dir = execSync(`git -C "${cwd}" rev-parse --git-common-dir`, { encoding: "utf-8" }).trim();
-    
-    // Convert to absolute paths
-    const abs_git_dir = git_dir.startsWith("/") ? git_dir : `${cwd}/${git_dir}`;
-    const abs_common_dir = common_dir.startsWith("/") ? common_dir : `${cwd}/${common_dir}`;
-    
-    return require("path").resolve(abs_git_dir) !== require("path").resolve(abs_common_dir);
-  } catch {
-    return false;
-  }
-}
-
 export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     // Only enforce in maker sessions (marked worktrees)
     const root = is_maker_worktree(ctx.cwd);
     if (!root) return undefined;
 
-    // Only act on specific tools
-    if (!["bash", "read", "write", "edit", "NotebookEdit"].includes(event.toolName)) return undefined;
+    // Only act on specific tools (lowercase - what pi actually emits)
+    if (!["bash", "read", "write", "edit", "notebookedit"].includes(event.toolName.toLowerCase())) return undefined;
 
     const cwd = ctx.cwd;
     const { allowed, reason } = decide(event.toolName, event.input, cwd, root);
@@ -331,34 +314,15 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const root = is_maker_worktree(ctx.cwd);
       const isMarkerSet = root !== null;
-      const gitWorktree = is_real_git_worktree(ctx.cwd);
       
       let msg = `Current worktree: ${ctx.cwd}\n`;
-      msg += `Is git worktree: ${gitWorktree ? "yes" : "no (primary checkout)"}\n`;
+      msg += `Scope guard: ${isMarkerSet ? "ACTIVE" : "INACTIVE (worktree not marked)"}\n`;
       
       if (root) {
-        msg += `Scope guard: ACTIVE\n`;
         msg += `Marker path: ${_marker_path_for(root)}\n`;
-      } else {
-        msg += `Scope guard: INACTIVE (worktree not marked)\n`;
       }
       
       ctx.ui.notify(msg, "info");
-    },
-  });
-
-  // Also register a command to show the marker location
-  pi.registerCommand("scope-guard-marker", {
-    description: "Print the marker file path for current worktree",
-    handler: async (_args, ctx) => {
-      const root = is_maker_worktree(ctx.cwd);
-      if (!root) {
-        ctx.ui.notify("Current directory is not in a marked maker worktree", "warning");
-        return;
-      }
-      
-      const markerPath = _marker_path_for(root);
-      ctx.ui.notify(`Marker path: ${markerPath}`, "info");
     },
   });
 }
