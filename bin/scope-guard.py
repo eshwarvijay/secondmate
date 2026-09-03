@@ -44,27 +44,49 @@ FAIL-OPEN vs FAIL-CLOSED, deliberately different at two layers:
     Fail CLOSED (deny) on anything unresolvable or ambiguous (symlink escapes, `..` traversal, unexpanded
     shell variables/substitutions in a path-looking token, unparseable quoting, command substitutions).
 
-SCOPE OF THE BASH GUARD -- READ BEFORE RELYING ON THIS FOR ANYTHING ADVERSARIAL:
-Bash commands are scanned with a token heuristic (shlex + regex), not a real shell parser and not an OS
-sandbox. It is a best-effort deterrent against accidental scope creep and common evasive patterns (shell
-variable indirection, command substitution, credential commands wrapped in `sh -c`, inline interpreter
-one-liners, any pipeline whose final stage is a shell interpreter) -- the concrete things a real maker
-session has been observed to do or that are one obvious step away from the real incident above. It is NOT
-a sandboxing boundary: a deliberately adversarial process can still defeat a string heuristic (novel
-encodings, obscure shells, splitting a payload across many innocuous-looking calls, etc.), and no amount
-of pattern-matching closes that gap completely.
+SCOPE OF THE BASH GUARD -- READ THIS BEFORE RELYING ON check_bash() FOR ANYTHING ADVERSARIAL:
+check_bash() recognizes COMMON AND LITERAL command and credential patterns ONLY: a fixed vocabulary of
+shell tokens (paths, `security`/`gh auth`, known interpreters' inline-code flags, `sh`/`bash`/`eval`
+wrappers, pipelines ending in a shell) matched by shlex + regex against the literal text of the command
+string. It is not a shell parser, not a data-flow analysis, and not an OS sandbox. It is a best-effort
+deterrent against accidental scope creep and the literal patterns above -- the concrete things a real
+maker session has been observed to do, or one obvious step away from the real incident this hook defends
+against (a maker running ordinary-looking commands like `gh pr view` or `cat` that happened to reach
+outside its worktree).
 
-Two specific, KNOWN, and ACCEPTED gaps that this hook's design cannot close, by construction, no matter
-how the string heuristic is extended:
-  - A genuinely adversarial process can always defeat pattern-matching with a novel encoding or an
-    obscure interpreter this hook doesn't know about.
-  - TOCTOU on path checks: this hook approves a Read/Edit/Write/NotebookEdit call BEFORE the tool's
-    actual file operation runs. Nothing binds the check atomically to that later operation -- a symlink
-    that resolves in-root at check time could be swapped by a concurrent process to point outside the
-    worktree before the tool actually opens the file. A PreToolUse hook has no way to close this window.
-Real isolation against either gap requires OS-level sandboxing (chroot, seccomp, containers) -- explicitly
-out of scope for this hook. Treat every fix here as raising the cost of accidental or unsophisticated scope
-violations, not as chasing a moving target of encoding tricks or attempting to fix what only a sandbox can fix.
+THIS IS A PERMANENT, ACCEPTED LIMITATION OF A STRING-HEURISTIC APPROACH -- NOT A TODO LIST OF GAPS AWAITING
+THE NEXT PATCH. Every round of "found a bypass, added a check for it" converges on the same wall: a fixed
+vocabulary of literal patterns cannot enumerate every way a command line can reach a file or a credential.
+check_bash() does NOT reliably catch, and will not be extended further to chase:
+  (a) Alternate redirection syntax -- e.g. `cat</etc/passwd` or `>/etc/foo` with no space before the
+      operator. The token scan expects paths as their own shell words; a path fused to a redirection
+      operator is a different token shape it doesn't recognize.
+  (b) Indirect / deferred execution -- e.g. `find . -exec cat /etc/passwd \;` or
+      `printf '%s\n' /etc/passwd | xargs -0 sh -c 'cat "$0"'`. These invoke a program using a path or
+      command that arrives as DATA at runtime (an -exec argument, an xargs-substituted parameter), not as
+      a literal token in the command string this hook can see ahead of execution.
+  (c) Interpreter code that shells out via a library call rather than a shell wrapper -- e.g.
+      `python3 -c "import os; os.system('cat /etc/passwd')"`, Node's `child_process.exec(...)`, or Ruby/Perl
+      backticks, all invoked through an interpreter's `-c`/`-e` flag that this hook already recognizes and
+      scans as a STRING for path-looking substrings. `_embedded_code_violation()` looks for path-like text
+      in that string; it does not parse the code, so a call that reaches a file through a language's own
+      exec/shell-out API instead of writing the path as visible text defeats it.
+
+These three are representative, not exhaustive -- new instances of the same three root causes (a literal
+token the scanner doesn't recognize the shape of; data that becomes a command only at runtime; a nested
+interpreter's own execution API) will keep surfacing for as long as the check is a string heuristic. Adding
+one more special case per discovery is not a path to completeness and this file will not keep growing that
+way. The only way to actually close (a)-(c), and the TOCTOU gap below, is OS-level sandboxing (chroot,
+seccomp, containers) -- explicitly out of scope for this hook. Treat every check in this file as raising the
+cost of accidental or unsophisticated scope violations (the incident this hook actually defends against),
+not as an attempt to reach completeness against a deliberately adversarial command line.
+
+A second, structurally separate gap this hook's design cannot close either, no matter how check_bash() is
+extended: TOCTOU on path checks. This hook approves a Read/Edit/Write/NotebookEdit call BEFORE the tool's
+actual file operation runs. Nothing binds the check atomically to that later operation -- a symlink that
+resolves in-root at check time could be swapped by a concurrent process to point outside the worktree
+before the tool actually opens the file. A PreToolUse hook has no way to close this window; it too needs
+OS-level sandboxing to close for real.
 """
 import hashlib
 import json

@@ -188,16 +188,33 @@ than trusting the maker's judgment **— for Claude Code maker sessions only** (
   session is confirmed as a maker, anything unresolvable (unbalanced quoting, an unexpanded shell variable
   in a path-looking token, malformed tool input like a list where a string is expected) denies rather than
   crashing or guessing — the decision logic runs inside a try/except so no exception path can skip the deny.
-- **This is a deterrent, not a sandbox — two accepted, unfixable-by-design gaps.** The Bash scan is a string
-  heuristic against the concrete patterns above — accidental scope creep and the common evasions a real
-  maker session has been observed to reach for. It is explicitly not a security boundary against a
-  deliberately adversarial process: novel encodings, obscure shells, or splitting a payload across many
-  innocuous-looking calls can still get through, and no amount of pattern-matching closes that gap
-  completely. Separately, there's a **symlink TOCTOU**: this hook approves a call *before* the tool's actual
-  file operation runs, with no way to atomically bind the check to that later operation — a symlink that
-  resolves in-root at check time could be swapped to point outside the worktree before the tool opens the
-  file. Both gaps need OS-level sandboxing (chroot/seccomp/containers) to close for real, which is out of
-  scope for this hook by design — documented here, not chased with more pattern-matching.
+- **This is a deterrent, not a sandbox — a permanent limitation, not a punch list.** `check_bash()`
+  recognizes common and *literal* command and credential patterns only — a fixed vocabulary of shell
+  tokens matched against the literal text of the command string. It is not a shell parser, not data-flow
+  analysis, not an OS sandbox. Every round of "found a bypass, added a check for it" converges on the same
+  wall: a fixed vocabulary of literal patterns cannot enumerate every way a command line can reach a file
+  or a credential. It does **not** reliably catch, and will not be extended further to chase:
+  - **Alternate redirection syntax** — e.g. `cat</etc/passwd` or `>/etc/foo` with no space before the
+    operator; a path fused to a redirection operator is a token shape the scanner doesn't recognize.
+  - **Indirect/deferred execution** — e.g. `find . -exec cat /etc/passwd \;` or
+    `... | xargs -0 sh -c 'cat "$0"'`; the program invoked arrives as *data* at runtime (an `-exec`
+    argument, an `xargs`-substituted parameter), not as a literal token visible ahead of execution.
+  - **Interpreter code that shells out via a library call** — e.g. `python3 -c "import os;
+    os.system('cat /etc/passwd')"`, Node's `child_process`, or Ruby/Perl backticks, run through an
+    interpreter flag this hook already scans as *text* for path-like substrings — it doesn't parse the
+    code, so a call reaching a file through the language's own exec API instead of visible path text
+    defeats it.
+
+  These three are representative, not exhaustive — new instances of the same three root causes (an
+  unrecognized token shape, runtime-only data, a nested interpreter's own execution API) will keep
+  surfacing for as long as this is a string heuristic. This is accepted and permanent, not a queue of gaps
+  awaiting the next patch. Separately, there's a **symlink TOCTOU**: this hook approves a call *before* the
+  tool's actual file operation runs, with no way to atomically bind the check to that later operation — a
+  symlink that resolves in-root at check time could be swapped to point outside the worktree before the
+  tool opens the file. All of the above need OS-level sandboxing (chroot/seccomp/containers) to close for
+  real, which is out of scope for this hook by design — documented here, not chased with more
+  pattern-matching. What this hook *does* raise is the cost of accidental or unsophisticated scope
+  violations — the incident it actually defends against — not completeness against an adversarial command line.
 
 ## Invariants that make it trustworthy
 
