@@ -68,3 +68,4 @@ marker="$(python3 "$SCRIPT_DIR/scope-guard.py" markerpath "$root")"
 mkdir -p "$(dirname "$marker")"
 printf 'root=%s\n' "$root" > "$marker"
 echo "marked: $root -> $marker"
+

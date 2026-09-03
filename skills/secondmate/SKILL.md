@@ -89,7 +89,7 @@ This is the spec the maker receives.
   # Prerequisite: step 2 must have called mark-maker.sh after herdr worktree create (see step 2 for the full sequence)
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium
+    -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
   herdr agent prompt sm-pi-<task-id> "<plan>
 
 ## Known failure patterns — DO NOT SKIP
@@ -111,7 +111,7 @@ This is the spec the maker receives.
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium -p "<plan>
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan>
 
 ## Known failure patterns — DO NOT SKIP
 - A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
@@ -201,8 +201,8 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 - A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
 - Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
 - Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in." --wait --timeout 600000`
-     - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi ... --thinking medium -p "<fix plan>
+     - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
+     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan>
 
 ## Known failure patterns — DO NOT SKIP
 - A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
