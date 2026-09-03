@@ -346,8 +346,10 @@ function decide(
 
 function is_maker_worktree(cwd: string): string | null {
   try {
-    const { execSync } = require("child_process");
-    const top = execSync(`git -C "${cwd}" rev-parse --show-toplevel`, {
+    const { execFileSync } = require("child_process");
+    // Use argv array instead of shell string to avoid shell metacharacter interpretation
+    // (e.g., quotes in cwd causing parse errors, leading to fail-OPEN security bypass)
+    const top = execFileSync("git", ["-C", cwd, "rev-parse", "--show-toplevel"], {
       encoding: "utf-8",
       timeout: 3000,
     }).trim();
