@@ -32,10 +32,9 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
   harness is installed, the fallback is a different-model Claude sub-agent (same vendor, weaker, but maker is
   still not the checker) — see the Check step.
 
-## Plan Committee (pre-triage, complex and ambiguous tasks only)
+## Plan Committee (pre-triage, unconditionally for every task)
 
 Before triaging, run the planning committee to gather independent perspectives from multiple models.
-**Skip for trivial edits, known-root-cause bugs, or mechanical changes — earns its cost only on open-ended or high-stakes tasks.**
 
 **0a — adhd subagent (Claude cognitive frames, you run this):**
 Invoke `/adhd` as a Claude sub-agent; save its winning branch to `.secondmate/planning/adhd.md`.

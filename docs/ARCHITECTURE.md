@@ -37,12 +37,11 @@ The supervisor is deliberately kept out of the workshop: it commands, it does no
 ```mermaid
 flowchart TD
     Cap([Captain]) -->|goal| SUP[Supervisor: Claude Code + ponytail]
-    SUP -->|complex task| PC[plan-committee.sh<br/>6 models in parallel]
+    SUP -->|any task| PC[plan-committee.sh<br/>6 models in parallel]
     PC --> SYN[Supervisor synthesizes<br/>consolidated plan]
     SYN --> ROUTE{Route maker}
     ROUTE -->|needs judgment / MCP| MKC[Claude maker]
     ROUTE -->|well-specified / pure code| MKQ[pi + Qwen3-Coder maker]
-    SUP -->|trivial task| TRI
     MKC --> TRI{Triage: ship or scout, full or fast}
     MKQ --> TRI
     TRI -->|reasoning one-shot| RS[reason.sh: different model, read-only]
@@ -69,7 +68,7 @@ flowchart TD
 
 Each stage exists to close a specific failure mode.
 
-0. **Plan Committee** *(optional — complex and ambiguous tasks only).*
+0. **Plan Committee** *(runs unconditionally before triage for every task)*.
    `plan-committee.sh` spawns 6 headless pi planners in parallel (DeepSeek-R1, Qwen3-Next-80B,
    Qwen3-Coder-Next, Kimi-K2-Thinking, Mistral-Large-3, GLM-5), each covering one dimension of the task.
    The supervisor also runs `/adhd` as a Claude sub-agent for rapid cognitive-frame divergence.
