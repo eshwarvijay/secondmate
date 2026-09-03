@@ -15,6 +15,32 @@ brewable() { if have brew; then echo "brew install $1"; elif have apt-get; then 
 plugin_present() { claude plugin list 2>/dev/null | grep -q "$1@" || [ -d "$HOME/.claude/plugins/marketplaces/$1" ]; }
 skill_present() { [ -d "$HOME/.claude/skills/$1" ] || find "$HOME/.claude/plugins/marketplaces" -maxdepth 4 -type d -name "$1" 2>/dev/null | grep -q .; }
 
+# --- symlink resolution function: resolves a script path through all symlink hops ---
+# Usage: _resolve_symlink "$path" -> outputs absolute path or empty string on failure
+# Each relative symlink target is resolved against the REAL directory of its parent symlink
+_resolve_symlink() {
+  local _p="$1"
+  # First resolve to absolute path
+  case "$_p" in
+    /*) ;;  # already absolute
+    *) _p="$(pwd)/$_p" ;;
+  esac
+
+  while [ -L "$_p" ]; do
+    _target=$(readlink "$_p")
+    _link_dir=$(cd "$(dirname "$_p")" 2>/dev/null && pwd) || return 1
+    case "$_target" in
+      /*) _p="$_target" ;;  # absolute target
+      *) _p="$_link_dir/$_target" ;;  # relative target -> resolve against symlink's dir
+    esac
+  done
+
+  # Return the resolved absolute path
+  if [ -f "$_p" ]; then
+    echo "$(cd "$(dirname "$_p")" && pwd)/$(basename "$_p")"
+  fi
+}
+
 # read plugin version relative to script location (compute before selfcheck branch)
 # resolve real script path through symlinks using readlink -f (GNU) or realpath (BSD)
 _real_script=""
@@ -25,24 +51,8 @@ if [ -n "${BASH_SOURCE[0]}" ]; then
     elif realpath --version 2>&1 | grep -q GNU; then
       _real_script=$(realpath "${BASH_SOURCE[0]}")
     else
-      # portable fallback: follow symlinks manually
-      # each relative symlink target must be resolved relative to its parent symlink's directory
-      _p="${BASH_SOURCE[0]}"
-      _dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-      while [ -L "$_p" ]; do
-        _link_dir="$_dir"
-        _p=$(readlink "$_p")
-        # handle relative symlink targets: resolve relative to symlink's directory
-        case "$_p" in
-          /*) ;;
-          *) _p="$_link_dir/$_p" ;;
-        esac
-        _dir="$_link_dir"
-      done
-      _real_script=""
-      if [ -d "$(dirname "$_p")" ]; then
-        _real_script="$(cd "$(dirname "$_p")" && pwd)/$(basename "$_p")"
-      fi
+      # use fallback function when native tools unavailable
+      _real_script=$(_resolve_symlink "${BASH_SOURCE[0]}")
     fi
   fi
 fi
@@ -137,7 +147,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   out="$("$0" --json)" || { echo "FAIL: --json errored"; exit 1; }
   python3 -c 'import json,sys; json.loads(sys.stdin.read())' <<< "$out" || { echo "FAIL: --json not valid JSON"; exit 1; }
   "$0" >/dev/null 2>&1; rc=$?; [ "$rc" = 0 ] || [ "$rc" = 1 ] || { echo "FAIL: unexpected exit $rc"; exit 1; }
-  # symlink regression test: invoke via a temp symlink and verify version still resolves
+  # symlink regression test: invoke via temp symlink and verify version still resolves
   tmpdir=$(mktemp -d)
   script_abs="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   ln -sf "$script_abs" "$tmpdir/doctor"
@@ -145,6 +155,20 @@ if [ "${1:-}" = "--selfcheck" ]; then
   rm -rf "$tmpdir"
   # verify version line is present in table output
   echo "$symlink_table" | grep -q "^  \[ok\] version " || { echo "FAIL: symlink regression test failed - version not resolved when invoked via symlink"; exit 1; }
+  
+  # two-hop relative symlink chain test (exercises the fallback loop directly)
+  tmpdir2=$(mktemp -d)
+  mkdir -p "$tmpdir2/a/sub" "$tmpdir2/b"
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # a/sub/doctor -> ../../bin/doctor.sh (relative to a/sub/)
+  ln -sf "../../bin/doctor.sh" "$tmpdir2/a/sub/doctor"
+  # b/hop -> ../a/sub/doctor (relative to b/), creating a two-hop chain
+  ln -sf "../a/sub/doctor" "$tmpdir2/b/hop"
+  # invoke through the two-hop chain: b/hop -> a/sub/doctor -> bin/doctor.sh
+  hop_table="$($tmpdir2/b/hop)"
+  rm -rf "$tmpdir2"
+  # verify version resolves correctly through both hops
+  echo "$hop_table" | grep -q "^  \[ok\] version " || { echo "FAIL: two-hop symlink regression test failed"; exit 1; }
   echo ok; exit 0
 fi
 
