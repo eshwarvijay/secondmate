@@ -177,17 +177,16 @@ if [ "${1:-}" = "--selfcheck" ]; then
   rm -rf "$tmpdir2"
   [ "$resolved" = "$expected" ] || { echo "FAIL: two-hop symlink regression test failed - got '$resolved', expected '$expected'"; exit 1; }
   
-  # symlink cycle test: asserts _resolve_symlink returns empty and exits promptly (not hanging)
-  # this test calls the REAL _resolve_symlink function (not a reimplementation)
-  tmpdir3=$(mktemp -d)
-  mkdir -p "$tmpdir3/x" "$tmpdir3/y"
-  ln -sf "../y/loop" "$tmpdir3/x/loop"
-  ln -sf "../x/loop" "$tmpdir3/y/loop"
-  # call the real _resolve_symlink function with a timeout
-  # the function will hit the hop cap and return 1 (empty output) instead of hanging
-  cycle_result=$(timeout 5 bash -c 'set +e; _resolve_symlink "$1"' _ "$tmpdir3/x/loop" 2>/dev/null)
-  rm -rf "$tmpdir3"
-  [ -z "$cycle_result" ] || { echo "FAIL: cycle regression test failed - expected empty, got '$cycle_result'"; exit 1; }
+  # cycle regression test -- calls the REAL _resolve_symlink function directly, no subshell/timeout dependency
+  _cycle_test_dir=$(mktemp -d)
+  ln -sf "$_cycle_test_dir/a" "$_cycle_test_dir/b"
+  ln -sf "$_cycle_test_dir/b" "$_cycle_test_dir/a"
+  _cycle_start=$(date +%s)
+  _cycle_result=$(_resolve_symlink "$_cycle_test_dir/a")
+  _cycle_rc=$?
+  _cycle_elapsed=$(( $(date +%s) - _cycle_start ))
+  rm -rf "$_cycle_test_dir"
+  { [ -z "$_cycle_result" ] && [ "$_cycle_elapsed" -lt 5 ]; } || { echo "FAIL: cycle test -- result='$_cycle_result' rc=$_cycle_rc elapsed=${_cycle_elapsed}s (expected empty result within 5s)"; exit 1; }
   
   echo ok; exit 0
 fi
