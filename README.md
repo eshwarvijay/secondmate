@@ -79,6 +79,8 @@ flowchart LR
 | `secondmate` skill | The full SOP: plan-committee → triage → spawn → check → gate → hold → integrate |
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
+| `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`/`eval`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, any pipeline ending in a shell interpreter); recognizes literal patterns only — see the limitation callout below for what it permanently does not catch; no-op for the supervisor's primary checkout |
+| `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, refusing to mark anything but an isolated linked worktree (never the primary checkout) |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract |
@@ -88,9 +90,29 @@ flowchart LR
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
-| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
+| `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
+
+> ⚠️ **Scope guard covers Claude Code makers only — pi makers have ZERO scope confinement today.**
+> `scope-guard.py` is wired via `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. A **pi maker**
+> (the default "Simple task" route) never loads `hooks.json` and is never subject to this hook — no
+> worktree boundary, no credential-store denylist, no Bash pattern checks apply to it at all. **Routing a
+> security-sensitive or otherwise high-risk task to a pi maker gets none of the protections above.**
+> Confining pi makers needs its own mechanism (what can pi's `--extension` hooks actually intercept?) and
+> is a deliberately deferred follow-up — not something built here.
+
+> ⚠️ **The Bash guard is a permanent limitation, not a punch list — it recognizes literal patterns only.**
+> `check_bash()` matches a fixed vocabulary of shell tokens against the literal text of the command string.
+> It is not a shell parser, not data-flow analysis, not an OS sandbox, and it will **not** be extended
+> further to chase new bypasses — every round of "found one, patched it" converges on the same wall. It
+> does not reliably catch: **(a)** alternate redirection syntax with no space before the operator (e.g.
+> `cat</etc/passwd`, `>/etc/foo`); **(b)** indirect/deferred execution where the program invoked arrives as
+> *data* at runtime rather than a literal token (e.g. `find . -exec cat /etc/passwd \;`,
+> `... | xargs -0 sh -c 'cat "$0"'`); **(c)** interpreter code that shells out via a library call instead of
+> visible path text (e.g. `python3 -c "import os; os.system('cat /etc/passwd')"`, Node's `child_process`,
+> Ruby/Perl backticks). These are representative examples of permanent gaps, not a todo list — closing them
+> for real needs OS-level sandboxing (chroot/seccomp/containers), which is explicitly out of scope here.
 
 ## 🔎 Specialized review lenses
 
@@ -155,6 +177,8 @@ credentials only you can supply.
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
+| `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
+| `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 
@@ -173,7 +197,8 @@ claude plugin install secondmate@secondmate
 # verify everything
 bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --selfcheck \
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
-  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && echo ALL_OK
+  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
+  && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck && echo ALL_OK
 claude plugin validate .
 ```
 
