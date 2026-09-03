@@ -146,8 +146,18 @@ HERDMOCK
         echo "FAIL: split with --pane test-pane-123 was not called"; fails=1
       fi
     fi
-    # Test spawn with --pane targeting
-    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down >/dev/null 2>&1
+    # Test spawn with --pane targeting (use a real worktree as cwd to satisfy mark_maker)
+    base_repo="$tmpdir/base_repo"
+    mkdir -p "$base_repo"
+    git -C "$base_repo" init -q -b main
+    git -C "$base_repo" config user.email "t@t"
+    git -C "$base_repo" config user.name "t"
+    echo "x" > "$base_repo/f"
+    git -C "$base_repo" add -A
+    git -C "$base_repo" commit -qm "init"
+    wt_cwd="$tmpdir/wt_cwd"
+    git -C "$base_repo" worktree add -q -b feat "$wt_cwd" main
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down --cwd "$wt_cwd" >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: spawn with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check spawn with --pane mock-target-pane was called and has no --current
@@ -161,8 +171,17 @@ HERDMOCK
         echo "FAIL: spawn with --pane mock-target-pane was not called"; fails=1
       fi
     fi
-    # Test delegate with --pane targeting
-    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" >/dev/null 2>&1
+    base_repo4="$tmpdir/base_repo4"
+    mkdir -p "$base_repo4"
+    git -C "$base_repo4" init -q -b main
+    git -C "$base_repo4" config user.email "t@t"
+    git -C "$base_repo4" config user.name "t"
+    echo "x" > "$base_repo4/f"
+    git -C "$base_repo4" add -A
+    git -C "$base_repo4" commit -qm "init"
+    wt_cwd4="$tmpdir/wt_cwd4"
+    git -C "$base_repo4" worktree add -q -b feat "$wt_cwd4" main
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" --cwd "$wt_cwd4" >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: delegate with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check delegate with --pane delegate-target was called and has no --current
