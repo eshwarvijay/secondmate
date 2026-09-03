@@ -87,7 +87,7 @@ Each stage exists to close a specific failure mode.
    — creates a fresh git worktree on an `sm/<task>` branch. `herdr worktree create` additionally opens a
    dedicated herdr workspace/tab/pane; `.result.root_pane.pane_id` is used directly to start the pi maker
    agent, keeping it in its own workspace rather than the supervisor's.
-   `new-worktree.sh` (and `herdr-pane.sh spawn`, for the Claude-maker path) also drops a maker marker — see
+   `new-worktree.sh` (and `herdr agent start --pane <root_pane_id>` for the Claude-maker path) also drops a maker marker — see
    **Scope guard** below.
    *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo.
 

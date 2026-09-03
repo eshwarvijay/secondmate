@@ -44,8 +44,6 @@ do_split() { # pane_id? dir cwd -> pane_id
 mark_maker() { # cwd
   local cwd="$1"
   git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
-  # If mark-maker.sh doesn't exist, assume we're in a mock/test environment and succeed
-  [ -x "$SCRIPT_DIR/mark-maker.sh" ] || return 0
   "$SCRIPT_DIR/mark-maker.sh" --cwd "$cwd"
 }
 
@@ -157,7 +155,7 @@ HERDMOCK
     git -C "$base_repo" commit -qm "init"
     wt_cwd="$tmpdir/wt_cwd"
     git -C "$base_repo" worktree add -q -b feat "$wt_cwd" main
-    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down --cwd "$wt_cwd" >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 SM_MARKER_ROOT="$tmpdir/markers" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down --cwd "$wt_cwd" >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: spawn with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check spawn with --pane mock-target-pane was called and has no --current
@@ -181,7 +179,7 @@ HERDMOCK
     git -C "$base_repo4" commit -qm "init"
     wt_cwd4="$tmpdir/wt_cwd4"
     git -C "$base_repo4" worktree add -q -b feat "$wt_cwd4" main
-    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" --cwd "$wt_cwd4" >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 SM_MARKER_ROOT="$tmpdir/markers" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" --cwd "$wt_cwd4" >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: delegate with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check delegate with --pane delegate-target was called and has no --current
