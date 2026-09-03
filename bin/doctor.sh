@@ -15,6 +15,15 @@ brewable() { if have brew; then echo "brew install $1"; elif have apt-get; then 
 plugin_present() { claude plugin list 2>/dev/null | grep -q "$1@" || [ -d "$HOME/.claude/plugins/marketplaces/$1" ]; }
 skill_present() { [ -d "$HOME/.claude/skills/$1" ] || find "$HOME/.claude/plugins/marketplaces" -maxdepth 4 -type d -name "$1" 2>/dev/null | grep -q .; }
 
+# read plugin version relative to script location (compute before selfcheck branch)
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+version_line=""
+# plugin.json lives in script_dir's parent (one level up from bin/)
+plugin_json="$(dirname "$script_dir")/.claude-plugin/plugin.json"
+if [ -f "$plugin_json" ]; then
+  version_line=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('version',''))" "$plugin_json" 2>/dev/null || true)
+fi
+
 ROWS=""; core_missing=0; checker_missing=0
 add() { # status name category fix
   ROWS+="$1|$2|$3|$4"$'\n'
@@ -54,6 +63,11 @@ print(json.dumps(out,separators=(",",":")))'
 emit_table() {
   echo "secondmate doctor"
   echo "----------------------------------------------------------------------"
+  if [ -n "$version_line" ]; then
+    echo "  [ok] version $version_line"
+  else
+    echo "  [!!] version (unknown)"
+  fi
   while IFS='|' read -r st name cat fix; do
     [ -z "$name" ] && continue
     local mark="[ok]"; [ "$st" = MISSING ] && mark="[!!]"
@@ -82,6 +96,8 @@ heal() {
 
 # --- selfcheck (no installs) ---
 if [ "${1:-}" = "--selfcheck" ]; then
+  # assert version line is present and non-empty
+  [ -n "$version_line" ] || { echo "FAIL: version line is empty or missing"; exit 1; }
   out="$("$0" --json)" || { echo "FAIL: --json errored"; exit 1; }
   python3 -c 'import json,sys; json.loads(sys.stdin.read())' <<< "$out" || { echo "FAIL: --json not valid JSON"; exit 1; }
   "$0" >/dev/null 2>&1; rc=$?; [ "$rc" = 0 ] || [ "$rc" = 1 ] || { echo "FAIL: unexpected exit $rc"; exit 1; }
