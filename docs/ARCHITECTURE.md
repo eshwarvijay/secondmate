@@ -87,6 +87,8 @@ Each stage exists to close a specific failure mode.
    — creates a fresh git worktree on an `sm/<task>` branch. `herdr worktree create` additionally opens a
    dedicated herdr workspace/tab/pane; `.result.root_pane.pane_id` is used directly to start the pi maker
    agent, keeping it in its own workspace rather than the supervisor's.
+   `new-worktree.sh` (and `herdr-pane.sh spawn`, for the Claude-maker path) also drops a maker marker — see
+   **Scope guard** below.
    *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo.
 
 3. **Implement (guarded).** The maker works, wrapped by two deterministic guards:
@@ -136,6 +138,84 @@ Each stage exists to close a specific failure mode.
    Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
    Commit separately. Skip for trivial one-shot edits.
 
+## Scope guard
+
+> **⚠️ Claude Code makers only — pi makers get NONE of this, today.** `scope-guard.py` is wired via
+> `hooks/hooks.json`, a Claude Code `.claude-plugin` mechanism. A **pi maker** (SKILL.md step 0d's default
+> "Simple task" route) never loads `hooks.json` and is never subject to this hook — no worktree boundary,
+> no credential denylist, no Bash pattern checks, nothing below applies to it. **Routing a
+> security-sensitive or otherwise high-risk task to a pi maker gets zero of these protections** until a
+> pi-side mechanism exists (what can pi's `--extension` hooks actually intercept? — an open question, and a
+> deliberately deferred follow-up, not something this hook does).
+
+A real incident: a maker did ordinary-looking things — `gh pr view`, `cat` a file it assumed was local —
+that touched credentials and unrelated files outside its intended scope in a different repo.
+`bin/scope-guard.py`, wired as a `PreToolUse` hook in `hooks/hooks.json`, closes this structurally rather
+than trusting the maker's judgment **— for Claude Code maker sessions only** (see warning above):
+
+- **Activation is explicit, not inferred, and lives OUTSIDE the worktree it guards.** `bin/mark-maker.sh`
+  is the single shared marking call — `new-worktree.sh`, `herdr-pane.sh spawn`, and the `herdr worktree
+  create` + pi-maker path (SKILL.md step 2) all route through it, so marking can't drift out of sync across
+  launch sites. It writes a marker file under a fixed, supervisor-controlled directory (default
+  `~/.secondmate-markers`, override with `SM_MARKER_ROOT`), keyed by the worktree's realpath — never inside
+  the tracked working tree, and never inside git's per-worktree admin dir either (an earlier revision put it
+  there, but that path is still reachable via git commands run inside the worktree). Because the marker
+  lives outside the worktree root entirely, the scope check below already denies any Bash/Edit/Write call
+  the marked session makes against it — no separate persistence or env-var mechanism needed, and unlike an
+  env var, a file on disk survives the fact that every `PreToolUse` hook invocation is a brand-new
+  subprocess. The hook is a no-op unless the marker is present, so the supervisor's primary checkout, and
+  any worktree secondmate didn't create, are completely unaffected. `mark-maker.sh` itself refuses to mark
+  anything that isn't an isolated *linked* worktree — it compares `git rev-parse --git-dir` against
+  `--git-common-dir` (equal ⇒ this is the primary checkout, refuse) — so a caller can't accidentally
+  scope-guard the supervisor's own session by passing the wrong `--cwd`. And every marker-installation
+  failure propagates: `herdr-pane.sh spawn` aborts rather than starting an agent that looks scoped but
+  isn't (an earlier revision swallowed this with `|| true`).
+- **Scope check.** Every `Bash`/`Read`/`Edit`/`Write`/`NotebookEdit` call in a marked session has its
+  resolved path(s) checked against the worktree root (symlinks and `..` resolved via `realpath`). Outside
+  the worktree → deny. Bash commands get a token-level scan (not a full shell parser) that also looks inside
+  common evasions — shell variable indirection (`d=/etc; cat $d/x`), command substitution, inline
+  interpreter one-liners (`python3 -c "..."`, `node -e "..."`), and any pipeline whose *final stage* is a
+  shell interpreter (`sh`/`bash`/`zsh`/`dash`/...) — denied regardless of what feeds it (`printf`, `echo`,
+  `cat`, `base64 -d`, `curl`, anything), because what a piped-in script will do can't be verified without
+  executing it — plus a small denylist for credential-store commands with no filesystem path to catch
+  (`security`, `gh auth`). `sh`/`bash`/`zsh`/`env -c "<code>"` **and** `eval "<code>"` both recurse the
+  *entire* check (paths, credentials, interpreter code, pipelines) against the wrapped string, so wrapping
+  a denied command once doesn't launder it — `~/.ssh`, `~/.aws`, etc. are already denied by the general path
+  check since they resolve outside any worktree. `SM_MAKER_ALLOW_CREDS=1` is the explicit opt-in past the
+  credential denylist.
+- **Fail-open at the activation layer, fail-closed at the decision layer.** Can't parse the hook payload, or
+  git/cwd is unavailable? Allow — a broken hook must never brick tool calls in unrelated sessions. Once a
+  session is confirmed as a maker, anything unresolvable (unbalanced quoting, an unexpanded shell variable
+  in a path-looking token, malformed tool input like a list where a string is expected) denies rather than
+  crashing or guessing — the decision logic runs inside a try/except so no exception path can skip the deny.
+- **This is a deterrent, not a sandbox — a permanent limitation, not a punch list.** `check_bash()`
+  recognizes common and *literal* command and credential patterns only — a fixed vocabulary of shell
+  tokens matched against the literal text of the command string. It is not a shell parser, not data-flow
+  analysis, not an OS sandbox. Every round of "found a bypass, added a check for it" converges on the same
+  wall: a fixed vocabulary of literal patterns cannot enumerate every way a command line can reach a file
+  or a credential. It does **not** reliably catch, and will not be extended further to chase:
+  - **Alternate redirection syntax** — e.g. `cat</etc/passwd` or `>/etc/foo` with no space before the
+    operator; a path fused to a redirection operator is a token shape the scanner doesn't recognize.
+  - **Indirect/deferred execution** — e.g. `find . -exec cat /etc/passwd \;` or
+    `... | xargs -0 sh -c 'cat "$0"'`; the program invoked arrives as *data* at runtime (an `-exec`
+    argument, an `xargs`-substituted parameter), not as a literal token visible ahead of execution.
+  - **Interpreter code that shells out via a library call** — e.g. `python3 -c "import os;
+    os.system('cat /etc/passwd')"`, Node's `child_process`, or Ruby/Perl backticks, run through an
+    interpreter flag this hook already scans as *text* for path-like substrings — it doesn't parse the
+    code, so a call reaching a file through the language's own exec API instead of visible path text
+    defeats it.
+
+  These three are representative, not exhaustive — new instances of the same three root causes (an
+  unrecognized token shape, runtime-only data, a nested interpreter's own execution API) will keep
+  surfacing for as long as this is a string heuristic. This is accepted and permanent, not a queue of gaps
+  awaiting the next patch. Separately, there's a **symlink TOCTOU**: this hook approves a call *before* the
+  tool's actual file operation runs, with no way to atomically bind the check to that later operation — a
+  symlink that resolves in-root at check time could be swapped to point outside the worktree before the
+  tool opens the file. All of the above need OS-level sandboxing (chroot/seccomp/containers) to close for
+  real, which is out of scope for this hook by design — documented here, not chased with more
+  pattern-matching. What this hook *does* raise is the cost of accidental or unsophisticated scope
+  violations — the incident it actually defends against — not completeness against an adversarial command line.
+
 ## Invariants that make it trustworthy
 
 - **Maker is not checker, cross-model.** Enforced by launching the checker as a different harness/model,
@@ -146,6 +226,9 @@ Each stage exists to close a specific failure mode.
 - **Restart is a non-event.** Decisions, loop state, and audit trails are on disk (`decisions.jsonl`,
   `.secondmate/`, `audit.jsonl`); nothing lives only in chat.
 - **Human owns risk.** Autonomy is explicit and scoped; merges and destructive actions always escalate.
+- **A maker cannot leave its own worktree.** `scope-guard.py` denies any file/command touch outside it and
+  any credential-store command, activated only by an unspoofable marker — the supervisor's own session is
+  never affected.
 
 ## Failure modes it defends against
 
@@ -160,15 +243,18 @@ Each stage exists to close a specific failure mode.
 | Checker silently mutates the code | edit-locked checker |
 | Context bloats over a long run | prune-output + reasoning one-shots off the supervisor |
 | Ambiguous adjudication | machine-readable verdict envelope |
+| Maker touches files/credentials outside its scope | scope-guard.py PreToolUse hook, marker-activated |
 
 ## Component map
 
 | Path | Guarantee |
 |---|---|
 | `skills/secondmate/SKILL.md` | the SOP the supervisor follows |
-| `hooks/hooks.json` | SessionStart hold-surfacing |
+| `hooks/hooks.json` | SessionStart hold-surfacing + PreToolUse scope guard |
+| `bin/scope-guard.py` | confines a marker-activated maker session to its own worktree; denies credential-store commands and common Bash evasions |
+| `bin/mark-maker.sh` | the one shared call that drops the scope-guard marker (outside the worktree) — called by every maker-launch site |
 | `bin/plan-committee.sh` | 6 parallel pi planners → `.secondmate/planning/<label>.md` |
-| `bin/new-worktree.sh` | isolated worktree per maker |
+| `bin/new-worktree.sh` | isolated worktree per maker; marks it via `mark-maker.sh` |
 | `bin/run-round.sh` | timeout + idle watchdog + audit (used by planners + maker + checker) |
 | `bin/loop-guard.sh` | stuck-loop abort + round/spawn caps |
 | `bin/launch-checker.sh` + `bin/checker-envelope.md` | edit-locked cross-model checker + verdict contract |

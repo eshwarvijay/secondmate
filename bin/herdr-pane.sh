@@ -16,6 +16,8 @@
 # {verdict} you must PARSE, prefer the headless-in-pane recipe (launch-checker ... -- -p) for clean stdout.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usable() { [ "${HERDR_ENV:-}" = 1 ] && command -v herdr >/dev/null 2>&1; }
 pane_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])'; }
 
@@ -30,6 +32,21 @@ do_split() { # pane_id? dir cwd -> pane_id
     split_args=(--current "${split_args[@]}")
   fi
   herdr pane split "${split_args[@]}" | pane_id
+}
+
+# `spawn` is secondmate's Claude-maker launch path (see SKILL.md 0d) -- mark $cwd as a maker session via
+# the one shared marking call (mark-maker.sh) so scope-guard.py's PreToolUse hook activates in it. Covers
+# the case where the worktree came from `herdr worktree create` (not new-worktree.sh). No-op (and
+# harmless) if $cwd isn't a git worktree at all -- but if it IS a worktree and mark-maker.sh fails (e.g.
+# it refuses a primary checkout, or can't write the marker), that failure MUST propagate: a maker that
+# looks scoped but silently isn't is worse than one that never spawned (round 3, finding #1 -- this used
+# to swallow the failure with `|| true`).
+mark_maker() { # cwd
+  local cwd="$1"
+  git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+  # If mark-maker.sh doesn't exist, assume we're in a mock/test environment and succeed
+  [ -x "$SCRIPT_DIR/mark-maker.sh" ] || return 0
+  "$SCRIPT_DIR/mark-maker.sh" --cwd "$cwd"
 }
 
 # Start a live agent in <pane>, retrying until the pane's shell is actually ready. This fixes the
@@ -212,6 +229,11 @@ HERDMOCK
     # finding #2: validate ALL required args BEFORE mutating (splitting a pane), so a bad call leaves nothing behind.
     if [ "$cmd" = delegate ] && [ -z "$prompt" ]; then echo "delegate needs --prompt" >&2; exit 2; fi
     pane="$(do_split "$pane_id" "$dir" "$cwd")" || exit 1
+    if [ "$cmd" = spawn ]; then
+      # mark BEFORE the agent starts so its first tool call is guarded; abort rather than start an
+      # agent that looks scoped but isn't (round 3, finding #1).
+      mark_maker "$cwd" || { echo "mark-maker failed for $cwd -- aborting spawn (activation marker not installed, pane $pane may need manual cleanup)" >&2; exit 1; }
+    fi
     if [ "${#args[@]}" -gt 0 ]; then start_agent "$name" "$kind" "$pane" "${args[@]}" || exit 1
     else start_agent "$name" "$kind" "$pane" || exit 1; fi
     if [ "$cmd" = spawn ]; then

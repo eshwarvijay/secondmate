@@ -81,12 +81,15 @@ This is the spec the maker receives.
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
   ```bash
+  # Prerequisite: step 2 must have called mark-maker.sh after herdr worktree create (see step 2 for the full sequence)
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
     -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium
   herdr agent prompt sm-pi-<task-id> "<plan>" --wait --timeout 600000
   ```
-  `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2).
+  `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
+  worktree **must have been marked** by calling `${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd <wt>` BEFORE
+  starting this agent (finding #5 fix) — otherwise scope-guard.py won't activate and the maker can access anything.
   `<task-id>` is the same slug used in the worktree branch (e.g. `add-version-flag`). A task-scoped name
   prevents loop-back fix plans from being routed to a stale agent in a different worktree.
   Do NOT use `herdr-pane.sh spawn` here — without --pane, it splits from the caller's current pane (potentially in a different workspace); with --pane, it splits from the supplied pane's workspace.
@@ -127,9 +130,16 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
    `${CLAUDE_PLUGIN_ROOT}/bin/reason.sh [--model r1|gpt] [--context <file>] "question"` — read its answer, decide.
 
 2. **Spawn** — isolate the maker. Two paths:
-   - **Headless / not in herdr:** `read wt branch < <(${CLAUDE_PLUGIN_ROOT}/bin/new-worktree.sh --repo <repo> --task <id>)` — never the primary checkout.
-   - **In herdr (`HERDR_ENV=1`):** `herdr worktree create --cwd <repo> --branch sm/<task-id> --base HEAD --label sm-<task-id> --no-focus`
-     — creates the git worktree AND a herdr workspace/tab/pane in one call. Read the worktree path from `.result.worktree.path` and the pane ID from `.result.root_pane.pane_id`.
+   - **Headless / not in herdr:** `read wt branch < <(${CLAUDE_PLUGIN_ROOT}/bin/new-worktree.sh --repo <repo> --task <id>)` — never the primary checkout. (Already marks the worktree.)
+   - **In herdr (`HERDR_ENV=1`):** 
+     ```bash
+     result=$(herdr worktree create --cwd <repo> --branch sm/<task-id> --base HEAD --label sm-<task-id> --no-focus)
+     wt=$(echo "$result" | jq -r '.result.worktree.path')
+     root_pane=$(echo "$result" | jq -r '.result.root_pane.pane_id')
+     ${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd "$wt"  # REQUIRED: mark before starting the maker
+     ```
+     Creates the git worktree AND a herdr workspace/tab/pane in one call. **Must call mark-maker.sh** before starting
+     any maker agent in this worktree (finding #5 fix) — otherwise scope-guard.py won't activate.
 
 3. **Guard the round** — wrap each maker/checker invocation and track loop health:
    - `${CLAUDE_PLUGIN_ROOT}/bin/run-round.sh --label <id> -- <cmd>` (wall-clock timeout, idle watchdog, audit record even on kill).
