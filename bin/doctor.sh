@@ -23,7 +23,7 @@ skill_present() { [ -d "$HOME/.claude/skills/$1" ] || find "$HOME/.claude/plugin
 _resolve_symlink() {
   local _p="$1"
   local _hop=0
-  local _max_hops=999
+  local _max_hops=40
   
   # First resolve to absolute path
   case "$_p" in
