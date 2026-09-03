@@ -69,3 +69,18 @@ mkdir -p "$(dirname "$marker")"
 printf 'root=%s\n' "$root" > "$marker"
 echo "marked: $root -> $marker"
 
+# Auto-load scope guard extension for pi by creating .pi/settings.json with extension path
+pi_ext_dir="$cwd/.pi/extensions"
+mkdir -p "$pi_ext_dir"
+# Copy the extension to .pi/extensions/ (not symlink - pi may not follow symlinks)
+cp "$SCRIPT_DIR/scope-guard-extension.ts" "$pi_ext_dir/scope-guard-extension.ts" 2>/dev/null || echo "(skip ext copy if identical)" || true
+
+# Create .pi/settings.json if it doesn't exist, with extensions path
+pi_settings_json="$cwd/.pi/settings.json"
+if [ ! -f "$pi_settings_json" ]; then
+  # Use Python to create valid JSON
+  python3 -c "import json; json.dump({'approve': True, 'extensions': ['$pi_ext_dir/scope-guard-extension.ts']}, open('$pi_settings_json', 'w'), indent=2)"
+  echo "pi settings configured: $pi_settings_json (extension path: $pi_ext_dir/scope-guard-extension.ts)"
+else
+  echo "pi settings already exists: $pi_settings_json - skipping (may need manual update if extensions not configured)"
+fi
