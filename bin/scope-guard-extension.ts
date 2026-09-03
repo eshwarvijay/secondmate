@@ -86,8 +86,8 @@ function _within_root(path: string, root: string): boolean {
 
 function _is_path_violation(pathValue: string | undefined, cwd: string, root: string): { valid: boolean; reason: string } {
   if (!pathValue) return { valid: false, reason: "missing path" };
-  const p = require("path").resolve(require("os").homedir(), pathValue as string);
-  const resolved = require("path").resolve(p);
+  // Resolve relative paths against cwd (worktree root), not homedir
+  let resolved = require("path").resolve(cwd, pathValue as string);
   if (_within_root(resolved, root)) return { valid: true, reason: "" };
   return { valid: false, reason: `'${pathValue}' resolves to ${resolved}, outside the maker's worktree (${root})` };
 }

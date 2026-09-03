@@ -140,16 +140,11 @@ Each stage exists to close a specific failure mode.
 
 ## Scope guard
 
-> **⚠️ Scope guard covers both Claude Code makers and pi makers equally — both use the same heuristic Bash checks.**
+> **⚠️ Scope guard covers both Claude Code makers and pi makers.**
 > `scope-guard.py` is a Claude Code PreToolUse hook (wired via `hooks/hooks.json`). `scope-guard-extension.ts` is
-> a pi extension using the `tool_call` event. Both activate via the same `mark-maker.sh` marker convention and enforce
+> a pi extension using the `tool_call` event (activated via `--extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"` in the pi maker launch command). Both activate via the same `mark-maker.sh` marker convention and enforce
 > the same confinement rules. **Neither provides OS-level sandboxing.** A deliberately adversarial user can always
 > find an encoding that bypasses string-heuristic checks. See docs/SCOPE-GUARD-PI.md for full details.
-
-A real incident: a maker did ordinary-looking things — `gh pr view`, `cat` a file it assumed was local —
-that touched credentials and unrelated files outside its intended scope in a different repo.
-`bin/scope-guard.py`, wired as a `PreToolUse` hook in `hooks/hooks.json`, closes this structurally rather
-than trusting the maker's judgment **— for Claude Code maker sessions only** (see warning above):
 
 - **Activation is explicit, not inferred, and lives OUTSIDE the worktree it guards.** `bin/mark-maker.sh`
   is the single shared marking call — `new-worktree.sh`, `herdr-pane.sh spawn`, and the `herdr worktree
@@ -213,6 +208,10 @@ than trusting the maker's judgment **— for Claude Code maker sessions only** (
   real, which is out of scope for this hook by design — documented here, not chased with more
   pattern-matching. What this hook *does* raise is the cost of accidental or unsophisticated scope
   violations — the incident it actually defends against — not completeness against an adversarial command line.
+
+  > **Shell whitespace variations:** The tokenization heuristic only splits on plain spaces; tabs/other whitespace
+  > characters are not guaranteed to be caught as word separators. This is a documented, accepted limitation
+  > matching the same decision made for `scope-guard.py`'s Bash heuristic — not a bug to be patched.
 
 ## Invariants that make it trustworthy
 
