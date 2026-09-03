@@ -97,13 +97,13 @@ HERDMOCK
     repo_root="$(dirname "$script_dir")"
     # Run tests with mock herdr on PATH (HERDR_ENV still required since check needs it)
     # First set up mock herdr in PATH then run the check to verify it's on PATH
-    env PATH="$tmpdir:$PATH" herdr pane list >/dev/null 2>&1 || { echo "FAIL: mock herdr not on PATH"; fails=1; }
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 herdr pane list >/dev/null 2>&1 || { echo "FAIL: mock herdr not on PATH"; fails=1; }
     # Now run the arg parsing tests with HERDR_ENV=1
-    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split without args (rc=$rc)"; fails=1; }
-    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split down >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split down >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with bare down (rc=$rc)"; fails=1; }
-    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --dir right >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --dir right >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --dir (rc=$rc)"; fails=1; }
     # Assert mock herdr was called with --current (backward compat)
     if [ -f "$log_file" ]; then
@@ -115,7 +115,7 @@ HERDMOCK
       esac
     fi
     # Test split with --pane (must use --pane not --current)
-    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --pane test-pane-123 --dir right >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --pane test-pane-123 --dir right >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check split with --pane test-pane-123 was called and has no --current
@@ -130,7 +130,7 @@ HERDMOCK
       fi
     fi
     # Test spawn with --pane targeting
-    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: spawn with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check spawn with --pane mock-target-pane was called and has no --current
@@ -141,11 +141,11 @@ HERDMOCK
           *) ;; # good - has --pane mock-target-pane, no --current
         esac
       else
-        echo "DEBUG: spawn_pane_line=[$spawn_pane_line]"; echo "FAIL: spawn with --pane mock-target-pane was not called"; fails=1
+        echo "FAIL: spawn with --pane mock-target-pane was not called"; fails=1
       fi
     fi
     # Test delegate with --pane targeting
-    env PATH="$tmpdir:$PATH" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" >/dev/null 2>&1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" >/dev/null 2>&1
     rc=$?; [ "$rc" = 0 ] || { echo "FAIL: delegate with --pane (rc=$rc)"; fails=1; }
     if [ -f "$log_file" ]; then
       # Check delegate with --pane delegate-target was called and has no --current
