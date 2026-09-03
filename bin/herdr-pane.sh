@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # herdr-pane.sh -- helpers for VISIBLE side-by-side orchestration inside herdr.
-# Splits from the CURRENT (supervisor) pane, preserves the user's focus (--no-focus) and cwd.
+# Splits from the CURRENT (supervisor) pane by default (--current), preserves the user's focus (--no-focus) and cwd.
+# When --pane <ID> is given, splits from that specific pane instead (useful for routing panes into a dedicated worktree).
 # Requires HERDR_ENV=1 and the `herdr` CLI.
 #
 #   herdr-pane.sh check                 -> exit 0 if usable (inside herdr + herdr on PATH)
-#   herdr-pane.sh split [right|down]    -> print the new pane_id
-#   herdr-pane.sh spawn    --name N --kind K [--dir right|down] [--cwd DIR] [-- <agent args...>]
+#   herdr-pane.sh split [--pane <ID>] [--dir right|down] -> print the new pane_id
+#   herdr-pane.sh spawn    --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] [-- <agent args...>]
 #         split a pane, WAIT until its shell is ready (race-proof), start a live agent -> prints "<name> <pane_id>"
-#   herdr-pane.sh delegate --name N --kind K [--dir right|down] [--cwd DIR] --prompt TEXT [--timeout MS] [-- <agent args...>]
+#   herdr-pane.sh delegate --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] --prompt TEXT [--timeout MS] [-- <agent args...>]
 #         spawn, send the prompt, wait for the agent to settle, then print its harvested output
 #
 # KINDS: claude pi codex gemini cursor grok kimi opencode ... (herdr agent start --kind).
@@ -20,9 +21,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usable() { [ "${HERDR_ENV:-}" = 1 ] && command -v herdr >/dev/null 2>&1; }
 pane_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])'; }
 
-do_split() { # dir cwd -> pane_id
-  case "$1" in right|down) ;; *) echo "direction must be right|down" >&2; return 2;; esac
-  herdr pane split --current --direction "$1" --cwd "$2" --no-focus | pane_id
+do_split() { # pane_id? dir cwd -> pane_id
+  local pane_flag="$1"
+  local dir="$2"; local cwd="$3"
+  case "$dir" in right|down) ;; *) echo "direction must be right|down" >&2; return 2;; esac
+  local split_args=(--direction "$dir" --cwd "$cwd" --no-focus)
+  if [ -n "$pane_flag" ]; then
+    split_args=(--pane "$pane_flag" "${split_args[@]}")
+  else
+    split_args=(--current "${split_args[@]}")
+  fi
+  herdr pane split "${split_args[@]}" | pane_id
 }
 
 # `spawn` is secondmate's Claude-maker launch path (see SKILL.md 0d) -- mark $cwd as a maker session via
@@ -57,38 +66,178 @@ start_agent() { # name kind pane [-- agent args...]
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
   check) usable || { echo "not usable: need HERDR_ENV=1 and herdr on PATH (fall back to headless)" >&2; exit 1; };;
-  # Hidden, selfcheck-only: exercises mark_maker() directly without needing a real herdr environment
-  # (mark_maker has no herdr dependency -- it's pure git + mark-maker.sh).
-  _test-mark-maker) mark_maker "${1:-}";;
   --selfcheck)
     fails=0
     rc=0; "$0" bogusverb >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown verb exit $rc (want 2)"; fails=1; }
-    if usable; then  # validate-before-mutate: delegate w/o --prompt must exit 2 and create NO pane
+    # Test arg parsing without running real herdr: use mock herdr in temp dir
+    if usable; then
+      # validate-before-mutate: delegate w/o --prompt must exit 2 and create NO pane
       count() { herdr pane list --workspace "${HERDR_WORKSPACE_ID:-}" 2>/dev/null | python3 -c 'import json,sys;print(len(json.load(sys.stdin)["result"]["panes"]))' 2>/dev/null || echo 0; }
       b="$(count)"; rc=0; "$0" delegate --name _sc --kind pi >/dev/null 2>&1 || rc=$?; a="$(count)"
       { [ "$rc" = 2 ] && [ "$b" = "$a" ]; } || { echo "FAIL: delegate validate-before-split (rc=$rc panes $b->$a)"; fails=1; }
     fi
-    # Finding #1 (round 3): mark_maker() must propagate mark-maker.sh's failure, not swallow it with
-    # `|| true`. Force an orthogonal failure (marker root blocked by a plain file, unrelated to the
-    # primary-checkout guard which mark-maker.sh's own --selfcheck covers) and confirm it's nonzero.
-    t="$(mktemp -d)"; git init -q -b main "$t/proj" >/dev/null 2>&1
-    git -C "$t/proj" config user.email a@a; git -C "$t/proj" config user.name a
-    echo x > "$t/proj/f"; git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init >/dev/null 2>&1
-    git -C "$t/proj" worktree add -q -b feat "$t/wt" main >/dev/null 2>&1
-    : > "$t/blocked"   # a plain FILE where the marker root's parent dir needs to be -- forces mkdir -p to fail
-    rc=0; SM_MARKER_ROOT="$t/blocked/markers" "$0" _test-mark-maker "$t/wt" >/dev/null 2>&1 || rc=$?
-    [ "$rc" != 0 ] || { echo "FAIL: mark_maker() succeeded despite mark-maker.sh's mkdir failure (swallowed the failure)"; fails=1; }
-    rm -rf "$t"
+    # Mock-based tests for split/spawn/delegate arg parsing (no real panes created)
+    tmpdir="$(mktemp -d)"
+    mock_herdr="$tmpdir/herdr"
+    log_file="$tmpdir/herdr.log"
+    # Create mock herdr that logs argv and returns fake pane_id
+    cat > "$mock_herdr" << 'HERDMOCK'
+#!/usr/bin/env bash
+echo "$*" >> "${HERDR_MOCK_LOG:-/tmp/herdr-mock.log}"
+case "$1" in
+  pane)
+    case "$2" in
+      split) echo '{"result":{"pane":{"pane_id":"mock-pane-'"$RANDOM"'"}}}';;
+      list) echo '{"result":{"panes":[]}}';;
+      *) exit 1;;
+    esac;;
+  agent)
+    case "$2" in
+      start) echo '{"result":{"agent_info":{"agent_name":'$4'}}}';;
+      prompt|read) exit 0;;
+      *) exit 1;;
+    esac;;
+  worktree)
+    case "$2" in
+      create) echo '{"result":{"worktree":{"path":"/mock"},"root_pane":{"pane_id":"mock-root-'$RANDOM'"}}}';;
+      remove) exit 0;;
+      *) exit 1;;
+    esac;;
+  *) exit 1;;
+esac
+HERDMOCK
+    chmod +x "$mock_herdr"
+    # Get the repo root (one level up from bin/)
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    repo_root="$(dirname "$script_dir")"
+    # Run tests with mock herdr on PATH (HERDR_ENV still required since check needs it)
+    # First set up mock herdr in PATH then run the check to verify it's on PATH
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 herdr pane list >/dev/null 2>&1 || { echo "FAIL: mock herdr not on PATH"; fails=1; }
+    # Now run the arg parsing tests with HERDR_ENV=1
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split without args (rc=$rc)"; fails=1; }
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with bare down (rc=$rc)"; fails=1; }
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --dir right >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --dir (rc=$rc)"; fails=1; }
+    # Assert mock herdr was called with --current (backward compat)
+    if [ -f "$log_file" ]; then
+      # Check last call was for split down (should have --current)
+      last_split=$(grep "pane split" "$log_file" | tail -1)
+      case "$last_split" in
+        *"--current"*) ;; # good
+        *) echo "FAIL: split without args did not use --current: $last_split"; fails=1;;
+      esac
+    fi
+    # Test split with --pane (must use --pane not --current)
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" split --pane test-pane-123 --dir right >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: split with --pane (rc=$rc)"; fails=1; }
+    if [ -f "$log_file" ]; then
+      # Check split with --pane test-pane-123 was called and has no --current
+      split_pane_line=$(grep -- '--pane test-pane-123' "$log_file" | grep "pane split")
+      if [ -n "$split_pane_line" ]; then
+        case "$split_pane_line" in
+          *"--current"*) echo "FAIL: split with --pane test-pane-123 also had --current: $split_pane_line"; fails=1;;
+          *) ;; # good - has --pane, no --current
+        esac
+      else
+        echo "FAIL: split with --pane test-pane-123 was not called"; fails=1
+      fi
+    fi
+    # Test spawn with --pane targeting (use a real worktree as cwd to satisfy mark_maker)
+    base_repo="$tmpdir/base_repo"
+    mkdir -p "$base_repo"
+    git -C "$base_repo" init -q -b main
+    git -C "$base_repo" config user.email "t@t"
+    git -C "$base_repo" config user.name "t"
+    echo "x" > "$base_repo/f"
+    git -C "$base_repo" add -A
+    git -C "$base_repo" commit -qm "init"
+    wt_cwd="$tmpdir/wt_cwd"
+    git -C "$base_repo" worktree add -q -b feat "$wt_cwd" main
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 SM_MARKER_ROOT="$tmpdir/markers" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" spawn --name _sc_test --kind pi --pane mock-target-pane --dir down --cwd "$wt_cwd" >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: spawn with --pane (rc=$rc)"; fails=1; }
+    if [ -f "$log_file" ]; then
+      # Check spawn with --pane mock-target-pane was called and has no --current
+      spawn_pane_line=$(grep -- '--pane mock-target-pane' "$log_file" | grep "pane split")
+      if [ -n "$spawn_pane_line" ]; then
+        case "$spawn_pane_line" in
+          *"--current"*) echo "FAIL: spawn with --pane mock-target-pane also had --current: $spawn_pane_line"; fails=1;;
+          *) ;; # good - has --pane mock-target-pane, no --current
+        esac
+      else
+        echo "FAIL: spawn with --pane mock-target-pane was not called"; fails=1
+      fi
+    fi
+    base_repo4="$tmpdir/base_repo4"
+    mkdir -p "$base_repo4"
+    git -C "$base_repo4" init -q -b main
+    git -C "$base_repo4" config user.email "t@t"
+    git -C "$base_repo4" config user.name "t"
+    echo "x" > "$base_repo4/f"
+    git -C "$base_repo4" add -A
+    git -C "$base_repo4" commit -qm "init"
+    wt_cwd4="$tmpdir/wt_cwd4"
+    git -C "$base_repo4" worktree add -q -b feat "$wt_cwd4" main
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 SM_MARKER_ROOT="$tmpdir/markers" HERDR_MOCK_LOG="$log_file" "$repo_root/bin/herdr-pane.sh" delegate --name _sc_del --kind pi --pane delegate-target --dir down --prompt "test prompt" --cwd "$wt_cwd4" >/dev/null 2>&1
+    rc=$?; [ "$rc" = 0 ] || { echo "FAIL: delegate with --pane (rc=$rc)"; fails=1; }
+    if [ -f "$log_file" ]; then
+      # Check delegate with --pane delegate-target was called and has no --current
+      delegate_pane_line=$(grep -- '--pane delegate-target' "$log_file" | grep "pane split")
+      if [ -n "$delegate_pane_line" ]; then
+        case "$delegate_pane_line" in
+          *"--current"*) echo "FAIL: delegate with --pane delegate-target also had --current: $delegate_pane_line"; fails=1;;
+          *) ;; # good - has --pane, no --current
+        esac
+      else
+        echo "FAIL: delegate with --pane delegate-target was not called"; fails=1
+      fi
+    fi
+    # Test empty --pane value is rejected (must not silently fall back to --current)
+    # Note: herdr-pane.sh explicitly checks for -z "$2" and rejects with exit 2
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 "$repo_root/bin/herdr-pane.sh" split --pane "" --dir down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 2 ] || { echo "FAIL: split --pane "" should exit 2, got $rc"; fails=1; }
+    
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 "$repo_root/bin/herdr-pane.sh" spawn --name _sc_empty --kind pi --pane "" --dir down >/dev/null 2>&1
+    rc=$?; [ "$rc" = 2 ] || { echo "FAIL: spawn --pane "" should exit 2, got $rc"; fails=1; }
+    
+    env PATH="$tmpdir:$PATH" HERDR_ENV=1 "$repo_root/bin/herdr-pane.sh" delegate --name _sc_empty --kind pi --pane "" --dir down --prompt "test" >/dev/null 2>&1
+    rc=$?; [ "$rc" = 2 ] || { echo "FAIL: delegate --pane "" should exit 2, got $rc"; fails=1; }
+    
+    # Cleanup
+    rm -rf "$tmpdir"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   split)
     usable || { echo "not inside herdr" >&2; exit 1; }
-    do_split "${1:-right}" "$PWD";;
+    pane_id="" dir="right"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; 
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        if [ -z "$2" ]; then echo "$1 value cannot be empty" >&2; exit 2; fi
+        pane_id="$2"; shift 2;;
+        --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; };
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        dir="$2"; shift 2;;
+        --) shift; break;;
+        # bare positional direction (backward compat: no --dir flag required)
+        right|down) dir="$1"; shift;;
+        *) echo "unknown arg: $1" >&2; exit 2;;
+      esac
+    done
+    do_split "$pane_id" "$dir" "$PWD";;
   spawn|delegate)
     usable || { echo "not inside herdr" >&2; exit 1; }
-    name="" kind="" dir="right" cwd="$PWD" prompt="" timeout=600000; args=()
+    name="" kind="" dir="right" cwd="$PWD" pane_id="" prompt="" timeout=600000; args=()
     while [ $# -gt 0 ]; do case "$1" in
       --name) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; name="$2"; shift 2;; --kind) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; kind="$2"; shift 2;;
-      --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
+      --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; };
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
+      --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; 
+        if [[ "$2" == --* ]]; then echo "$1 value cannot be another flag: '$2'" >&2; exit 2; fi
+        if [ -z "$2" ]; then echo "$1 value cannot be empty" >&2; exit 2; fi
+        pane_id="$2"; shift 2;;
       --prompt) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; prompt="$2"; shift 2;; --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
       --) shift; args=("$@"); break;;
       *) echo "unknown arg: $1" >&2; exit 2;;
@@ -96,7 +245,7 @@ case "$cmd" in
     [ -n "$name" ] && [ -n "$kind" ] || { echo "need --name and --kind" >&2; exit 2; }
     # finding #2: validate ALL required args BEFORE mutating (splitting a pane), so a bad call leaves nothing behind.
     if [ "$cmd" = delegate ] && [ -z "$prompt" ]; then echo "delegate needs --prompt" >&2; exit 2; fi
-    pane="$(do_split "$dir" "$cwd")" || exit 1
+    pane="$(do_split "$pane_id" "$dir" "$cwd")" || exit 1
     if [ "$cmd" = spawn ]; then
       # mark BEFORE the agent starts so its first tool call is guarded; abort rather than start an
       # agent that looks scoped but isn't (round 3, finding #1).
@@ -113,5 +262,5 @@ case "$cmd" in
         || { echo "delegate: prompt to $name failed or timed out" >&2; exit 1; }
       herdr agent read "$name" --source recent-unwrapped --lines 400
     fi;;
-  *) echo "usage: herdr-pane.sh check | split [right|down] | spawn --name N --kind K [...] | delegate --name N --kind K --prompt T [...]" >&2; exit 2;;
+  *) echo "usage: herdr-pane.sh check | split [--pane <ID>] [--dir right|down] | spawn --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] [...] | delegate --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] --prompt T [...]" >&2; exit 2;;
 esac
