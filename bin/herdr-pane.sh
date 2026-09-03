@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # herdr-pane.sh -- helpers for VISIBLE side-by-side orchestration inside herdr.
-# Splits from the CURRENT (supervisor) pane, preserves the user's focus (--no-focus) and cwd.
+# Splits from the CURRENT (supervisor) pane by default (--current), preserves the user's focus (--no-focus) and cwd.
+# When --pane <ID> is given, splits from that specific pane instead (useful for routing panes into a dedicated worktree).
 # Requires HERDR_ENV=1 and the `herdr` CLI.
 #
 #   herdr-pane.sh check                 -> exit 0 if usable (inside herdr + herdr on PATH)
-#   herdr-pane.sh split [right|down]    -> print the new pane_id
-#   herdr-pane.sh spawn    --name N --kind K [--dir right|down] [--cwd DIR] [-- <agent args...>]
+#   herdr-pane.sh split [--pane <ID>] [--dir right|down] -> print the new pane_id
+#   herdr-pane.sh spawn    --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] [-- <agent args...>]
 #         split a pane, WAIT until its shell is ready (race-proof), start a live agent -> prints "<name> <pane_id>"
-#   herdr-pane.sh delegate --name N --kind K [--dir right|down] [--cwd DIR] --prompt TEXT [--timeout MS] [-- <agent args...>]
+#   herdr-pane.sh delegate --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] --prompt TEXT [--timeout MS] [-- <agent args...>]
 #         spawn, send the prompt, wait for the agent to settle, then print its harvested output
 #
 # KINDS: claude pi codex gemini cursor grok kimi opencode ... (herdr agent start --kind).
@@ -18,9 +19,17 @@ set -uo pipefail
 usable() { [ "${HERDR_ENV:-}" = 1 ] && command -v herdr >/dev/null 2>&1; }
 pane_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])'; }
 
-do_split() { # dir cwd -> pane_id
-  case "$1" in right|down) ;; *) echo "direction must be right|down" >&2; return 2;; esac
-  herdr pane split --current --direction "$1" --cwd "$2" --no-focus | pane_id
+do_split() { # pane_id? dir cwd -> pane_id
+  local pane_flag="$1"
+  local dir="$2"; local cwd="$3"
+  case "$dir" in right|down) ;; *) echo "direction must be right|down" >&2; return 2;; esac
+  local split_args=(--direction "$dir" --cwd "$cwd" --no-focus)
+  if [ -n "$pane_flag" ]; then
+    split_args=(--pane "$pane_flag" "${split_args[@]}")
+  else
+    split_args=(--current "${split_args[@]}")
+  fi
+  herdr pane split "${split_args[@]}" | pane_id
 }
 
 # Start a live agent in <pane>, retrying until the pane's shell is actually ready. This fixes the
@@ -53,13 +62,23 @@ case "$cmd" in
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   split)
     usable || { echo "not inside herdr" >&2; exit 1; }
-    do_split "${1:-right}" "$PWD";;
+    pane_id="" dir="right"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; pane_id="$2"; shift 2;;
+        --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;;
+        --) shift; break;;
+        *) echo "unknown arg: $1" >&2; exit 2;;
+      esac
+    done
+    do_split "$pane_id" "$dir" "$PWD";;
   spawn|delegate)
     usable || { echo "not inside herdr" >&2; exit 1; }
-    name="" kind="" dir="right" cwd="$PWD" prompt="" timeout=600000; args=()
+    name="" kind="" dir="right" cwd="$PWD" pane_id="" prompt="" timeout=600000; args=()
     while [ $# -gt 0 ]; do case "$1" in
       --name) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; name="$2"; shift 2;; --kind) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; kind="$2"; shift 2;;
       --dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; dir="$2"; shift 2;; --cwd) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; cwd="$2"; shift 2;;
+      --pane) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; pane_id="$2"; shift 2;;
       --prompt) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; prompt="$2"; shift 2;; --timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; timeout="$2"; shift 2;;
       --) shift; args=("$@"); break;;
       *) echo "unknown arg: $1" >&2; exit 2;;
@@ -67,7 +86,7 @@ case "$cmd" in
     [ -n "$name" ] && [ -n "$kind" ] || { echo "need --name and --kind" >&2; exit 2; }
     # finding #2: validate ALL required args BEFORE mutating (splitting a pane), so a bad call leaves nothing behind.
     if [ "$cmd" = delegate ] && [ -z "$prompt" ]; then echo "delegate needs --prompt" >&2; exit 2; fi
-    pane="$(do_split "$dir" "$cwd")" || exit 1
+    pane="$(do_split "$pane_id" "$dir" "$cwd")" || exit 1
     if [ "${#args[@]}" -gt 0 ]; then start_agent "$name" "$kind" "$pane" "${args[@]}" || exit 1
     else start_agent "$name" "$kind" "$pane" || exit 1; fi
     if [ "$cmd" = spawn ]; then
@@ -79,5 +98,5 @@ case "$cmd" in
         || { echo "delegate: prompt to $name failed or timed out" >&2; exit 1; }
       herdr agent read "$name" --source recent-unwrapped --lines 400
     fi;;
-  *) echo "usage: herdr-pane.sh check | split [right|down] | spawn --name N --kind K [...] | delegate --name N --kind K --prompt T [...]" >&2; exit 2;;
+  *) echo "usage: herdr-pane.sh check | split [--pane <ID>] [--dir right|down] | spawn --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] [...] | delegate --name N --kind K [--pane <ID>] [--dir right|down] [--cwd DIR] --prompt T [...]" >&2; exit 2;;
 esac

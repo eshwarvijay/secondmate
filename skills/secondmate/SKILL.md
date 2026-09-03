@@ -73,16 +73,12 @@ This is the spec the maker receives.
 
 **0d — route the maker** (after step 2 Spawn has created `<wt>`):
 - **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
+  After step 2 Spawn creates `<wt>`, start the Claude maker directly on the root_pane from `herdr worktree create`:
   ```bash
-  read mk mk_pane < <(herdr-pane.sh spawn --name sm-<task-id> --kind claude --dir right \
-    --cwd <wt> -- --permission-mode acceptEdits)
-  [ -n "$mk_pane" ] || { echo "spawn failed — abort" >&2; exit 1; }
+  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop." --wait --timeout 600000
   ```
-  Use `spawn` (not `delegate`) to capture `$mk_pane` for cleanup. Guard on `$mk_pane` before prompting —
-  if spawn fails (Herdr unavailable, split error), abort rather than routing to a stale agent.
-  Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning
-  resolves the how — do not pre-specify steps that the maker's thinking can figure out.
+  The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
   ```bash
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
@@ -195,7 +191,7 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
    ```bash
    herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
    git branch -d sm/<task-id>                          # delete the merged branch
-   herdr pane close "$mk_pane"                         # maker pane (if visible path was used)
+
    herdr pane close "$ck"                              # checker pane (if visible path was used)
    ```
    A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
@@ -213,21 +209,17 @@ watch them. Inside herdr, run the loop in VISIBLE side-by-side panes. You stay i
 others via the herdr CLI. First check: `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` (if it fails, use the
 headless path). Every split uses `--no-focus` so the captain's focus never moves.
 
-- **Maker pane** — use `spawn` (not `delegate`) to capture the pane ID for cleanup, then drive via `agent prompt`:
+- **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
-  read mk mk_pane < <(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh spawn \
-    --name sm-<task-id> --kind claude --dir right --cwd <worktree> -- --permission-mode acceptEdits)
-  [ -n "$mk_pane" ] || { echo "spawn failed — abort" >&2; exit 1; }
+  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop." --wait --timeout 600000
   ```
-  `spawn` returns `<name> <pane_id>` — guard on `$mk_pane` before prompting to avoid routing to a stale
-  agent if spawn fails. If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
+  If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
 - **Checker pane** — the edit-locked checker, run headless IN the pane so it's visible AND capturable.
-  **Must include `--diff-base` and `--repo` so the checker sees the actual diff.** Use a unique per-round
-  marker (R1, R2, R3…) to avoid matching stale buffer output from prior rounds:
+  Start by splitting off the SAME dedicated workspace's root_pane (not off the supervisor's pane):
   ```bash
-  ck=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split down)
+  ck=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split --pane <root_pane_id> --dir down)
   herdr pane run "$ck" "${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh \
     --lens qa/coverage --addendum-text '...' \
     --diff-base <base-ref> --repo <wt> \
@@ -240,7 +232,7 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
 - **Watch + integrate from your pane** — `herdr agent get/read sm-<task-id>`, `herdr pane read "$ck"`; then the
   usual verify-gate + hold. You can't answer another pane's live prompt, so run any gated command yourself
   in the supervisor context (still a separate context, so maker ≠ checker holds).
-- **Clean up ONLY the panes you created**: `herdr pane close "$mk_pane"`, `herdr pane close "$ck"`.
+- **Clean up ONLY the panes you created**: `herdr pane close "$ck"` (no `$mk_pane` to close since the maker ran on the root_pane directly).
 
 Not in herdr (`HERDR_ENV != 1`)? Use the headless path — in-process maker sub-agent + `run-round.sh`-wrapped
 checker. Same loop, same guards, just not visible.
