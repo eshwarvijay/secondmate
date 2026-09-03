@@ -8,6 +8,8 @@
 # Worktrees live under $SM_WT_ROOT (default ~/.secondmate-worktrees).
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [ "${1:-}" = "--selfcheck" ]; then
   t="$(mktemp -d)"; git init -q -b main "$t/proj" >/dev/null
   git -C "$t/proj" config user.email a@a; git -C "$t/proj" config user.name a
@@ -48,8 +50,7 @@ case "$wt_root_abs/" in "$primary"/*) echo "isolation failed: SM_WT_ROOT ($wt_ro
 [ -e "$wt" ] && { echo "worktree already exists: $wt" >&2; exit 1; }
 git -C "$repo" worktree add -b "$branch" "$wt" "$base" >&2
 # mark this worktree as a maker session (never the primary checkout) so scope-guard.py's PreToolUse hook
-# activates in it. Lives in git's per-worktree admin dir (--git-path), not the working tree, so it never
-# shows up in `git status` and can't be spoofed by an ordinary file drop.
-marker="$(git -C "$wt" rev-parse --git-path secondmate-maker.marker)"
-mkdir -p "$(dirname "$marker")"; printf '%s\n' "$task" > "$marker"
+# activates in it -- via the one shared marking call so this can't drift out of sync with the other
+# maker-launch sites (see mark-maker.sh for why the marker lives OUTSIDE the worktree entirely).
+"$SCRIPT_DIR/mark-maker.sh" --cwd "$wt" >&2
 echo "$wt $branch"

@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# mark-maker.sh -- mark a git worktree as a secondmate maker session so scope-guard.py activates in it.
-# Called by new-worktree.sh, herdr-pane.sh spawn, and manually after `herdr worktree create`.
+# mark-maker.sh -- the ONE shared call that marks a git worktree as a secondmate maker session so
+# scope-guard.py's PreToolUse hook activates in it. Called by new-worktree.sh, herdr-pane.sh spawn, and
+# manually after `herdr worktree create` (see SKILL.md step 2) -- every maker-launch path funnels through
+# here so the marking logic can't drift out of sync across call sites.
 #
 #   mark-maker.sh [--cwd DIR]
 #   mark-maker.sh --selfcheck
 #
-# Drops a marker file in the worktree's per-worktree git admin dir (never the working tree, can't be
-# spoofed by an ordinary file). Also exports SM_WORKTREE_ROOT so the session remembers its root even if
-# the marker is later deleted (defense-in-depth for finding #1).
+# Writes the activation marker OUTSIDE the worktree entirely (default ~/.secondmate-markers, override
+# with SM_MARKER_ROOT), keyed by the worktree's realpath via `scope-guard.py markerpath`. Living outside
+# the worktree means scope-guard.py's own path-confinement (Bash/Read/Edit/Write/NotebookEdit) already
+# denies the marked session from writing or deleting its own marker -- no env var or other in-process
+# state needed, and unlike an env var this is a real file that survives every fresh PreToolUse subprocess.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "${1:-}" = "--selfcheck" ]; then
   t="$(mktemp -d)"; git init -q -b main "$t/proj" >/dev/null
@@ -16,9 +22,12 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo x > "$t/proj/f"; git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init
   git -C "$t/proj" worktree add -q -b feat "$t/wt" main
   fails=0
-  rc=0; "$0" --cwd "$t/wt" >/dev/null 2>&1 || rc=$?; [ "$rc" = 0 ] || { echo "FAIL: mark-maker exit $rc"; fails=1; }
-  marker="$(git -C "$t/wt" rev-parse --git-path secondmate-maker.marker 2>/dev/null)"
-  [ -f "$marker" ] || { echo "FAIL: marker not created"; fails=1; }
+  rc=0; SM_MARKER_ROOT="$t/markers" "$0" --cwd "$t/wt" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL: mark-maker exit $rc"; fails=1; }
+  root="$(cd "$t/wt" && pwd -P)"
+  marker="$(SM_MARKER_ROOT="$t/markers" python3 "$SCRIPT_DIR/scope-guard.py" markerpath "$root")"
+  [ -f "$marker" ] || { echo "FAIL: marker not created at $marker"; fails=1; }
+  case "$marker" in "$root"/*) echo "FAIL: marker lives inside the worktree ($marker)"; fails=1;; esac
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
@@ -29,17 +38,10 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 
 git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "not a git worktree: $cwd" >&2; exit 1; }
-marker="$(git -C "$cwd" rev-parse --git-path secondmate-maker.marker 2>/dev/null)" || { echo "git rev-parse --git-path failed" >&2; exit 1; }
-
-# Resolve relative marker paths relative to cwd
-if [[ ! "$marker" = /* ]]; then
-  marker="$cwd/$marker"
-fi
-
-mkdir -p "$(dirname "$marker")"
-printf 'marked-by=mark-maker.sh\n' > "$marker"
-
-# Export SM_WORKTREE_ROOT so even if the marker is deleted, the session remembers (finding #1 defense)
 root="$(git -C "$cwd" rev-parse --show-toplevel)" || { echo "git rev-parse --show-toplevel failed" >&2; exit 1; }
-export SM_WORKTREE_ROOT="$(cd "$root" && pwd -P)"  # realpath
-echo "marked: $cwd (SM_WORKTREE_ROOT=$SM_WORKTREE_ROOT)"
+root="$(cd "$root" && pwd -P)"  # physical/realpath -- must match scope-guard.py's os.path.realpath
+
+marker="$(python3 "$SCRIPT_DIR/scope-guard.py" markerpath "$root")"
+mkdir -p "$(dirname "$marker")"
+printf 'root=%s\n' "$root" > "$marker"
+echo "marked: $root -> $marker"

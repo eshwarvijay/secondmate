@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-# ponytail: marker-file + env var activation -- env var injection on marker presence defends against
-# marker deletion, while marker file survives split panes/subshells (env vars wouldn't be inherited).
+# ponytail: marker lives in a fixed directory OUTSIDE the worktree tree entirely (see _marker_root),
+# not an env var -- PreToolUse hooks are fresh subprocesses every call, so anything written to
+# os.environ in one invocation is gone before the next one starts. A real file on disk is the only
+# thing that actually persists across invocations.
 """scope-guard.py -- PreToolUse hook: confine a secondmate MAKER session to its own git worktree.
 
   scope-guard.py             # reads the PreToolUse JSON payload from stdin (wired via hooks.json)
   scope-guard.py selfcheck
+  scope-guard.py markerpath <worktree-root>   # print where mark-maker.sh should write the marker
 
-Real incident this defends against: a maker touched credentials/unrelated files outside its intended
-scope in a different repo. This hook denies Bash/Read/Edit/Write/NotebookEdit calls whose resolved path(s)
-fall outside the maker's own worktree, and denies Bash commands that read credential stores (macOS Keychain
-via `security`, `gh auth`) unless SM_MAKER_ALLOW_CREDS=1 is explicitly set.
+Real incident this defends against: a maker did ordinary-looking things -- `gh pr view`, `cat` a file it
+assumed was local -- that happened to touch credentials/files outside its intended scope in a different
+repo. This hook denies Bash/Read/Edit/Write/NotebookEdit calls whose resolved path(s) fall outside the
+maker's own worktree, and denies Bash commands that read credential stores (macOS Keychain via `security`,
+`gh auth`) unless SM_MAKER_ALLOW_CREDS=1 is explicitly set.
 
-ACTIVATION: only when the session's cwd is inside a git worktree carrying a `secondmate-maker.marker` file
-in its per-worktree git-path (dropped by new-worktree.sh / herdr-pane.sh spawn / mark-maker.sh -- never
-in the primary checkout). No marker -> no-op, exit 0. The marker must be OUTSIDE the worktree root
-(in .git/worktrees/<name>/) to prevent deletion by the session it gates. This keeps the supervisor's own
-primary-checkout session (and any worktree secondmate didn't create) completely unaffected; only sessions
-explicitly marked as a maker are guarded.
+ACTIVATION: only when the session's cwd is inside a git worktree whose realpath has a marker file under
+`_marker_root()` (default `~/.secondmate-markers`, override with SM_MARKER_ROOT), written once by
+mark-maker.sh at maker-launch time (called from new-worktree.sh / herdr-pane.sh spawn -- never in the
+primary checkout). No marker -> no-op, exit 0. The marker deliberately lives OUTSIDE the worktree tree
+entirely, in a supervisor-controlled directory the marked session cannot reach: this hook's own
+path-confinement (proven below) already denies any Bash/Edit/Write/NotebookEdit call that targets a path
+outside the worktree root, so a file that lives there is protected by the same mechanism it activates --
+no extra defense needed, and no reliance on an in-process env var that wouldn't survive to the next hook
+invocation anyway.
 
 FAIL-OPEN vs FAIL-CLOSED, deliberately different at two layers:
   - Can we even tell if this is a maker session (bad/missing stdin JSON, git unavailable, cwd gone)?
@@ -25,9 +32,19 @@ FAIL-OPEN vs FAIL-CLOSED, deliberately different at two layers:
     Fail CLOSED (deny) on anything unresolvable or ambiguous (symlink escapes, `..` traversal, unexpanded
     shell variables/substitutions in a path-looking token, unparseable quoting, command substitutions).
 
-Bash commands are scanned with a token heuristic, not a real shell parser -- sufficient to catch accidental
-scope creep AND simple evasion (the incident this defends against), not a sandbox against a sophisticated adversary.
+SCOPE OF THE BASH GUARD -- READ BEFORE RELYING ON THIS FOR ANYTHING ADVERSARIAL:
+Bash commands are scanned with a token heuristic (shlex + regex), not a real shell parser and not an OS
+sandbox. It is a best-effort deterrent against accidental scope creep and common evasive patterns (shell
+variable indirection, command substitution, credential commands wrapped in `sh -c`, inline interpreter
+one-liners, decode-into-shell pipelines) -- the concrete things a real maker session has been observed to
+do or that are one obvious step away from the real incident above. It is NOT a sandboxing boundary: a
+deliberately adversarial process can still defeat a string heuristic (novel encodings, obscure shells,
+splitting a payload across many innocuous-looking calls, etc.), and no amount of pattern-matching closes
+that gap completely. Real isolation against a genuinely adversarial process requires OS-level sandboxing
+(chroot, seccomp, containers) -- explicitly out of scope for this hook. Treat every fix here as raising the
+cost of accidental or unsophisticated scope violations, not as chasing a moving target of encoding tricks.
 """
+import hashlib
 import json
 import os
 import re
@@ -35,64 +52,53 @@ import shlex
 import subprocess
 import sys
 
-MARKER_NAME = "secondmate-maker.marker"
 PATH_FIELD = {"Read": "file_path", "Edit": "file_path", "Write": "file_path", "NotebookEdit": "notebook_path"}
 
 
-def is_maker_worktree(cwd):
-    """cwd inside a git worktree carrying the maker marker -> realpath'd worktree root; else None.
+def _marker_root():
+    """Fixed, supervisor-controlled directory the marker lives under -- never inside any worktree."""
+    return os.environ.get("SM_MARKER_ROOT") or os.path.join(os.path.expanduser("~"), ".secondmate-markers")
 
-    Defends against marker deletion (finding #1): the marker must be OUTSIDE the worktree root
-    (in .git/worktrees/<name>/ or equivalent), not inside it where a marked session could delete it.
-    Also checks SM_WORKTREE_ROOT env var as a secondary source (set on initial activation).
+
+def _marker_path_for(root):
+    """root (a realpath'd worktree root) -> the marker file path for it, keyed by a hash of root.
+
+    Hashing (rather than e.g. slugifying the path) sidesteps filename-safety entirely and guarantees
+    mark-maker.sh (bash) and this module compute the identical path for the identical root.
+    """
+    key = hashlib.sha256(root.encode()).hexdigest()
+    return os.path.join(_marker_root(), key + ".marker")
+
+
+def is_maker_worktree(cwd):
+    """cwd inside a git worktree with a marker on disk under _marker_root() -> realpath'd worktree root; else None.
+
+    The marker lives OUTSIDE the worktree tree entirely (finding #1, round 2): a marked maker session's
+    own Bash/Edit/Write/NotebookEdit calls are already denied by this hook's path-confinement for
+    anything outside its worktree root, so a marker that lives outside the root can't be written to,
+    overwritten, or deleted by the very session it gates -- no separate persistence mechanism needed,
+    and unlike an env var this is a real file that survives across every fresh PreToolUse subprocess.
     """
     try:
         top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
                               capture_output=True, text=True, timeout=3)
         if top.returncode != 0 or not top.stdout.strip():
-            return _check_env_backup(cwd)
+            return None
         root = os.path.realpath(top.stdout.strip())
 
-        gp = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-path", MARKER_NAME],
-                             capture_output=True, text=True, timeout=3)
-        if gp.returncode != 0 or not gp.stdout.strip():
-            return _check_env_backup(cwd)
-
-        marker_path = gp.stdout.strip()
-        # Resolve relative marker paths relative to cwd, not process cwd
-        if not marker_path.startswith("/"):
-            marker_path = os.path.join(cwd, marker_path)
-        marker_path = os.path.realpath(marker_path)
-
+        marker_path = _marker_path_for(root)
         if not os.path.isfile(marker_path):
-            # Marker was deleted - check env var backup (finding #1 defense)
-            return _check_env_backup(cwd)
+            return None
 
-        # Defense: marker must be OUTSIDE the worktree root (finding #1).
-        # In a proper worktree, the marker lives in .git/worktrees/<name>/ which is outside the tree.
-        # If it's somehow inside (misconfiguration or attack), refuse to activate.
-        if _within_root(marker_path, root):
-            return None  # suspicious: marker inside the tree it's supposed to guard
-
-        # Set env var on first activation so even if marker is later deleted, we remember this is a maker session
-        if "SM_WORKTREE_ROOT" not in os.environ:
-            os.environ["SM_WORKTREE_ROOT"] = root
+        # Defensive check only: _marker_root() is fixed and never chosen to be inside a worktree, but
+        # if some future misconfiguration ever placed it there, refuse rather than trust a marker that
+        # the session it's supposed to gate could itself have written.
+        if _within_root(os.path.realpath(marker_path), root):
+            return None
 
         return root
     except Exception:
-        return _check_env_backup(cwd)
-
-
-def _check_env_backup(cwd):
-    """Backup: if marker check failed but SM_WORKTREE_ROOT is set and cwd is within it, trust it (finding #1)."""
-    env_root = os.environ.get("SM_WORKTREE_ROOT")
-    if env_root:
-        try:
-            if _within_root(os.path.realpath(cwd), env_root):
-                return env_root
-        except Exception:
-            pass
-    return None
+        return None
 
 
 def _within_root(path, root):
@@ -171,6 +177,86 @@ def _credential_command(tokens):
     return None
 
 
+# Interpreters whose inline-code flag takes the code as its own argument (finding #2a, round 2): the
+# general token scan above only looks at shell words, never at a string an interpreter will itself
+# execute, so `python3 -c "open('/etc/passwd').read()"` sails through untouched otherwise.
+_INTERPRETER_CODE_FLAG = {
+    "python": "-c", "python3": "-c", "python2": "-c",
+    "node": "-e", "nodejs": "-e",
+    "ruby": "-e",
+    "perl": "-e",
+    "php": "-r",
+}
+# Path-looking substrings embedded in interpreter code: an absolute path or ~-path, stopping at the
+# first shell/string-quoting character so `open('/etc/passwd')` yields '/etc/passwd', not the rest of the line.
+_EMBEDDED_PATH_RE = re.compile(r"~?/[^\s'\"()]+|~[^\s'\"()]*")
+
+
+def _embedded_code_violation(code, cwd, root):
+    """Scan an interpreter's inline code string for out-of-worktree or ambiguous path references."""
+    if not code:
+        return None
+    for m in _EMBEDDED_PATH_RE.finditer(code):
+        tok = m.group(0)
+        if _has_unresolvable_ref(tok):
+            return f"ambiguous path-like token '{tok}' embedded in interpreter code (unresolved shell variable/substitution)"
+        resolved = _resolve_token(tok, cwd)
+        if not _within_root(resolved, root):
+            return f"embedded interpreter code references '{tok}' -> resolves to {resolved}, outside the maker's worktree ({root})"
+    return None
+
+
+def _interpreter_inline_code_violation(tokens, cwd, root):
+    """Detect `python3 -c "..."` / `node -e "..."` / etc. and scan the embedded code string (finding #2a)."""
+    for i, tok in enumerate(tokens):
+        flag = _INTERPRETER_CODE_FLAG.get(os.path.basename(tok))
+        if not flag:
+            continue
+        for j in range(i + 1, len(tokens)):
+            if tokens[j] == flag and j + 1 < len(tokens):
+                reason = _embedded_code_violation(tokens[j + 1], cwd, root)
+                if reason:
+                    return reason
+                break
+    return None
+
+
+# Decode utilities whose output, piped into a shell interpreter, we cannot inspect without decoding it
+# ourselves -- so the pattern itself is denied by default rather than trying to see through it (finding #2b).
+_DECODE_UTILS = {"base64", "xxd", "uudecode"}
+_SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh"}
+
+
+def _is_decode_segment(seg):
+    if not seg:
+        return False
+    head = os.path.basename(seg[0])
+    if head in _DECODE_UTILS:
+        return True
+    return head == "openssl" and "enc" in seg
+
+
+def _pipeline_decode_to_shell(tokens):
+    """`... | base64 -d | sh` (and xxd/uudecode/openssl enc equivalents) -- deny the pattern, not the payload."""
+    segments, current = [], []
+    for tok in tokens:
+        if tok == "|":
+            segments.append(current)
+            current = []
+        else:
+            current.append(tok)
+    segments.append(current)
+    if len(segments) < 2:
+        return None
+    decode_idx = next((i for i, seg in enumerate(segments) if _is_decode_segment(seg)), None)
+    shell_idx = next((i for i, seg in enumerate(segments)
+                       if seg and os.path.basename(seg[0]) in _SHELL_INTERPRETERS), None)
+    if decode_idx is not None and shell_idx is not None and decode_idx < shell_idx:
+        return ("pipeline decodes data (base64/xxd/uudecode/openssl enc) into a shell interpreter -- "
+                "denied by default (decoded content can't be inspected without decoding it first)")
+    return None
+
+
 def check_bash(command, cwd, root):
     try:
         tokens = shlex.split(command or "", comments=False)
@@ -181,6 +267,14 @@ def check_bash(command, cwd, root):
         cred = _credential_command(tokens)
         if cred:
             return False, f"blocked: {cred} (set SM_MAKER_ALLOW_CREDS=1 to allow)"
+
+    pipeline_reason = _pipeline_decode_to_shell(tokens)
+    if pipeline_reason:
+        return False, pipeline_reason
+
+    interp_reason = _interpreter_inline_code_violation(tokens, cwd, root)
+    if interp_reason:
+        return False, interp_reason
 
     for tok in tokens:
         if not _is_path_candidate(tok):
@@ -212,6 +306,12 @@ def _deny(reason, tool_name):
 def main(argv):
     if argv[:1] == ["selfcheck"]:
         return _selfcheck()
+    if argv[:1] == ["markerpath"]:
+        if len(argv) < 2 or not argv[1]:
+            print("usage: scope-guard.py markerpath <worktree-root>", file=sys.stderr)
+            return 2
+        print(_marker_path_for(os.path.realpath(argv[1])))
+        return 0
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -290,6 +390,26 @@ def _selfcheck():
         check("reject: backtick command substitution",
               decide("Bash", {"command": "cat `echo /etc/passwd`"}, root, root)[0] is False)
 
+        # Finding #2a (round 2): inline interpreter code with an out-of-worktree path argument
+        check("reject: python3 -c reading an out-of-worktree file",
+              decide("Bash", {"command": "python3 -c \"print(open('/etc/passwd').read())\""}, root, root)[0] is False)
+        check("reject: node -e reading an out-of-worktree file",
+              decide("Bash", {"command": "node -e \"require('fs').readFileSync('/etc/passwd')\""}, root, root)[0] is False)
+        check("reject: ruby -e reading an out-of-worktree file",
+              decide("Bash", {"command": "ruby -e \"File.read('/etc/passwd')\""}, root, root)[0] is False)
+        check("accept: python3 -c touching only in-worktree paths",
+              decide("Bash", {"command": f"python3 -c \"open('{os.path.join(root, 'sub', 'f.txt')}').read()\""}, root, root)[0] is True)
+
+        # Finding #2b (round 2): decode-utility output piped into a shell interpreter
+        check("reject: base64 -d piped into sh",
+              decide("Bash", {"command": "echo Y2F0IC9ldGMvcGFzc3dk | base64 -d | sh"}, root, root)[0] is False)
+        check("reject: xxd -r piped into bash",
+              decide("Bash", {"command": "echo deadbeef | xxd -r -p | bash"}, root, root)[0] is False)
+        check("reject: openssl enc -d piped into sh",
+              decide("Bash", {"command": "echo x | openssl enc -d -base64 | sh"}, root, root)[0] is False)
+        check("accept: base64 -d NOT piped into a shell",
+              decide("Bash", {"command": "echo Y2F0 | base64 -d"}, root, root)[0] is True)
+
         os.environ.pop("SM_MAKER_ALLOW_CREDS", None)
         check("reject: security (keychain) command by default",
               decide("Bash", {"command": "security find-generic-password -s x -w"}, root, root)[0] is False)
@@ -311,6 +431,9 @@ def _selfcheck():
 
     # --- is_maker_worktree(): real git worktree, marker presence gates activation -----------------
     tmp = tempfile.mkdtemp()
+    marker_root = os.path.join(tmp, "markers")
+    prior_marker_root = os.environ.get("SM_MARKER_ROOT")
+    os.environ["SM_MARKER_ROOT"] = marker_root
     try:
         proj = os.path.join(tmp, "proj")
         subprocess.run(["git", "init", "-q", "-b", "main", proj], check=True)
@@ -322,45 +445,53 @@ def _selfcheck():
         subprocess.run(["git", "-C", proj, "commit", "-qm", "init"], check=True)
         wt = os.path.join(tmp, "wt")
         subprocess.run(["git", "-C", proj, "worktree", "add", "-q", "-b", "feat", wt, "main"], check=True)
+        wt_root = os.path.realpath(wt)
 
         check("no marker -> not a maker session (supervisor/unrelated worktree unaffected)",
               is_maker_worktree(wt) is None)
 
-        gp = subprocess.run(["git", "-C", wt, "rev-parse", "--git-path", MARKER_NAME],
-                             capture_output=True, text=True, check=True).stdout.strip()
-        os.makedirs(os.path.dirname(gp), exist_ok=True)
-        with open(gp, "w") as f:
-            f.write("feat\n")
+        check("CLI markerpath matches _marker_path_for",
+              subprocess.run([sys.executable, os.path.abspath(__file__), "markerpath", wt_root],
+                              capture_output=True, text=True, env=os.environ).stdout.strip()
+              == _marker_path_for(wt_root))
+
+        marker_path = _marker_path_for(wt_root)
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, "w") as f:
+            f.write(f"root={wt_root}\n")
 
         check("marker present -> maker session, root resolved",
-              is_maker_worktree(wt) == os.path.realpath(wt))
+              is_maker_worktree(wt) == wt_root)
 
-        # Finding #1: marker inside worktree (not in .git/worktrees/) must be rejected
-        fake_marker = os.path.join(wt, ".git-fake-marker")
-        with open(fake_marker, "w") as f:
-            f.write("fake\n")
-        # We'll test this by verifying that _within_root catches it:
-        check("marker-inside-worktree: _within_root correctly identifies marker inside root",
-              _within_root(os.path.realpath(fake_marker), os.path.realpath(wt)) is True)
+        # Finding #1 (round 2): the marker lives OUTSIDE the worktree it guards -- by construction,
+        # not by a check that could itself be bypassed.
+        check("marker lives outside the worktree it guards",
+              not _within_root(os.path.realpath(marker_path), wt_root))
+        # ... and that means this hook's OWN path-confinement already denies the maker session from
+        # writing/deleting it -- proven via decide(), not just the path-membership predicate.
+        check("scope-guard denies a Write targeting the marker file's literal path",
+              decide("Write", {"file_path": marker_path}, wt_root, wt_root)[0] is False)
+        check("scope-guard denies a Bash rm targeting the marker file's literal path",
+              decide("Bash", {"command": f"rm {marker_path}"}, wt_root, wt_root)[0] is False)
 
-        # Finding #1: env var SM_WORKTREE_ROOT survives marker deletion
-        # First call is_maker_worktree to set the env var
-        _ = is_maker_worktree(wt)  # sets SM_WORKTREE_ROOT
-        os.remove(gp)  # delete the marker
-        check("env var backup: after marker deletion, env var keeps session marked",
-              is_maker_worktree(wt) == os.path.realpath(wt))
-        os.environ.pop("SM_WORKTREE_ROOT", None)
-
-        # Re-create marker for e2e tests
-        os.makedirs(os.path.dirname(gp), exist_ok=True)
-        with open(gp, "w") as f:
-            f.write("feat\n")
-
-        # --- end-to-end via main()/stdin, matching new-worktree.sh's accept+reject selfcheck style ---
-        def run(payload):
+        # Finding #1 (round 2), the actual bug: the marker must survive a FRESH subprocess invocation,
+        # not just reuse within one long-lived python process (which is how the previous env-var
+        # "backup" passed its own selfcheck despite providing zero real protection -- PreToolUse hooks
+        # are a brand-new subprocess every single call).
+        def run_fresh(payload):
             return subprocess.run([sys.executable, os.path.abspath(__file__)],
                                    input=json.dumps(payload), capture_output=True, text=True, cwd=wt,
-                                   env={k: v for k, v in os.environ.items() if k != "SM_WORKTREE_ROOT"})
+                                   env=dict(os.environ))
+
+        r1 = run_fresh({"cwd": wt, "tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}})
+        r2 = run_fresh({"cwd": wt, "tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}})
+        check("marker persists across independent fresh subprocess #1",
+              r1.returncode == 2 and '"permissionDecision": "deny"' in r1.stdout)
+        check("marker persists across independent fresh subprocess #2 (no shared process state)",
+              r2.returncode == 2 and '"permissionDecision": "deny"' in r2.stdout)
+
+        # --- end-to-end via main()/stdin, matching new-worktree.sh's accept+reject selfcheck style ---
+        run = run_fresh
 
         r = run({"cwd": wt, "tool_name": "Read", "tool_input": {"file_path": os.path.join(wt, "f")}})
         check("e2e accept: in-scope Read exits 0", r.returncode == 0)
@@ -369,13 +500,14 @@ def _selfcheck():
         check("e2e reject: out-of-scope Read exits 2", r.returncode == 2)
         check("e2e reject: deny JSON on stdout", '"permissionDecision": "deny"' in r.stdout)
 
-        os.remove(gp)
+        os.remove(marker_path)
         r = run({"cwd": wt, "tool_name": "Read", "tool_input": {"file_path": "/etc/passwd"}})
         check("e2e no-op: unmarked worktree exits 0 even for an out-of-scope path", r.returncode == 0)
 
         # Re-mark for finding #4 tests
-        with open(gp, "w") as f:
-            f.write("feat\n")
+        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+        with open(marker_path, "w") as f:
+            f.write(f"root={wt_root}\n")
 
         # Finding #4: malformed input must fail closed (exit 2 with deny JSON), not crash
         r = run({"cwd": wt, "tool_name": "Read", "tool_input": {"file_path": ["/etc/passwd"]}})
@@ -388,6 +520,10 @@ def _selfcheck():
     finally:
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
+        if prior_marker_root is None:
+            os.environ.pop("SM_MARKER_ROOT", None)
+        else:
+            os.environ["SM_MARKER_ROOT"] = prior_marker_root
 
     if fails == 0:
         print("ok")

@@ -79,7 +79,8 @@ flowchart LR
 | `secondmate` skill | The full SOP: plan-committee → triage → spawn → check → gate → hold → integrate |
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
-| `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it and Bash commands reading credential stores (Keychain, `gh auth`); no-op for the supervisor's primary checkout |
+| `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, `base64 -d \| sh`); best-effort deterrent, not a sandbox; no-op for the supervisor's primary checkout |
+| `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree (so the marked session can't reach or delete it) |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract |
@@ -156,6 +157,7 @@ credentials only you can supply.
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
+| `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
@@ -175,7 +177,8 @@ claude plugin install secondmate@secondmate
 # verify everything
 bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --selfcheck \
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
-  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck && echo ALL_OK
+  && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
+  && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck && echo ALL_OK
 claude plugin validate .
 ```
 

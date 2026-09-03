@@ -15,6 +15,8 @@
 # {verdict} you must PARSE, prefer the headless-in-pane recipe (launch-checker ... -- -p) for clean stdout.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 usable() { [ "${HERDR_ENV:-}" = 1 ] && command -v herdr >/dev/null 2>&1; }
 pane_id() { python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])'; }
 
@@ -23,15 +25,14 @@ do_split() { # dir cwd -> pane_id
   herdr pane split --current --direction "$1" --cwd "$2" --no-focus | pane_id
 }
 
-# `spawn` is secondmate's Claude-maker launch path (see SKILL.md 0d) -- mark $cwd as a maker session so
-# scope-guard.py's PreToolUse hook activates in it, same marker new-worktree.sh drops. Covers the case where
-# the worktree came from `herdr worktree create` (not new-worktree.sh). No-op (and harmless) if $cwd isn't a
-# git worktree yet. Lives in git's per-worktree admin dir, never the working tree.
+# `spawn` is secondmate's Claude-maker launch path (see SKILL.md 0d) -- mark $cwd as a maker session via
+# the one shared marking call (mark-maker.sh) so scope-guard.py's PreToolUse hook activates in it. Covers
+# the case where the worktree came from `herdr worktree create` (not new-worktree.sh). No-op (and
+# harmless) if $cwd isn't a git worktree yet.
 mark_maker() { # cwd
   local cwd="$1"
   git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
-  local marker; marker="$(git -C "$cwd" rev-parse --git-path secondmate-maker.marker 2>/dev/null)" || return 0
-  mkdir -p "$(dirname "$marker")"; printf 'spawned-by=herdr-pane.sh\n' > "$marker"
+  "$SCRIPT_DIR/mark-maker.sh" --cwd "$cwd" >/dev/null 2>&1 || true
 }
 
 # Start a live agent in <pane>, retrying until the pane's shell is actually ready. This fixes the
