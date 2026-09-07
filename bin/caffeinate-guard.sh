@@ -411,8 +411,14 @@ PS_EOF
   [ "$rc" = 1 ] || { echo "FAIL: start with failing ps should exit 1 (rc=$rc)"; fails=1; }
   [ ! -f "$root/guard.pid" ] || { echo "FAIL: start with failing ps should not write pidfile"; fails=1; }
   # Verify no orphan caffeinate process (the spawned one should be killed on fingerprint fail)
-  orphan_count=$(ps aux | grep '[c]affeinate -d -i -s' | wc -l | tr -d ' ' || true)
-  [ "$orphan_count" = "0" ] || { echo "FAIL: fingerprint failure left orphan caffeinate process"; fails=1; }
+  # Poll with brief sleeps since SIGTERM delivery and process reaping is not instantaneous
+  orphan_count=1
+  for _poll in 1 2 3 4 5; do
+    orphan_count=$(ps aux | grep '[c]affeinate -d -i -s' | wc -l | tr -d ' ' || true)
+    [ "$orphan_count" = "0" ] && break
+    sleep 0.2
+  done
+  [ "$orphan_count" = "0" ] || { echo "FAIL: fingerprint failure left orphan caffeinate process (count=$orphan_count after polling)"; fails=1; }
   rm -rf "$fake_ps_bin"
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
