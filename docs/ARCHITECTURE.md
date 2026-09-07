@@ -61,7 +61,9 @@ flowchart TD
     GT -->|pass| HD{hold.py: your approval}
     HD -->|merge| INT[integrate]
     HD -->|hold or abandon| STOP([stop])
-    INT --> Cap
+    INT --> TD[Teardown: close panes, worktree, branch]
+    TD --> AU[Audit trail: flow.md, decision.md]
+    AU --> Cap
 ```
 
 ## Stage by stage
@@ -88,7 +90,8 @@ Each stage exists to close a specific failure mode.
    agent, keeping it in its own workspace rather than the supervisor's.
    `new-worktree.sh` (and `herdr agent start --pane <root_pane_id>` for the Claude-maker path) also drops a maker marker — see
    **Scope guard** below.
-   *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo.
+   *In addition to marking, the supervisor must call `caffeinate-guard.sh start` after the worktree is created* to prevent system sleep during the session (8-hour ceiling via `-t` flag as defense-in-depth orphan cleanup). This is a no-op if already running, spawning a single long-lived guard process per session. Not marking the worktree with `mark-maker.sh` before starting the maker agent is a critical failure — scope-guard.py won't activate, letting the maker access the primary checkout. Not starting `caffeinate-guard.sh` lets the laptop sleep mid-session, leaving processes orphaned.
+   *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo; unattended runs interrupted by macOS sleep.
 
 3. **Implement (guarded).** The maker works, wrapped by two deterministic guards:
    - `run-round.sh` gives each invocation a **wall-clock timeout** and an **idle watchdog** (kills it if
@@ -135,7 +138,20 @@ Each stage exists to close a specific failure mode.
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here.
 
-8. **Audit trail.** After integration, append to `audit/flow.md` (orchestration: maker path, models, rounds,
+8. **Teardown.** Immediately after integration, close everything created for this task:
+   ```bash
+   herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
+   herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
+   git branch -d sm/<task-id>                          # delete the merged branch
+   ```
+   A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+
+   **IMPORTANT:** `caffeinate-guard.sh stop` is SESSION-SCOPED, not per-task. Call it ONCE yourself, directly,
+   only after you have confirmed EVERY task/worktree in that batch has been torn down. Never call `stop` inside
+   a task's per-task teardown — sibling tasks may still be running and need sleep prevention.
+   *See the Roles section above for the session guard lifecycle.*
+
+9. **Audit trail.** After teardown, append to `audit/flow.md` (orchestration: maker path, models, rounds,
    outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
    escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
    Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
@@ -265,5 +281,6 @@ Each stage exists to close a specific failure mode.
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
+| `bin/caffeinate-guard.sh` | macOS sleep prevention during session execution — single session-scoped guard process, PID identity verification, bounded TTL ceiling, idempotent start/stop |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.
