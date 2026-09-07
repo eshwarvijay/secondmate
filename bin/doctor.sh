@@ -1512,7 +1512,11 @@ STUB_EOF
   rc=$?
 
   # With Bug 6 fix: should return 1 (lock not stale - process is alive)
-  [ "$rc" -eq 1 ] || { echo "FAIL: Test F1 bug6 fix: _is_lock_still_stale should return 1 for live PID, got $rc"; rm -rf "$d"; exit 1; }
+  [ "$rc" -eq 1 ] || { echo "FAIL: Test F1 bug6 fix: _is_lock_still_stale should return 1 for live PID, got $rc"; kill "$alive_pid" 2>/dev/null; wait "$alive_pid" 2>/dev/null; rm -rf "$d"; exit 1; }
+
+  # Kill the live PID process immediately after the assertion that needs it alive
+  kill "$alive_pid" 2>/dev/null
+  wait "$alive_pid" 2>/dev/null
 
   # Also test with a DEAD PID (same timestamp but PID that doesn't exist)
   # Write dead PID to file (not using the already-killed process)
@@ -1752,13 +1756,38 @@ STUB_EOF
   rm -rf "$d" "$origin_dir"
 
   # === Test I (Bug 11 fix): atomic lock steal via mv ===
-  # This tests the atomic rename fix: instead of rm -rf directly after _is_lock_still_stale,
-  # we first mv to a unique name, verify it's still the same stale lock, then rm and create fresh.
-  # We test that if another process replaces the lock between mv and rm, we detect it and back off.
+  # This tests the atomic rename fix by calling the REAL _acquire_heal_lock function
+  # with a stubbed 'mv' command that fails on first invocation, simulating the race
+  # condition where another process already claimed the lock.
+  # We verify that _acquire_heal_lock properly handles the mv failure (back off and retry)
+  # and that the mv command is actually called (the Bug 11 fix).
   # Note: We use an arbitrary large PID (999999) that's extremely unlikely to be alive.
   d=$(mktemp -d)
   lock_dir="$d/lock"
   lock_file="$lock_dir/secondmate-heal.lock"
+  
+  # Create a temp directory for the mv stub
+  stub_dir=$(mktemp -d)
+  stub_mv="$stub_dir/mv"
+  marker_file="$d/mv_called"
+  
+  # Create stub mv that: on first call, fails after removing source (simulating race);
+  # on subsequent calls, delegates to real mv
+  # Uses environment variables: STUB_MV_MARKER (marker file), STUB_MV_SOURCE (source to remove)
+  cat > "$stub_mv" << 'EOF'
+#!/bin/bash
+# stub mv: first call fails after removing source (simulating race), subsequent calls succeed
+if [ ! -f "${STUB_MV_MARKER:-}" ]; then
+  # First invocation - record it and simulate race by removing source
+  touch "${STUB_MV_MARKER:-}"
+  rm -rf "${STUB_MV_SOURCE:-}" 2>/dev/null
+  exit 1
+else
+  # Subsequent Invocation - delegate to real mv
+  /bin/mv "$@"
+fi
+EOF
+  chmod +x "$stub_mv"
   
   # Create a lock with a stale timestamp (using a DEAD PID for testing)
   mkdir -p "$lock_file"
@@ -1772,54 +1801,35 @@ STUB_EOF
   _doctor_lock_dir="$lock_dir"
   _doctor_lock_file="$lock_file"
   
-  # Simulate what _acquire_heal_lock does when it finds a stale lock
-  # Step 1: read the lock metadata once
-  first_ts=$(cat "$lock_file/.timestamp")
-  first_pid=$(cat "$lock_file/.pid")
+  # Call _acquire_heal_lock with stubbed mv on PATH
+  # The stub will fail on first call (simulating race), then subsequent calls succeed
+  # Export marker and source path for stub to use
+  export STUB_MV_MARKER="$marker_file"
+  export STUB_MV_SOURCE="$lock_file"
+  PATH="$stub_dir:$PATH" _acquire_heal_lock >/dev/null 2>&1
+  rc=$?
   
-  # Step 2: verify it's still stale (simulating _is_lock_still_stale)
-  # With dead_pid=999999, _is_lock_still_stale should return 0 (stale) since kill -0 fails
-  if ! _is_lock_still_stale "$first_ts" 30 "$first_pid"; then
-    echo "FAIL: Test I bug11 fix: lock should be stale for testing (dead_pid=$dead_pid)"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d"; exit 1
-  fi
+  # Clean up environment variables
+  unset STUB_MV_MARKER
+  unset STUB_MV_SOURCE
   
-  # Step 3: simulate the mv attempt (atomic steal)
-  # In the real code, this would be: mv "$lock_file" "${lock_file}.stealing.$$"
-  stolen_lock="${lock_file}.stealing.$$"
+  # Verify mv was called (marker file exists)
+  [ -f "$marker_file" ] || { echo "FAIL: Test I bug11 fix: mv should have been called (no marker)"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d" "$stub_dir"; exit 1; }
   
-  # Now, BEFORE the mv succeeds, SIMULATE another process replacing the lock
-  # (This is hard to do in a real race without mkfifo, so we simulate the scenario)
-  # Just before our mv, we replace the lock with a fresh one
-  # Our mv should fail because the lock file no longer exists at that path
-  rm -rf "$lock_file" 2>/dev/null
-  mkdir -p "$lock_file"
-  new_ts=$(date +%s)
-  echo "$new_ts" > "$lock_file/.timestamp"
-  echo "$dead_pid" > "$lock_file/.pid"
+  # Verify lock was acquired successfully
+  [ "$rc" -eq 0 ] || { echo "FAIL: Test I bug11 fix: _acquire_heal_lock should succeed, got rc=$rc"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d" "$stub_dir"; exit 1; }
   
-  # Now try the mv - it should fail (source no longer exists)
-  if mv "$lock_file" "$stolen_lock" 2>/dev/null; then
-    # If mv succeeded (unlikely but possible in single-threaded test), verify it's still our stale lock
-    # Read the moved copy's metadata
-    moved_ts=$(cat "$stolen_lock/.timestamp" 2>/dev/null || echo "")
-    moved_pid=$(cat "$stolen_lock/.pid" 2>/dev/null || echo "")
-    
-    # This should NOT match our original read (first_ts, first_pid)
-    # because we replaced the lock before the mv
-    if [ "$moved_ts" = "$first_ts" ] && [ "$moved_pid" = "$first_pid" ]; then
-      echo "FAIL: Test I bug11 fix: mv should have found a new lock, not our stale one"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d"; exit 1
-    fi
-    # It's a new lock - back off
-    rm -rf "$stolen_lock" 2>/dev/null
-  else
-    # mv failed - someone already claimed it (or it's gone)
-    # This is the expected behavior for the race condition
-    : # success - we would back off and retry
-  fi
+  # Verify new lock was created (fresh, not the old stale one)
+  [ -d "$lock_file" ] || { echo "FAIL: Test I bug11 fix: lock directory doesn't exist after successful acquire"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d" "$stub_dir"; exit 1; }
+  
+  # Verify fresh timestamp (not the old stale one)
+  new_ts=$(cat "$lock_file/.timestamp" 2>/dev/null || echo "")
+  [ -n "$new_ts" ] || { echo "FAIL: Test I bug11 fix: couldn't read timestamp after acquire"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d" "$stub_dir"; exit 1; }
+  [ "$new_ts" -gt "$old_ts" ] || { echo "FAIL: Test I bug11 fix: timestamp wasn't updated"; _doctor_lock_dir="$_old_lock_dir"; _doctor_lock_file="$_old_lock_file"; rm -rf "$d" "$stub_dir"; exit 1; }
   
   _doctor_lock_dir="$_old_lock_dir"
   _doctor_lock_file="$_old_lock_file"
-  rm -rf "$d"
+  rm -rf "$d" "$stub_dir"
 
   # === Test I2 (Bug 11 companion): normal stale-lock steal works end-to-end ===
   # This confirms the normal path (no race) still works: a genuinely stale lock
