@@ -30,47 +30,66 @@ def _truncate(s: str, max_len: int = 80) -> str:
     return s[:max_len - 3] + "..."
 
 
-def _print_progress(tool_name: str, args: dict) -> None:
-    """Print a single progress line to stderr, based on tool type and args."""
+def _print_progress(tool_name: str, args: dict, err_file) -> None:
+    """Print a single progress line to err_file, based on tool type and args."""
     if tool_name == "bash":
         cmd = args.get("command", "")
         # Truncate the command to keep it readable
         truncated = _truncate(cmd, 70)
-        print(f"checker: bash -- {truncated}", file=sys.stderr, flush=True)
+        print(f"checker: bash -- {truncated}", file=err_file, flush=True)
     elif tool_name == "read":
         path = args.get("path", "")
         truncated = _truncate(path, 70)
-        print(f"checker: read -- {truncated}", file=sys.stderr, flush=True)
+        print(f"checker: read -- {truncated}", file=err_file, flush=True)
     else:
         # Generic handler for other tools
-        print(f"checker: {tool_name} -- {args}", file=sys.stderr, flush=True)
+        print(f"checker: {tool_name} -- {args}", file=err_file, flush=True)
 
 
 def _extract_final_text(messages: list) -> Optional[str]:
-    """Extract the final assistant message's text content from agent_end messages array."""
+    """Extract the final assistant message's text content from agent_end messages array.
+    
+    Returns None if:
+    - No assistant message found
+    - The assistant message has stopReason 'error' or 'aborted'
+    - No text content found
+    
+    Collects ALL text-type content parts in order and joins with newlines.
+    """
     if not messages:
         return None
-    # The last message is typically the assistant's final response
-    last_msg = messages[-1]
-    if last_msg.get("role") != "assistant":
-        # If the last message isn't assistant, look for the last assistant message
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                last_msg = msg
-                break
-        else:
-            return None
+    
+    # Find the last assistant message
+    last_msg = None
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            last_msg = msg
+            break
+    
+    if last_msg is None:
+        return None
+    
+    # Check stopReason: error or aborted = suppress output (real pi text mode behavior)
+    stop_reason = last_msg.get("stopReason", "")
+    if stop_reason in ("error", "aborted"):
+        return None
     
     content = last_msg.get("content", [])
     if not content:
         return None
     
-    # Content is a list of content parts; get the first text part
+    # Collect ALL text-type parts in order
+    text_parts = []
     for part in content:
         if isinstance(part, dict) and part.get("type") == "text":
-            return part.get("text", "")
+            text = part.get("text", "")
+            if text:
+                text_parts.append(text)
     
-    return None
+    if not text_parts:
+        return None
+    
+    return "\n".join(text_parts)
 
 
 def _process_line(line: str, out_file, err_file, text_start_printed: list):
@@ -90,7 +109,7 @@ def _process_line(line: str, out_file, err_file, text_start_printed: list):
     if event_type == "tool_execution_start":
         tool_name = obj.get("toolName", "unknown")
         args = obj.get("args", {})
-        _print_progress(tool_name, args)
+        _print_progress(tool_name, args, err_file)
     
     elif event_type == "message_update":
         # Check for text_start event type within message_update
@@ -233,6 +252,51 @@ def main():
                 _process_line(line, sys.stdout, sys.stderr, text_start)
         if "checker: writing analysis..." in cap.stderr.getvalue():
             failures.append(f"Test 7b failed: expected dedup, marker printed twice")
+        
+        # Test 8: stopReason 'error' or 'aborted' must produce empty stdout
+        test8_error_lines = [
+            '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"test"}],"timestamp":123},{"role":"assistant","content":[{"type":"text","text":" partial text"}],"api":"test","provider":"test","model":"test","usage":{},"stopReason":"error","timestamp":123}],"willRetry":false}',
+        ]
+        test8_aborted_lines = [
+            '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"test"}],"timestamp":123},{"role":"assistant","content":[{"type":"text","text":"some text"}],"api":"test","provider":"test","model":"test","usage":{},"stopReason":"aborted","timestamp":123}],"willRetry":false}',
+        ]
+        with _Capture() as cap:
+            text_start = [False]
+            for line in test8_error_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        if cap.stdout.getvalue().strip() != "":
+            failures.append(f"Test 8a failed: stopReason='error' should produce empty stdout, got '{cap.stdout.getvalue().strip()}'")
+        with _Capture() as cap:
+            text_start = [False]
+            for line in test8_aborted_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        if cap.stdout.getvalue().strip() != "":
+            failures.append(f"Test 8b failed: stopReason='aborted' should produce empty stdout, got '{cap.stdout.getvalue().strip()}'")
+        
+        # Test 9: Multi-part text content - ALL text parts must be concatenated
+        test9_lines = [
+            '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"user query"}],"timestamp":123},{"role":"assistant","content":[{"type":"text","text":"first part"},{"type":"text","text":"second part"},{"type":"text","text":"third part"}],"api":"test","provider":"test","model":"test","usage":{},"stopReason":"stop","timestamp":123}],"willRetry":false}',
+        ]
+        with _Capture() as cap:
+            text_start = [False]
+            for line in test9_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        expected = "first part\nsecond part\nthird part"
+        if cap.stdout.getvalue().strip() != expected:
+            failures.append(f"Test 9 failed: expected '{expected}', got '{cap.stdout.getvalue().strip()}'")
+        
+        # Test 10: _print_progress must use the err_file parameter (direct call test)
+        # This directly tests the API contract violation fix
+        from io import StringIO
+        custom_err = StringIO()
+        args = {"command": "echo hello"}
+        _print_progress("bash", args, custom_err)
+        if custom_err.getvalue().strip() != "checker: bash -- echo hello":
+            failures.append(f"Test 10 failed: _print_progress must use err_file param, got '{custom_err.getvalue().strip()}'")
+        if sys.stderr is not None and hasattr(sys.stderr, 'getvalue'):
+            # Verify the print didn't go to global sys.stderr (if it was patched)
+            if "checker: bash" in sys.stderr.getvalue():
+                failures.append(f"Test 10 failed: progress printed to global sys.stderr instead of err_file param")
         
         if failures:
             for f in failures:
