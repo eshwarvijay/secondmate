@@ -582,7 +582,77 @@ if [ "${1:-}" = "--selfcheck" ]; then
   _cycle_elapsed=$(( $(date +%s) - _cycle_start ))
   rm -rf "$_cycle_test_dir"
   { [ -z "$_cycle_result" ] && [ "$_cycle_elapsed" -lt 5 ]; } || { echo "FAIL: cycle test -- result='$_cycle_result' rc=$_cycle_rc elapsed=${_cycle_elapsed}s (expected empty result within 5s)"; exit 1; }
-  
+
+  # === 5-state staleness detection selfcheck ===
+  # running_version is read from THIS worktree's actual plugin.json (live, not hardcoded)
+  running_version="$version_line"
+
+  # Helper functions for test fixtures
+  mk_marketplace() {  # mk_marketplace <dir> <version...for each sequential commit>
+    local dir="$1"; shift
+    mkdir -p "$dir/.claude-plugin"
+    git -C "$dir" init -q -b main 2>/dev/null || true
+    git -C "$dir" config user.email t@t.com 2>/dev/null
+    git -C "$dir" config user.name t 2>/dev/null
+    local v sha=""
+    for v in "$@"; do
+      printf '{"name":"secondmate","version":"%s"}\n' "$v" > "$dir/.claude-plugin/plugin.json"
+      git -C "$dir" add -A 2>/dev/null || true
+      git -C "$dir" commit -q -m "v$v" 2>/dev/null || true
+      sha=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
+    done
+    echo "$sha"
+  }
+  mk_installed_json() {  # mk_installed_json <path> <sha> <version>
+    cat > "$1" <<EOF
+{"plugins":{"secondmate@secondmate":[{"scope":"user","installPath":"/tmp/x","version":"$3","gitCommitSha":"$2"}]}}
+EOF
+  }
+
+  # Test 1: ok state -- sha and version both match
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  j="$d/plugins.json"
+  mk_installed_json "$j" "$sha" "0.1.8"
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  [ "$name" = "secondmate plugin" ] || { echo "FAIL: expected ok state, got name '$name'"; exit 1; }
+  rm -rf "$d"
+
+  # Test 2: stale state -- sha differs, version differs (marketplace ahead)
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.9")  # marketplace now has version 0.1.9
+  j="$d/plugins.json"
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.7"  # old sha, old version
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  [ "$name" = "secondmate plugin (stale)" ] || { echo "FAIL: expected stale state, got name '$name'"; exit 1; }
+  rm -rf "$d"
+
+  # Test 3: silent_drift state -- sha differs but version unchanged
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  j="$d/plugins.json"
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.8"  # old sha, same version
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  [ "$name" = "secondmate plugin (silent drift)" ] || { echo "FAIL: expected silent_drift state, got name '$name'"; exit 1; }
+  rm -rf "$d"
+
+  # Test 4: reload_pending state -- sha matches, installed_version differs from running
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  j="$d/plugins.json"
+  mk_installed_json "$j" "$sha" "0.1.7"  # same sha as marketplace (0.1.8), but version (0.1.7) != running (0.1.8)
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  [ "$name" = "secondmate plugin (reload pending)" ] || { echo "FAIL: expected reload_pending state, got name '$name'"; exit 1; }
+  rm -rf "$d"
+
+  # Test 5: missing state -- marketplace checkout doesn't exist
+  d=$(mktemp -d)
+  j="$d/plugins.json"
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.7"
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/noexist" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  [ "$name" = "secondmate plugin (marketplace)" ] || { echo "FAIL: expected missing state, got name '$name'"; exit 1; }
+  rm -rf "$d"
+
   echo ok; exit 0
 fi
 
