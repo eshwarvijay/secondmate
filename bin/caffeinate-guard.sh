@@ -19,11 +19,11 @@ _STATE_ROOT() {
   echo "${SM_CAFFEINATE_ROOT:-$HOME/.secondmate-caffeinate}"
 }
 
-# Lock directory for a task-id (used for mutual exclusion via mkdir)
-_lockdir() {
+# Atomic lock file path for a task-id (O_CREAT|O_EXCL ensures atomic create)
+_lockfile() {
   local id="$1"
   local root="$(_STATE_ROOT)"
-  echo "$root/$id.lock.d"
+  echo "$root/${id}.lock"
 }
 
 # Task-id to path component: validate strict alphanumeric with -_ only, reasonable max length
@@ -140,60 +140,39 @@ _start() {
 
   local root="$(_STATE_ROOT)"
   local pf="$(_pidfile "$task_id")"
-  local lockdir="${root}/${task_id}.lock.d"
+  local lockfile="$(_lockfile "$task_id")"
 
   # Ensure state directory exists before locking
   mkdir -p "$root"
   chmod 700 "$root"
 
-  # Atomic check-then-spawn using mkdir-based mutual exclusion (atomic on all POSIX FS)
-  # Lock dir contains a PID file to detect dead lock holders
-  local lockpidfile="$lockdir/owner.pid"
-  local locktimeout=10  # 10 second timeout to prevent hanging on stuck locks
+  # Lock timeout and start time
+  local locktimeout=10
   local lockstart=$SECONDS
 
-  while ! mkdir "$lockdir" 2>/dev/null; do
-    # Timeout protection for lock acquisition (MUST run on every iteration)
+  # Atomic lock acquisition using O_CREAT|O_EXCL via bash noclobber (set -C)
+  # This ensures the lockfile creation AND PID write happen atomically
+  # From every observer's perspective, the lockfile either exists with a PID or doesn't exist at all
+  while ! ( set -C; echo "$$" > "$lockfile" ) 2>/dev/null; do
+    # Timeout protection (runs on EVERY loop iteration)
     if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
       echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
       exit 1
     fi
-    # Lock directory exists - check for staleness by examining the PID file
-    if [ -f "$lockpidfile" ]; then
+    # Lockfile exists - check if holder is alive
+    if [ -f "$lockfile" ]; then
       local held_pid
-      held_pid="$(cat "$lockpidfile" 2>/dev/null)"
+      held_pid="$(cat "$lockfile" 2>/dev/null)"
       if [ -n "$held_pid" ] && ps -p "$held_pid" >/dev/null 2>&1; then
         # Holder is still alive - wait and retry
         sleep 0.1
         continue
       fi
-      # Holder is dead - this is a stale lock, reclaim it
-    else
-      # No owner.pid file - could be race (another process just created lockdir)
-      # or genuinely abandoned. Give a short grace period (max ~0.5s total)
-      local grace_retries=5
-      local grace_wait=0.1
-      while [ $grace_retries -gt 0 ]; do
-        sleep "$grace_wait"
-        # Check again for owner.pid after brief delay
-        if [ -f "$lockpidfile" ]; then
-          # Another process acquired the lock, wait and retry
-          break
-        fi
-        grace_retries=$((grace_retries - 1))
-      done
-      # After grace period, if still no owner.pid, it's genuinely abandoned
+      # Holder is dead - stale lock, remove it and retry
+      rm -f "$lockfile"
     fi
-    # Reclaim: remove owner.pid and rmdir the directory, then try to create fresh
-    rm -f "$lockdir/owner.pid"
-    rmdir "$lockdir" 2>/dev/null || true
-    mkdir "$lockdir" 2>/dev/null && break
-    # If race detected, continue to retry
-    sleep 0.1
+    # Retry atomic create (either never created, or we just removed stale lock)
   done
-
-  # Record our PID as the lock owner immediately after acquiring lock
-  echo "$$" > "$lockpidfile"
 
   # Re-check under lock (in case another process won the race while we waited in the loop)
   if [ -f "$pf" ]; then
@@ -205,13 +184,11 @@ _start() {
     if [ -n "$existing_pid" ] && [ -n "$existing_fingerprint" ]; then
       if _verify_pid_fingerprint "$existing_pid" "$existing_fingerprint"; then
         echo "guard already active for task '$task_id' (pid=$existing_pid), no action taken"
-        rm -f "$lockdir/owner.pid"
-        rmdir "$lockdir" 2>/dev/null || true
+        rm -f "$lockfile"
         exit 0
       else
         rm -f "$pf"
-        rm -f "$lockdir/owner.pid"
-        rmdir "$lockdir" 2>/dev/null || true
+        rm -f "$lockfile"
       fi
     fi
   fi
@@ -222,8 +199,7 @@ _start() {
     # Degraded gracefully: write a sentinel marking we know caffeinate is missing
     # This keeps the script idempotent (next call also sees it)
     echo "# caffeinate not found" > "$pf"
-    rm -f "$lockdir/owner.pid"
-    rmdir "$lockdir"
+    rm -f "$lockfile"
     exit 0
   fi
 
@@ -238,14 +214,12 @@ _start() {
   if [ -z "$fingerprint" ]; then
     echo "ERROR: failed to capture fingerprint for new caffeinate process (pid=$pid)" >&2
     kill "$pid" 2>/dev/null || true
-    rm -f "$lockdir/owner.pid"
-    rmdir "$lockdir"
+    rm -f "$lockfile"
     exit 1
   fi
   echo "$pid $fingerprint" > "$pf"
   
-  rm -f "$lockdir/owner.pid"
-  rmdir "$lockdir"
+  rm -f "$lockfile"
   echo "started guard for task '$task_id' (pid=$pid, ttl=${ttl}s)"
 }
 
@@ -277,52 +251,34 @@ _stop() {
   # This must happen BEFORE lock acquisition to avoid 10s timeout when no state exists
   [ -f "$pf" ] || { echo "no guard found for task '$task_id', nothing to stop"; exit 0; }
 
-  local lockdir="${root}/${task_id}.lock.d"
-  local lockpidfile="$lockdir/owner.pid"
+  local lockfile="$(_lockfile "$task_id")"
   local locktimeout=10
   local lockstart=$SECONDS
 
   # Acquire lock for serialization with _start
-  while ! mkdir "$lockdir" 2>/dev/null; do
+  # Use noclobber idiom (set -C) for atomic create
+  while ! ( set -C; echo "$$" > "$lockfile" ) 2>/dev/null; do
     # Timeout protection for lock acquisition (MUST run on every iteration)
     if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
       echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
       exit 1
     fi
-    if [ -f "$lockpidfile" ]; then
+    # Lockfile exists - check if holder is alive
+    if [ -f "$lockfile" ]; then
       local held_pid
-      held_pid="$(cat "$lockpidfile" 2>/dev/null)"
+      held_pid="$(cat "$lockfile" 2>/dev/null)"
       if [ -n "$held_pid" ] && ps -p "$held_pid" >/dev/null 2>&1; then
         sleep 0.1
         continue
       fi
-    else
-      # No owner.pid file - could be race (another process just created lockdir)
-      # or genuinely abandoned. Give a short grace period (max ~0.5s total)
-      local grace_retries=5
-      local grace_wait=0.1
-      while [ $grace_retries -gt 0 ]; do
-        sleep "$grace_wait"
-        # Check again for owner.pid after brief delay
-        if [ -f "$lockpidfile" ]; then
-          # Another process acquired the lock, wait and retry
-          break
-        fi
-        grace_retries=$((grace_retries - 1))
-      done
-      # After grace period, if still no owner.pid, it's genuinely abandoned
+      # Holder is dead - stale lock, remove it and retry
+      rm -f "$lockfile"
     fi
-    # Reclaim: remove owner.pid and rmdir, then try to create fresh
-    rm -f "$lockdir/owner.pid"
-    rmdir "$lockdir" 2>/dev/null || true
-    mkdir "$lockdir" 2>/dev/null && break
-    # If race detected, continue to retry
-    sleep 0.1
+    # Retry atomic create (either never created, or we just removed stale lock)
   done
-  echo "$$" > "$lockpidfile"
 
   # Idempotent: no pidfile/state -> exit 0, no error
-  [ -f "$pf" ] || { echo "no guard found for task '$task_id', nothing to stop"; rm -f "$lockdir/owner.pid"; rmdir "$lockdir" 2>/dev/null || true; exit 0; }
+  [ -f "$pf" ] || { echo "no guard found for task '$task_id', nothing to stop"; rm -f "$lockfile"; exit 0; }
 
   local line
   line="$(head -n1 "$pf" 2>/dev/null)" || line=""
@@ -333,8 +289,7 @@ _stop() {
   # Idempotent: if fingerprint doesn't match (PID recycled, process dead, etc.), treat as already stopped
   if [ -z "$pid" ] || [ -z "$fingerprint" ]; then
     rm -f "$pf"
-    rm -f "$lockdir/owner.pid"
-    rmdir "$lockdir" 2>/dev/null || true
+    rm -f "$lockfile"
     echo "guard for task '$task_id' had invalid state (empty pid/fingerprint), cleaned up"
     exit 0
   fi
@@ -343,8 +298,7 @@ _stop() {
   if ! _verify_pid_fingerprint "$pid" "$fingerprint"; then
     # Process is already gone or PID recycled -> clean up state and return success
     rm -f "$pf"
-    rm -f "$lockdir/owner.pid"
-    rmdir "$lockdir" 2>/dev/null || true
+    rm -f "$lockfile"
     echo "guard for task '$task_id' (pid=$pid) is no longer active, cleaned up state"
     exit 0
   fi
@@ -379,8 +333,7 @@ _stop() {
 
   # Clean up state
   rm -f "$pf"
-  rm -f "$lockdir/owner.pid"
-  rmdir "$lockdir" 2>/dev/null || true
+  rm -f "$lockfile"
 
   echo "stopped guard for task '$task_id' (pid=$pid verified dead)"
 }
@@ -415,7 +368,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   ps -p "$beta_pid" >/dev/null 2>&1 && { echo "FAIL: task-beta guard still running after stop"; fails=1; }
 
   # Cleanup task-alpha and task-beta lockdirs
-  rm -rf "${root}/task-alpha.lock.d" "${root}/task-beta.lock.d"
+  rm -rf "${root}/task-alpha.lock" "${root}/task-beta.lock"
 
   # Finding #2: idempotent double-stop (should exit 0, no error)
   _cg stop --task task-alpha >/dev/null || { echo "FAIL: double-stop exited non-zero"; fails=1; }
@@ -438,7 +391,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   [ "$num_states" = "1" ] || { echo "FAIL: expected 1 PID file, found $num_states (possible leak)"; fails=1; }
 
   # Cleanup task-gamma (double-start test)
-  rm -rf "${root}/task-gamma.lock.d"
+  rm -rf "${root}/task-gamma.lock"
   _cg stop --task task-gamma >/dev/null
 
   # Finding #4: identity verification catches PID recycling simulation
@@ -479,13 +432,13 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # The script checks `command -v caffeinate` and warns if not found
 
   # Finding #7: stale lock detection (dead owner doesn't block forward progress)
-  # Create a lock dir without owner PID file (using correct path format)
-  mkdir -p "${root}/task-stale.lock.d"
+  # Create a lockfile with a dead PID (simulating a crashed lock holder)
+  echo "99999" > "${root}/task-stale.lock"
   _cg start --task task-stale --ttl 60 >/dev/null || { echo "FAIL: stale lock not recovered"; fails=1; }
   # Verify a guard was actually started (pidfile exists and process is alive)
   [ -f "$root/task-stale.pid" ] || { echo "FAIL: no pidfile after stale lock recovery"; fails=1; }
   _cg stop --task task-stale >/dev/null
-  rm -rf "${root}/task-stale.lock.d"
+  rm -f "${root}/task-stale.lock"
 
   # Finding #8: stop/interleaving race protection (stop can't erase a live guard)
   # Start a long-running guard, immediately call stop which should find it and clean up properly
