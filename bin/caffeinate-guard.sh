@@ -135,7 +135,6 @@ _start() {
   # Spawn caffeinate with bounded TTL (defense-in-depth)
   # -d -i -s: display, idle, screensaver (prevent sleep on all activity)
   # -t <ttl>: bounded ceiling to ensure orphan cleanup if supervisor crashes
-  local ttl="$DEFAULT_TTL_SECONDS"
   caffeinate -d -i -s -t "$ttl" &
   local pid=$!
 
@@ -256,7 +255,14 @@ if [ "${1:-}" = "--selfcheck" ]; then
   rc=0; _cg start --ttl 1234567890123456789012345678901234567890 >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: 40-digit TTL not rejected (rc=$rc)"; fails=1; }
 
-  # Finding #6:caffeiante missing degrades gracefully (warn, exit 0)
+  # Finding #6: custom TTL value is actually applied (not overwritten by default)
+  _cg start --ttl 45 >/dev/null
+  guard_pid="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
+  actual_ttl="$(ps -p "$guard_pid" -o args= 2>/dev/null | grep -o -- '-t [0-9]*' | awk '{print $2}')"
+  [ "$actual_ttl" = "45" ] || { echo "FAIL: custom TTL 45 not applied (actual=$actual_ttl)"; fails=1; }
+  _cg stop >/dev/null
+
+  # Finding #7:caffeiante missing degrades gracefully (warn, exit 0)
   # This is tested implicitly -- on non-macOS systems it warns and continues
   # On macOS it should find caffeinate and run normally
   # We just verify the warning path exists in the script (can't simulate missing binary easily)
