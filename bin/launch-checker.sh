@@ -26,6 +26,15 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo "$out" | grep -aq 'focus verify boundary'      || { echo "FAIL: focus note not injected"; fails=1; }
   echo "$out" | grep -aq 'THIS review round'          || { echo "FAIL: live header missing"; fails=1; }
   rm -rf "$t"
+  # Verify --mode json is included (required for progress filter) and checker-progress.py is used
+  out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec -- -p q 2>&1)" || { echo "FAIL: dryrun errored for mode check"; fails=1; }
+  # args are printed one per line, so --mode and json are on separate lines
+  echo "$out" | grep -q 'ARG: --mode'                 || { echo "FAIL: --mode arg not in args"; fails=1; }
+  echo "$out" | grep -q 'ARG: json'                   || { echo "FAIL: json arg not in args"; fails=1; }
+  # checker-progress.py is NOT in the args (dryrun only shows the harness command),
+  # but it IS in the script - verify it exists and is referenced in exec
+  [ -f "$SCRIPT_DIR/checker-progress.py" ]            || { echo "FAIL: checker-progress.py not found"; fails=1; }
+  grep -q 'checker-progress.py' "$0"                || { echo "FAIL: checker-progress.py not referenced in launch-checker.sh"; fails=1; }
   [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
@@ -108,7 +117,7 @@ This reflects exactly what changed now and what the prior round concluded; it is
 $live")
 
 # Assemble the harness command (bash-3.2-safe empty-array guards).
-args=(--provider "$provider" --model "$model" --thinking "$thinking" --exclude-tools edit,write)
+args=(--provider "$provider" --model "$model" --thinking "$thinking" --exclude-tools edit,write --mode json)
 args+=(--append-system-prompt "$(cat "$base_prompt")")
 [ "${#lens_args[@]}" -gt 0 ] && args+=("${lens_args[@]}")
 [ "${#envelope_arg[@]}" -gt 0 ] && args+=("${envelope_arg[@]}")
@@ -128,5 +137,10 @@ if ! command -v "$harness" >/dev/null 2>&1; then
   exit 3
 fi
 
+# Filter pi's --mode json output: print progress to stderr (live), final review to stdout.
+progress_filter="$SCRIPT_DIR/checker-progress.py"
+
 # --exclude-tools edit,write is NOT optional: it makes the checker physically read-only.
-exec "$harness" "${args[@]}" "$@"
+# Pipe pi's JSON output through the filter; filter writes progress to stderr, final text to stdout.
+# Exit code propagation is preserved because of `set -o pipefail` at the top.
+exec "$harness" "${args[@]}" "$@" | python3 "$progress_filter"
