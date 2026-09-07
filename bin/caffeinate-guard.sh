@@ -91,6 +91,7 @@ _verify_pid_fingerprint() {
 _start() {
   local root="$(_STATE_ROOT)"
   local pf="$(_GUARD_PIDFILE)"
+  local claimfile="$root/.start.lock"
   local ttl="$DEFAULT_TTL_SECONDS"
 
   # Parse --ttl <seconds> argument if provided
@@ -115,6 +116,31 @@ _start() {
   mkdir -p "$root"
   chmod 700 "$root"
 
+  # SHORT-LOCK: wrap the critical section (check pidfile, maybe spawn, write pidfile)
+  # Use bash noclobber (set -C) for atomic O_CREAT|O_EXCL claim acquisition
+  # Timeout is brief (~2s) since the critical section itself is tiny
+  local claimstart=$SECONDS
+  local claimtimeout=2
+  while ! ( set -C; echo "$$" > "$claimfile" ) 2>/dev/null; do
+    if [ $((SECONDS - claimstart)) -ge $claimtimeout ]; then
+      echo "failed to acquire start lock within ${claimtimeout}s" >&2
+      exit 1
+    fi
+    # Claim file exists - check if holder is alive
+    if [ -f "$claimfile" ]; then
+      local held_pid
+      held_pid="$(cat "$claimfile" 2>/dev/null)"
+      if [ -n "$held_pid" ] && ps -p "$held_pid" >/dev/null 2>&1; then
+        # Holder is still alive - wait and retry
+        sleep 0.1
+        continue
+      fi
+      # Holder is dead - stale claim, remove it and retry
+      rm -f "$claimfile"
+    fi
+  done
+
+  # Now holding the claim - run the critical section
   # Idempotent: if guard already exists and is alive with matching fingerprint, no-op
   if [ -f "$pf" ]; then
     local line existing_pid existing_fingerprint
@@ -124,6 +150,7 @@ _start() {
 
     if [ -n "$existing_pid" ] && [ -n "$existing_fingerprint" ]; then
       if _verify_pid_fingerprint "$existing_pid" "$existing_fingerprint"; then
+        rm -f "$claimfile"  # Release claim before returning
         echo "guard already active (pid=$existing_pid), no action taken"
         return 0
       fi
@@ -135,6 +162,7 @@ _start() {
     echo "WARNING: caffeinate not found in PATH; sleep prevention unavailable on this system" >&2
     # Write a sentinel marking we know caffeinate is missing (keeps idempotent)
     echo "# caffeinate not found" > "$pf"
+    rm -f "$claimfile"  # Release claim
     return 0
   fi
 
@@ -151,9 +179,12 @@ _start() {
   if [ -z "$fingerprint" ]; then
     echo "ERROR: failed to capture fingerprint for new caffeinate process (pid=$pid)" >&2
     kill "$pid" 2>/dev/null || true
+    rm -f "$claimfile"  # Release claim
     return 1
   fi
   echo "$pid $fingerprint" > "$pf"
+
+  rm -f "$claimfile"  # Release claim before returning
 
   echo "started guard (pid=$pid, ttl=${ttl}s)"
 }
@@ -230,9 +261,14 @@ _stop() {
 
 if [ "${1:-}" = "--selfcheck" ]; then
   t="$(mktemp -d)"; fails=0; export SM_CAFFEINATE_ROOT="$t"; root="$t"
+  # Capture current PATH before any tests modify it
+  _CG_ORIG_PATH="$PATH"
 
   _cg() {
-    bin/caffeinate-guard.sh "$@"
+    local script_path="$SCRIPT_DIR/caffeinate-guard.sh"
+    # Use the PATH that was passed to _cg (e.g., PATH=/tmp/empty_bin _cg start)
+    # which overrides the default original PATH
+    SM_CAFFEINATE_ROOT="$t" PATH="$PATH" /bin/bash "$script_path" "$@"
   }
 
   _guard_pidfile() {
@@ -298,10 +334,52 @@ if [ "${1:-}" = "--selfcheck" ]; then
   ps -p "$guard_pid" >/dev/null 2>&1 || { echo "FAIL: guard process not actually running after start"; fails=1; }
   _cg stop >/dev/null
 
-  # Finding #8:caffeiante missing degrades gracefully (warn, exit 0)
-  # This is tested implicitly -- on non-macOS systems it warns and continues
-  # On macOS it should find caffeinate and run normally
-  # We just verify the warning path exists in the script (can't simulate missing binary easily)
+  # Finding #8: command substitution does not hang (backgrounded child stdout/stderr handled)
+  # TIME BOUNDED: must complete in <3s (TTL is 8 hours, so <3s proves no hang)
+  rm -f "$root/guard.pid"
+  start_time=$SECONDS
+  result=$(_cg start)  # Use actual command substitution like a real caller
+  elapsed=$((SECONDS - start_time))
+  [ $elapsed -le 3 ] || { echo "FAIL: start via command substitution took ${elapsed}s (should be <3s)"; fails=1; }
+  guard_pid="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
+  ps -p "$guard_pid" >/dev/null 2>&1 || { echo "FAIL: guard process not actually running after start"; fails=1; }
+  _cg stop >/dev/null
+
+  # Finding #9: concurrent starts produce exactly ONE guard (no orphan processes)
+  # Run 20 parallel starts (simulating multiple tasks calling start redundantly)
+  for i in $(seq 1 20); do
+    _cg start >/dev/null &
+  done
+  wait  # Wait for all parallel starts to complete
+  # Verify exactly ONE guard process is running
+  # Use ps to check for caffeinate processes (more portable than pgrep)
+  num_guards=$(ps aux | grep '[c]affeinate -d -i -s' | wc -l | tr -d ' ')
+  [ "$num_guards" = "1" ] || { echo "FAIL: expected 1 guard process, found $num_guards"; fails=1; }
+  # Verify the guard.pid has exactly one entry
+  num_entries=$(wc -l < "$root/guard.pid" | tr -d ' ')
+  [ "$num_entries" = "1" ] || { echo "FAIL: guard.pid has $num_entries lines, expected 1"; fails=1; }
+  _cg stop >/dev/null
+
+  # Finding #10: caffeinate missing degrades gracefully (warn, exit 0)
+  # Build an allowlist PATH containing ONLY the coreutils this script needs, deliberately
+  # excluding caffeinate -- excluding a whole real directory (e.g. /usr/bin) breaks the
+  # script's OWN dependencies on macOS, since caffeinate lives alongside dirname/awk/etc there.
+  fake_bin="$(mktemp -d)"
+  for tool in bash dirname awk sed head ps kill mkdir chmod rm sleep cat wc grep tr seq env; do
+    tool_path="$(command -v "$tool" 2>/dev/null)"
+    [ -n "$tool_path" ] && ln -s "$tool_path" "$fake_bin/$tool"
+  done
+  rm -f "$root/guard.pid"
+  PATH="$fake_bin" bash "$SCRIPT_DIR/caffeinate-guard.sh" start > /tmp/cg10-out.txt 2>&1
+  rc10=$?
+  [ "$rc10" = 0 ] || { echo "FAIL: start with missing binary should exit 0 (rc=$rc10)"; fails=1; }
+  grep -q 'caffeinate not found' /tmp/cg10-out.txt || { echo "FAIL: should warn caffeinate not found"; fails=1; }
+  [ -f "$root/guard.pid" ] || { echo "FAIL: should write sentinel"; fails=1; }
+  head -n1 "$root/guard.pid" | grep -q '# caffeinate not found' || { echo "FAIL: sentinel content wrong"; fails=1; }
+  PATH="$fake_bin" bash "$SCRIPT_DIR/caffeinate-guard.sh" start > /tmp/cg10-out2.txt 2>&1
+  [ "$?" = 0 ] || { echo "FAIL: second start with missing binary should exit 0"; fails=1; }
+  rm -f "$root/guard.pid" /tmp/cg10-out.txt /tmp/cg10-out2.txt
+  rm -rf "$fake_bin"
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
