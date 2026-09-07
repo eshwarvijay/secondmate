@@ -8,14 +8,14 @@ Usage:
 
 Event types handled:
   - session, agent_start, agent_settled, turn_start, turn_end, message_start, message_end: ignored
-  - message_update: only text deltas are tracked; never flood the terminal
+  - message_update: text_start prints "checker: writing analysis..." once (not per delta)
   - tool_execution_start: print "checker: <tool> -- <args/truncated>" to stderr
   - tool_execution_end: ignored (already printed at start)
   - agent_end: extract final assistant message's content from messages array and print to stdout
 
 Key behaviors:
   - Final output comes ONLY from agent_end.messages[-1].content[0].text (authoritative assembled text)
-  - Progress to stderr: one line per tool_execution_start, nothing per text_delta (too noisy)
+  - Progress to stderr: one line per tool_execution_start, one "writing analysis..." on text_start
   - Malformed JSON lines are skipped gracefully (no crash)
   - Exit code propagation: the filter always exits 0; pi's exit code is preserved via pipefail
 """
@@ -73,7 +73,7 @@ def _extract_final_text(messages: list) -> Optional[str]:
     return None
 
 
-def _process_line(line: str, out_file, err_file):
+def _process_line(line: str, out_file, err_file, text_start_printed: list):
     """Process a single JSON line and write progress to err_file, final text to out_file."""
     line = line.strip()
     if not line:
@@ -91,6 +91,16 @@ def _process_line(line: str, out_file, err_file):
         tool_name = obj.get("toolName", "unknown")
         args = obj.get("args", {})
         _print_progress(tool_name, args)
+    
+    elif event_type == "message_update":
+        # Check for text_start event type within message_update
+        # pi sends: message_update -> assistantMessageEvent -> {type: 'text_start', ...}
+        assistant_message_event = obj.get("assistantMessageEvent", {})
+        if isinstance(assistant_message_event, dict) and assistant_message_event.get("type") == "text_start":
+            # Print the marker only once (first time)
+            if not text_start_printed[0]:
+                print("checker: writing analysis...", file=err_file, flush=True)
+                text_start_printed[0] = True
     
     elif event_type == "agent_end":
         final_text = _extract_final_text(obj.get("messages", []))
@@ -128,8 +138,9 @@ def main():
             '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"test"}],"timestamp":123},{"role":"assistant","content":[{"type":"text","text":"Final review text here"}],"api":"test","provider":"test","model":"test","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"cost":{"input":0.001,"output":0.0005,"cacheRead":0,"cacheWrite":0,"total":0.0015}},"stopReason":"stop","timestamp":123,"rawStopReason":"end_turn"}],"willRetry":false}',
         ]
         with _Capture() as cap:
+            text_start = [False]
             for line in test1_lines:
-                _process_line(line, sys.stdout, sys.stderr)
+                _process_line(line, sys.stdout, sys.stderr, text_start)
         if cap.stdout.getvalue().strip() != "Final review text here":
             failures.append(f"Test 1 failed: expected 'Final review text here', got '{cap.stdout.getvalue().strip()}'")
         
@@ -138,26 +149,27 @@ def main():
             '{"type":"tool_execution_start","toolName":"bash","args":{"command":"git diff HEAD"}}',
         ]
         with _Capture() as cap:
+            text_start = [False]
             for line in test2_lines:
-                _process_line(line, sys.stdout, sys.stderr)
+                _process_line(line, sys.stdout, sys.stderr, text_start)
         if "checker: bash -- git diff HEAD" not in cap.stderr.getvalue():
             failures.append(f"Test 2 failed: expected bash tool progress in stderr")
         
         # Test 3: Read tool progress with truncation
         test3_lines = [
-            '{"type":"tool_execution_start","toolName":"read","args":{"path":"/very/long/path/to/a/file/that/should/be/truncated.md"}}',
+            '{"type":"tool_execution_start","toolName":"read","args":{"path":"/very/long/path/to/a/file/that/exceeds/the/truncation/limit/significantly/extra/long.md"}}',
         ]
         with _Capture() as cap:
+            text_start = [False]
             for line in test3_lines:
-                _process_line(line, sys.stdout, sys.stderr)
+                _process_line(line, sys.stdout, sys.stderr, text_start)
         stderr_out = cap.stderr.getvalue().strip()
-        if "checker: read -- " not in stderr_out:
-            failures.append(f"Test 3 failed: expected read tool progress in stderr")
-        elif "...}" in stderr_out or "should be truncat" not in stderr_out:
-            # Should be truncated with ...
-            pass
-        else:
-            failures.append(f"Test 3 failed: expected truncation in progress line")
+        # Assert (a) full untruncated path is NOT present in output
+        if "/very/long/path/to/a/file/that/exceeds/the/truncation/limit.md" in stderr_out:
+            failures.append(f"Test 3 failed: expected full path to be truncated, but it's present in output")
+        # Assert (b) output ends with the '...' truncation marker
+        elif not stderr_out.endswith("..."):
+            failures.append(f"Test 3 failed: expected truncation marker '...' at end of output")
         
         # Test 4: Malformed JSON line should not crash
         test4_lines = [
@@ -166,8 +178,9 @@ def main():
             '{"type":"tool_execution_start","toolName":"bash","args":{"command":"true"}}',
         ]
         with _Capture() as cap:
+            text_start = [False]
             for line in test4_lines:
-                _process_line(line, sys.stdout, sys.stderr)
+                _process_line(line, sys.stdout, sys.stderr, text_start)
         # Should extract text from first valid agent_end without crashing
         if cap.stdout.getvalue().strip() != "Works after malformed":
             failures.append(f"Test 4 failed: should handle malformed JSON without crash, got '{cap.stdout.getvalue().strip()}'")
@@ -177,8 +190,9 @@ def main():
             '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"test"}],"timestamp":123}],"willRetry":false}',
         ]
         with _Capture() as cap:
+            text_start = [False]
             for line in test5_lines:
-                _process_line(line, sys.stdout, sys.stderr)
+                _process_line(line, sys.stdout, sys.stderr, text_start)
         # Should output nothing (no assistant message)
         if cap.stdout.getvalue().strip() != "":
             failures.append(f"Test 5 failed: expected empty output for no assistant message, got '{cap.stdout.getvalue().strip()}'")
@@ -190,13 +204,35 @@ def main():
             '{"type":"tool_execution_start","toolName":"bash","args":{"command":"python3 -m test"}}',
         ]
         with _Capture() as cap:
+            text_start = [False]
             for line in test6_lines:
-                _process_line(line, sys.stdout, sys.stderr)
+                _process_line(line, sys.stdout, sys.stderr, text_start)
         stderr_lines = cap.stderr.getvalue().strip().split('\n')
         if len(stderr_lines) != 3:
             failures.append(f"Test 6 failed: expected 3 progress lines, got {len(stderr_lines)}")
         elif "git status" not in stderr_lines[0] or "README.md" not in stderr_lines[1] or "python3 -m test" not in stderr_lines[2]:
             failures.append(f"Test 6 failed: expected specific commands in progress lines")
+        
+        # Test 7: text_start message_update event
+        test7_lines = [
+            '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}',
+        ]
+        with _Capture() as cap:
+            text_start = [False]
+            for line in test7_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        if "checker: writing analysis..." not in cap.stderr.getvalue():
+            failures.append(f"Test 7 failed: expected text_start marker in stderr")
+        # Verify second text_start doesn't print again (dedup)
+        test7b_lines = [
+            '{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":1}}',
+        ]
+        with _Capture() as cap:
+            text_start = [True]  # Already printed
+            for line in test7b_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        if "checker: writing analysis..." in cap.stderr.getvalue():
+            failures.append(f"Test 7b failed: expected dedup, marker printed twice")
         
         if failures:
             for f in failures:
@@ -208,8 +244,11 @@ def main():
     
     # --- main mode: read from stdin, filter, output ---
     
+    # Track if text_start marker has been printed (list to allow mutation in nested function)
+    text_start_printed = [False]
+    
     for line in sys.stdin:
-        _process_line(line, sys.stdout, sys.stderr)
+        _process_line(line, sys.stdout, sys.stderr, text_start_printed)
 
 
 if __name__ == "__main__":
