@@ -50,11 +50,18 @@ def _extract_final_text(messages: list) -> Optional[str]:
     """Extract the final assistant message's text content from agent_end messages array.
     
     Returns None if:
-    - No assistant message found
+    - No assistant message found at all
     - The assistant message has stopReason 'error' or 'aborted'
-    - No text content found
+    - No text content found (no text-type parts)
     
-    Collects ALL text-type content parts in order and joins with newlines.
+    Returns empty string ('') if:
+    - Assistant message found but has zero text-type content parts (empty content array)
+    
+    Returns joined string otherwise (may include empty strings from text parts).
+    
+    This distinction is important: pi's --mode text prints a newline for each text part,
+    including empty ones. So we need to distinguish 'no message' (print nothing) from
+    'message with empty text content' (print empty line matching pi's behavior).
     """
     if not messages:
         return None
@@ -76,7 +83,9 @@ def _extract_final_text(messages: list) -> Optional[str]:
     
     content = last_msg.get("content", [])
     if not content:
-        return None
+        # Assistant message exists but has no content at all -> return empty string
+        # This will print a newline when joined (empty string + newline = just newline)
+        return ""
     
     # Collect ALL text-type parts in order, INCLUDING empty strings (pi's real --mode text behavior).
     # pi's --mode text prints EVERY text-type content part including empty ones (content.text + newline, unconditionally).
@@ -88,7 +97,9 @@ def _extract_final_text(messages: list) -> Optional[str]:
             text_parts.append(text)  # Include ALL parts, even empty strings
     
     if not text_parts:
-        return None
+        # Assistant message exists but has no text-type parts -> return empty string
+        # This will print a newline when joined
+        return ""
     
     return "\n".join(text_parts)
 
@@ -124,7 +135,9 @@ def _process_line(line: str, out_file, err_file, text_start_printed: list):
     
     elif event_type == "agent_end":
         final_text = _extract_final_text(obj.get("messages", []))
-        if final_text:
+        # Print when we found an assistant message (even if text is empty string)
+        # This matches pi's --mode text behavior: it prints a newline for each text part
+        if final_text is not None:
             print(final_text, file=out_file, flush=True)
 
 
@@ -349,6 +362,21 @@ def main():
             failures.append(f"Test 11 failed: expected 3 lines (with one empty), got {len(lines)} lines: {lines}")
         elif lines[0] != "a" or lines[1] != "" or lines[2] != "b":
             failures.append(f"Test 11 failed: expected ['a', '', 'b'], got {lines}")
+        
+        # Test 12: Single empty text part must produce exactly one newline (pi's --mode text behavior)
+        # When content has one empty text part, [""].join("") = "", and print("") adds newline
+        # Expected: exactly one newline character (0x0a), not empty output
+        test12_lines = [
+            '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"user query"}],"timestamp":123},{"role":"assistant","content":[{"type":"text","text":""}],"api":"test","provider":"test","model":"test","usage":{},"stopReason":"stop","timestamp":123}],"willRetry":false}',
+        ]
+        with _Capture() as cap:
+            text_start = [False]
+            for line in test12_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        # Should output exactly one newline (print("".flush() adds '\n')
+        stdout_content = cap.stdout.getvalue()
+        if stdout_content != "\n":
+            failures.append(f"Test 12 failed: expected exactly one newline, got {repr(stdout_content)}")
         
         if failures:
             for f in failures:

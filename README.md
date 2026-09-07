@@ -197,7 +197,8 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
   && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
   && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck \
-  && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && echo ALL_OK
+  && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
+  && echo ALL_OK
 claude plugin validate .
 ```
 

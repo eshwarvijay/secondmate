@@ -104,16 +104,18 @@ Each stage exists to close a specific failure mode.
 
 4. **Check.** The diff is trimmed with `prune-output.sh` (model-free head/tail truncation), then
    `launch-checker.sh` runs the cross-model, edit-locked checker with the verdict-envelope contract injected.
-   On `fail`: the supervisor reads findings, synthesizes a concrete fix plan, and routes it to the
-   **task-scoped maker agent** (`sm-pi-<task-id>` or `sm-<task-id>`) — never fixes inline. The supervisor
-   never writes project code. On `error`/`refused`: fix the checker invocation or escalate; do not loop back
-   to the maker. Every fix round re-runs Check with refreshed `--live-text` and a unique round marker.
-   The checker must end with a machine-readable block:
+   `launch-checker.sh` invokes `pi` with `--mode json` (after caller args, so caller's `--mode text` cannot override)
+   and pipes the output through `checker-progress.py` to filter progress to stderr (live tool execution updates)
+   while forwarding the final review text to stdout. The checker's final output must end with a machine-readable block:
    ```json
    {"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"..."}
    ```
    `verdict.py` parses it and exits `0` / `1` / `2`. The supervisor branches on the exit code, never on the
-   checker's prose. If no checker harness is installed, `launch-checker.sh` signals `SM_NO_CHECKER_HARNESS` and
+   checker's prose. On `fail`: the supervisor reads findings, synthesizes a concrete fix plan, and routes it to the
+   **task-scoped maker agent** (`sm-pi-<task-id>` or `sm-<task-id>`) — never fixes inline. The supervisor
+   never writes project code. On `error`/`refused`: fix the checker invocation or escalate; do not loop back
+   to the maker. Every fix round re-runs Check with refreshed `--live-text` and a unique round marker.
+   If no checker harness is installed, `launch-checker.sh` signals `SM_NO_CHECKER_HARNESS` and
    the supervisor falls back to a second Claude model as the checker, in-session: weaker (same vendor) but the
    maker is still not the checker, and the verdict is still machine-read. After every verdict, `log-round.sh`
    appends one structured record (task, round, maker kind, verdict, caller-supplied finding-category tags,
@@ -275,6 +277,7 @@ Each stage exists to close a specific failure mode.
 | `bin/run-round.sh` | timeout + idle watchdog + audit (used by planners + maker + checker) |
 | `bin/loop-guard.sh` | stuck-loop abort + round/spawn caps |
 | `bin/launch-checker.sh` + `bin/checker-envelope.md` | edit-locked cross-model checker + verdict contract |
+| `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
 | `bin/hold.py` | durable human-gate decisions |
