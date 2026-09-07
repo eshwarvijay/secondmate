@@ -79,9 +79,10 @@ if [ -f "$plugin_json" ]; then
 fi
 
 # secondmate plugin staleness detection constants
-_marketplace_checkout="$HOME/.claude/plugins/marketplaces/secondmate"
-_installed_plugins_json="$HOME/.claude/plugins/installed_plugins.json"
-_doctor_lock_dir="$HOME/.secondmate-doctor-lock"
+# SM_* env vars allow overrides (for testing). Default to real paths if unset.
+_marketplace_checkout="${SM_SECONDMATE_MARKETPLACE_DIR:-$HOME/.claude/plugins/marketplaces/secondmate}"
+_installed_plugins_json="${SM_INSTALLED_PLUGINS_JSON:-$HOME/.claude/plugins/installed_plugins.json}"
+_doctor_lock_dir="${SM_DOCTOR_LOCK_DIR:-$HOME/.secondmate-doctor-lock}"
 _doctor_lock_file="$_doctor_lock_dir/secondmate-heal.lock"
 
 # get current running script's git commit SHA (from its own marketplace checkout)
@@ -129,9 +130,10 @@ _detect_secondmate_status() {
     return
   fi
   
-  # Extract the installed secondmate SHA from installed_plugins.json
+  # Extract the installed secondmate SHA and version from installed_plugins.json
   local installed_sha=""
-  installed_sha=$(python3 -c "
+  local installed_version=""
+  read -r installed_sha installed_version < <(python3 -c "
 import json,sys
 try:
     data=json.load(open(sys.argv[1]))
@@ -143,7 +145,9 @@ try:
                 for entry in entries:
                     if isinstance(entry, dict):
                         if key.startswith('secondmate@'):
-                            print(entry.get('gitCommitSha', ''))
+                            sha = entry.get('gitCommitSha', '')
+                            ver = entry.get('version', '')
+                            print(sha, ver)
                             sys.exit(0)
 except Exception as e:
     import sys
@@ -151,7 +155,7 @@ except Exception as e:
     pass
 print('', end='')
 sys.exit(1)
-" "$_installed_plugins_json" 2>/dev/null) || installed_sha=""
+" "$_installed_plugins_json" 2>/dev/null) || { installed_sha=""; installed_version=""; }
   [ -z "$installed_sha" ] && { _sm_status="unknown"; _sm_details="secondmate not found in installed_plugins.json"; return; }
   
   # Get marketplace plugin.json version
@@ -167,13 +171,23 @@ sys.exit(1)
     running_version=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$plugin_json" 2>/dev/null || true)
   fi
   
-  # Compare SHAs
+  # Compare SHAs - mutually exclusive states
   if [ "$marketplace_sha" = "$installed_sha" ]; then
-    _sm_status="ok"
-    _sm_details="installed and marketplace SHAs match"
+    # SHA matches - check if version matches (ok) or version differs (reload_pending)
+    if [ "$running_version" = "$installed_version" ]; then
+      _sm_status="ok"
+      _sm_details="installed and marketplace SHAs match, version in sync"
+    else
+      # Installed SHA matches marketplace SHA, but version differs
+      # This means the plugin was already healed (claude plugin update ran),
+      # but /reload-plugins hasn't been run yet to pick up the new version
+      _sm_status="reload_pending"
+      _sm_details="heal completed but /reload-plugins not yet run"
+    fi
   else
-    # SHA differs — check if version also changed (silent drift)
-    if [ "$marketplace_version" = "$running_version" ]; then
+    # SHA differs — installed is behind marketplace
+    # Check if running version differs from marketplace version to distinguish stale vs silent_drift
+    if [ "$running_version" = "$marketplace_version" ]; then
       # Version didn't change but SHA differs — silent drift
       _sm_status="silent_drift"
       _sm_details="new commits but version unchanged (claude plugin update won't act)"
@@ -182,13 +196,6 @@ sys.exit(1)
       _sm_status="stale"
       _sm_details="marketplace ahead of installed (sha $installed_sha -> $marketplace_sha)"
     fi
-  fi
-  
-  # Check for reload pending: currently running version differs from latest in installed_plugins.json
-  if [ "$running_version" != "$marketplace_version" ]; then
-    # If version differs, that means /reload-plugins hasn't been run yet
-    _sm_status="reload_pending"
-    _sm_details="heal completed but /reload-plugins not yet run"
   fi
 }
 
