@@ -92,12 +92,14 @@ if [ -d "$_marketplace_checkout" ] && git -C "$_marketplace_checkout" rev-parse 
   _running_script_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null || true)
 fi
 
-ROWS=""; core_missing=0; checker_missing=0
+ROWS=""; core_missing=0; checker_missing=0; stale_count=0
 add() { # status name category fix
   ROWS+="$1|$2|$3|$4"$'\n'
   if [ "$1" = MISSING ]; then
     [ "$3" = core ] && core_missing=$((core_missing + 1))
     [ "$3" = checker ] && checker_missing=$((checker_missing + 1))
+  elif [ "$1" = STALE ]; then
+    stale_count=$((stale_count + 1))
   fi
 }
 
@@ -265,6 +267,7 @@ _acquire_heal_lock() {
         
         # Bug 5 fix: Extract stale check into helper for deterministic testing
         # and TOCTOU-safe re-verification (pass original timestamp and pid)
+        # Bug 6 fix: _is_lock_still_stale now also checks if PID is alive before stealing
         if _is_lock_still_stale "$lock_timestamp" "$max_wait" "$lock_pid"; then
           # Stale lock, try to steal it
           rm -rf "$_doctor_lock_file" 2>/dev/null
@@ -321,6 +324,18 @@ _is_lock_still_stale() {
   local lock_age
   lock_age=$(( $(date +%s) - current_timestamp ))
   [ "$lock_age" -gt "$max_wait" ] || return 1
+  
+  # Bug 6 fix: Before treating as stale, verify the PID is actually dead
+  # A lock with an old timestamp but a LIVING process is NOT stale
+  # The PID file should contain a single numeric PID
+  if [ -n "$current_pid" ] && [ "$current_pid" -eq "$current_pid" ] 2>/dev/null; then
+    # PID is numeric - check if process is alive using kill -0 (doesn't actually send signal)
+    if kill -0 "$current_pid" 2>/dev/null; then
+      # Process is alive, so lock is NOT stale (process is still working)
+      return 1
+    fi
+  fi
+  # PID is missing, non-numeric, or confirmed dead - treat as stale
   
   # Still stale after re-verification
   return 0
@@ -501,9 +516,9 @@ sys.exit(1)
 " "$_installed_plugins_json" 2>/dev/null)
   
   if [ -z "$after_sha" ]; then
-    echo "[WARN] cannot verify heal - secondmate not found in installed_plugins.json"
-    echo "       but plugin update may have succeeded"
-    return 0
+    echo "[FAIL] cannot verify heal - secondmate not found in installed_plugins.json"
+    echo "       plugin update may have failed or corrupted the file"
+    return 1
   fi
   
   local after_version
@@ -583,7 +598,7 @@ emit_table() {
   fi
   while IFS='|' read -r st name cat fix; do
     [ -z "$name" ] && continue
-    local mark="[ok]"; [ "$st" = MISSING ] && mark="[!!]"
+    local mark="[ok]"; [ "$st" != OK ] && mark="[!!]"
     printf '%-4s %-38s %-9s %s\n' "$mark" "$name" "$cat" "$fix"
   done <<< "$ROWS"
   echo "----------------------------------------------------------------------"
@@ -591,6 +606,7 @@ emit_table() {
   echo "      (defaults: amazon-bedrock GPT-5.6 / DeepSeek-R1). Set SM_CHECKER_* / SM_REASON_* to yours."
   if [ "$core_missing" -gt 0 ]; then echo "STATUS: not ready. $core_missing core missing. Run: doctor.sh --heal"
   elif [ "$checker_missing" -gt 0 ]; then echo "STATUS: ready via in-session Claude fallback. No external checker harness found; install one (doctor.sh --heal) for a stronger cross-vendor check."
+  elif [ "$stale_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin needs healing (doctor.sh --heal)"
   else echo "STATUS: ready (core plus checker harness present)"; fi
 }
 
