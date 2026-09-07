@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.7-4C8BF5?style=flat-square" alt="version 0.1.7" />
+  <img src="https://img.shields.io/badge/version-0.1.8-4C8BF5?style=flat-square" alt="version 0.1.8" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -84,8 +84,9 @@ flowchart LR
 | `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, keyed by the worktree's realpath; refuses to mark anything but an isolated linked worktree (never the primary checkout) |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
-| `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract |
+| `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract; streams pi's `--mode json` output through `checker-progress.py` for live progress visibility |
 | `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused |
+| `bin/checker-progress.py` | Filter pi's `--mode json` output: prints one progress line per tool execution to stderr (live activity), extracts final assistant message text from `agent_end` and writes to stdout (exactly as `--mode text` would); handles malformed JSON lines gracefully; preserves exit code propagation via pipefail
 | `bin/loop-guard.sh` | Stuck-loop abort + per-run round cap + global spawn cap |
 | `bin/run-round.sh` | Wall-clock timeout + idle watchdog + paired audit record (even on kill) |
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
@@ -196,7 +197,8 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
   && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
   && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck \
-  && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && echo ALL_OK
+  && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
+  && echo ALL_OK
 claude plugin validate .
 ```
 
