@@ -186,13 +186,16 @@ sys.exit(1)
     fi
   else
     # SHA differs — installed is behind marketplace
-    # Check if running version differs from marketplace version to distinguish stale vs silent_drift
-    if [ "$running_version" = "$marketplace_version" ]; then
-      # Version didn't change but SHA differs — silent drift
+    # Compare installed_version against marketplace_version (not running_version)
+    # to determine if a real version bump occurred:
+    # - if installed_version != marketplace_version: stale (healable bump happened)
+    # - if installed_version == marketplace_version: silent_drift (no bump, healing won't help)
+    if [ "$installed_version" = "$marketplace_version" ]; then
+      # Version didn't change since installation but SHA differs — silent drift
       _sm_status="silent_drift"
       _sm_details="new commits but version unchanged (claude plugin update won't act)"
     else
-      # Both SHA and version changed — stale and can be healed
+      # Version changed since installation — stale and can be healed
       _sm_status="stale"
       _sm_details="marketplace ahead of installed (sha $installed_sha -> $marketplace_sha)"
     fi
@@ -238,25 +241,37 @@ _acquire_heal_lock() {
   
   mkdir -p "$_doctor_lock_dir"
   
-  while [ ! -d "$_doctor_lock_file" ]; do
-    if mkdir "$_doctor_lock_file" 2>/dev/null; then
-      # Lock acquired, write our PID
-      echo "$$" > "$_doctor_lock_file/.pid"
-      echo "$(date +%s)" > "$_doctor_lock_file/.timestamp"
-      return 0
-    fi
-    
-    # Check if lock is stale (older than max_wait)
-    if [ -f "$_doctor_lock_file/.timestamp" ]; then
-      local lock_age
-      lock_age=$(( $(date +%s) - $(cat "$_doctor_lock_file/.timestamp" 2>/dev/null || echo $max_wait) ))
-      if [ "$lock_age" -gt "$max_wait" ]; then
-        # Stale lock, try to steal it
-        rm -rf "$_doctor_lock_file" 2>/dev/null
-        continue
+  while true; do  # Loop forever until we acquire lock or timeout
+    # First, check if lock directory exists
+    if [ ! -d "$_doctor_lock_file" ]; then
+      # Lock doesn't exist, try to acquire it
+      if mkdir "$_doctor_lock_file" 2>/dev/null; then
+        # Lock acquired, write our PID
+        echo "$$" > "$_doctor_lock_file/.pid"
+        echo "$(date +%s)" > "$_doctor_lock_file/.timestamp"
+        return 0
       fi
+      # mkdir failed - someone else got it first (race condition)
+    else
+      # Lock directory exists, check if it's stale
+      if [ -f "$_doctor_lock_file/.timestamp" ]; then
+        local lock_age
+        lock_age=$(( $(date +%s) - $(cat "$_doctor_lock_file/.timestamp" 2>/dev/null || echo 0) ))
+        if [ "$lock_age" -gt "$max_wait" ]; then
+          # Stale lock, try to steal it
+          rm -rf "$_doctor_lock_file" 2>/dev/null
+          continue  # Retry (lock is gone now)
+        fi
+      fi
+      # Lock exists and is not stale, OR we couldn't read timestamp
+      # This means another heal is actively running (not stale)
+      echo "heal cancelled: another heal is already in progress" >&2
+      return 1
     fi
     
+    # We didn't acquire the lock this iteration, wait and retry
+    # Only wait if we're in the "race condition" case (mkdir failed, lock gained in between)
+    # For lock-exists-not-stale case, we already returned above
     sleep "$wait_interval"
     elapsed=$((elapsed + wait_interval))
     if [ "$elapsed" -ge "$max_wait" ]; then
@@ -264,10 +279,6 @@ _acquire_heal_lock() {
       return 1
     fi
   done
-  
-  # If we got here, the lock directory already exists (someone else got it)
-  echo "heal cancelled: another heal is already in progress" >&2
-  return 1
 }
 
 _release_heal_lock() {
@@ -364,16 +375,36 @@ _heal_secondmate() {
   echo "[OK] marketplace checkout updated"
   
   # Check if claude plugin update would actually do something
-  local current_version new_version
-  current_version=$(python3 -c "import json,sys; d=json.load(open('$plugin_json')); print(d.get('version',''))" 2>/dev/null || true)
-  new_version=$(python3 -c "import json,sys; d=json.load(open('$_marketplace_checkout/.claude-plugin/plugin.json')); print(d.get('version',''))" 2>/dev/null || true)
+  # Use installed_version (from installed_plugins.json) not current_version
+  local installed_version new_version
+  installed_version=$(python3 -c "
+import json,sys
+try:
+    data=json.load(open(sys.argv[1]))
+    plugins=data.get('plugins',{})
+    if isinstance(plugins,dict):
+        for key,entries in plugins.items():
+            if isinstance(entries,list) and len(entries)>0 and isinstance(entries[0],dict):
+                if key.startswith('secondmate@'):
+                    print(entries[0].get('version',''))
+                    sys.exit(0)
+except Exception as e:
+    pass
+print('',end='')
+sys.exit(1)
+" "$_installed_plugins_json" 2>/dev/null || true)
+  new_version=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$_marketplace_checkout/.claude-plugin/plugin.json" 2>/dev/null || true)
   
-  if [ "$current_version" = "$new_version" ]; then
+  if [ "$installed_version" = "$new_version" ]; then
     echo "[SKIP] claude plugin update is not applicable (version unchanged)"
     echo "       new commits exist but version string was not bumped"
     echo "       run 'claude plugin update secondmate@secondmate' manually to force"
     return 0
   fi
+  
+  # Get running version for display purposes (unchanged, still used in output)
+  local current_version
+  current_version=$(python3 -c "import json,sys; print(json.load(open('$plugin_json')).get('version',''))" 2>/dev/null || true)
   
   # Run the actual plugin update
   if [ "$yes" = 1 ]; then
@@ -437,10 +468,13 @@ sys.exit(1)
   local after_version
   after_version=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('version',''))" "$_installed_plugins_json" 2>/dev/null || true)
   
-  if [ "$after_sha" != "$local_sha" ]; then
+  if [ "$after_sha" = "$remote_sha" ]; then
     echo "[OK] SHA advanced: $local_sha -> $after_sha (version: $current_version -> $after_version)"
   else
-    echo "[WARN] SHA unchanged after heal - plugin may not have reinstalled properly"
+    echo "[WARN] SHA did not advance to expected value
+       expected: $remote_sha
+       got:      $after_sha"
+    return 1
   fi
   
   # Print the reload reminder
@@ -919,6 +953,8 @@ STUB_EOF
   rm -rf "$d" "$origin_dir" "$stub_dir"
 
   # === Test C: lock contention (pre-created lock directory blocks _acquire_heal_lock) ===
+  # Note: With Bug 3 fix, a non-stale lock will now fail immediately (correct behavior)
+  # because we now check staleness even when lock already exists (fixing the TOCTOU bug)
   d=$(mktemp -d)
   lock_dir="$d/lock"
   lock_file="$lock_dir/secondmate-heal.lock"
@@ -937,18 +973,173 @@ STUB_EOF
   out=$(_acquire_heal_lock 2>&1)
   rc=$?
   
-  # Restore original
   _doctor_lock_dir="$_old_lock_dir"
 
-  # Assert: returns non-zero (lock contention)
+  # Assert: returns non-zero (lock contention - lock exists and not stale)
   [ "$rc" -ne 0 ] || { echo "FAIL: Test C lock contention test expected non-zero rc, got $rc"; rm -rf "$d"; exit 1; }
 
-  # Assert: error message indicates lock contention
+  # Assert: error message indicates lock contention (lock was not stale, so fail immediately)
   echo "$out" | grep -q "another heal is already in progress" || { echo "FAIL: Test C lock contention test: expected lock contention error message"; echo "output: $out" >&2; rm -rf "$d"; exit 1; }
 
   # Verify lock directory contents were not corrupted (still has .pid and .timestamp)
   [ -f "$lock_file/.pid" ] || { echo "FAIL: Test C lock contention test: .pid file missing after contention"; rm -rf "$d"; exit 1; }
   [ -f "$lock_file/.timestamp" ] || { echo "FAIL: Test C lock contention test: .timestamp file missing after contention"; rm -rf "$d"; exit 1; }
+
+  rm -rf "$d"
+
+  # === Test D1 (Bug 1 fix): marketplace checkout with real version bump should report "stale", not "silent_drift"
+  # This reproduces the realistic scenario from the issue description:
+  # - marketplace checkout has gone from 0.1.8 to 0.1.9 via local commits (no remote needed)
+  # - installed_plugins.json still has the old sha/version (0.1.8)
+  # - Running doctor.sh from within that same marketplace checkout should report "stale"
+  #   (because a real version bump occurred), NOT "silent_drift"
+  d=$(mktemp -d)
+  mkt_dir="$d/mkt"
+  j="$d/plugins.json"
+
+  # Create marketplace checkout with version 0.1.8
+  mkdir -p "$mkt_dir/.claude-plugin"
+  git -C "$mkt_dir" init -q -b main 2>/dev/null || true
+  git -C "$mkt_dir" config user.email t@t.com 2>/dev/null
+  git -C "$mkt_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$mkt_dir/.claude-plugin/plugin.json"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  old_sha=$(git -C "$mkt_dir" rev-parse HEAD)
+
+  # Advance locally with version 0.1.9 (no remote needed - this is the key scenario)
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$mkt_dir/.claude-plugin/plugin.json"
+  echo "new content" >> "$mkt_dir/readme.md"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+  new_sha=$(git -C "$mkt_dir" rev-parse HEAD)
+
+  # installed_plugins.json has the old sha/version
+  mk_installed_json "$j" "$old_sha" "0.1.8"
+
+  # Run doctor.sh --json with the marketplace checkout as the running script location
+  # The plugin_json inside the script points to $mkt_dir/.claude-plugin/plugin.json
+  # which now has version 0.1.9 (same as marketplace)
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  
+  # The bug would say "silent_drift" because running_version == marketplace_version
+  # The fix should say "stale" because installed_version != marketplace_version
+  [ "$name" = "secondmate plugin (stale)" ] || { echo "FAIL: Test D1 bug1 fix: expected 'secondmate plugin (stale)', got '$name'"; rm -rf "$d"; exit 1; }
+  
+  # Also verify the other direction still works: no version change (true silent_drift)
+  # Now set installed_plugins.json to have the same version as marketplace
+  mk_installed_json "$j" "$old_sha" "0.1.9"  # same version as marketplace
+  name=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
+  [ "$name" = "secondmate plugin (silent drift)" ] || { echo "FAIL: Test D1 bug1 fix: expected 'secondmate plugin (silent drift)', got '$name'"; rm -rf "$d"; exit 1; }
+  
+  rm -rf "$d"
+
+  # === Test D2 (Bug 2 fix): heal verification rejects wrong SHA, not just any changed SHA ===
+  # Create a stub claude that writes a RANDOM wrong SHA (not the remote HEAD) to installed_plugins.json
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+
+  # Create origin repo with version 0.1.8
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  # Create stub claude that writes a WRONG SHA (not origin_sha) when called
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "$1" = "plugin" ] && [ "$2" = "update" ] && [ "$3" = "secondmate@secondmate" ] && [ "$4" = "-y" ]; then
+  # Write a completely wrong SHA (not the real remote HEAD)
+  wrong_sha="deadbeef11111111111111111111111111111111"
+  python3 -c "
+import json,sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        for key in list(plugins.keys()):
+            if key.startswith('secondmate@'):
+                entries = plugins[key]
+                if isinstance(entries, list) and len(entries) > 0 and isinstance(entries[0], dict):
+                    entries[0]['gitCommitSha'] = '$wrong_sha'
+    with open(sys.argv[1], 'w') as f:
+        json.dump(data, f)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$SM_TEST_INSTALLED_JSON_FOR_STUB"
+  exit 0
+else
+  echo "stub claude: unexpected args: $*" >&2
+  exit 1
+fi
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  # Write installed_plugins.json with old sha
+  mk_installed_json "$j" "aaaaaaaa00000000000000000000000000000000" "0.1.7"
+
+  # Run heal with stub in PATH
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" SM_TEST_INSTALLED_JSON_FOR_STUB="$j" PATH="$stub_dir:$PATH" bash -c 'source "'"$script_abs"'"; _heal_secondmate 1' 2>&1)
+  rc=$?
+
+  # With Bug 2 fix: should FAIL because after_sha (deadbeef...) != remote_sha (origin_sha)
+  [ "$rc" -ne 0 ] || { echo "FAIL: Test D2 bug2 fix: heal should have failed (wrong SHA written), got rc=$rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Verify the warning message mentions the expected vs actual SHA
+  echo "$out" | grep -q "SHA did not advance to expected value" || { echo "FAIL: Test D2 bug2 fix: expected warning about expected vs actual SHA"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  echo "$out" | grep -q "expected: $origin_sha" || { echo "FAIL: Test D2 bug2 fix: expected warning to show correct remote_sha"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  echo "$out" | grep -q "got:.*deadbeef" || { echo "FAIL: Test D2 bug2 fix: expected warning to show wrong SHA"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  rm -rf "$d" "$origin_dir" "$stub_dir"
+
+  # === Test D3 (Bug 3 fix): pre-created stale lock should be stolen ===
+  # This tests the real fix: the lock loop should now handle pre-existing stale locks
+  d=$(mktemp -d)
+  lock_dir="$d/lock"
+  lock_file="$lock_dir/secondmate-heal.lock"
+
+  # Pre-create lock directory with a STALE timestamp (older than max_wait=30 seconds)
+  mkdir -p "$lock_file"
+  echo "$$_" > "$lock_file/.pid"
+  old_timestamp=$(( $(date +%s) - 60 ))  # 60 seconds ago, definitely stale
+  echo "$old_timestamp" > "$lock_file/.timestamp"
+
+  # Run _acquire_heal_lock - with the fix, it should steal the lock and return 0
+  _old_lock_dir="$_doctor_lock_dir"
+  _doctor_lock_dir="$lock_dir"
+  _doctor_lock_file="$_doctor_lock_dir/secondmate-heal.lock"
+  
+  out=$(_acquire_heal_lock 2>&1)
+  rc=$?
+  
+  _doctor_lock_dir="$_old_lock_dir"
+
+  # With Bug 3 fix: should succeed (return 0) because the stale lock was stolen
+  [ "$rc" -eq 0 ] || { echo "FAIL: Test D3 bug3 fix: should have stolen stale lock, got rc=$rc"; echo "output: $out" >&2; rm -rf "$d"; exit 1; }
+
+  # Verify new lock was created with fresh timestamp
+  [ -d "$lock_file" ] || { echo "FAIL: Test D3 bug3 fix: lock directory doesn't exist after steal"; rm -rf "$d"; exit 1; }
+  [ -f "$lock_file/.pid" ] || { echo "FAIL: Test D3 bug3 fix: .pid file missing after steal"; rm -rf "$d"; exit 1; }
+  [ -f "$lock_file/.timestamp" ] || { echo "FAIL: Test D3 bug3 fix: .timestamp file missing after steal"; rm -rf "$d"; exit 1; }
+  
+  # Verify the timestamp is now fresh (not the old stale one)
+  new_ts=$(cat "$lock_file/.timestamp" 2>/dev/null || echo "")
+  [ -n "$new_ts" ] || { echo "FAIL: Test D3 bug3 fix: couldn't read timestamp after steal"; rm -rf "$d"; exit 1; }
+  [ "$new_ts" -gt "$old_timestamp" ] || { echo "FAIL: Test D3 bug3 fix: timestamp wasn't updated"; rm -rf "$d"; exit 1; }
 
   rm -rf "$d"
 
