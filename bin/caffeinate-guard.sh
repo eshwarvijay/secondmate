@@ -168,6 +168,21 @@ _start() {
         continue
       fi
       # Holder is dead - this is a stale lock, reclaim it
+    else
+      # No owner.pid file - could be race (another process just created lockdir)
+      # or genuinely abandoned. Give a short grace period (max ~0.5s total)
+      local grace_retries=5
+      local grace_wait=0.1
+      while [ $grace_retries -gt 0 ]; do
+        sleep "$grace_wait"
+        # Check again for owner.pid after brief delay
+        if [ -f "$lockpidfile" ]; then
+          # Another process acquired the lock, wait and retry
+          break
+        fi
+        grace_retries=$((grace_retries - 1))
+      done
+      # After grace period, if still no owner.pid, it's genuinely abandoned
     fi
     # Reclaim: remove owner.pid and rmdir the directory, then try to create fresh
     rm -f "$lockdir/owner.pid"
@@ -257,6 +272,11 @@ _stop() {
 
   local root="$(_STATE_ROOT)"
   local pf="$(_pidfile "$task_id")"
+
+  # Fast path: no state for this task-id -> immediate idempotent success (exit 0)
+  # This must happen BEFORE lock acquisition to avoid 10s timeout when no state exists
+  [ -f "$pf" ] || { echo "no guard found for task '$task_id', nothing to stop"; exit 0; }
+
   local lockdir="${root}/${task_id}.lock.d"
   local lockpidfile="$lockdir/owner.pid"
   local locktimeout=10
@@ -276,6 +296,21 @@ _stop() {
         sleep 0.1
         continue
       fi
+    else
+      # No owner.pid file - could be race (another process just created lockdir)
+      # or genuinely abandoned. Give a short grace period (max ~0.5s total)
+      local grace_retries=5
+      local grace_wait=0.1
+      while [ $grace_retries -gt 0 ]; do
+        sleep "$grace_wait"
+        # Check again for owner.pid after brief delay
+        if [ -f "$lockpidfile" ]; then
+          # Another process acquired the lock, wait and retry
+          break
+        fi
+        grace_retries=$((grace_retries - 1))
+      done
+      # After grace period, if still no owner.pid, it's genuinely abandoned
     fi
     # Reclaim: remove owner.pid and rmdir, then try to create fresh
     rm -f "$lockdir/owner.pid"
@@ -466,6 +501,14 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # Use a 40-digit number that would overflow bash arithmetic
   rc=0; _cg start --task task-overflow --ttl 1234567890123456789012345678901234567890 >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: 40-digit TTL not rejected (rc=$rc)"; fails=1; }
+
+  # Finding #10: stop against nonexistent state is immediate idempotent success
+  # Verify it returns immediately (not 10s) with exit 0 when no state exists for task
+  start_time=$SECONDS
+  rc=0; _cg stop --task never-started >/dev/null 2>&1 || rc=$?
+  elapsed=$((SECONDS - start_time))
+  [ "$rc" = 0 ] || { echo "FAIL: stop on nonexistent state returned rc=$rc"; fails=1; }
+  [ $elapsed -le 2 ] || { echo "FAIL: stop on nonexistent state took ${elapsed}s (should be <2s)"; fails=1; }
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
