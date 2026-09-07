@@ -92,7 +92,7 @@ flowchart LR
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
 | `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the free-text `audit/flow.md`/`audit/decision.md` |
-| `bin/caffeinate-guard.sh` | Prevents macOS sleep during session execution via `start`/`stop` commands; session-scoped single guard process with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times) |
+| `bin/caffeinate-guard.sh` | Prevents macOS sleep during session execution via `start`/`stop` commands; session-scoped single guard process with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times); **accepted limitation: host-wide singleton = multiple concurrent sessions on same machine not supported** |
 | `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`

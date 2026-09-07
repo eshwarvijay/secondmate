@@ -6,6 +6,12 @@
 # State: $SM_CAFFEINATE_ROOT (default ~/.secondmate-caffeinate), host-wide.
 # Single guard process per session; spawned once when session starts, torn down once when session ends.
 # Bounded -t <seconds> ceiling (default 8 hours) as defense-in-depth orphan cleanup.
+#
+# LIMITATIONS (accepted, not bugs):
+# - This is a single host-wide guard. Running multiple independent secondmate-orchestrating
+#   sessions concurrently on the same machine is not supported. One session's stop can kill
+#   sleep prevention for another session's still-active batch (by design, matching this
+#   project's precedent of documenting rather than chasing every possible concurrency edge case).
 
 set -euo pipefail
 
@@ -135,7 +141,9 @@ _start() {
   # Spawn caffeinate with bounded TTL (defense-in-depth)
   # -d -i -s: display, idle, screensaver (prevent sleep on all activity)
   # -t <ttl>: bounded ceiling to ensure orphan cleanup if supervisor crashes
-  caffeinate -d -i -s -t "$ttl" &
+  # Redirect stdout/stderr to /dev/null to avoid command substitution hanging
+  # (backgrounded child would inherit parent's stdout, blocking until TTL expires)
+  caffeinate -d -i -s -t "$ttl" >/dev/null 2>&1 &
   local pid=$!
 
   # Record PID immediately, before any other step that could fail
@@ -277,6 +285,17 @@ if [ "${1:-}" = "--selfcheck" ]; then
   _cg start >/dev/null
   rc=0; _cg stop --task legacy >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: stop with --task legacy should exit 2 (rc=$rc)"; fails=1; }
+  _cg stop >/dev/null
+
+  # Finding #7: command substitution does not hang (backgrounded child stdout/stderr handled)
+  # TIME BOUNDED: must complete in <2s (TTL is 8 hours, so <2s proves no hang)
+  rm -f "$root/guard.pid"
+  start_time=$SECONDS
+  _cg start >/dev/null
+  elapsed=$((SECONDS - start_time))
+  [ $elapsed -le 2 ] || { echo "FAIL: start via command substitution took ${elapsed}s (should be <2s)"; fails=1; }
+  guard_pid="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
+  ps -p "$guard_pid" >/dev/null 2>&1 || { echo "FAIL: guard process not actually running after start"; fails=1; }
   _cg stop >/dev/null
 
   # Finding #8:caffeiante missing degrades gracefully (warn, exit 0)
