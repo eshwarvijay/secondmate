@@ -138,17 +138,18 @@ Each stage exists to close a specific failure mode.
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here.
 
-8. **Teardown.** Immediately after integration, close everything created for this session:
+8. **Teardown.** Immediately after integration, close everything created for this task:
    ```bash
-   ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop  # end sleep prevention (safe no-op if already stopped)
    herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
    herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
    git branch -d sm/<task-id>                          # delete the merged branch
    ```
-   A merged session that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
-   **Must call `caffeinate-guard.sh stop`** to clean up the sleep-prevention process. This is idempotent
-   (exits 0 even if never started or already stopped) so it's safe to call unconditionally. The single session-scoped guard process is cleaned up, along with any per-worktree or per-task artifacts. The state directory (`~/.secondmate-caffeinate`) is host-wide but the guard is session-scoped, not per-task.
-   *Guards against:* orphan `caffeinate` processes consuming battery after session completion.
+   A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+
+   **IMPORTANT:** `caffeinate-guard.sh stop` is SESSION-SCOPED, not per-task. Call it ONCE yourself, directly,
+   only after you have confirmed EVERY task/worktree in that batch has been torn down. Never call `stop` inside
+   a task's per-task teardown — sibling tasks may still be running and need sleep prevention.
+   *See the Roles section above for the session guard lifecycle.*
 
 9. **Audit trail.** After teardown, append to `audit/flow.md` (orchestration: maker path, models, rounds,
    outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
@@ -280,6 +281,6 @@ Each stage exists to close a specific failure mode.
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
-| `bin/caffeinate-guard.sh` | macOS sleep prevention during task execution — per-task isolation, PID identity verification, bounded TTL ceiling, idempotent start/stop |
+| `bin/caffeinate-guard.sh` | macOS sleep prevention during session execution — single session-scoped guard process, PID identity verification, bounded TTL ceiling, idempotent start/stop |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.
