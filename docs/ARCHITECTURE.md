@@ -61,7 +61,9 @@ flowchart TD
     GT -->|pass| HD{hold.py: your approval}
     HD -->|merge| INT[integrate]
     HD -->|hold or abandon| STOP([stop])
-    INT --> Cap
+    INT --> TD[Teardown: close panes, worktree, branch]
+    TD --> AU[Audit trail: flow.md, decision.md]
+    AU --> Cap
 ```
 
 ## Stage by stage
@@ -136,15 +138,7 @@ Each stage exists to close a specific failure mode.
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here.
 
-8. **Audit trail.** After integration, append to `audit/flow.md` (orchestration: maker path, models, rounds,
-   outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
-   escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
-   Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
-   `audit/metrics.jsonl` (via `log-round.sh`, step 4) accumulates alongside them as the structured
-   counterpart — same append-only convention, but one JSON line per round instead of prose per task.
-   Commit separately. Skip for trivial one-shot edits.
-
-9. **Teardown.** Immediately after integration, close everything created for this task:
+8. **Teardown.** Immediately after integration, close everything created for this task:
    ```bash
    ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop --task <task-id>  # end sleep prevention (safe no-op if already stopped)
    herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
@@ -157,6 +151,14 @@ Each stage exists to close a specific failure mode.
    directory (`~/.secondmate-caffeinate`) is host-wide and keyed by task-id, so each task's guard is
    isolated and can be cleaned up independently.
    *Guards against:* orphan `caffeinate` processes consuming battery after task completion.
+
+9. **Audit trail.** After teardown, append to `audit/flow.md` (orchestration: maker path, models, rounds,
+   outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
+   escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
+   Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
+   `audit/metrics.jsonl` (via `log-round.sh`, step 4) accumulates alongside them as the structured
+   counterpart — same append-only convention, but one JSON line per round instead of prose per task.
+   Commit separately. Skip for trivial one-shot edits.
 
 ## Scope guard
 
