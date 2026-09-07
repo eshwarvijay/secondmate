@@ -1452,6 +1452,166 @@ STUB_EOF
 
   rm -rf "$d" "$origin_dir" "$stub_dir" "$d2" "$origin_dir2" "$stub_dir2"
 
+  # === Test F1 (Bug 6 fix): _is_lock_still_stale with real live PID ===
+  # A lock with an old timestamp but a LIVING process should NOT be treated as stale
+  d=$(mktemp -d)
+  lock_dir="$d/lock"
+  lock_file="$lock_dir/secondmate-heal.lock"
+
+  # Spawn a real background sleep process and get its PID
+  sleep 300 &
+  alive_pid=$!
+  # Give the process a moment to start
+  sleep 0.2
+
+  # Create a lock with the live PID and old timestamp
+  mkdir -p "$lock_file"
+  old_ts=$(( $(date +%s) - 60 ))  # 60 seconds ago, definitely stale by age
+  echo "$old_ts" > "$lock_file/.timestamp"
+  echo "$alive_pid" > "$lock_file/.pid"
+
+  # Temporarily set _doctor_lock_file for the helper
+  _old_lock_file="$_doctor_lock_file"
+  _doctor_lock_file="$lock_file"
+
+  # Call _is_lock_still_stale - should return 1 (NOT stale) because PID is alive
+  out=$(_is_lock_still_stale "$old_ts" 30 "$alive_pid" 2>&1)
+  rc=$?
+
+  # With Bug 6 fix: should return 1 (lock not stale - process is alive)
+  [ "$rc" -eq 1 ] || { echo "FAIL: Test F1 bug6 fix: _is_lock_still_stale should return 1 for live PID, got $rc"; rm -rf "$d"; exit 1; }
+
+  # Also test with a DEAD PID (same timestamp but PID that doesn't exist)
+  # Write dead PID to file (not using the already-killed process)
+  fake_dead_pid=999999
+  echo "$fake_dead_pid" > "$lock_file/.pid"
+
+  # Call _is_lock_still_stale with the same old timestamp and dead PID
+  out=$(_is_lock_still_stale "$old_ts" 30 "$fake_dead_pid" 2>&1)
+  rc=$?
+
+  # With Bug 6 fix: should return 0 (stale) because PID is dead/nonexistent
+  # Note: kill -0 returns non-zero if process doesn't exist
+  [ "$rc" -eq 0 ] || { echo "FAIL: Test F1 companion: _is_lock_still_stale should return 0 for dead PID, got $rc"; rm -rf "$d"; exit 1; }
+
+  _doctor_lock_file="$_old_lock_file"
+  rm -rf "$d"
+
+  # === Test F2 (Bug 7 fix): healing fails when installed_plugins.json is deleted ===
+  # This tests that _heal_secondmate returns non-zero when installed_plugins.json is missing
+  # after the git pull succeeds but before the heal verification passes.
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  # Create origin repo with v0.1.8
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+  # checkout_dir now has v0.1.8 commit with sha origin_sha_1
+
+  # Advance origin with new commit at v0.1.9
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  echo "new content" >> "$origin_dir/readme.md"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Write installed_plugins.json with a COMPLETELY DIFFERENT sha (not matching checkout_dir)
+  # This creates the "stale" state: SHA differs AND version differs (0.1.8 != 0.1.9)
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.8"
+
+  # Create stub claude that deletes installed_plugins.json during update
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "$1" = "plugin" ] && [ "$2" = "update" ] && [ "$3" = "secondmate@secondmate" ] && [ "$4" = "-y" ]; then
+  if [ -n "$SM_TEST_INSTALLED_JSON_FOR_STUB" ] && [ -f "$SM_TEST_INSTALLED_JSON_FOR_STUB" ]; then
+    # DELETE the file (simulating corruption/failure)
+    rm -f "$SM_TEST_INSTALLED_JSON_FOR_STUB"
+  fi
+  exit 0
+else
+  echo "stub claude: unexpected args: $*" >&2
+  exit 1
+fi
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  # Record checkout HEAD before heal (should be origin_sha_1 - v0.1.8 commit)
+  before_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+  [ "$before_checkout_head" = "$origin_sha_1" ] || { echo "FAIL: Test F2 setup: checkout HEAD should be v0.1.8 commit"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Run REAL doctor.sh as subprocess with --heal --yes
+  # Use PATH with stub claude
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" SM_TEST_INSTALLED_JSON_FOR_STUB="$j" PATH="$stub_dir:$PATH" "$script_abs" --heal --yes 2>&1)
+  rc=$?
+
+  # With Bug 7 fix: should FAIL because installed_plugins.json is missing after update
+  [ "$rc" -ne 0 ] || { echo "FAIL: Test F2 bug7 fix: heal should have failed (installed_plugins.json deleted), got rc=$rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: error message mentions installed_plugins.json
+  echo "$out" | grep -q "cannot verify heal.*secondmate not found in installed_plugins.json" || { echo "FAIL: Test F2 bug7 fix: expected error about installed_plugins.json missing"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Verify file was actually deleted
+  [ ! -f "$j" ] || { echo "FAIL: Test F2 bug7 fix: installed_plugins.json should have been deleted"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  rm -rf "$d" "$origin_dir" "$stub_dir"
+
+  
+  # === Test F3 (Bug 8 fix): stale state shows [!!] not [ok] and different STATUS ===
+  # This tests that the table output correctly marks stale secondmate with [!!] and STATUS line differs
+  d=$(mktemp -d)
+  mkt_dir="$d/mkt"
+  j="$d/plugins.json"
+
+  # Create marketplace checkout with version 0.1.8
+  mkdir -p "$mkt_dir/.claude-plugin"
+  git -C "$mkt_dir" init -q -b main 2>/dev/null || true
+  git -C "$mkt_dir" config user.email t@t.com 2>/dev/null
+  git -C "$mkt_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$mkt_dir/.claude-plugin/plugin.json"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  old_sha=$(git -C "$mkt_dir" rev-parse HEAD)
+
+  # Advance locally with version 0.1.9
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$mkt_dir/.claude-plugin/plugin.json"
+  echo "new content" >> "$mkt_dir/readme.md"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+
+  # installed_plugins.json has the old sha/version (creates stale state)
+  mk_installed_json "$j" "$old_sha" "0.1.8"
+
+  # Run doctor.sh --report and capture output
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$script_abs" --report 2>&1)
+
+  # With Bug 8 fix: secondmate row should have [!!] (not [ok])
+  # Find the secondmate row and check its status marker
+  secondmate_row=$(echo "$out" | grep "secondmate plugin" || true)
+  echo "$secondmate_row" | grep -q "\[!!\]" || { echo "FAIL: Test F3 bug8 fix: secondmate stale row should have [!!], got: $secondmate_row"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+
+  # Assert: STATUS line differs from plain "ready (core plus checker harness present)"
+  status_line=$(echo "$out" | grep "^STATUS:" || true)
+  [ -n "$status_line" ] || { echo "FAIL: Test F3 bug8 fix: STATUS line not found"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+  echo "$status_line" | grep -q "ready, but secondmate plugin needs healing" || { echo "FAIL: Test F3 bug8 fix: STATUS should mention healing needed, got: $status_line"; rm -rf "$d"; exit 1; }
+  # Make sure it's NOT the plain ready status
+  echo "$status_line" | grep -q "ready (core plus checker harness present)" && { echo "FAIL: Test F3 bug8 fix: STATUS should NOT be plain ready, got: $status_line"; rm -rf "$d"; exit 1; }
+
+  rm -rf "$d"
+
   echo ok; exit 0
 fi
 
