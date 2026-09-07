@@ -148,18 +148,18 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 2. **Spawn** — isolate the maker. Two paths:
    - **Headless / not in herdr:** `read wt branch < <(${CLAUDE_PLUGIN_ROOT}/bin/new-worktree.sh --repo <repo> --task <task-id>)` — never the primary checkout.
-     (Already marks the worktree via `mark-maker.sh` internally.) **Remember to call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start --task <task-id>` after this** to prevent system sleep during the task.
+     (Already marks the worktree via `mark-maker.sh` internally.) **Remember to call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start` after this** to prevent system sleep during the session.
    - **In herdr (`HERDR_ENV=1`):** 
      ```bash
      result=$(herdr worktree create --cwd <repo> --branch sm/<task-id> --base HEAD --label sm-<task-id> --no-focus)
      wt=$(echo "$result" | jq -r '.result.worktree.path')
      root_pane=$(echo "$result" | jq -r '.result.root_pane.pane_id')
      ${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd "$wt"  # REQUIRED: mark before starting the maker
-     ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start --task <task-id>  # prevent sleep during task execution
+     ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start  # prevent sleep during session execution
      ```
      Creates the git worktree AND a herdr workspace/tab/pane in one call. **Must call mark-maker.sh** before starting
      any maker agent in this worktree (finding #5 fix) — otherwise scope-guard.py won't activate.
-     **Must call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start`** to prevent system sleep during the task (default 8-hour ceiling via -t).
+     **Must call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start`** to prevent system sleep during the session (default 8-hour ceiling via -t).
 
 3. **Guard the round** — wrap each maker/checker invocation and track loop health:
    - `${CLAUDE_PLUGIN_ROOT}/bin/run-round.sh --label <id> -- <cmd>` (wall-clock timeout, idle watchdog, audit record even on kill).
@@ -241,14 +241,14 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 8. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
 
-9. **Teardown** — immediately after integration, close everything created for this task:
+9. **Teardown** — immediately after integration, close everything created for this session:
    ```bash
-   ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop --task <task-id>  # end sleep prevention (safe no-op if already stopped)
+   ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop  # end sleep prevention (safe no-op if already stopped)
    herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
    herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
    git branch -d sm/<task-id>                          # delete the merged branch
    ```
-   A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+   A merged session that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
    **Must call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop`** to clean up the sleep-prevention process. This is idempotent
    (exits 0 even if never started or already stopped) so it's safe to call unconditionally.
 
@@ -295,7 +295,7 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
   usual verify-gate + hold. You can't answer another pane's live prompt, so run any gated command yourself
   in the supervisor context (still a separate context, so maker ≠ checker holds).
 - **Clean up ONLY the panes you created**: `herdr pane close "$ck"` (no `$mk_pane` to close since the maker ran on the root_pane directly).
-  **Remember to call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop --task <task-id>`** to clean up the sleep-prevention process.
+  **Remember to call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop`** to clean up the sleep-prevention process.
 
 Not in herdr (`HERDR_ENV != 1`)? Use the headless path — in-process maker sub-agent + `run-round.sh`-wrapped
 checker. Same loop, same guards, just not visible.

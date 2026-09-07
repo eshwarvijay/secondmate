@@ -92,7 +92,7 @@ flowchart LR
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
 | `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the free-text `audit/flow.md`/`audit/decision.md` |
-| `bin/caffeinate-guard.sh` | Prevents macOS sleep during task execution via `start`/`stop` commands; per-task isolation with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times) |
+| `bin/caffeinate-guard.sh` | Prevents macOS sleep during session execution via `start`/`stop` commands; session-scoped single guard process with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times) |
 | `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
@@ -173,7 +173,7 @@ credentials only you can supply.
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
 | `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
-| `SM_CAFFEINATE_ROOT` | `~/.secondmate-caffeinate` | where `caffeinate-guard.sh` stores per-task state files (PID + fingerprint) |
+| `SM_CAFFEINATE_ROOT` | `~/.secondmate-caffeinate` | where `caffeinate-guard.sh` stores the session-scoped guard PID file (PID + fingerprint) |
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
 

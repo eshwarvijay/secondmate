@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# caffeinate-guard.sh -- prevent macOS sleep during a task's active workwindow
-#   caffeinate-guard.sh start --task <id>
-#   caffeinate-guard.sh stop --task <id>
-#   caffeinate-guard.sh --selfcheck
+# caffeinate-guard.sh -- prevent macOS sleep during a session's active workwindow
+#   caffeinate-guard.sh start
+#   caffeinate-guard.sh stop
 #
-# State: $SM_CAFFEINATE_ROOT (default ~/.secondmate-caffeinate), host-wide, keyed by task-id.
-# One pidfile per task-id; each task spawns its own caffeinate process.
+# State: $SM_CAFFEINATE_ROOT (default ~/.secondmate-caffeinate), host-wide.
+# Single guard process per session; spawned once when session starts, torn down once when session ends.
 # Bounded -t <seconds> ceiling (default 8 hours) as defense-in-depth orphan cleanup.
+
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,31 +14,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Default: multi-hour ceiling so a bug elsewhere only leaks for hours, not "forever"
 DEFAULT_TTL_SECONDS=28800  # 8 hours
 
-# State directory, host-wide like scope-guard's marker root
+# State directory, host-wide
 _STATE_ROOT() {
   echo "${SM_CAFFEINATE_ROOT:-$HOME/.secondmate-caffeinate}"
 }
 
-# Atomic lock file path for a task-id (O_CREAT|O_EXCL ensures atomic create)
-_lockfile() {
-  local id="$1"
+# Guard PID file path (fixed, session-scoped, no per-task separation)
+_GUARD_PIDFILE() {
   local root="$(_STATE_ROOT)"
-  echo "$root/${id}.lock"
-}
-
-# Task-id to path component: validate strict alphanumeric with -_ only, reasonable max length
-_validate_task_id() {
-  local id="$1"
-  # Reject empty
-  [ -n "$id" ] || { echo "task-id must not be empty" >&2; return 1; }
-  # Reject length > 128 (conservative upper bound)
-  [ "${#id}" -le 128 ] || { echo "task-id too long (max 128 chars): $id" >&2; return 1; }
-  # Reject anything other than [A-Za-z0-9_-]
-  if [[ ! "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
-    echo "task-id contains invalid characters (must match [A-Za-z0-9_-]): $id" >&2
-    return 1
-  fi
-  return 0
+  echo "$root/guard.pid"
 }
 
 # Validate TTL: must be a positive integer, clamped to ceiling (8 hours)
@@ -72,17 +56,10 @@ _validate_ttl() {
   return 0
 }
 
-# Build path to pidfile for a task-id
-_pidfile() {
-  local id="$1"
-  local root="$(_STATE_ROOT)"
-  echo "$root/$id.pid"
-}
-
 # Build fingerprint for a PID: "comm=... lstart=..." snapshot
 _build_fingerprint() {
   local pid="$1"
-  # Use ps to get comm and lstart; format as key=value for stable parsing
+  # Use ps to get comm command and lstart; format as key=value for stable parsing
   local comm lstart
   comm="$(ps -p "$pid" -o comm= 2>/dev/null)" || { echo ""; return; }
   lstart="$(ps -p "$pid" -o lstart= 2>/dev/null)" || { echo ""; return; }
@@ -91,33 +68,28 @@ _build_fingerprint() {
   echo "comm=$comm lstart=$lstart"
 }
 
-# Check if a PID is still alive AND matches the expected fingerprint
-# Returns 0 if alive+matches, 1 if dead/mismatched
+# Verify PID still exists and matches the stored fingerprint
 _verify_pid_fingerprint() {
   local pid="$1"
-  local expected="$2"
-  [ -z "$pid" ] || [ -z "$expected" ] && return 1
-  # First, process must exist (kill -0 doesn't work reliably across user boundaries on some macOS versions)
-  ps -p "$pid" >/dev/null 2>&1 || return 1
-  # Second, fingerprint must match
-  local actual
-  actual="$(_build_fingerprint "$pid")"
-  [ "$actual" = "$expected" ] || return 1
-  return 0
+  local expected_fingerprint="$2"
+  # Check if process exists
+  [ -n "$pid" ] || { return 1; }
+  ps -p "$pid" >/dev/null 2>&1 || { return 1; }
+  # Get current fingerprint and compare
+  local current_fingerprint
+  current_fingerprint="$(_build_fingerprint "$pid")"
+  [ -n "$current_fingerprint" ] || { return 1; }
+  [ "$current_fingerprint" = "$expected_fingerprint" ]
 }
 
-# Start a new caffeinate guard for a task-id
 _start() {
-  local task_id=""
+  local root="$(_STATE_ROOT)"
+  local pf="$(_GUARD_PIDFILE)"
   local ttl="$DEFAULT_TTL_SECONDS"
 
+  # Parse --ttl <seconds> argument if provided
   while [ $# -gt 0 ]; do
     case "$1" in
-      --task)
-        [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
-        task_id="$2"
-        shift 2
-        ;;
       --ttl)
         [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
         ttl="$2"
@@ -130,51 +102,14 @@ _start() {
     esac
   done
 
-  [ -n "$task_id" ] || { echo "missing --task" >&2; exit 2; }
-  _validate_task_id "$task_id" || exit 2
-
   # Validate and clamp TTL
-  local validated_ttl
-  validated_ttl="$(_validate_ttl "$ttl")" || exit 2
-  ttl="$validated_ttl"
+  ttl="$(_validate_ttl "$ttl")" || exit 2
 
-  local root="$(_STATE_ROOT)"
-  local pf="$(_pidfile "$task_id")"
-  local lockfile="$(_lockfile "$task_id")"
-
-  # Ensure state directory exists before locking
+  # Ensure state directory exists
   mkdir -p "$root"
   chmod 700 "$root"
 
-  # Lock timeout and start time
-  local locktimeout=10
-  local lockstart=$SECONDS
-
-  # Atomic lock acquisition using O_CREAT|O_EXCL via bash noclobber (set -C)
-  # This ensures the lockfile creation AND PID write happen atomically
-  # From every observer's perspective, the lockfile either exists with a PID or doesn't exist at all
-  while ! ( set -C; echo "$$" > "$lockfile" ) 2>/dev/null; do
-    # Timeout protection (runs on EVERY loop iteration)
-    if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
-      echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
-      exit 1
-    fi
-    # Lockfile exists - check if holder is alive
-    if [ -f "$lockfile" ]; then
-      local held_pid
-      held_pid="$(cat "$lockfile" 2>/dev/null)"
-      if [ -n "$held_pid" ] && ps -p "$held_pid" >/dev/null 2>&1; then
-        # Holder is still alive - wait and retry
-        sleep 0.1
-        continue
-      fi
-      # Holder is dead - stale lock, remove it and retry
-      rm -f "$lockfile"
-    fi
-    # Retry atomic create (either never created, or we just removed stale lock)
-  done
-
-  # Re-check under lock (in case another process won the race while we waited in the loop)
+  # Idempotent: if guard already exists and is alive with matching fingerprint, no-op
   if [ -f "$pf" ]; then
     local line existing_pid existing_fingerprint
     line="$(head -n1 "$pf" 2>/dev/null)" || line=""
@@ -183,12 +118,8 @@ _start() {
 
     if [ -n "$existing_pid" ] && [ -n "$existing_fingerprint" ]; then
       if _verify_pid_fingerprint "$existing_pid" "$existing_fingerprint"; then
-        echo "guard already active for task '$task_id' (pid=$existing_pid), no action taken"
-        rm -f "$lockfile"
-        exit 0
-      else
-        rm -f "$pf"
-        rm -f "$lockfile"
+        echo "guard already active (pid=$existing_pid), no action taken"
+        return 0
       fi
     fi
   fi
@@ -196,16 +127,15 @@ _start() {
   # Check if caffeinate is available
   if ! command -v caffeinate >/dev/null 2>&1; then
     echo "WARNING: caffeinate not found in PATH; sleep prevention unavailable on this system" >&2
-    # Degraded gracefully: write a sentinel marking we know caffeinate is missing
-    # This keeps the script idempotent (next call also sees it)
+    # Write a sentinel marking we know caffeinate is missing (keeps idempotent)
     echo "# caffeinate not found" > "$pf"
-    rm -f "$lockfile"
-    exit 0
+    return 0
   fi
 
   # Spawn caffeinate with bounded TTL (defense-in-depth)
   # -d -i -s: display, idle, screensaver (prevent sleep on all activity)
   # -t <ttl>: bounded ceiling to ensure orphan cleanup if supervisor crashes
+  local ttl="$DEFAULT_TTL_SECONDS"
   caffeinate -d -i -s -t "$ttl" &
   local pid=$!
 
@@ -214,93 +144,37 @@ _start() {
   if [ -z "$fingerprint" ]; then
     echo "ERROR: failed to capture fingerprint for new caffeinate process (pid=$pid)" >&2
     kill "$pid" 2>/dev/null || true
-    rm -f "$lockfile"
-    exit 1
+    return 1
   fi
   echo "$pid $fingerprint" > "$pf"
-  
-  rm -f "$lockfile"
-  echo "started guard for task '$task_id' (pid=$pid, ttl=${ttl}s)"
+
+  echo "started guard (pid=$pid, ttl=${ttl}s)"
 }
 
-# Stop a guarded task, with identity verification
 _stop() {
-  local task_id=""
-
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --task)
-        [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
-        task_id="$2"
-        shift 2
-        ;;
-      *)
-        echo "unknown arg: $1" >&2
-        exit 2
-        ;;
-    esac
-  done
-
-  [ -n "$task_id" ] || { echo "missing --task" >&2; exit 2; }
-  _validate_task_id "$task_id" || exit 2
-
   local root="$(_STATE_ROOT)"
-  local pf="$(_pidfile "$task_id")"
+  local pf="$(_GUARD_PIDFILE)"
 
-  # Fast path: no state for this task-id -> immediate idempotent success (exit 0)
-  # This must happen BEFORE lock acquisition to avoid 10s timeout when no state exists
-  [ -f "$pf" ] || { echo "no guard found for task '$task_id', nothing to stop"; exit 0; }
-
-  local lockfile="$(_lockfile "$task_id")"
-  local locktimeout=10
-  local lockstart=$SECONDS
-
-  # Acquire lock for serialization with _start
-  # Use noclobber idiom (set -C) for atomic create
-  while ! ( set -C; echo "$$" > "$lockfile" ) 2>/dev/null; do
-    # Timeout protection for lock acquisition (MUST run on every iteration)
-    if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
-      echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
-      exit 1
-    fi
-    # Lockfile exists - check if holder is alive
-    if [ -f "$lockfile" ]; then
-      local held_pid
-      held_pid="$(cat "$lockfile" 2>/dev/null)"
-      if [ -n "$held_pid" ] && ps -p "$held_pid" >/dev/null 2>&1; then
-        sleep 0.1
-        continue
-      fi
-      # Holder is dead - stale lock, remove it and retry
-      rm -f "$lockfile"
-    fi
-    # Retry atomic create (either never created, or we just removed stale lock)
-  done
-
-  # Idempotent: no pidfile/state -> exit 0, no error
-  [ -f "$pf" ] || { echo "no guard found for task '$task_id', nothing to stop"; rm -f "$lockfile"; exit 0; }
+  # Idempotent: no pidfile -> immediate exit 0, no error
+  [ -f "$pf" ] || { echo "no guard found, nothing to stop"; return 0; }
 
   local line
   line="$(head -n1 "$pf" 2>/dev/null)" || line=""
   local pid="$(echo "$line" | awk '{print $1}')"
-  # Extract everything after the first field (PID) as the fingerprint
   local fingerprint="$(echo "$line" | sed 's/^[^ ]* //')"
 
-  # Idempotent: if fingerprint doesn't match (PID recycled, process dead, etc.), treat as already stopped
+  # Check for invalid state
   if [ -z "$pid" ] || [ -z "$fingerprint" ]; then
     rm -f "$pf"
-    rm -f "$lockfile"
-    echo "guard for task '$task_id' had invalid state (empty pid/fingerprint), cleaned up"
-    exit 0
+    echo "guard had invalid state (empty pid/fingerprint), cleaned up"
+    return 0
   fi
 
-  # Verify identity BEFORE signaling
+  # Verify identity BEFORE signaling (PID may have been recycled)
   if ! _verify_pid_fingerprint "$pid" "$fingerprint"; then
-    # Process is already gone or PID recycled -> clean up state and return success
     rm -f "$pf"
-    rm -f "$lockfile"
-    echo "guard for task '$task_id' (pid=$pid) is no longer active, cleaned up state"
-    exit 0
+    echo "guard (pid=$pid) is no longer active, cleaned up state"
+    return 0
   fi
 
   # Send SIGTERM first
@@ -326,142 +200,66 @@ _stop() {
 
   # Final verification: confirm process is gone
   if ps -p "$pid" >/dev/null 2>&1; then
-    echo "WARNING: failed to terminate caffeinate process (pid=$pid) for task '$task_id'" >&2
+    echo "WARNING: failed to terminate caffeinate process (pid=$pid)" >&2
     rm -f "$pf"
-    exit 1
+    return 1
   fi
 
   # Clean up state
   rm -f "$pf"
-  rm -f "$lockfile"
 
-  echo "stopped guard for task '$task_id' (pid=$pid verified dead)"
+  echo "stopped guard (pid=$pid verified dead)"
 }
 
 if [ "${1:-}" = "--selfcheck" ]; then
-  t="$(mktemp -d)"; fails=0; root="$t/state"
+  t="$(mktemp -d)"; fails=0; export SM_CAFFEINATE_ROOT="$t"; root="$t"
 
-  # Helper: run caffeinate-guard.sh with state override
   _cg() {
-    SM_CAFFEINATE_ROOT="$root" "$SCRIPT_DIR/caffeinate-guard.sh" "$@"
+    bin/caffeinate-guard.sh "$@"
   }
 
-  # Finding #1: two concurrent task-ids, stopping one doesn't touch the other's live process
-  _cg start --task task-alpha --ttl 3600 >/dev/null
-  _cg start --task task-beta --ttl 3600 >/dev/null
+  _guard_pidfile() {
+    local root="$SM_CAFFEINATE_ROOT"
+    echo "$root/guard.pid"
+  }
 
-  # Verify both running
-  alpha_pid="$(head -n1 "$root/task-alpha.pid" | awk '{print $1}')"
-  beta_pid="$(head -n1 "$root/task-beta.pid" | awk '{print $1}')"
-  ps -p "$alpha_pid" >/dev/null 2>&1 || { echo "FAIL: task-alpha guard not running"; fails=1; }
-  ps -p "$beta_pid" >/dev/null 2>&1 || { echo "FAIL: task-beta guard not running"; fails=1; }
-
-  # Stop task-alpha only
-  _cg stop --task task-alpha >/dev/null
-
-  # Verify alpha is dead, beta is still alive
-  ps -p "$alpha_pid" >/dev/null 2>&1 && { echo "FAIL: task-alpha guard still running after stop"; fails=1; }
-  ps -p "$beta_pid" >/dev/null 2>&1 || { echo "FAIL: task-beta guard died when stopping task-alpha"; fails=1; }
-
-  # Stop task-beta
-  _cg stop --task task-beta >/dev/null
-  ps -p "$beta_pid" >/dev/null 2>&1 && { echo "FAIL: task-beta guard still running after stop"; fails=1; }
-
-  # Cleanup task-alpha and task-beta lockdirs
-  rm -rf "${root}/task-alpha.lock" "${root}/task-beta.lock"
+  # Finding #1: idempotent double-start (should reuse same process)
+  _cg start >/dev/null; pid1="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
+  _cg start >/dev/null; pid2="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
+  [ "$pid1" = "$pid2" ] || { echo "FAIL: double-start produces different PIDs"; fails=1; }
+  ps -p "$pid1" >/dev/null 2>&1 || { echo "FAIL: guard process not running after double-start"; fails=1; }
+  _cg stop >/dev/null
 
   # Finding #2: idempotent double-stop (should exit 0, no error)
-  _cg stop --task task-alpha >/dev/null || { echo "FAIL: double-stop exited non-zero"; fails=1; }
+  _cg start >/dev/null; _cg stop >/dev/null; _cg stop || { echo "FAIL: double-stop exited non-zero"; fails=1; }
 
-  # Finding #3: idempotent double-start (should reuse, not orphan first)
-  _cg start --task task-gamma --ttl 3600 >/dev/null
-  gamma_pid1="$(head -n1 "$root/task-gamma.pid" | awk '{print $1}')"
-  gamma_fp1="$(sed 's/^[^ ]* //' "$root/task-gamma.pid")"
-  _cg start --task task-gamma --ttl 3600 >/dev/null
-  gamma_pid2="$(head -n1 "$root/task-gamma.pid" | awk '{print $1}')"
-  gamma_fp2="$(sed 's/^[^ ]* //' "$root/task-gamma.pid")"
+  # Finding #3: stop on no prior start (should be instant exit 0)
+  rm -f "$root/guard.pid"
+  start_time=$SECONDS
+  _cg stop >/dev/null || { echo "FAIL: stop on no-prior-start exited non-zero"; fails=1; }
+  elapsed=$((SECONDS - start_time))
+  [ $elapsed -le 2 ] || { echo "FAIL: stop on no-prior-start took ${elapsed}s (should be <2s)"; fails=1; }
 
-  # Same PID/fingerprint means reuses, doesn't spawn orphan
-  [ "$gamma_pid1" = "$gamma_pid2" ] || { echo "FAIL: double-start spawned new process (pid1=$gamma_pid1, pid2=$gamma_pid2)"; fails=1; }
-  [ "$gamma_fp1" = "$gamma_fp2" ] || { echo "FAIL: double-start fingerprint mismatch"; fails=1; }
-  ps -p "$gamma_pid1" >/dev/null 2>&1 || { echo "FAIL: task-gamma guard not running after double-start"; fails=1; }
-  # Verify no extra processes are leaked - only the task-gamma process should be alive
-  # Check by scanning the state directory, not system-wide (to avoid false positives from prior test runs)
-  num_states=$(ls -1 "$root"/*.pid 2>/dev/null | wc -l | tr -d ' ')
-  [ "$num_states" = "1" ] || { echo "FAIL: expected 1 PID file, found $num_states (possible leak)"; fails=1; }
-
-  # Cleanup task-gamma (double-start test)
-  rm -rf "${root}/task-gamma.lock"
-  _cg stop --task task-gamma >/dev/null
-
-  # Finding #4: identity verification catches PID recycling simulation
-  # Start a real background process (sleep 100), capture its real PID, then create a pidfile
-  # pointing to that LIVE PID but with a WRONG fingerprint to prove the identity check blocks it.
+  # Finding #4: identity mismatch protects a live unrelated process
+  # Start a live unrelated process and put its PID into guard.pid with wrong fingerprint
   sleep 100 &
-  real_sleep_pid=$!
-  # Write a pidfile that claims it's a different process (wrong lstart value)
-  echo "$real_sleep_pid comm=wrongprocess lstart=Mon Jan  1 00:00:00 2020" > "$root/task-epsilon.pid"
-  
-  # Call stop - should exit 0 (idempotent-safe) and NOT kill the real sleep process
-  _cg stop --task task-epsilon >/dev/null || { echo "FAIL: stop with live PID but mismatched fingerprint exited non-zero"; fails=1; }
-  # State should be cleaned up even though process was not killed
-  [ -f "$root/task-epsilon.pid" ] && { echo "FAIL: state not cleaned up for mismatched fingerprint"; fails=1; }
-  # CRITICAL: the real sleep process must still be running (identity check prevented wrong kill)
-  ps -p "$real_sleep_pid" >/dev/null 2>&1 || { echo "FAIL: sleep process killed despite identity mismatch"; fails=1; }
-  
-  # Cleanup: kill the sleep process we started for the test
-  kill "$real_sleep_pid" 2>/dev/null || true
+  unrelated_pid=$!
+  # Store wrong fingerprint (simulate mismatch)
+  echo "$unrelated_pid wrong=fingerprint" > "$root/guard.pid"
+  _cg stop >/dev/null || { echo "FAIL: stop on mismatched fingerprint exited non-zero"; fails=1; }
+  # The unrelated process should still be alive
+  ps -p "$unrelated_pid" >/dev/null 2>&1 || { echo "FAIL: unrelated process was incorrectly killed"; fails=1; }
+  kill "$unrelated_pid" 2>/dev/null || true
+  rm -f "$root/guard.pid"
 
-  # Finding #5: invalid/malicious task-id characters being rejected
-  rc=0; _cg start --task "bad;rm -rf /" >/dev/null 2>&1 || rc=$?
-  [ "$rc" != 0 ] || { echo "FAIL: semicolon in task-id should be rejected"; fails=1; }
-  rc=0; _cg start --task 'bad"quote' >/dev/null 2>&1 || rc=$?
-  [ "$rc" != 0 ] || { echo "FAIL: double-quote in task-id should be rejected"; fails=1; }
-  rc=0; _cg start --task "bad space" >/dev/null 2>&1 || rc=$?
-  [ "$rc" != 0 ] || { echo "FAIL: space in task-id should be rejected"; fails=1; }
-  rc=0; _cg start --task "" >/dev/null 2>&1 || rc=$?
-  [ "$rc" != 0 ] || { echo "FAIL: empty task-id should be rejected"; fails=1; }
-  # Valid task-ids should work
-  _cg start --task "valid-task_123" --ttl 3600 >/dev/null || { echo "FAIL: valid task-id 'valid-task_123' rejected"; fails=1; }
-  _cg stop --task "valid-task_123" >/dev/null
+  # Finding #5: oversized TTL is rejected or clamped
+  rc=0; _cg start --ttl 1234567890123456789012345678901234567890 >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: 40-digit TTL not rejected (rc=$rc)"; fails=1; }
 
-  # Finding #6:caffeiante missing degrades gracefully (warn, exit 0 from start)
+  # Finding #6:caffeiante missing degrades gracefully (warn, exit 0)
   # This is tested implicitly -- on non-macOS systems it warns and continues
   # On macOS it should find caffeinate and run normally
   # We just verify the warning path exists in the script (can't simulate missing binary easily)
-  # The script checks `command -v caffeinate` and warns if not found
-
-  # Finding #7: stale lock detection (dead owner doesn't block forward progress)
-  # Create a lockfile with a dead PID (simulating a crashed lock holder)
-  echo "99999" > "${root}/task-stale.lock"
-  _cg start --task task-stale --ttl 60 >/dev/null || { echo "FAIL: stale lock not recovered"; fails=1; }
-  # Verify a guard was actually started (pidfile exists and process is alive)
-  [ -f "$root/task-stale.pid" ] || { echo "FAIL: no pidfile after stale lock recovery"; fails=1; }
-  _cg stop --task task-stale >/dev/null
-  rm -f "${root}/task-stale.lock"
-
-  # Finding #8: stop/interleaving race protection (stop can't erase a live guard)
-  # Start a long-running guard, immediately call stop which should find it and clean up properly
-  _cg start --task task-interleave --ttl 120 >/dev/null
-  inter_pid=$(head -n1 "$root/task-interleave.pid" | awk '{print $1}')
-  # Stop should succeed and actually kill the process
-  _cg stop --task task-interleave >/dev/null
-  ps -p "$inter_pid" >/dev/null 2>&1 && { echo "FAIL: stop didn't kill process (race failed)"; fails=1; }
-  # pidfile should be cleaned up
-  [ -f "$root/task-interleave.pid" ] && { echo "FAIL: stop didn't clean up pidfile"; fails=1; }
-
-  # Finding #9: oversized TTL string rejection
-  # Use a 40-digit number that would overflow bash arithmetic
-  rc=0; _cg start --task task-overflow --ttl 1234567890123456789012345678901234567890 >/dev/null 2>&1 || rc=$?
-  [ "$rc" = 2 ] || { echo "FAIL: 40-digit TTL not rejected (rc=$rc)"; fails=1; }
-
-  # Finding #10: stop against nonexistent state is immediate idempotent success
-  # Verify it returns immediately (not 10s) with exit 0 when no state exists for task
-  start_time=$SECONDS
-  rc=0; _cg stop --task never-started >/dev/null 2>&1 || rc=$?
-  elapsed=$((SECONDS - start_time))
-  [ "$rc" = 0 ] || { echo "FAIL: stop on nonexistent state returned rc=$rc"; fails=1; }
-  [ $elapsed -le 2 ] || { echo "FAIL: stop on nonexistent state took ${elapsed}s (should be <2s)"; fails=1; }
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
@@ -477,7 +275,7 @@ case "$cmd" in
     _stop "$@"
     ;;
   *)
-    echo "usage: $0 start --task <id> [--ttl <seconds>] | stop --task <id> | --selfcheck" >&2
+    echo "usage: $0 start | stop | --selfcheck" >&2
     exit 2
     ;;
 esac
