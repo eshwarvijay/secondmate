@@ -29,12 +29,29 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # Verify --mode json is included (required for progress filter) and checker-progress.py is used
   out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec -- -p q 2>&1)" || { echo "FAIL: dryrun errored for mode check"; fails=1; }
   # args are printed one per line, so --mode and json are on separate lines
+  # The new structure has main_args printed first, then separately --mode and json
   echo "$out" | grep -q 'ARG: --mode'                 || { echo "FAIL: --mode arg not in args"; fails=1; }
   echo "$out" | grep -q 'ARG: json'                   || { echo "FAIL: json arg not in args"; fails=1; }
   # checker-progress.py is NOT in the args (dryrun only shows the harness command),
   # but it IS in the script - verify it exists and is referenced in exec
   [ -f "$SCRIPT_DIR/checker-progress.py" ]            || { echo "FAIL: checker-progress.py not found"; fails=1; }
   grep -q 'checker-progress.py' "$0"                || { echo "FAIL: checker-progress.py not referenced in launch-checker.sh"; fails=1; }
+  # Regression test: --mode json must come AFTER caller's args so it wins if they pass --mode text
+  # Simulate this with dryrun: caller -- -p "..." --mode text should not override our --mode json
+  out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec -- -p "test prompt" --mode text 2>&1)" || { echo "FAIL: dryrun failed for --mode override test"; fails=1; }
+  # Parse the dryrun output: extract lines after last "ARG: json" - those are caller args
+  # The order should be: main_args ... caller args ... ARG: --mode ARG: json
+  # So if caller passed --mode text, it appears BEFORE our json in dryrun output.
+  # Verify: the last two ARG lines should be "--mode" and "json" in that order.
+  last_mode_line=$(echo "$out" | grep '^ARG: --mode$' | tail -1)
+  last_json_line=$(echo "$out" | grep '^ARG: json$' | tail -1)
+  # Find line numbers
+  mode_line_num=$(echo "$out" | grep -n '^ARG: --mode$' | tail -1 | cut -d: -f1)
+  json_line_num=$(echo "$out" | grep -n '^ARG: json$' | tail -1 | cut -d: -f1)
+  [ "$mode_line_num" -lt "$json_line_num" ] || { echo "FAIL: expected --mode before json in dryrun output"; fails=1; }
+  # Verify json is last in the output (our --mode json must be AFTER caller args)
+  last_arg_line=$(echo "$out" | grep '^ARG:' | tail -1)
+  [ "$last_arg_line" = "ARG: json" ] || { echo "FAIL: expected last ARG to be json, got '$last_arg_line'"; fails=1; }
   [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
@@ -117,17 +134,24 @@ This reflects exactly what changed now and what the prior round concluded; it is
 $live")
 
 # Assemble the harness command (bash-3.2-safe empty-array guards).
-args=(--provider "$provider" --model "$model" --thinking "$thinking" --exclude-tools edit,write --mode json)
-args+=(--append-system-prompt "$(cat "$base_prompt")")
-[ "${#lens_args[@]}" -gt 0 ] && args+=("${lens_args[@]}")
-[ "${#envelope_arg[@]}" -gt 0 ] && args+=("${envelope_arg[@]}")
-args+=(--append-system-prompt "$addendum")
-[ "${#live_args[@]}" -gt 0 ] && args+=("${live_args[@]}")
+# NOTE: --mode json MUST appear AFTER the caller's "$@" so it always wins if they pass --mode text.
+# This prevents silent failure when a caller passes -- -p "..." --mode text (the last --mode wins).
+main_args=(--provider "$provider" --model "$model" --thinking "$thinking" --exclude-tools edit,write)
+main_args+=(--append-system-prompt "$(cat "$base_prompt")")
+[ "${#lens_args[@]}" -gt 0 ] && main_args+=("${lens_args[@]}")
+[ "${#envelope_arg[@]}" -gt 0 ] && main_args+=("${envelope_arg[@]}")
+main_args+=(--append-system-prompt "$addendum")
+[ "${#live_args[@]}" -gt 0 ] && main_args+=("${live_args[@]}")
 
 # Inspect mode: print the assembled command (one arg per line) instead of running it (used by --selfcheck / debugging).
+# The order matches the exec: main_args, then caller args, then --mode json (so json wins if caller passes --mode text).
 if [ "${SM_CHECKER_DRYRUN:-}" = 1 ]; then
   printf 'HARNESS: %s\n' "$harness"
-  printf 'ARG: %s\n' "${args[@]}" "$@"
+  printf 'ARG: %s\n' "${main_args[@]}"
+  printf 'ARG: %s\n' "$@"
+  # --mode json comes LAST so it overrides any caller's --mode text
+  echo "ARG: --mode"
+  echo "ARG: json"
   exit 0
 fi
 
@@ -142,5 +166,6 @@ progress_filter="$SCRIPT_DIR/checker-progress.py"
 
 # --exclude-tools edit,write is NOT optional: it makes the checker physically read-only.
 # Pipe pi's JSON output through the filter; filter writes progress to stderr, final text to stdout.
-# Exit code propagation is preserved because of `set -o pipefail` at the top.
-exec "$harness" "${args[@]}" "$@" | python3 "$progress_filter"
+# --mode json appears AFTER caller args so it wins if they pass --mode text. Exit code propagation
+# is preserved because of `set -o pipefail` at the top.
+exec "$harness" "${main_args[@]}" "$@" --mode json | python3 "$progress_filter"

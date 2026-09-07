@@ -78,13 +78,14 @@ def _extract_final_text(messages: list) -> Optional[str]:
     if not content:
         return None
     
-    # Collect ALL text-type parts in order
+    # Collect ALL text-type parts in order, INCLUDING empty strings (pi's real --mode text behavior).
+    # pi's --mode text prints EVERY text-type content part including empty ones (content.text + newline, unconditionally).
+    # So ["a","","b"] should produce "a\n\nb\n" with a blank line preserved.
     text_parts = []
     for part in content:
         if isinstance(part, dict) and part.get("type") == "text":
             text = part.get("text", "")
-            if text:
-                text_parts.append(text)
+            text_parts.append(text)  # Include ALL parts, even empty strings
     
     if not text_parts:
         return None
@@ -297,6 +298,57 @@ def main():
             # Verify the print didn't go to global sys.stderr (if it was patched)
             if "checker: bash" in sys.stderr.getvalue():
                 failures.append(f"Test 10 failed: progress printed to global sys.stderr instead of err_file param")
+        
+        # Test 11: Empty text parts must be preserved (pi's real --mode text behavior)
+        # pi's --mode text prints EVERY text-type content part including empty ones (content.text + newline).
+        # So ["a","","b"] should produce "a\n\nb\n" with a blank line preserved.
+        test11_lines = [
+            '{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"user query"}],"timestamp":123},{"role":"assistant","content":[{"type":"text","text":"a"},{"type":"text","text":""},{"type":"text","text":"b"}],"api":"test","provider":"test","model":"test","usage":{},"stopReason":"stop","timestamp":123}],"willRetry":false}',
+        ]
+        with _Capture() as cap:
+            text_start = [False]
+            for line in test11_lines:
+                _process_line(line, sys.stdout, sys.stderr, text_start)
+        # Expected: "a\n\nb\n" (three lines: "a", "", "b", each followed by newline from join)
+        # But wait, join adds newline BETWEEN parts, so "a" + "" + "b" with "\n" join gives "a\nb" (no blank line)
+        # Actually no: "\n".join(["a", "", "b"]) = "a\n\nb" (two newlines: one after a, one after empty)
+        # Then print adds one more newline, so final output is "a\n\nb\n"
+        # But stdout has strip() applied in capture... let me reconsider.
+        # _Print to stdout (without strip): "a\n\nb\n"
+        # _Capture.stdout gives us this exactly. The test expects "a\n\nb" (without trailing newline from print).
+        # Actually print() adds newline, so output is "a\n\nb" + "\n" = "a\n\nb\n"
+        # Wait, let me trace through more carefully:
+        # - text_parts = ["a", "", "b"]
+        # - "\n".join(text_parts) = "a\n\nb"
+        # - print(final_text) = "a\n\nb\n" (print adds trailing newline)
+        # - cap.stdout.getvalue() = "a\n\nb\n"
+        # - We want to verify blank line is preserved, so we check "a\n\nb" appears
+        # Actually cap.stdout.getvalue() gives us the raw bytes, so let's verify the content
+        stdout_content = cap.stdout.getvalue()
+        # Should contain "a\n\nb" (with blank line between a and b)
+        if "a\n\nb" not in stdout_content:
+            failures.append(f"Test 11 failed: empty text part not preserved in join. Expected 'a\\n\\nb' in output, got: {repr(stdout_content)}")
+        # Also verify the format matches pi's exact behavior: each text part + newline
+        # pi does: print(content.text + "\n") for each text part
+        # But our code does: print("\n".join(text_parts))
+        # These differ! Let's check what pi really does...
+        # Actually looking at the checker contract, it says "content.text + newline" per part.
+        # But pi's --mode text output is the assistant's final assembled text, not per-part.
+        # Let me check the issue description again... it says pi prints "EVERY text-type content part including empty ones (content.text + newline, unconditionally)"
+        # This suggests pi prints each part separately. But our filter receives agent_end with assembled content.
+        # The key point is: pi's real --mode text output includes blank lines when there are empty text parts.
+        # So our join behavior should match. Let me just verify we don't drop empty strings.
+        # current join: "\n".join(["a", "", "b"]) = "a\n\nb" (blank line preserved)
+        # Previously, with "if text:" filter: ["a", "b"] -> "a\nb" (blank line lost)
+        # So the fix should preserve the blank line. Let me verify.
+        # Let me simplify the test: just verify empty part is NOT dropped
+        lines = stdout_content.strip().split('\n')
+        # With ["a", "", "b"] and "\n".join, we get "a\n\nb" -> split by '\n' gives ["a", "", "b"]
+        # Wait no: "a\n\nb".split('\n') = ["a", "", "b"] indeed (3 elements with middle empty)
+        if len(lines) != 3:
+            failures.append(f"Test 11 failed: expected 3 lines (with one empty), got {len(lines)} lines: {lines}")
+        elif lines[0] != "a" or lines[1] != "" or lines[2] != "b":
+            failures.append(f"Test 11 failed: expected ['a', '', 'b'], got {lines}")
         
         if failures:
             for f in failures:
