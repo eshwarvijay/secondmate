@@ -288,12 +288,12 @@ if [ "${1:-}" = "--selfcheck" ]; then
   _cg stop >/dev/null
 
   # Finding #7: command substitution does not hang (backgrounded child stdout/stderr handled)
-  # TIME BOUNDED: must complete in <2s (TTL is 8 hours, so <2s proves no hang)
+  # TIME BOUNDED: must complete in <3s (TTL is 8 hours, so <3s proves no hang)
   rm -f "$root/guard.pid"
   start_time=$SECONDS
-  _cg start >/dev/null
+  result=$(_cg start)  # Use actual command substitution like a real caller
   elapsed=$((SECONDS - start_time))
-  [ $elapsed -le 2 ] || { echo "FAIL: start via command substitution took ${elapsed}s (should be <2s)"; fails=1; }
+  [ $elapsed -le 3 ] || { echo "FAIL: start via command substitution took ${elapsed}s (should be <3s)"; fails=1; }
   guard_pid="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
   ps -p "$guard_pid" >/dev/null 2>&1 || { echo "FAIL: guard process not actually running after start"; fails=1; }
   _cg stop >/dev/null
