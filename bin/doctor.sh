@@ -653,6 +653,120 @@ EOF
   [ "$name" = "secondmate plugin (marketplace)" ] || { echo "FAIL: expected missing state, got name '$name'"; exit 1; }
   rm -rf "$d"
 
+  # === 5 abort-path selfcheck tests for _heal_secondmate ===
+
+  # Test 6: dirty marketplace tree abort
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  j="$d/plugins.json"
+  mk_installed_json "$j" "$sha" "0.1.8"
+  # make a dirty change without committing
+  echo "x" >> "$d/mkt/somefile.txt" 2>/dev/null || echo "initial" > "$d/mkt/somefile.txt"
+  echo "x" >> "$d/mkt/somefile.txt"
+  # record the dirty file content before calling _heal_secondmate
+  dirty_content=$(cat "$d/mkt/somefile.txt")
+  # set up origin remote for fetch to succeed
+  git -C "$d/mkt" remote add origin /tmp/nonexistent 2>/dev/null || true
+  # capture state before
+  before_head=$(git -C "$d/mkt" rev-parse HEAD)
+  # try to heal (should abort on dirty tree check, before any git fetch/pull)
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" bash -c 'source "'$script_abs'"; _heal_secondmate 0' 2>&1)
+  rc=$?
+  # verify it failed
+  [ "$rc" -ne 0 ] || { echo "FAIL: dirty tree test expected non-zero rc, got $rc"; rm -rf "$d"; exit 1; }
+  # verify it printed the right message
+  echo "$out" | grep -q "\[FAIL\] marketplace checkout has uncommitted changes" || { echo "FAIL: dirty tree test expected [FAIL] about uncommitted changes"; rm -rf "$d"; exit 1; }
+  # verify NO git fetch/pull happened (dirty file unchanged and HEAD unchanged)
+  after_head=$(git -C "$d/mkt" rev-parse HEAD)
+  [ "$before_head" = "$after_head" ] || { echo "FAIL: dirty tree test: HEAD changed from $before_head to $after_head (should not proceed past dirty check)"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
+  # Test 7: detached HEAD abort
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  j="$d/plugins.json"
+  mk_installed_json "$j" "$sha" "0.1.8"
+  # create an origin remote that exists (a bare repo)
+  origin_dir=$(mktemp -d)
+  git -C "$origin_dir" init -q --bare 2>/dev/null
+  git -C "$d/mkt" remote add origin "$origin_dir" 2>/dev/null || true
+  # checkout a specific SHA to go into detached HEAD
+  git -C "$d/mkt" checkout "$sha" 2>/dev/null || true
+  # try to heal (should abort on detached HEAD check)
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" bash -c 'source "'$script_abs'"; _heal_secondmate 0' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || { echo "FAIL: detached HEAD test expected non-zero rc, got $rc"; rm -rf "$d" "$origin_dir"; exit 1; }
+  echo "$out" | grep -q "\[FAIL\] marketplace checkout is on detached HEAD" || { echo "FAIL: detached HEAD test expected [FAIL] about detached HEAD"; rm -rf "$d" "$origin_dir"; exit 1; }
+  rm -rf "$d" "$origin_dir"
+
+  # Test 8: non-fast-forward (diverged history) abort
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  # create origin repo with one commit
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.7"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.7" 2>/dev/null || true
+  origin_sha=$(git -C "$origin_dir" rev-parse HEAD)
+  # add a remote to the origin
+  git -C "$origin_dir" remote add origin "$origin_dir" 2>/dev/null || true
+  # clone origin to create the marketplace checkout
+  git clone -q "$origin_dir" "$d/mkt" 2>/dev/null
+  # make a local commit on the clone (that doesn't exist on origin)
+  echo "local change" >> "$d/mkt/local.txt"
+  git -C "$d/mkt" add local.txt 2>/dev/null || true
+  git -C "$d/mkt" commit -q -m "local-only" 2>/dev/null || true
+  local_sha=$(git -C "$d/mkt" rev-parse HEAD)
+  # now advance origin with a new commit (so histories diverge)
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  j="$d/plugins.json"
+  mk_installed_json "$j" "$origin_sha" "0.1.7"
+  # try to heal (should abort on fast-forward check)
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" bash -c 'source "'$script_abs'"; _heal_secondmate 0' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || { echo "FAIL: non-ff test expected non-zero rc, got $rc"; rm -rf "$d" "$origin_dir"; exit 1; }
+  echo "$out" | grep -q "\[FAIL\] pull would not be a fast-forward" || { echo "FAIL: non-ff test expected [FAIL] about non-fast-forward"; rm -rf "$d" "$origin_dir"; exit 1; }
+  # verify local state unchanged (local commit still there, HEAD unchanged)
+  after_head=$(git -C "$d/mkt" rev-parse HEAD)
+  [ "$local_sha" = "$after_head" ] || { echo "FAIL: non-ff test: HEAD changed from $local_sha to $after_head"; rm -rf "$d" "$origin_dir"; exit 1; }
+  [ -f "$d/mkt/local.txt" ] || { echo "FAIL: non-ff test: local.txt missing (should be preserved)"; rm -rf "$d" "$origin_dir"; exit 1; }
+  rm -rf "$d" "$origin_dir"
+
+  # Test 9: marketplace checkout directory missing
+  d=$(mktemp -d)
+  j="$d/plugins.json"
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.7"
+  # try to heal with nonexistent checkout directory
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/nonexistent" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" bash -c 'source "'$script_abs'"; _heal_secondmate 0' 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || { echo "FAIL: missing dir test expected non-zero rc, got $rc"; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q "\[FAIL\] secondmate marketplace checkout not found" || { echo "FAIL: missing dir test expected [FAIL] about checkout not found"; rm -rf "$d"; exit 1; }
+  # verify it printed the fix command
+  echo "$out" | grep -q "claude plugin marketplace add eshwarvijay/secondmate" || { echo "FAIL: missing dir test should print the fix command"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
+  # Test 10: claude not resolvable (PATH without claude)
+  d=$(mktemp -d)
+  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  j="$d/plugins.json"
+  mk_installed_json "$j" "$sha" "0.1.8"
+  # create a fake PATH without claude
+  fake_path="/usr/bin:/bin"
+  # try to heal with PATH that has no claude
+  # We need to capture the script path for sourcing
+  script_abs_for_source="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  # IMPORTANT: need to use export or explicit PATH for EACH command since PATH=/path prefix only applies to immediate command
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" bash -c "export PATH='$fake_path'; source $script_abs_for_source; _heal_secondmate 0" 2>&1)
+  rc=$?
+  [ "$rc" -ne 0 ] || { echo "FAIL: no-claude test expected non-zero rc, got $rc"; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q "\[FAIL\] claude CLI not found" || { echo "FAIL: no-claude test expected [FAIL] about claude not found"; echo "DEBUG output was:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
   echo ok; exit 0
 fi
 
