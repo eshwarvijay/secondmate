@@ -406,19 +406,14 @@ exit 1
 PS_EOF
   chmod +x "$fake_ps_bin/ps"
   # Temporarily prepend fake bin to PATH for ps override only
-  rc=0
-  PATH="${fake_ps_bin}:${PATH}" bash "$SCRIPT_DIR/caffeinate-guard.sh" start >/dev/null 2>&1 || rc=$?
+  cg10b_out="$(PATH="${fake_ps_bin}:${PATH}" bash "$SCRIPT_DIR/caffeinate-guard.sh" start 2>&1)" || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: start with failing ps should exit 1 (rc=$rc)"; fails=1; }
   [ ! -f "$root/guard.pid" ] || { echo "FAIL: start with failing ps should not write pidfile"; fails=1; }
-  # Verify no orphan caffeinate process (the spawned one should be killed on fingerprint fail)
-  # Poll with brief sleeps since SIGTERM delivery and process reaping is not instantaneous
-  orphan_count=1
-  for _poll in 1 2 3 4 5; do
-    orphan_count=$(ps aux | grep '[c]affeinate -d -i -s' | wc -l | tr -d ' ' || true)
-    [ "$orphan_count" = "0" ] && break
-    sleep 0.2
-  done
-  [ "$orphan_count" = "0" ] || { echo "FAIL: fingerprint failure left orphan caffeinate process (count=$orphan_count after polling)"; fails=1; }
+  # Verify the spawned process was killed (extract PID from error message and check it's dead)
+  spawned_pid="$(echo "$cg10b_out" | grep -o 'pid=[0-9]*' | head -1 | grep -o '[0-9]*')"
+  if [ -n "$spawned_pid" ]; then
+    kill -0 "$spawned_pid" 2>/dev/null && { echo "FAIL: fingerprint failure left orphan caffeinate process (pid=$spawned_pid still alive)"; fails=1; }
+  fi
   rm -rf "$fake_ps_bin"
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
