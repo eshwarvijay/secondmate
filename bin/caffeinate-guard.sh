@@ -312,7 +312,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # Finding #6: custom TTL value is actually applied (not overwritten by default)
   _cg start --ttl 45 >/dev/null
   guard_pid="$(head -n1 "$(_guard_pidfile)" | awk '{print $1}')"
-  actual_ttl="$(ps -p "$guard_pid" -o args= 2>/dev/null | grep -o -- '-t [0-9]*' | awk '{print $2}')"
+  actual_ttl="$(ps -p "$guard_pid" -o args= 2>/dev/null | grep -o -- '-t [0-9]*' | awk '{print $2}' || true)"
   [ "$actual_ttl" = "45" ] || { echo "FAIL: custom TTL 45 not applied (actual=$actual_ttl)"; fails=1; }
   _cg stop >/dev/null
 
@@ -347,14 +347,16 @@ if [ "${1:-}" = "--selfcheck" ]; then
 
   # Finding #9: concurrent starts produce exactly ONE guard (no orphan processes)
   # Run 20 parallel starts (simulating multiple tasks calling start redundantly)
+  before_pids="$(ps aux | grep '[c]affeinate -d -i -s' | awk '{print $2}' | sort || true)"
   for i in $(seq 1 20); do
     _cg start >/dev/null &
   done
   wait  # Wait for all parallel starts to complete
-  # Verify exactly ONE guard process is running
-  # Use ps to check for caffeinate processes (more portable than pgrep)
-  num_guards=$(ps aux | grep '[c]affeinate -d -i -s' | wc -l | tr -d ' ')
-  [ "$num_guards" = "1" ] || { echo "FAIL: expected 1 guard process, found $num_guards"; fails=1; }
+  # Verify exactly ONE new guard process was created by this test
+  after_pids="$(ps aux | grep '[c]affeinate -d -i -s' | awk '{print $2}' | sort || true)"
+  new_pids="$(comm -13 <(echo "$before_pids") <(echo "$after_pids"))"
+  num_new="$(echo "$new_pids" | grep -c . || true)"
+  [ "$num_new" = "1" ] || { echo "FAIL: expected exactly 1 new guard process from concurrent starts, found $num_new"; fails=1; }
   # Verify the guard.pid has exactly one entry
   num_entries=$(wc -l < "$root/guard.pid" | tr -d ' ')
   [ "$num_entries" = "1" ] || { echo "FAIL: guard.pid has $num_entries lines, expected 1"; fails=1; }
@@ -376,10 +378,42 @@ if [ "${1:-}" = "--selfcheck" ]; then
   grep -q 'caffeinate not found' /tmp/cg10-out.txt || { echo "FAIL: should warn caffeinate not found"; fails=1; }
   [ -f "$root/guard.pid" ] || { echo "FAIL: should write sentinel"; fails=1; }
   head -n1 "$root/guard.pid" | grep -q '# caffeinate not found' || { echo "FAIL: sentinel content wrong"; fails=1; }
-  PATH="$fake_bin" bash "$SCRIPT_DIR/caffeinate-guard.sh" start > /tmp/cg10-out2.txt 2>&1
-  [ "$?" = 0 ] || { echo "FAIL: second start with missing binary should exit 0"; fails=1; }
+  rc10=0
+  PATH="$fake_bin" bash "$SCRIPT_DIR/caffeinate-guard.sh" start > /tmp/cg10-out.txt 2>&1 || rc10=$?
+  [ "$rc10" = 0 ] || { echo "FAIL: first start with missing binary should exit 0"; fails=1; }
+  grep -q 'caffeinate not found' /tmp/cg10-out.txt || { echo "FAIL: should warn caffeinate not found"; fails=1; }
+  [ -f "$root/guard.pid" ] || { echo "FAIL: should write sentinel"; fails=1; }
+  head -n1 "$root/guard.pid" | grep -q '# caffeinate not found' || { echo "FAIL: sentinel content wrong"; fails=1; }
+  rc10=0
+  PATH="$fake_bin" bash "$SCRIPT_DIR/caffeinate-guard.sh" start > /tmp/cg10-out2.txt 2>&1 || rc10=$?
+  [ "$rc10" = 0 ] || { echo "FAIL: second start with missing binary should exit 0"; fails=1; }
   rm -f "$root/guard.pid" /tmp/cg10-out.txt /tmp/cg10-out2.txt
   rm -rf "$fake_bin"
+
+  # Finding #10b: fingerprint capture failure path (ps fails after spawn)
+  # The _start function spawns caffeinate then immediately calls ps to capture fingerprint.
+  # If ps fails at that moment, fingerprint is empty, and we exit 1 with cleanup.
+  # Test this by temporarily replacing ps with a command that fails
+  fake_ps_bin="$(mktemp -d)"
+  for tool in bash dirname awk sed head mkdir chmod rm sleep cat grep tr seq env; do
+    tool_path="$(command -v "$tool" 2>/dev/null)"
+    [ -n "$tool_path" ] && ln -s "$tool_path" "$fake_ps_bin/$tool"
+  done
+  # Create fake ps that always exits 1
+  cat > "$fake_ps_bin/ps" << 'PS_EOF'
+#!/bin/bash
+exit 1
+PS_EOF
+  chmod +x "$fake_ps_bin/ps"
+  # Temporarily prepend fake bin to PATH for ps override only
+  rc=0
+  PATH="${fake_ps_bin}:${PATH}" bash "$SCRIPT_DIR/caffeinate-guard.sh" start >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: start with failing ps should exit 1 (rc=$rc)"; fails=1; }
+  [ ! -f "$root/guard.pid" ] || { echo "FAIL: start with failing ps should not write pidfile"; fails=1; }
+  # Verify no orphan caffeinate process (the spawned one should be killed on fingerprint fail)
+  orphan_count=$(ps aux | grep '[c]affeinate -d -i -s' | wc -l | tr -d ' ' || true)
+  [ "$orphan_count" = "0" ] || { echo "FAIL: fingerprint failure left orphan caffeinate process"; fails=1; }
+  rm -rf "$fake_ps_bin"
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
