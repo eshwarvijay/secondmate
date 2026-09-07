@@ -92,12 +92,14 @@ if [ -d "$_marketplace_checkout" ] && git -C "$_marketplace_checkout" rev-parse 
   _running_script_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null || true)
 fi
 
-ROWS=""; core_missing=0; checker_missing=0; stale_count=0; unknown_count=0
+ROWS=""; core_missing=0; checker_missing=0; stale_count=0; unknown_count=0; missing_marketplace_count=0
 add() { # status name category fix
   ROWS+="$1|$2|$3|$4"$'\n'
   if [ "$1" = MISSING ]; then
     [ "$3" = core ] && core_missing=$((core_missing + 1))
     [ "$3" = checker ] && checker_missing=$((checker_missing + 1))
+    # secondmate's missing marketplace checkout is a hard-abort condition (premises check)
+    [ "$2" = "secondmate plugin (marketplace)" ] && missing_marketplace_count=$((missing_marketplace_count + 1))
   elif [ "$1" = STALE ]; then
     stale_count=$((stale_count + 1))
   elif [ "$1" = UNKNOWN ]; then
@@ -631,6 +633,7 @@ emit_table() {
   echo "      (defaults: amazon-bedrock GPT-5.6 / DeepSeek-R1). Set SM_CHECKER_* / SM_REASON_* to yours."
   if [ "$core_missing" -gt 0 ]; then echo "STATUS: not ready. $core_missing core missing. Run: doctor.sh --heal"
   elif [ "$checker_missing" -gt 0 ]; then echo "STATUS: ready via in-session Claude fallback. No external checker harness found; install one (doctor.sh --heal) for a stronger cross-vendor check."
+  elif [ "$missing_marketplace_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin marketplace checkout is missing (claude plugin marketplace add eshwarvijay/secondmate)"
   elif [ "$unknown_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin state is unknown/unverifiable -- check installed_plugins.json"
   elif [ "$stale_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin needs healing (doctor.sh --heal)"
   else echo "STATUS: ready (core plus checker harness present)"; fi
@@ -1876,6 +1879,76 @@ EOF
   _doctor_lock_dir="$_old_lock_dir"
   _doctor_lock_file="$_old_lock_file"
   rm -rf "$d"
+
+  # === Test J (Bug 12 fix): missing marketplace checkout triggers hard-abort in heal ===
+  # This tests that when the marketplace checkout doesn't exist at all,
+  # a real doctor.sh --heal --yes subprocess invocation exits non-zero
+  # and prints a [FAIL] message (not silently succeeds with "STATUS: ready")
+  # Also verifies the STATUS line in report output is NOT "ready (core plus checker harness present)"
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  # Create origin repo with v0.1.8
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Create a valid installed_plugins.json pointing to existing checkout
+  mk_installed_json "$j" "$origin_sha_1" "0.1.8"
+
+  # Create the marketplace checkout (so state is 'ok' initially)
+  checkout_dir="$d/mkt"
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  # Advance origin with new commit at v0.1.9
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  echo "new content" >> "$origin_dir/readme.md"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Rewrite installed_plugins.json with OLD sha (creates stale state, needs heal)
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.8"
+
+  # First run: marketplace exists (heal should attempt and fail due to missing remote)
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --report 2>&1)
+  # Assert: STATUS line should NOT be plain ready (since there's a stale state)
+  status_line=$(echo "$out" | grep "^STATUS:" || true)
+  [ -n "$status_line" ] || { echo "FAIL: Test J (setup) STATUS line not found"; rm -rf "$d" "$origin_dir"; exit 1; }
+  echo "$status_line" | grep -q "ready (core plus checker harness present)" && { echo "FAIL: Test J (setup) STATUS should NOT be plain ready due to stale state"; rm -rf "$d" "$origin_dir"; exit 1; }
+
+  # Second run: marketplace checkout missing (missing state)
+  nonexistent_mkt="$d/i_dont_exist"
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$nonexistent_mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --report 2>&1)
+
+  # Assert: secondmate row exists and shows [!!]
+  secondmate_row=$(echo "$out" | grep "secondmate plugin" || true)
+  echo "$secondmate_row" | grep -q "\[!!\]" || { echo "FAIL: Test J bug12 fix: secondmate missing row should have [!!], got: $secondmate_row"; rm -rf "$d" "$origin_dir"; exit 1; }
+
+  # Assert: STATUS line is NOT plain ready (Bug 12 fix)
+  status_line=$(echo "$out" | grep "^STATUS:" || true)
+  [ -n "$status_line" ] || { echo "FAIL: Test J bug12 fix: STATUS line not found"; rm -rf "$d" "$origin_dir"; exit 1; }
+  echo "$status_line" | grep -q "ready (core plus checker harness present)" && { echo "FAIL: Test J bug12 fix: STATUS should NOT be plain ready when marketplace missing, got: $status_line"; rm -rf "$d" "$origin_dir"; exit 1; }
+  echo "$status_line" | grep -q "secondmate plugin marketplace checkout is missing" || { echo "FAIL: Test J bug12 fix: STATUS should mention missing marketplace, got: $status_line"; rm -rf "$d" "$origin_dir"; exit 1; }
+
+  # Third run: --heal --yes with missing marketplace should exit non-zero
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$nonexistent_mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --heal --yes 2>&1)
+  rc=$?
+
+  # Should fail with non-zero exit code (Bug 10 fix, which is prerequisite for Bug 12)
+  [ "$rc" -ne 0 ] || { echo "FAIL: Test J bug12 fix: heal should have failed (missing marketplace checkout), got rc=$rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir"; exit 1; }
+
+  # Assert: error message mentions missing checkout
+  echo "$out" | grep -q "\[FAIL\] secondmate marketplace checkout not found" || { echo "FAIL: Test J bug12 fix: expected [FAIL] about missing checkout, got: $out"; rm -rf "$d" "$origin_dir"; exit 1; }
+
+  rm -rf "$d" "$origin_dir"
 
   echo ok; exit 0
 fi
