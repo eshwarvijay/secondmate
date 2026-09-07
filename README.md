@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.6-4C8BF5?style=flat-square" alt="version 0.1.6" />
+  <img src="https://img.shields.io/badge/version-0.1.7-4C8BF5?style=flat-square" alt="version 0.1.7" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -92,6 +92,7 @@ flowchart LR
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
 | `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the free-text `audit/flow.md`/`audit/decision.md` |
+| `bin/caffeinate-guard.sh` | Prevents macOS sleep during task execution via `start`/`stop` commands; per-task isolation with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times) |
 | `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
@@ -172,6 +173,7 @@ credentials only you can supply.
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
 | `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
+| `SM_CAFFEINATE_ROOT` | `~/.secondmate-caffeinate` | where `caffeinate-guard.sh` stores per-task state files (PID + fingerprint) |
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
 
@@ -194,7 +196,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/prune-output.sh --selfcheck && bin/run-round.sh selfcheck && bin/reason.sh --selfcheck \
   && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
   && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck \
-  && bin/log-round.sh --selfcheck && echo ALL_OK
+  && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && echo ALL_OK
 claude plugin validate .
 ```
 
