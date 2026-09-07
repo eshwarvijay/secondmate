@@ -92,7 +92,7 @@ if [ -d "$_marketplace_checkout" ] && git -C "$_marketplace_checkout" rev-parse 
   _running_script_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null || true)
 fi
 
-ROWS=""; core_missing=0; checker_missing=0; stale_count=0
+ROWS=""; core_missing=0; checker_missing=0; stale_count=0; unknown_count=0
 add() { # status name category fix
   ROWS+="$1|$2|$3|$4"$'\n'
   if [ "$1" = MISSING ]; then
@@ -100,6 +100,8 @@ add() { # status name category fix
     [ "$3" = checker ] && checker_missing=$((checker_missing + 1))
   elif [ "$1" = STALE ]; then
     stale_count=$((stale_count + 1))
+  elif [ "$1" = UNKNOWN ]; then
+    unknown_count=$((unknown_count + 1))
   fi
 }
 
@@ -606,6 +608,7 @@ emit_table() {
   echo "      (defaults: amazon-bedrock GPT-5.6 / DeepSeek-R1). Set SM_CHECKER_* / SM_REASON_* to yours."
   if [ "$core_missing" -gt 0 ]; then echo "STATUS: not ready. $core_missing core missing. Run: doctor.sh --heal"
   elif [ "$checker_missing" -gt 0 ]; then echo "STATUS: ready via in-session Claude fallback. No external checker harness found; install one (doctor.sh --heal) for a stronger cross-vendor check."
+  elif [ "$unknown_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin state is unknown/unverifiable -- check installed_plugins.json"
   elif [ "$stale_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin needs healing (doctor.sh --heal)"
   else echo "STATUS: ready (core plus checker harness present)"; fi
 }
@@ -634,6 +637,13 @@ heal() {
     [ "$heal_result" -ne 0 ] && heal_failed=1
     
     echo
+  elif [ "$_sm_status" = "unknown" ]; then
+    # Bug 7 fix: unknown state means we cannot determine whether healing is needed/possible
+    # Treat this as failure, matching the precedent for Bug 7 (unverifiable = failure, not success)
+    echo "=== SECONDMATE PLUGIN HEAL ==="
+    echo "[FAIL] cannot determine secondmate plugin state (installed_plugins.json is malformed or unreadable)"
+    echo "       please fix installed_plugins.json and re-run"
+    return 1
   fi
   
   # Then heal other missing items
@@ -1609,6 +1619,58 @@ STUB_EOF
   echo "$status_line" | grep -q "ready, but secondmate plugin needs healing" || { echo "FAIL: Test F3 bug8 fix: STATUS should mention healing needed, got: $status_line"; rm -rf "$d"; exit 1; }
   # Make sure it's NOT the plain ready status
   echo "$status_line" | grep -q "ready (core plus checker harness present)" && { echo "FAIL: Test F3 bug8 fix: STATUS should NOT be plain ready, got: $status_line"; rm -rf "$d"; exit 1; }
+
+  rm -rf "$d"
+
+  # === Test G: malformed installed_plugins.json (Bug 9 fix) ===
+  # Test that UNKNOWN status is properly tracked, reported, and heals fail with non-zero exit
+  d=$(mktemp -d)
+  mkt_dir="$d/mkt"
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  # Create marketplace checkout with version 0.1.8
+  mkdir -p "$mkt_dir/.claude-plugin"
+  git -C "$mkt_dir" init -q -b main 2>/dev/null || true
+  git -C "$mkt_dir" config user.email t@t.com 2>/dev/null
+  git -C "$mkt_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$mkt_dir/.claude-plugin/plugin.json"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  sha=$(git -C "$mkt_dir" rev-parse HEAD)
+
+  # Create malformed installed_plugins.json (invalid JSON)
+  echo '{not-json' > "$j"
+
+  # --- Test G1: --report should show [!!] for secondmate and NOT plain "ready" STATUS ---
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --report 2>&1)
+
+  # secondmate row should still show [!!] (Bug 8 generalization already handles this)
+  secondmate_row=$(echo "$out" | grep "secondmate plugin" || true)
+  echo "$secondmate_row" | grep -q "\[!!\]" || { echo "FAIL: Test G1 bug9 fix: secondmate unknown row should have [!!], got: $secondmate_row"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+
+  # STATUS line should NOT be plain "ready (core plus checker harness present)"
+  status_line=$(echo "$out" | grep "^STATUS:" || true)
+  [ -n "$status_line" ] || { echo "FAIL: Test G1 bug9 fix: STATUS line not found"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+  echo "$status_line" | grep -q "ready, but secondmate plugin state is unknown" || { echo "FAIL: Test G1 bug9 fix: STATUS should mention unknown state, got: $status_line"; rm -rf "$d"; exit 1; }
+  echo "$status_line" | grep -q "ready (core plus checker harness present)" && { echo "FAIL: Test G1 bug9 fix: STATUS should NOT be plain ready, got: $status_line"; rm -rf "$d"; exit 1; }
+
+  # --- Test G2: --heal --yes should exit non-zero when installed_plugins.json is malformed ---
+  # Create a valid installed_plugins.json first, then make it malformed to simulate failure
+  mk_installed_json "$j" "$sha" "0.1.8"
+  # Now make it malformed
+  echo '{not-json' > "$j"
+
+  # Run REAL doctor.sh as subprocess with --heal --yes
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --heal --yes 2>&1)
+  heal_rc=$?
+
+  # Should fail with non-zero exit code
+  [ "$heal_rc" -ne 0 ] || { echo "FAIL: Test G2 bug9 fix: heal should have failed (malformed installed_plugins.json), got rc=$heal_rc"; echo "output: $out" >&2; rm -rf "$d"; exit 1; }
+
+  # Should print appropriate error message
+  echo "$out" | grep -q "cannot determine secondmate plugin state" || { echo "FAIL: Test G2 bug9 fix: expected error about unknown state, got: $out"; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q "installed_plugins.json is malformed" || { echo "FAIL: Test G2 bug9 fix: expected error about malformed installed_plugins.json, got: $out"; rm -rf "$d"; exit 1; }
 
   rm -rf "$d"
 
