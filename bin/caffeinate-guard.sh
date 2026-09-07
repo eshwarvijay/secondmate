@@ -12,6 +12,11 @@
 #   sessions concurrently on the same machine is not supported. One session's stop can kill
 #   sleep prevention for another session's still-active batch (by design, matching this
 #   project's precedent of documenting rather than chasing every possible concurrency edge case).
+# - A start call overlapping a concurrent stop call for the same guard is not fully serialized
+#   against each other (only start-vs-start is). An adversarially-timed overlap could in theory
+#   let stop's cleanup remove a just-written new guard's pidfile, leaving it untracked until its
+#   TTL expires. This requires violating the documented call-stop-only-after-all-tasks-are-torn-down
+#   contract to reach in practice.
 
 set -euo pipefail
 
