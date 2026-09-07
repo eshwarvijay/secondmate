@@ -17,6 +17,10 @@
 #   let stop's cleanup remove a just-written new guard's pidfile, leaving it untracked until its
 #   TTL expires. This requires violating the documented call-stop-only-after-all-tasks-are-torn-down
 #   contract to reach in practice.
+# - The fingerprint check identifies a process by its comm name and start time at spawn time;
+#   it assumes 'caffeinate' in PATH resolves to a well-behaved system utility that does not
+#   replace its own process image via exec after launch. Defending against an adversarially-
+#   substituted PATH entry masquerading as caffeinate is out of scope for this feature.
 
 set -euo pipefail
 
