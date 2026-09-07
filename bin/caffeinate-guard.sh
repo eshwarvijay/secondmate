@@ -153,6 +153,11 @@ _start() {
   local lockstart=$SECONDS
 
   while ! mkdir "$lockdir" 2>/dev/null; do
+    # Timeout protection for lock acquisition (MUST run on every iteration)
+    if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
+      echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
+      exit 1
+    fi
     # Lock directory exists - check for staleness by examining the PID file
     if [ -f "$lockpidfile" ]; then
       local held_pid
@@ -170,11 +175,6 @@ _start() {
     mkdir "$lockdir" 2>/dev/null && break
     # If race detected, continue to retry
     sleep 0.1
-    # Timeout protection for lock acquisition
-    if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
-      echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
-      exit 1
-    fi
   done
 
   # Record our PID as the lock owner immediately after acquiring lock
@@ -264,6 +264,11 @@ _stop() {
 
   # Acquire lock for serialization with _start
   while ! mkdir "$lockdir" 2>/dev/null; do
+    # Timeout protection for lock acquisition (MUST run on every iteration)
+    if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
+      echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
+      exit 1
+    fi
     if [ -f "$lockpidfile" ]; then
       local held_pid
       held_pid="$(cat "$lockpidfile" 2>/dev/null)"
@@ -278,10 +283,6 @@ _stop() {
     mkdir "$lockdir" 2>/dev/null && break
     # If race detected, continue to retry
     sleep 0.1
-    if [ $((SECONDS - lockstart)) -ge $locktimeout ]; then
-      echo "failed to acquire lock for task '$task_id' within ${locktimeout}s" >&2
-      exit 1
-    fi
   done
   echo "$$" > "$lockpidfile"
 
