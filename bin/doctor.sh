@@ -767,6 +767,191 @@ EOF
   echo "$out" | grep -q "\[FAIL\] claude CLI not found" || { echo "FAIL: no-claude test expected [FAIL] about claude not found"; echo "DEBUG output was:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
   rm -rf "$d"
 
+  # === Test A: successful heal path (real origin repo, real fetch+ff-only pull, stub claude binary) ===
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+
+  # Create origin repo with first commit (version 0.1.7)
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.7"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.7" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  # Advance origin with second commit (version 0.1.9)
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Write installed_plugins.json with OLD sha and version
+  mk_installed_json "$j" "$origin_sha_1" "0.1.7"
+
+  # Create stub claude binary that rewrites installed_plugins.json when called correctly
+  # USE QUOTED heredoc delimiter so $1/$2 are NOT expanded when WRITING the file
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "$1" = "plugin" ] && [ "$2" = "update" ] && [ "$3" = "secondmate@secondmate" ] && [ "$4" = "-y" ]; then
+  if [ -n "$SM_TEST_INSTALLED_JSON_FOR_STUB" ] && [ -f "$SM_TEST_INSTALLED_JSON_FOR_STUB" ]; then
+    # Get new sha from origin repo
+    origin_sha=$(git -C "$SM_SECONDMATE_MARKETPLACE_DIR" rev-parse HEAD 2>/dev/null || true)
+    origin_ver=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$SM_SECONDMATE_MARKETPLACE_DIR/.claude-plugin/plugin.json" 2>/dev/null || true)
+    # Rewrite installed_plugins.json with new sha and version
+    python3 -c "
+import json,sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        for key in list(plugins.keys()):
+            if key.startswith('secondmate@'):
+                entries = plugins[key]
+                if isinstance(entries, list) and len(entries) > 0 and isinstance(entries[0], dict):
+                    entries[0]['gitCommitSha'] = '$origin_sha'
+                    entries[0]['version'] = '$origin_ver'
+    with open(sys.argv[1], 'w') as f:
+        json.dump(data, f)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$SM_TEST_INSTALLED_JSON_FOR_STUB"
+  fi
+  exit 0
+else
+  echo "stub claude: unexpected args: $*" >&2
+  exit 1
+fi
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  # Record checkout HEAD before heal
+  before_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+
+  # Run _heal_secondmate with stub in PATH
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" SM_TEST_INSTALLED_JSON_FOR_STUB="$j" PATH="$stub_dir:$PATH" bash -c 'source "'"$script_abs"'"; _heal_secondmate 1' 2>&1)
+  rc=$?
+
+  # Assert: return code 0
+  [ "$rc" -eq 0 ] || { echo "FAIL: Test A heal test expected rc=0, got $rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: checkout HEAD now equals origin's new HEAD (proving real fetch+ff-only pull happened)
+  after_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+  [ "$after_checkout_head" = "$origin_sha_2" ] || { echo "FAIL: Test A heal test: checkout HEAD $after_checkout_head != origin HEAD $origin_sha_2"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: installed_plugins.json shows new sha/version (proving stub was invoked)
+  after_sha=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('gitCommitSha','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j" 2>/dev/null)
+  after_ver=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('version','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j" 2>/dev/null)
+  [ "$after_sha" = "$origin_sha_2" ] || { echo "FAIL: Test A heal test: installed_plugins.json sha $after_sha != expected $origin_sha_2"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  [ "$after_ver" = "0.1.9" ] || { echo "FAIL: Test A heal test: installed_plugins.json version $after_ver != expected 0.1.9"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  rm -rf "$d" "$origin_dir" "$stub_dir"
+
+  # === Test B: silent-drift skip path (version unchanged, claude stub should NOT be called) ===
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+
+  # Create origin repo with first commit (version 0.1.8)
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  # Advance origin with new commit (same version, different file content)
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  echo "new file" > "$origin_dir/newfile.txt"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "add newfile" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Write installed_plugins.json with OLD sha but SAME version 0.1.8
+  mk_installed_json "$j" "$origin_sha_1" "0.1.8"
+
+  # Create stub claude binary that would FAIL if called (proves it wasn't)
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+echo "stub claude SHOULD NOT BE CALLED - this is a silent drift scenario" >&2
+exit 1
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  # Record checkout HEAD before heal
+  before_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+
+  # Run _heal_secondmate with stub in PATH
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" PATH="$stub_dir:$PATH" bash -c 'source "'"$script_abs"'"; _heal_secondmate 1' 2>&1)
+  rc=$?
+
+  # Assert: return code 0 (graceful skip, not failure)
+  [ "$rc" -eq 0 ] || { echo "FAIL: Test B silent-drift test expected rc=0, got $rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: checkout HEAD advanced (git pull DID happen since new commits exist)
+  after_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+  [ "$after_checkout_head" = "$origin_sha_2" ] || { echo "FAIL: Test B silent-drift test: checkout HEAD $after_checkout_head != origin HEAD $origin_sha_2"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: stub was NEVER invoked (check by stdout not containing error message about not being called)
+  echo "$out" | grep -q "SHOULD NOT BE CALLED" && { echo "FAIL: Test B silent-drift test: stub claude WAS called but shouldn't have been"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: [SKIP] message about version unchanged appears
+  echo "$out" | grep -q "\[SKIP\] claude plugin update is not applicable" || { echo "FAIL: Test B silent-drift test: expected [SKIP] message about version unchanged"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  rm -rf "$d" "$origin_dir" "$stub_dir"
+
+  # === Test C: lock contention (pre-created lock directory blocks _acquire_heal_lock) ===
+  d=$(mktemp -d)
+  lock_dir="$d/lock"
+  lock_file="$lock_dir/secondmate-heal.lock"
+
+  # Pre-create lock directory with a fresh timestamp (non-stale)
+  mkdir -p "$lock_file"
+  echo "$$" > "$lock_file/.pid"
+  echo "$(date +%s)" > "$lock_file/.timestamp"
+
+  # Run _acquire_heal_lock with pre-existing lock (call directly, no subshell needed)
+  # Temporarily set _doctor_lock_dir to our test path
+  _old_lock_dir="$_doctor_lock_dir"
+  _doctor_lock_dir="$lock_dir"
+  _doctor_lock_file="$_doctor_lock_dir/secondmate-heal.lock"
+  
+  out=$(_acquire_heal_lock 2>&1)
+  rc=$?
+  
+  # Restore original
+  _doctor_lock_dir="$_old_lock_dir"
+
+  # Assert: returns non-zero (lock contention)
+  [ "$rc" -ne 0 ] || { echo "FAIL: Test C lock contention test expected non-zero rc, got $rc"; rm -rf "$d"; exit 1; }
+
+  # Assert: error message indicates lock contention
+  echo "$out" | grep -q "another heal is already in progress" || { echo "FAIL: Test C lock contention test: expected lock contention error message"; echo "output: $out" >&2; rm -rf "$d"; exit 1; }
+
+  # Verify lock directory contents were not corrupted (still has .pid and .timestamp)
+  [ -f "$lock_file/.pid" ] || { echo "FAIL: Test C lock contention test: .pid file missing after contention"; rm -rf "$d"; exit 1; }
+  [ -f "$lock_file/.timestamp" ] || { echo "FAIL: Test C lock contention test: .timestamp file missing after contention"; rm -rf "$d"; exit 1; }
+
+  rm -rf "$d"
+
   echo ok; exit 0
 fi
 
