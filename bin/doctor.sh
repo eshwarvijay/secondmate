@@ -507,7 +507,21 @@ sys.exit(1)
   fi
   
   local after_version
-  after_version=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('version',''))" "$_installed_plugins_json" 2>/dev/null || true)
+  after_version=$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    plugins=d.get('plugins',{})
+    if isinstance(plugins,dict):
+        for key,entries in plugins.items():
+            if isinstance(entries,list) and len(entries)>0 and isinstance(entries[0],dict):
+                if key.startswith('secondmate@'):
+                    print(entries[0].get('version',''))
+                    sys.exit(0)
+except Exception as e:
+    pass
+print('',end='')
+" "$_installed_plugins_json" 2>/dev/null || true)
   
   if [ "$after_sha" = "$remote_sha" ]; then
     echo "[OK] SHA advanced: $local_sha -> $after_sha (version: $current_version -> $after_version)"
@@ -623,7 +637,9 @@ heal() {
   done <<< "$ROWS"
   
   # Bug 4 fix: return failure if secondmate heal failed
-  [ "$heal_failed" -eq 1 ] && return 1
+  if [ "$heal_failed" -eq 1 ]; then
+    return 1
+  fi
 }
 
 # --- selfcheck (no installs) ---
@@ -1246,13 +1262,192 @@ STUB_EOF
   _doctor_lock_file="$_old_lock_file"
   rm -rf "$d"
 
+  # === Test E: real doctor.sh subprocess heal failure (Bug 4 fix) ===
+  # This test invokes the ACTUAL doctor.sh script as a real subprocess with --heal --yes
+  # It verifies that when heal fails (stub claude writes wrong SHA), the PROCESS exits non-zero
+  # This is the ONE THING that was never actually checked: does running doctor.sh as a real command,
+  # when a heal fails, actually exit non-zero?
+  # Also tests that when heal SUCCEEDS, the process still exits 0.
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  # Create origin repo with first commit (version 0.1.8)
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  # Advance origin with second commit (version 0.1.9)
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Write installed_plugins.json with OLD sha but version 0.1.8
+  # This creates the "stale" state: SHA differs AND version differs (0.1.8 != 0.1.9)
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.8"
+
+  # Create stub claude binary that writes WRONG SHA (simulating failed heal)
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "$1" = "plugin" ] && [ "$2" = "update" ] && [ "$3" = "secondmate@secondmate" ] && [ "$4" = "-y" ]; then
+  if [ -n "$SM_TEST_INSTALLED_JSON_FOR_STUB" ] && [ -f "$SM_TEST_INSTALLED_JSON_FOR_STUB" ]; then
+    # Write WRONG sha - simulating a failed update that doesn't actually update
+    python3 -c "
+import json,sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        for key in list(plugins.keys()):
+            if key.startswith('secondmate@'):
+                entries = plugins[key]
+                if isinstance(entries, list) and len(entries) > 0 and isinstance(entries[0], dict):
+                    entries[0]['gitCommitSha'] = '0000000000000000000000000000000000000000'  # WRONG SHA
+    with open(sys.argv[1], 'w') as f:
+        json.dump(data, f)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$SM_TEST_INSTALLED_JSON_FOR_STUB"
+  fi
+  exit 0
+else
+  echo "stub claude: unexpected args: $*" >&2
+  exit 1
+fi
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  # Record checkout HEAD before heal
+  before_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+
+  # Run REAL doctor.sh as subprocess with --heal --yes (NOT sourcing _heal_secondmate directly)
+  # This is the critical difference from earlier tests
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" SM_TEST_INSTALLED_JSON_FOR_STUB="$j" PATH="$stub_dir:$PATH" "$script_abs" --heal --yes 2>&1)
+  heal_fail_rc=$?
+
+  # Assert: process exit code non-zero (Bug 4 fix)
+  [ "$heal_fail_rc" -ne 0 ] || { echo "FAIL: Test E heal failure test expected non-zero exit code, got $heal_fail_rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: installed_plugins.json still has old SHA (heal didn't update it)
+  after_sha=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('gitCommitSha','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j" 2>/dev/null)
+  [ "$after_sha" = "0000000000000000000000000000000000000000" ] || { echo "FAIL: Test E heal failure test: installed_plugins.json sha $after_sha != expected wrong SHA"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # === Test E2: real doctor.sh subprocess heal success (happy path) ===
+  # Now test that when heal SUCCEEDS (stub claude writes CORRECT SHA), the process exits 0
+  d2=$(mktemp -d)
+  origin_dir2=$(mktemp -d)
+  checkout_dir2="$d2/mkt"
+  stub_dir2=$(mktemp -d)
+  j2="$d2/plugins.json"
+  lock_dir2="$d2/lock"
+
+  # Create origin repo with first commit (version 0.1.7)
+  mkdir -p "$origin_dir2/.claude-plugin"
+  git -C "$origin_dir2" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir2" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir2" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir2/.claude-plugin/plugin.json"
+  git -C "$origin_dir2" add -A 2>/dev/null || true
+  git -C "$origin_dir2" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir2" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir2" "$checkout_dir2" 2>/dev/null
+
+  # Advance origin with second commit (version 0.1.9)
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir2/.claude-plugin/plugin.json"
+  git -C "$origin_dir2" add -A 2>/dev/null || true
+  git -C "$origin_dir2" commit -q -m "v0.1.9" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir2" rev-parse HEAD)
+
+  # Write installed_plugins.json with OLD sha but version 0.1.8
+  # This creates the "stale" state: SHA differs AND versions differ (0.1.8 != 0.1.9)
+  mk_installed_json "$j2" "deadbeef00000000000000000000000000000000" "0.1.8"
+
+  # Create stub claude binary that writes CORRECT SHA (simulating successful heal)
+  cat > "$stub_dir2/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "$1" = "plugin" ] && [ "$2" = "update" ] && [ "$3" = "secondmate@secondmate" ] && [ "$4" = "-y" ]; then
+  if [ -n "$SM_TEST_INSTALLED_JSON_FOR_STUB" ] && [ -f "$SM_TEST_INSTALLED_JSON_FOR_STUB" ]; then
+    # Get new sha from origin repo and write CORRECT SHA
+    origin_sha=$(git -C "$SM_SECONDMATE_MARKETPLACE_DIR" rev-parse HEAD 2>/dev/null || true)
+    origin_ver=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$SM_SECONDMATE_MARKETPLACE_DIR/.claude-plugin/plugin.json" 2>/dev/null || true)
+    python3 -c "
+import json,sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        for key in list(plugins.keys()):
+            if key.startswith('secondmate@'):
+                entries = plugins[key]
+                if isinstance(entries, list) and len(entries) > 0 and isinstance(entries[0], dict):
+                    entries[0]['gitCommitSha'] = '$origin_sha'
+                    entries[0]['version'] = '$origin_ver'
+    with open(sys.argv[1], 'w') as f:
+        json.dump(data, f)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$SM_TEST_INSTALLED_JSON_FOR_STUB"
+  fi
+  exit 0
+else
+  echo "stub claude: unexpected args: $*" >&2
+  exit 1
+fi
+STUB_EOF
+  chmod +x "$stub_dir2/claude"
+
+  # Record checkout HEAD before heal
+  before_checkout_head=$(git -C "$checkout_dir2" rev-parse HEAD)
+
+  # Run REAL doctor.sh as subprocess with --heal --yes
+  out2=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir2" SM_INSTALLED_PLUGINS_JSON="$j2" SM_DOCTOR_LOCK_DIR="$lock_dir2" SM_TEST_INSTALLED_JSON_FOR_STUB="$j2" PATH="$stub_dir2:$PATH" "$script_abs" --heal --yes 2>&1)
+  heal_success_rc=$?
+
+  # Assert: process exit code 0 (happy path)
+  [ "$heal_success_rc" -eq 0 ] || { echo "FAIL: Test E2 heal success test expected exit code 0, got $heal_success_rc"; echo "output: $out2" >&2; rm -rf "$d2" "$origin_dir2" "$stub_dir2"; exit 1; }
+
+  # Assert: installed_plugins.json shows new sha/version (proving stub was invoked correctly)
+  after_sha2=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('gitCommitSha','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j2" 2>/dev/null)
+  after_ver2=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('version','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j2" 2>/dev/null)
+  [ "$after_sha2" = "$origin_sha_2" ] || { echo "FAIL: Test E2 heal success test: installed_plugins.json sha $after_sha2 != expected $origin_sha_2"; rm -rf "$d2" "$origin_dir2" "$stub_dir2"; exit 1; }
+  [ "$after_ver2" = "0.1.9" ] || { echo "FAIL: Test E2 heal success test: installed_plugins.json version $after_ver2 != expected 0.1.9"; rm -rf "$d2" "$origin_dir2" "$stub_dir2"; exit 1; }
+
+  rm -rf "$d" "$origin_dir" "$stub_dir" "$d2" "$origin_dir2" "$stub_dir2"
+
   echo ok; exit 0
 fi
 
 detect
 case "${1:-}" in
   --json) emit_json;;
-  --heal) [ "${2:-}" = "--yes" ] && heal 1 || heal 0; echo; emit_table;;
+  --heal)
+    if [ "${2:-}" = "--yes" ]; then
+      heal 1; heal_rc=$?; echo; emit_table; exit $heal_rc
+    else
+      heal 0; heal_rc=$?; echo; emit_table; exit $heal_rc
+    fi;;
   ""|--report) emit_table;;
   *) echo "usage: doctor.sh [--json|--heal [--yes]|--selfcheck]" >&2; exit 2;;
 esac
