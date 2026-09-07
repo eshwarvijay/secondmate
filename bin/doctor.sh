@@ -78,6 +78,19 @@ if [ -f "$plugin_json" ]; then
   version_line=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('version',''))" "$plugin_json" 2>/dev/null || true)
 fi
 
+# secondmate plugin staleness detection constants
+_marketplace_checkout="$HOME/.claude/plugins/marketplaces/secondmate"
+_installed_plugins_json="$HOME/.claude/plugins/installed_plugins.json"
+_doctor_lock_dir="$HOME/.secondmate-doctor-lock"
+_doctor_lock_file="$_doctor_lock_dir/secondmate-heal.lock"
+
+# get current running script's git commit SHA (from its own marketplace checkout)
+# This is the version that's currently loaded in this session
+_running_script_sha=""
+if [ -d "$_marketplace_checkout" ] && git -C "$_marketplace_checkout" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  _running_script_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null || true)
+fi
+
 ROWS=""; core_missing=0; checker_missing=0
 add() { # status name category fix
   ROWS+="$1|$2|$3|$4"$'\n'
@@ -85,6 +98,354 @@ add() { # status name category fix
     [ "$3" = core ] && core_missing=$((core_missing + 1))
     [ "$3" = checker ] && checker_missing=$((checker_missing + 1))
   fi
+}
+
+# Helper to detect secondmate plugin staleness
+# Usage: _detect_secondmate_status, sets _sm_status and _sm_details global variables
+_detect_secondmate_status() {
+  _sm_status="unknown"
+  _sm_details=""
+  
+  # Check if marketplace checkout exists
+  if [ ! -d "$_marketplace_checkout" ]; then
+    _sm_status="missing"
+    _sm_details="marketplace checkout not found"
+    return
+  fi
+  
+  # Get marketplace HEAD SHA
+  local marketplace_sha=""
+  marketplace_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null) || {
+    _sm_status="unknown"
+    _sm_details="cannot read marketplace HEAD"
+    return
+  }
+  [ -z "$marketplace_sha" ] && { _sm_status="unknown"; _sm_details="marketplace HEAD is empty"; return; }
+  
+  # Check if installed_plugins.json exists and has secondmate entry
+  if [ ! -f "$_installed_plugins_json" ]; then
+    _sm_status="unknown"
+    _sm_details="installed_plugins.json not found"
+    return
+  fi
+  
+  # Extract the installed secondmate SHA from installed_plugins.json
+  local installed_sha=""
+  installed_sha=$(python3 -c "
+import json,sys
+try:
+    data=json.load(open(sys.argv[1]))
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        # Structure: plugins is a dict with keys like 'name@scope'
+        for key, entries in plugins.items():
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        if key.startswith('secondmate@'):
+                            print(entry.get('gitCommitSha', ''))
+                            sys.exit(0)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    pass
+print('', end='')
+sys.exit(1)
+" "$_installed_plugins_json" 2>/dev/null) || installed_sha=""
+  [ -z "$installed_sha" ] && { _sm_status="unknown"; _sm_details="secondmate not found in installed_plugins.json"; return; }
+  
+  # Get marketplace plugin.json version
+  local marketplace_version=""
+  if [ -f "$_marketplace_checkout/.claude-plugin/plugin.json" ]; then
+    marketplace_version=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$_marketplace_checkout/.claude-plugin/plugin.json" 2>/dev/null || true)
+  fi
+  [ -z "$marketplace_version" ] && { _sm_status="unknown"; _sm_details="cannot read marketplace version"; return; }
+  
+  # Get running script's version
+  local running_version=""
+  if [ -f "$plugin_json" ]; then
+    running_version=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$plugin_json" 2>/dev/null || true)
+  fi
+  
+  # Compare SHAs
+  if [ "$marketplace_sha" = "$installed_sha" ]; then
+    _sm_status="ok"
+    _sm_details="installed and marketplace SHAs match"
+  else
+    # SHA differs — check if version also changed (silent drift)
+    if [ "$marketplace_version" = "$running_version" ]; then
+      # Version didn't change but SHA differs — silent drift
+      _sm_status="silent_drift"
+      _sm_details="new commits but version unchanged (claude plugin update won't act)"
+    else
+      # Both SHA and version changed — stale and can be healed
+      _sm_status="stale"
+      _sm_details="marketplace ahead of installed (sha $installed_sha -> $marketplace_sha)"
+    fi
+  fi
+  
+  # Check for reload pending: currently running version differs from latest in installed_plugins.json
+  if [ "$running_version" != "$marketplace_version" ]; then
+    # If version differs, that means /reload-plugins hasn't been run yet
+    _sm_status="reload_pending"
+    _sm_details="heal completed but /reload-plugins not yet run"
+  fi
+}
+
+# Add secondmate staleness row
+_detect_secondmate_staleness() {
+  _detect_secondmate_status
+  
+  local fix_cmd=""
+  case "$_sm_status" in
+    stale)
+      fix_cmd="doctor.sh --heal (pulls and re-installs secondmate plugin)"
+      add STALE "secondmate plugin (stale)" companion "$fix_cmd"
+      ;;
+    silent_drift)
+      fix_cmd="doctor.sh --heal (pull succeeds but update is blocked until version bump)"
+      add STALE "secondmate plugin (silent drift)" companion "$fix_cmd"
+      ;;
+    reload_pending)
+      fix_cmd="claude /reload-plugins (reload into running session)"
+      add STALE "secondmate plugin (reload pending)" companion "$fix_cmd"
+      ;;
+    missing)
+      fix_cmd="claude plugin marketplace add eshwarvijay/secondmate"
+      add MISSING "secondmate plugin (marketplace)" companion "$fix_cmd"
+      ;;
+    ok)
+      add OK "secondmate plugin" companion ""
+      ;;
+    *)
+      add UNKNOWN "secondmate plugin" companion ""
+      ;;
+  esac
+}
+
+# Lock mechanism for heal operations (mkdir-based atomic lock)
+_acquire_heal_lock() {
+  local max_wait=30  # 30 seconds
+  local wait_interval=1
+  local elapsed=0
+  
+  mkdir -p "$_doctor_lock_dir"
+  
+  while [ ! -d "$_doctor_lock_file" ]; do
+    if mkdir "$_doctor_lock_file" 2>/dev/null; then
+      # Lock acquired, write our PID
+      echo "$$" > "$_doctor_lock_file/.pid"
+      echo "$(date +%s)" > "$_doctor_lock_file/.timestamp"
+      return 0
+    fi
+    
+    # Check if lock is stale (older than max_wait)
+    if [ -f "$_doctor_lock_file/.timestamp" ]; then
+      local lock_age
+      lock_age=$(( $(date +%s) - $(cat "$_doctor_lock_file/.timestamp" 2>/dev/null || echo $max_wait) ))
+      if [ "$lock_age" -gt "$max_wait" ]; then
+        # Stale lock, try to steal it
+        rm -rf "$_doctor_lock_file" 2>/dev/null
+        continue
+      fi
+    fi
+    
+    sleep "$wait_interval"
+    elapsed=$((elapsed + wait_interval))
+    if [ "$elapsed" -ge "$max_wait" ]; then
+      echo "heal cancelled: could not acquire lock after ${max_wait}s" >&2
+      return 1
+    fi
+  done
+  
+  # If we got here, the lock directory already exists (someone else got it)
+  echo "heal cancelled: another heal is already in progress" >&2
+  return 1
+}
+
+_release_heal_lock() {
+  rm -rf "$_doctor_lock_file" 2>/dev/null
+}
+
+# Heal secondmate plugin
+_heal_secondmate() {
+  local yes="$1"
+  local abort_reason=""
+  
+  # Check if claude CLI exists
+  if ! have claude; then
+    echo "[FAIL] claude CLI not found on PATH"
+    echo "       please ensure claude is installed and on your PATH"
+    return 1
+  fi
+  
+  # Check if marketplace checkout exists
+  if [ ! -d "$_marketplace_checkout" ]; then
+    echo "[FAIL] secondmate marketplace checkout not found at $_marketplace_checkout"
+    echo "       run: claude plugin marketplace add eshwarvijay/secondmate"
+    return 1
+  fi
+  
+  # Check for uncommitted changes (dirty tree)
+  local dirty_files
+  dirty_files=$(git -C "$_marketplace_checkout" status --porcelain 2>/dev/null)
+  if [ -n "$dirty_files" ]; then
+    echo "[FAIL] marketplace checkout has uncommitted changes:"
+    git -C "$_marketplace_checkout" status --porcelain | sed 's/^/       /'
+    echo ""
+    echo "       cannot heal with dirty working tree"
+    echo "       please commit, stash, or discard changes first"
+    return 1
+  fi
+  
+  # Check if on detached HEAD or non-fast-forward capable
+  local current_branch
+  current_branch=$(git -C "$_marketplace_checkout" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$current_branch" = "HEAD" ]; then
+    echo "[FAIL] marketplace checkout is on detached HEAD"
+    echo "       heal requires a named branch for safe fast-forward pulls"
+    return 1
+  fi
+  
+  # Try to fetch + fast-forward only (no merge, no rebase, no force)
+  echo "[INFO] pulling marketplace checkout..."
+  if ! git -C "$_marketplace_checkout" fetch origin 2>/dev/null; then
+    echo "[FAIL] git fetch failed"
+    return 1
+  fi
+  
+  # Get remote branch ref
+  local remote_ref="origin/$current_branch"
+  if ! git -C "$_marketplace_checkout" rev-parse --verify "$remote_ref" >/dev/null 2>&1; then
+    # Try with refs/heads/ prefix
+    remote_ref="refs/heads/$current_branch"
+    if ! git -C "$_marketplace_checkout" rev-parse --verify "$remote_ref" >/dev/null 2>&1; then
+      echo "[FAIL] cannot determine remote branch for fast-forward"
+      return 1
+    fi
+  fi
+  
+  # Check if this is a fast-forward (local is ancestor of remote)
+  local local_sha remote_sha merge_base
+  local_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null) || {
+    echo "[FAIL] cannot read local SHA"
+    return 1
+  }
+  remote_sha=$(git -C "$_marketplace_checkout" rev-parse "$remote_ref" 2>/dev/null) || {
+    echo "[FAIL] cannot read remote SHA"
+    return 1
+  }
+  
+  merge_base=$(git -C "$_marketplace_checkout" merge-base "$local_sha" "$remote_sha" 2>/dev/null) || {
+    echo "[FAIL] cannot compute merge base"
+    return 1
+  }
+  
+  if [ "$merge_base" != "$local_sha" ]; then
+    echo "[FAIL] pull would not be a fast-forward (local has diverged from remote)"
+    echo "       local commit $local_sha is not an ancestor of $remote_ref"
+    echo "       heal requires clean fast-forward; aborting to preserve local state"
+    return 1
+  fi
+  
+  # Perform fast-forward only pull
+  if ! git -C "$_marketplace_checkout" pull --ff-only 2>/dev/null; then
+    echo "[FAIL] git pull --ff-only failed"
+    return 1
+  fi
+  
+  echo "[OK] marketplace checkout updated"
+  
+  # Check if claude plugin update would actually do something
+  local current_version new_version
+  current_version=$(python3 -c "import json,sys; d=json.load(open('$plugin_json')); print(d.get('version',''))" 2>/dev/null || true)
+  new_version=$(python3 -c "import json,sys; d=json.load(open('$_marketplace_checkout/.claude-plugin/plugin.json')); print(d.get('version',''))" 2>/dev/null || true)
+  
+  if [ "$current_version" = "$new_version" ]; then
+    echo "[SKIP] claude plugin update is not applicable (version unchanged)"
+    echo "       new commits exist but version string was not bumped"
+    echo "       run 'claude plugin update secondmate@secondmate' manually to force"
+    return 0
+  fi
+  
+  # Run the actual plugin update
+  if [ "$yes" = 1 ]; then
+    echo "[INFO] running claude plugin update secondmate@secondmate -y"
+    if ! claude plugin update secondmate@secondmate -y 2>&1; then
+      echo "[FAIL] claude plugin update failed"
+      echo "       marketplace checkout was updated but plugin was not reinstalled"
+      echo "       run 'claude plugin update secondmate@secondmate' manually to complete"
+      return 1
+    fi
+  else
+    printf '[INFO] claude plugin update secondmate@secondmate will run\n  proceed? [y/N] '
+    read -r ans
+    case "$ans" in
+      y|Y)
+        echo "[INFO] running claude plugin update secondmate@secondmate"
+        if ! claude plugin update secondmate@secondmate 2>&1; then
+          echo "[FAIL] claude plugin update failed"
+          echo "       marketplace checkout was updated but plugin was not reinstalled"
+          echo "       run 'claude plugin update secondmate@secondmate' manually to complete"
+          return 1
+        fi
+        ;;
+      *)
+        echo "[ABORTED] claude plugin update skipped"
+        return 0
+        ;;
+    esac
+  fi
+  
+  # Verify the heal by re-reading installed_plugins.json fresh from disk
+  echo "[VERIFY] re-reading installed_plugins.json to confirm SHA advance..."
+  local after_sha
+  after_sha=$(python3 -c "
+import json,sys
+try:
+    data=json.load(open(sys.argv[1]))
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        for key, entries in plugins.items():
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        if key.startswith('secondmate@'):
+                            print(entry.get('gitCommitSha', ''))
+                            sys.exit(0)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    pass
+print('', end='')
+sys.exit(1)
+" "$_installed_plugins_json" 2>/dev/null)
+  
+  if [ -z "$after_sha" ]; then
+    echo "[WARN] cannot verify heal - secondmate not found in installed_plugins.json"
+    echo "       but plugin update may have succeeded"
+    return 0
+  fi
+  
+  local after_version
+  after_version=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('version',''))" "$_installed_plugins_json" 2>/dev/null || true)
+  
+  if [ "$after_sha" != "$local_sha" ]; then
+    echo "[OK] SHA advanced: $local_sha -> $after_sha (version: $current_version -> $after_version)"
+  else
+    echo "[WARN] SHA unchanged after heal - plugin may not have reinstalled properly"
+  fi
+  
+  # Print the reload reminder
+  echo ""
+  echo "============================================================"
+  echo "  IMPORTANT: /reload-plugins is still required to load"
+  echo "  the healed plugin into any currently-running session."
+  echo "  This is a genuine, permanent limitation (a bash script"
+  echo "  cannot trigger a Claude Code slash command)."
+  echo "============================================================"
+  
+  return 0
 }
 
 detect() {
@@ -100,6 +461,8 @@ detect() {
   plugin_present ponytail && add OK "ponytail (complexity lens plugin)" companion "" || add MISSING "ponytail (complexity lens plugin)" companion "claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail --yes"
   # loop-task ships bundled with this plugin (commands/loop-task.md) — no external install needed.
   skill_present adhd && add OK "adhd (divergent ideation)" companion "" || add MISSING "adhd (divergent ideation)" companion "claude plugin marketplace add UditAkhourii/adhd && claude plugin install adhd@adhd --yes"
+  # SECONDMATE PLUGIN STALENESS — check if the running copy is stale compared to marketplace checkout
+  _detect_secondmate_staleness
 }
 
 emit_json() {
@@ -137,9 +500,34 @@ emit_table() {
 
 heal() {
   local yes="$1"
+  
+  # Handle secondmate plugin staleness first
+  _detect_secondmate_status
+  if [ "$_sm_status" = "stale" ] || [ "$_sm_status" = "silent_drift" ]; then
+    echo "=== SECONDMATE PLUGIN HEAL ==="
+    _acquire_heal_lock || {
+      echo "Heal not performed."
+      return 1
+    }
+    trap '_release_heal_lock' EXIT
+    
+    _heal_secondmate "$yes"
+    heal_result=$?
+    _release_heal_lock
+    trap - EXIT
+    
+    echo
+  fi
+  
+  # Then heal other missing items
   while IFS='|' read -r st name cat fix; do
     [ "$st" = MISSING ] || continue
-    if [ -z "$fix" ]; then echo "SKIP  $name — no known auto-fix; provide its source (see README) and set the matching SM_* var"; continue; fi
+    # Skip secondmate here since we already handled it above
+    [ "$name" = "secondmate plugin (marketplace)" ] && continue
+    [ "$name" = "secondmate plugin (stale)" ] && continue
+    [ "$name" = "secondmate plugin (silent drift)" ] && continue
+    [ "$name" = "secondmate plugin (reload pending)" ] && continue
+    [ -z "$fix" ] && { echo "SKIP  $name — no known auto-fix; provide its source (see README) and set the matching SM_* var"; continue; }
     if [ "$yes" = 1 ]; then echo ">> healing $name: $fix"; bash -c "$fix" || echo "   (failed — do it manually: $fix)"
     else
       printf 'Fix %s via: %s\n  proceed? [y/N] ' "$name" "$fix"; read -r ans
