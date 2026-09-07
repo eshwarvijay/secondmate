@@ -33,7 +33,8 @@ If `$CLAUDE_PLUGIN_ROOT` is unset in your shell, resolve it once: it is this plu
   still not the checker) — see the Check step.
 
 **Session guard (sleep prevention):** `caffeinate-guard.sh` is a SESSION-SCOPED process, NOT per-task.
-- Call `start` ONCE at the beginning of a work session/batch (before triaging the first task) — idempotent, calling it per-task is harmless
+- Primary: call `start` ONCE at the very beginning of a work session/batch (before triaging the first task)
+- Also safe (though redundant): you may call `start` again at each task's Spawn step since it is idempotent
 - Call `stop` ONCE yourself, after you have confirmed EVERY task/worktree in that batch has been torn down
 - Never call `stop` inside per-task teardown — sibling tasks may still be running
 

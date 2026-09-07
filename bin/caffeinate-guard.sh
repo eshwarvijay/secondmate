@@ -154,6 +154,16 @@ _stop() {
   local root="$(_STATE_ROOT)"
   local pf="$(_GUARD_PIDFILE)"
 
+  # Parse arguments strictly - stop takes no arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      *)
+        echo "unknown arg: $1" >&2
+        exit 2
+        ;;
+    esac
+  done
+
   # Idempotent: no pidfile -> immediate exit 0, no error
   [ -f "$pf" ] || { echo "no guard found, nothing to stop"; return 0; }
 
@@ -262,7 +272,14 @@ if [ "${1:-}" = "--selfcheck" ]; then
   [ "$actual_ttl" = "45" ] || { echo "FAIL: custom TTL 45 not applied (actual=$actual_ttl)"; fails=1; }
   _cg stop >/dev/null
 
-  # Finding #7:caffeiante missing degrades gracefully (warn, exit 0)
+  # Finding #7: stop with unrecognized argument must exit 2 (strict arg validation)
+  # Start a guard first (stop needs a pidfile to check for unknown args, but we verify it rejects them)
+  _cg start >/dev/null
+  rc=0; _cg stop --task legacy >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: stop with --task legacy should exit 2 (rc=$rc)"; fails=1; }
+  _cg stop >/dev/null
+
+  # Finding #8:caffeiante missing degrades gracefully (warn, exit 0)
   # This is tested implicitly -- on non-macOS systems it warns and continues
   # On macOS it should find caffeinate and run normally
   # We just verify the warning path exists in the script (can't simulate missing binary easily)
