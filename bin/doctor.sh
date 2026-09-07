@@ -234,6 +234,8 @@ _detect_secondmate_staleness() {
 }
 
 # Lock mechanism for heal operations (mkdir-based atomic lock)
+# Returns 0 if lock acquired or stolen, 1 if in-use or timeout
+# Bug 5 fix: Use helper function to re-verify stale lock between reads and rm -rf
 _acquire_heal_lock() {
   local max_wait=30  # 30 seconds
   local wait_interval=1
@@ -255,9 +257,15 @@ _acquire_heal_lock() {
     else
       # Lock directory exists, check if it's stale
       if [ -f "$_doctor_lock_file/.timestamp" ]; then
-        local lock_age
-        lock_age=$(( $(date +%s) - $(cat "$_doctor_lock_file/.timestamp" 2>/dev/null || echo 0) ))
-        if [ "$lock_age" -gt "$max_wait" ]; then
+        # Read lock metadata once
+        local lock_timestamp lock_pid lock_age
+        lock_timestamp=$(cat "$_doctor_lock_file/.timestamp" 2>/dev/null || echo 0)
+        lock_pid=$(cat "$_doctor_lock_file/.pid" 2>/dev/null || echo 0)
+        lock_age=$(( $(date +%s) - lock_timestamp ))
+        
+        # Bug 5 fix: Extract stale check into helper for deterministic testing
+        # and TOCTOU-safe re-verification (pass original timestamp and pid)
+        if _is_lock_still_stale "$lock_timestamp" "$max_wait" "$lock_pid"; then
           # Stale lock, try to steal it
           rm -rf "$_doctor_lock_file" 2>/dev/null
           continue  # Retry (lock is gone now)
@@ -283,6 +291,39 @@ _acquire_heal_lock() {
 
 _release_heal_lock() {
   rm -rf "$_doctor_lock_file" 2>/dev/null
+}
+
+# Bug 5 helper: Verify lock is still stale after reading it
+# Usage: _is_lock_still_stale <original_timestamp> <max_wait> [original_pid]
+# Returns 0 (true) if still stale, 1 (false) if TOCTOU happened or not stale
+_is_lock_still_stale() {
+  local original_timestamp="$1"
+  local max_wait="$2"
+  local original_pid="${3:-}"  # Optional third arg: original pid
+  
+  # Read current timestamp and pid
+  local current_timestamp current_pid
+  current_timestamp=$(cat "$_doctor_lock_file/.timestamp" 2>/dev/null || echo "")
+  current_pid=$(cat "$_doctor_lock_file/.pid" 2>/dev/null || echo "")
+  
+  # Bug 5 fix: Re-verify the lock hasn't changed since our first read
+  # If either value changed, another process modified the lock - DO NOT remove!
+  [ -z "$current_timestamp" ] && return 1
+  [ -z "$current_pid" ] && return 1
+  [ "$current_timestamp" != "$original_timestamp" ] && return 1
+  
+  # Also verify pid hasn't changed (TOCTOU protection)
+  if [ -n "$original_pid" ] && [ "$current_pid" != "$original_pid" ]; then
+    return 1
+  fi
+  
+  # Re-check age with the fresh timestamp
+  local lock_age
+  lock_age=$(( $(date +%s) - current_timestamp ))
+  [ "$lock_age" -gt "$max_wait" ] || return 1
+  
+  # Still stale after re-verification
+  return 0
 }
 
 # Heal secondmate plugin
@@ -541,6 +582,7 @@ emit_table() {
 
 heal() {
   local yes="$1"
+  local heal_failed=0  # Bug 4 fix: track if secondmate heal failed
   
   # Handle secondmate plugin staleness first
   _detect_secondmate_status
@@ -556,6 +598,10 @@ heal() {
     heal_result=$?
     _release_heal_lock
     trap - EXIT
+    
+    # Bug 4 fix: if heal failed, mark it and continue to report all issues
+    # But we'll still return 1 at the end if any heal failed
+    [ "$heal_result" -ne 0 ] && heal_failed=1
     
     echo
   fi
@@ -575,6 +621,9 @@ heal() {
       case "$ans" in y|Y) bash -c "$fix" || echo "   (failed — do it manually: $fix)";; *) echo "   skipped";; esac
     fi
   done <<< "$ROWS"
+  
+  # Bug 4 fix: return failure if secondmate heal failed
+  [ "$heal_failed" -eq 1 ] && return 1
 }
 
 # --- selfcheck (no installs) ---
@@ -1141,6 +1190,60 @@ STUB_EOF
   [ -n "$new_ts" ] || { echo "FAIL: Test D3 bug3 fix: couldn't read timestamp after steal"; rm -rf "$d"; exit 1; }
   [ "$new_ts" -gt "$old_timestamp" ] || { echo "FAIL: Test D3 bug3 fix: timestamp wasn't updated"; rm -rf "$d"; exit 1; }
 
+  rm -rf "$d"
+
+  # === Test E (Bug 5 fix): _is_lock_still_stale re-verification during TOCTOU window ===
+  # Test without using mkfifo, background jobs, or wait - just sequential file ops
+  # This directly tests the helper function that prevents TOCTOU race
+  d=$(mktemp -d)
+  lock_dir="$d/lock"
+  lock_file="$lock_dir/secondmate-heal.lock"
+  
+  # Create a lock with a stale timestamp
+  mkdir -p "$lock_file"
+  old_ts=$(( $(date +%s) - 60 ))
+  echo "$old_ts" > "$lock_file/.timestamp"
+  echo "12345" > "$lock_file/.pid"
+  
+  # Temporarily set _doctor_lock_file for the helper
+  _old_lock_file="$_doctor_lock_file"
+  _doctor_lock_file="$lock_file"
+  
+  # Test E1: _is_lock_still_stale returns 0 (success) when nothing changed
+  # Read the timestamp and pid once, then call the helper (which re-reads and compares)
+  first_read_ts=$(cat "$lock_file/.timestamp")
+  first_read_pid=$(cat "$lock_file/.pid")  # Save original pid
+  out=$(_is_lock_still_stale "$first_read_ts" 30 "$first_read_pid" 2>&1)
+  rc=$?
+  
+  [ "$rc" -eq 0 ] || { echo "FAIL: Test E1 bug5 fix: _is_lock_still_stale should return 0 when nothing changed, got $rc"; rm -rf "$d"; exit 1; }
+  
+  # Test E2: _is_lock_still_stale returns 1 (failure) when TOCTOU happened
+  # Simulate another process modifying the lock between our reads
+  first_read_ts=$(cat "$lock_file/.timestamp")
+  # Write a NEW value (simulating TOCTOU - another process stole/updated the lock)
+  new_ts=$(( $(date +%s) - 5 ))  # Not stale anymore
+  echo "$new_ts" > "$lock_file/.timestamp"  # <-- This is the TOCTOU window simulation
+  out=$(_is_lock_still_stale "$first_read_ts" 30 "$first_read_pid" 2>&1)
+  rc=$?
+  
+  [ "$rc" -eq 1 ] || { echo "FAIL: Test E2 bug5 fix: _is_lock_still_stale should return 1 when TOCTOU happened (timestamp changed), got $rc"; rm -rf "$d"; exit 1; }
+  
+  # Test E3: _is_lock_still_stale returns 1 when pid changed (another kind of TOCTOU)
+  # Reset the timestamp to stale
+  old_ts2=$(( $(date +%s) - 60 ))
+  echo "$old_ts2" > "$lock_file/.timestamp"
+  first_read_ts=$(cat "$lock_file/.timestamp")
+  first_read_pid=$(cat "$lock_file/.pid")  # Save original pid
+  # Simulate another process changing only the pid
+  echo "99999" > "$lock_file/.pid"  # <-- PID changed, TOCTOU detected
+  # Pass original pid as third argument
+  out=$(_is_lock_still_stale "$first_read_ts" 30 "$first_read_pid" 2>&1)
+  rc=$?
+  
+  [ "$rc" -eq 1 ] || { echo "FAIL: Test E3 bug5 fix: _is_lock_still_stale should return 1 when pid changed (TOCTOU), got $rc"; rm -rf "$d"; exit 1; }
+  
+  _doctor_lock_file="$_old_lock_file"
   rm -rf "$d"
 
   echo ok; exit 0
