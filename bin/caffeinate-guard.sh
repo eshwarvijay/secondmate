@@ -19,6 +19,13 @@ _STATE_ROOT() {
   echo "${SM_CAFFEINATE_ROOT:-$HOME/.secondmate-caffeinate}"
 }
 
+# Lockfile for a task-id (used for flock-based mutual exclusion)
+_lockfile() {
+  local id="$1"
+  local root="$(_STATE_ROOT)"
+  echo "$root/$id.lock"
+}
+
 # Task-id to path component: validate strict alphanumeric with -_ only, reasonable max length
 _validate_task_id() {
   local id="$1"
@@ -31,6 +38,30 @@ _validate_task_id() {
     echo "task-id contains invalid characters (must match [A-Za-z0-9_-]): $id" >&2
     return 1
   fi
+  return 0
+}
+
+# Validate TTL: must be a positive integer, clamped to ceiling (8 hours)
+# Exits 2 if invalid, prints clamped value to stdout otherwise
+_validate_ttl() {
+  local input="$1"
+  # Must be all digits (positive integer check)
+  if [[ ! "$input" =~ ^[0-9]+$ ]]; then
+    echo "TTL must be a positive integer (got: $input)" >&2
+    exit 2
+  fi
+  # Reject zero (caffeinate -t 0 exits almost immediately)
+  if [ "$input" -eq 0 ]; then
+    echo "TTL must be positive (got 0 -- caffeinate exits almost immediately)" >&2
+    exit 2
+  fi
+  # Clamp to ceiling (8 hours / 28800 seconds)
+  if [ "$input" -gt "$DEFAULT_TTL_SECONDS" ]; then
+    echo "TTL clamped from $input to max $DEFAULT_TTL_SECONDS seconds (8 hours)" >&2
+    echo "$DEFAULT_TTL_SECONDS"
+    return 0
+  fi
+  echo "$input"
   return 0
 }
 
@@ -95,33 +126,58 @@ _start() {
   [ -n "$task_id" ] || { echo "missing --task" >&2; exit 2; }
   _validate_task_id "$task_id" || exit 2
 
+  # Validate and clamp TTL
+  local validated_ttl
+  validated_ttl="$(_validate_ttl "$ttl")" || exit 2
+  ttl="$validated_ttl"
+
   local root="$(_STATE_ROOT)"
   local pf="$(_pidfile "$task_id")"
+  local lockdir="$(_STATE_ROOT)/$task_id.lock.d"
 
-  # Idempotent: if a live guard already exists for this task-id, reuse it (no-op)
-  local existing_fingerprint="" existing_pid=""
-  if [ -f "$pf" ]; then
-    local line
-    line="$(head -n1 "$pf" 2>/dev/null)" || line=""
-    existing_pid="$(echo "$line" | awk '{print $1}')"
-    # Extract everything after the first field (PID) as the fingerprint
-    existing_fingerprint="$(echo "$line" | sed 's/^[^ ]* //')"
-  fi
-
-  if [ -n "$existing_pid" ] && [ -n "$existing_fingerprint" ]; then
-    if _verify_pid_fingerprint "$existing_pid" "$existing_fingerprint"; then
-      # Already running, fingerprint matches -> it's the same process, reuse
-      echo "guard already active for task '$task_id' (pid=$existing_pid), no action taken"
-      exit 0
-    else
-      # PID is gone or fingerprint mismatch (recycled PID, etc.) -> clean up and spawn fresh
-      rm -f "$pf"
-    fi
-  fi
-
-  # Ensure state directory exists with correct permissions
+  # Ensure state directory exists before locking
   mkdir -p "$root"
   chmod 700 "$root"
+
+  # Atomic check-then-spawn using mkdir-based mutual exclusion (atomic on all POSIX FS)
+  # mkdir succeeds only if the directory doesn't exist, making it a perfect lock
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    # Lock is held by another process - check if the holder is still alive
+    if [ -f "$pf" ]; then
+      local line existing_pid
+      line="$(head -n1 "$pf" 2>/dev/null)" || line=""
+      existing_pid="$(echo "$line" | awk '{print $1}')"
+      if [ -n "$existing_pid" ] && ps -p "$existing_pid" >/dev/null 2>&1; then
+        # Holder is alive - wait and retry
+        sleep 0.1
+        continue
+      else
+        # Holder is dead - remove stale state and retry
+        rm -rf "$lockdir"
+        continue
+      fi
+    fi
+    # No pidfile - someone else won the race, wait and retry
+    sleep 0.1
+  done
+
+  # Re-check under lock (in case another process won the race while we waited in the loop)
+  if [ -f "$pf" ]; then
+    local line existing_pid existing_fingerprint
+    line="$(head -n1 "$pf" 2>/dev/null)" || line=""
+    existing_pid="$(echo "$line" | awk '{print $1}')"
+    existing_fingerprint="$(echo "$line" | sed 's/^[^ ]* //')"
+
+    if [ -n "$existing_pid" ] && [ -n "$existing_fingerprint" ]; then
+      if _verify_pid_fingerprint "$existing_pid" "$existing_fingerprint"; then
+        echo "guard already active for task '$task_id' (pid=$existing_pid), no action taken"
+        rmdir "$lockdir"
+        exit 0
+      else
+        rm -f "$pf"
+      fi
+    fi
+  fi
 
   # Check if caffeinate is available
   if ! command -v caffeinate >/dev/null 2>&1; then
@@ -129,6 +185,7 @@ _start() {
     # Degraded gracefully: write a sentinel marking we know caffeinate is missing
     # This keeps the script idempotent (next call also sees it)
     echo "# caffeinate not found" > "$pf"
+    rmdir "$lockdir"
     exit 0
   fi
 
@@ -143,10 +200,12 @@ _start() {
   if [ -z "$fingerprint" ]; then
     echo "ERROR: failed to capture fingerprint for new caffeinate process (pid=$pid)" >&2
     kill "$pid" 2>/dev/null || true
+    rmdir "$lockdir"
     exit 1
   fi
   echo "$pid $fingerprint" > "$pf"
-
+  
+  rmdir "$lockdir"
   echo "started guard for task '$task_id' (pid=$pid, ttl=${ttl}s)"
 }
 
