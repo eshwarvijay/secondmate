@@ -148,7 +148,7 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 2. **Spawn** — isolate the maker. Two paths:
    - **Headless / not in herdr:** `read wt branch < <(${CLAUDE_PLUGIN_ROOT}/bin/new-worktree.sh --repo <repo> --task <task-id>)` — never the primary checkout.
-     (Already marks the worktree. **Also calls `caffeinate-guard.sh start`** via new-worktree.sh to prevent sleep.)
+     (Already marks the worktree via `mark-maker.sh` internally.) **Remember to call `caffeinate-guard.sh start --task <task-id>` after this** to prevent system sleep during the task.
    - **In herdr (`HERDR_ENV=1`):** 
      ```bash
      result=$(herdr worktree create --cwd <repo> --branch sm/<task-id> --base HEAD --label sm-<task-id> --no-focus)

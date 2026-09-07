@@ -88,7 +88,8 @@ Each stage exists to close a specific failure mode.
    agent, keeping it in its own workspace rather than the supervisor's.
    `new-worktree.sh` (and `herdr agent start --pane <root_pane_id>` for the Claude-maker path) also drops a maker marker — see
    **Scope guard** below.
-   *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo.
+   *In addition to marking, the supervisor must call `caffeinate-guard.sh start --task <task-id>` after the worktree is created* to prevent system sleep during task execution (8-hour ceiling via `-t` flag as defense-in-depth orphan cleanup). This is a no-op if already running, and the PIDfile is keyed by task-id so concurrent tasks are isolated. Not marking the worktree with `mark-maker.sh` before starting the maker agent is a critical failure — scope-guard.py won't activate, letting the maker access the primary checkout. Not starting `caffeinate-guard.sh` lets the laptop sleep mid-task, leaving processes orphaned.
+   *Guards against:* a maker corrupting the main tree; parallel makers colliding on one repo; unattended runs interrupted by macOS sleep.
 
 3. **Implement (guarded).** The maker works, wrapped by two deterministic guards:
    - `run-round.sh` gives each invocation a **wall-clock timeout** and an **idle watchdog** (kills it if
@@ -142,6 +143,20 @@ Each stage exists to close a specific failure mode.
    `audit/metrics.jsonl` (via `log-round.sh`, step 4) accumulates alongside them as the structured
    counterpart — same append-only convention, but one JSON line per round instead of prose per task.
    Commit separately. Skip for trivial one-shot edits.
+
+9. **Teardown.** Immediately after integration, close everything created for this task:
+   ```bash
+   ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh stop --task <task-id>  # end sleep prevention (safe no-op if already stopped)
+   herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
+   herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
+   git branch -d sm/<task-id>                          # delete the merged branch
+   ```
+   A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+   **Must call `caffeinate-guard.sh stop`** to clean up the sleep-prevention process. This is idempotent
+   (exits 0 even if never started or already stopped) so it's safe to call unconditionally. The state
+   directory (`~/.secondmate-caffeinate`) is host-wide and keyed by task-id, so each task's guard is
+   isolated and can be cleaned up independently.
+   *Guards against:* orphan `caffeinate` processes consuming battery after task completion.
 
 ## Scope guard
 
@@ -265,5 +280,6 @@ Each stage exists to close a specific failure mode.
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
+| `bin/caffeinate-guard.sh` | macOS sleep prevention during task execution — per-task isolation, PID identity verification, bounded TTL ceiling, idempotent start/stop |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.

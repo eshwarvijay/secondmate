@@ -41,21 +41,6 @@ _pidfile() {
   echo "$root/$id.pid"
 }
 
-# Extract PID and fingerprint from pidfile
-# Returns: PID FINGERPRINT (space separated), or empty if file missing/invalid
-_read_pidfile() {
-  local pf="$1"
-  [ -f "$pf" ] || { echo ""; return; }
-  local line
-  line="$(head -n1 "$pf" 2>/dev/null)" || { echo ""; return; }
-  # Format: PID fingerprint_key=fingerprint_value fingerprint_key2=fingerprint_value2...
-  local pid fingerprint
-  pid="$(echo "$line" | awk '{print $1}')"
-  fingerprint="$(echo "$line" | awk '{print $2}')"
-  [ -n "$pid" ] && [ -n "$fingerprint" ] || { echo ""; return; }
-  echo "$pid $fingerprint"
-}
-
 # Build fingerprint for a PID: "comm=... lstart=..." snapshot
 _build_fingerprint() {
   local pid="$1"
@@ -299,13 +284,22 @@ if [ "${1:-}" = "--selfcheck" ]; then
   _cg stop --task task-gamma >/dev/null
 
   # Finding #4: identity verification catches PID recycling simulation
-  # We simulate by creating a pidfile with a fake PID that will be recycled
-  # Since we can't predict PID recycling in a test, we instead test the verification function logic
-  # Create a pidfile with a dead PID and wrong fingerprint
-  echo "12345 fakecomm=bar lstart=never" > "$root/task-delta.pid"
-  _cg stop --task task-delta >/dev/null || { echo "FAIL: stop with dead PID and mismatched fingerprint exited non-zero"; fails=1; }
-  # State should be cleaned up
-  [ -f "$root/task-delta.pid" ] && { echo "FAIL: state not cleaned up for dead PID"; fails=1; }
+  # Start a real background process (sleep 100), capture its real PID, then create a pidfile
+  # pointing to that LIVE PID but with a WRONG fingerprint to prove the identity check blocks it.
+  sleep 100 &
+  real_sleep_pid=$!
+  # Write a pidfile that claims it's a different process (wrong lstart value)
+  echo "$real_sleep_pid comm=wrongprocess lstart=Mon Jan  1 00:00:00 2020" > "$root/task-epsilon.pid"
+  
+  # Call stop - should exit 0 (idempotent-safe) and NOT kill the real sleep process
+  _cg stop --task task-epsilon >/dev/null || { echo "FAIL: stop with live PID but mismatched fingerprint exited non-zero"; fails=1; }
+  # State should be cleaned up even though process was not killed
+  [ -f "$root/task-epsilon.pid" ] && { echo "FAIL: state not cleaned up for mismatched fingerprint"; fails=1; }
+  # CRITICAL: the real sleep process must still be running (identity check prevented wrong kill)
+  ps -p "$real_sleep_pid" >/dev/null 2>&1 || { echo "FAIL: sleep process killed despite identity mismatch"; fails=1; }
+  
+  # Cleanup: kill the sleep process we started for the test
+  kill "$real_sleep_pid" 2>/dev/null || true
 
   # Finding #5: invalid/malicious task-id characters being rejected
   rc=0; _cg start --task "bad;rm -rf /" >/dev/null 2>&1 || rc=$?
