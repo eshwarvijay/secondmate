@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.8-4C8BF5?style=flat-square" alt="version 0.1.8" />
+  <img src="https://img.shields.io/badge/version-0.1.10-4C8BF5?style=flat-square" alt="version 0.1.10" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -82,7 +82,7 @@ flowchart LR
 | `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`/`eval`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, any pipeline ending in a shell interpreter); recognizes literal patterns only — see the limitation callout below for what it permanently does not catch; no-op for the supervisor's primary checkout |
 | `bin/scope-guard-extension.ts` | **pi extension equivalent** of scope-guard.py — denies the same tool calls and patterns for pi maker sessions; uses pi's `tool_call` event instead of Claude's PreToolUse hook; activated by same `mark-maker.sh` convention; same heuristic limitations Apply |
 | `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, keyed by the worktree's realpath; refuses to mark anything but an isolated linked worktree (never the primary checkout) |
-| `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open`) |
+| `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open` / `next`); `hold`/`answer` support an optional `--sha` that binds a decision to the exact commit it applies to, and `next` hands back exactly one oldest-open decision at a time |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract; streams pi's `--mode json` output through `checker-progress.py` for live progress visibility |
 | `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused |
@@ -199,6 +199,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
   && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck \
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
+  && bin/hold.py selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```
