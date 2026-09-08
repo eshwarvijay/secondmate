@@ -10,18 +10,26 @@ BAD_TOKENS = ("<tool_call>", "<|tool_calls_section_begin|>", "<function=")
 
 def extract(messages):
     """Return (text, bad): follow checker-progress.py's multipart text handling."""
-    assistant = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
+    if not isinstance(messages, list):
+        return "", True
+    assistant = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") == "assistant"), None)
     if assistant is None:
         return "", True
     bad = assistant.get("stopReason", "") != "stop"
     parts = assistant.get("content", [])
+    if not isinstance(parts, list):
+        return "", True
     text_parts = []
     for part in parts:
         if not isinstance(part, dict):
             bad = True
         elif part.get("type") == "text":
             # Preserve empty and multipart text parts, as checker-progress.py does.
-            text_parts.append(part.get("text", ""))
+            text = part.get("text", "")
+            if isinstance(text, str):
+                text_parts.append(text)
+            else:
+                bad = True
         elif part.get("type") == "thinking":
             # Real Bedrock reasoning responses include a separate thinking part; it
             # is normal metadata, not a tool invocation and is not planner prose.
@@ -38,6 +46,8 @@ def classify(stream):
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
             continue
         if event.get("type") == "agent_end":
             result = extract(event.get("messages", []))
@@ -83,6 +93,10 @@ def selfcheck():
     _, stopped = classify([_event(clean, stop="length")])
     if not stopped:
         failures.append("non-stop stopReason was not classified bad")
+    null_messages = json.dumps({"type": "agent_end", "messages": None})
+    null_text, null_bad = classify([null_messages])
+    if null_text != "" or not null_bad:
+        failures.append("null messages was not classified as empty bad output")
     if failures:
         print("\n".join("FAIL: " + failure for failure in failures), file=sys.stderr)
         return 1
