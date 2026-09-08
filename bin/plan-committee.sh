@@ -487,7 +487,7 @@ _claim_task_marker() {
       echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
       return 2
     fi
-  elif find "$out_dir" -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) | grep -q .; then
+  elif find "$out_dir" -mindepth 1 -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) | grep -q .; then
     rmdir "$task_lock"
     echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
     return 2
@@ -684,6 +684,11 @@ FAKEPI
     FAKE_CALLS="$_ctmp/calls-collision" PATH="$_ctmp:$PATH" "$0" --task other-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" = 2 ] || { echo "FAIL: output-directory task collision exit $_src (want 2)"; fails=1; }
+    # The out-dir name itself is not a prior artifact; only its contents are.
+    FAKE_CALLS="$_ctmp/calls-named-dir" PATH="$_ctmp:$PATH" "$0" --task named-directory-task --out-dir "$_ctmp/fresh-plan.md" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: fresh .md-named output directory exit $_src (want 0)"; fails=1; }
+    [ -s "$_ctmp/fresh-plan.md/deepseek-r1.md" ] || { echo "FAIL: fresh .md-named output directory did not launch planners"; fails=1; }
     # An unmarked raw diagnostic alone must prevent a different task from
     # destroying evidence from a failed committee.
     mkdir -p "$_ctmp/raw-only"
