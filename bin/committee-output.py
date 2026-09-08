@@ -10,8 +10,7 @@ import sys
 # their delimiters.
 BAD_PATTERNS = (
     re.compile(r"<\s*tool_call\s*>"),
-    re.compile(r"<\s*\|\s*tool_calls_section_begin\s*\|\s*>"),
-    re.compile(r"<\s*\|\s*tool_call_begin\s*\|\s*>"),
+    re.compile(r"<\s*\|\s*tool_call[a-z_]*\s*\|\s*>"),
     re.compile(r"<\s*function\s*="),
 )
 
@@ -104,9 +103,10 @@ def selfcheck():
     _, whitespace_tool_call = classify([_event("<tool_call > <function =read_file>")])
     if not whitespace_tool_call:
         failures.append("whitespace-variant tool call was not classified bad")
-    _, inner_kimi_tool_call = classify([_event("preamble < | tool_call_begin | > functions.Read:0 more")])
-    if not inner_kimi_tool_call:
-        failures.append("inner Kimi tool-call token was not classified bad")
+    for kimi_token in ("tool_calls_section_begin", "tool_call_begin", "tool_call_argument_begin"):
+        _, kimi_tool_call = classify([_event(f"preamble < | {kimi_token} | > functions.Read:0 more")])
+        if not kimi_tool_call:
+            failures.append(f"Kimi {kimi_token} token was not classified bad")
     _, angle_bracket_prose = classify([_event("the value is <100 and the function=foo() call succeeds")])
     if angle_bracket_prose:
         failures.append("ordinary angle-bracket prose was incorrectly classified bad")
