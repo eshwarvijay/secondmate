@@ -163,6 +163,8 @@ BODY
 
 _prompt_qwen3_coder() {
   cat << 'BODY'
+IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
+
 Goal: Walk the concrete implementation steps and rate each one so the supervisor knows where the real difficulty is.
 
 Success means:
@@ -226,6 +228,8 @@ BODY
 
 _prompt_kimi_k2() {
   cat << 'BODY'
+IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
+
 Goal: Map every system this task touches and rate the blast radius and reversibility of each connection.
 
 Success means:
@@ -443,7 +447,7 @@ BODY
 }
 
 _planner_prompt() {
-  local label="$1" task="$2"
+  local label="$1" task="$2" retry="${3:-}"
   case "$label" in
     deepseek-r1)    _prompt_deepseek_r1   "$task" ;;
     qwen3-80b)      _prompt_qwen3_80b     "$task" ;;
@@ -453,6 +457,90 @@ _planner_prompt() {
     glm5)           _prompt_glm5          "$task" ;;
     *)              printf 'You are a planning agent. Analyze the task.\n\nTASK:\n%s\n' "$task" ;;
   esac
+  if [ "$retry" = retry ]; then
+    printf '\nIMPORTANT RETRY: The prior response was unusable tool-call-shaped text. Return the requested analysis now as plain prose/markdown only; do not emit tool syntax.\n'
+  fi
+}
+
+# Return 0 only when the unmarked output directory can be inspected and has no
+# committee artifacts; 1 means an artifact exists, 2 means inspection failed.
+_unmarked_output_dir_is_safe() {
+  local found
+  found="$(find "$out_dir" -mindepth 1 -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) -print -quit)" || return 2
+  [ -z "$found" ]
+}
+
+# Claim the output directory's task marker. mkdir is atomic, so the marker check and
+# write are serialized even when independent supervisors start simultaneously.
+_claim_task_marker() {
+  local task_marker="$out_dir/.plan-committee-task"
+  local task_lock="$out_dir/.plan-committee-task.lock"
+  local attempts=0 max_attempts=20 previous_task directory_status
+
+  while ! mkdir "$task_lock" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$max_attempts" ]; then
+      echo "refusing to use planning output directory: could not acquire task-marker lock" >&2
+      return 2
+    fi
+    sleep 0.1
+  done
+
+  # Never erase a different task's claim. A marker-less non-empty directory is
+  # unknown/unsafe rather than guessed reusable.
+  if [ -f "$task_marker" ]; then
+    previous_task="$(cat "$task_marker")"
+    if [ "$previous_task" != "$task" ]; then
+      rmdir "$task_lock"
+      echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
+      return 2
+    fi
+  else
+    _unmarked_output_dir_is_safe; directory_status=$?
+    if [ "$directory_status" -ne 0 ]; then
+      rmdir "$task_lock"
+      if [ "$directory_status" = 2 ]; then
+        echo "refusing to inspect planning output directory; pass a new --out-dir" >&2
+      else
+        echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
+      fi
+      return 2
+    fi
+  fi
+  if ! printf '%s' "$task" > "$task_marker"; then
+    rmdir "$task_lock"
+    echo "refusing to use planning output directory: could not write task marker" >&2
+    return 2
+  fi
+  rmdir "$task_lock"
+}
+
+# Run and JSON-classify one planner. Return 0 for clean or self-healed, 1 failed.
+_run_planner() {
+  local label="$1" model_id="$2" thinking="$3" prompt="$4" out="$5"
+  local raw="$out.jsonl" retry_raw="$out.retry.jsonl" retry_prompt status first_run_status retry_run_status
+  rm -f "$out.healed" "$out.raw" "$raw" "$retry_raw"
+  "$SCRIPT_DIR/run-round.sh" --label "plan-$label" --log "$raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$prompt"
+  first_run_status=$?
+  "$SCRIPT_DIR/committee-output.py" --input "$raw" --output "$out"; status=$?
+  [ "$first_run_status" = 0 ] && [ "$status" = 0 ] && { rm -f "$raw"; return 0; }
+
+  # Preserve the first bad response while retrying with a deliberately changed prompt.
+  [ -s "$out" ] && cp "$out" "$out.raw" || cp "$raw" "$out.raw"
+  retry_prompt="$(_planner_prompt "$label" "$task" retry)"
+  "$SCRIPT_DIR/run-round.sh" --label "plan-$label-retry" --log "$retry_raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$retry_prompt"
+  retry_run_status=$?
+  "$SCRIPT_DIR/committee-output.py" --input "$retry_raw" --output "$out"; status=$?
+  if [ "$retry_run_status" = 0 ] && [ "$status" = 0 ]; then
+    touch "$out.healed"
+    rm -f "$raw" "$retry_raw"
+    return 0
+  fi
+  [ -s "$out" ] && cp "$out" "$out.raw" || cp "$retry_raw" "$out.raw"
+  rm -f "$out"
+  return 1
 }
 
 # ---- arg parsing ----
@@ -538,6 +626,174 @@ while [ $# -gt 0 ]; do case "$1" in
       echo "$_pp" | grep -q "$_m2" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m2'"; fails=1; }
       echo "$_pp" | grep -q "$_m3" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m3'"; fails=1; }
     done
+    "$SCRIPT_DIR/committee-output.py" --selfcheck >/dev/null || { echo "FAIL: committee-output real fixture classifier"; fails=1; }
+    _qwen_prompt="$(_planner_prompt qwen3-coder test-task-xyz)"
+    _kimi_prompt="$(_planner_prompt kimi-k2 test-task-xyz)"
+    echo "$_qwen_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: qwen3-coder missing no-tools hardening"; fails=1; }
+    echo "$_kimi_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: kimi-k2 missing no-tools hardening"; fails=1; }
+    # Exercise the actual launch/classify/retry path. The fake pi emits the captured qwen
+    # failure on attempt one and clean JSON on the deliberately changed retry prompt.
+    _ctmp="$(mktemp -d)"
+    cat > "$_ctmp/pi" <<'FAKEPI'
+#!/usr/bin/env bash
+model=""; prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in --model) model="$2"; shift 2;; -p) prompt="$2"; shift 2;; *) shift;; esac
+done
+echo "$model" >> "$FAKE_CALLS"
+if { [ "$model" = qwen.qwen3-coder-next ] && [ "${FAKE_CLEAN_QWEN:-}" != 1 ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; } || { [ "${FAKE_DUAL_BAD:-}" = 1 ] && { [ "$model" = moonshot.kimi-k2-thinking ] || [ "$model" = qwen.qwen3-coder-next ]; } && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
+  text='I'"'"'ll analyze the bug in `bin/plan-committee.sh` by walking through its concrete implementation steps. Let me first examine the file and related code.
+
+<tool_call>
+<function=read_file>
+<item path="/Users/eshwar.vijay/secondmate/bin/plan-committee.sh">'
+else
+  text='### Implementation Steps
+1. Classify the final JSON assistant text before accepting it.'
+fi
+python3 -c 'import json,sys; print(json.dumps({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":sys.argv[1]}]}]}))' "$text"
+if [ "$model" = qwen.qwen3-coder-next ]; then
+  if [ "${FAKE_EXIT_17_FIRST_QWEN:-}" = 1 ] && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; then exit 17; fi
+  if [ "${FAKE_EXIT_17_RETRY_QWEN:-}" = 1 ] && [[ "$prompt" = *"IMPORTANT RETRY:"* ]]; then exit 17; fi
+fi
+FAKEPI
+    chmod +x "$_ctmp/pi"
+    FAKE_CALLS="$_ctmp/calls" PATH="$_ctmp:$PATH" "$0" --task fixture-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: self-healed planner run exited $_src"; fails=1; }
+    [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls" 2>/dev/null || true)" = 2 ] || { echo "FAIL: self-healed path did not retry exactly once"; fails=1; }
+    [ -f "$_ctmp/out/qwen3-coder.md.healed" ] || { echo "FAIL: self-healed planner was not visibly marked"; fails=1; }
+    # Both tool-call-hardened models can independently need one retry; one
+    # model's failure must not consume the other's retry budget.
+    FAKE_CALLS="$_ctmp/calls-dual" FAKE_DUAL_BAD=1 PATH="$_ctmp:$PATH" "$0" --task dual-retry-fixture --out-dir "$_ctmp/dual" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: dual self-healed planner run exited $_src"; fails=1; }
+    for _model in moonshot.kimi-k2-thinking qwen.qwen3-coder-next; do
+      [ "$(grep -c "^$_model$" "$_ctmp/calls-dual" 2>/dev/null || true)" = 2 ] || { echo "FAIL: $_model did not retry exactly once in dual fixture"; fails=1; }
+    done
+    [ -f "$_ctmp/dual/kimi-k2.md.healed" ] || { echo "FAIL: kimi-k2 was not marked healed in dual fixture"; fails=1; }
+    [ -f "$_ctmp/dual/qwen3-coder.md.healed" ] || { echo "FAIL: qwen3-coder was not marked healed in dual fixture"; fails=1; }
+    for _model in us.deepseek.r1-v1:0 qwen.qwen3-next-80b-a3b mistral.mistral-large-3-675b-instruct zai.glm-5; do
+      [ "$(grep -c "^$_model$" "$_ctmp/calls-dual" 2>/dev/null || true)" = 1 ] || { echo "FAIL: untouched $_model was not invoked exactly once in dual fixture"; fails=1; }
+    done
+    for _label in deepseek-r1 qwen3-80b mistral-large3 glm5; do
+      [ ! -f "$_ctmp/dual/$_label.md.healed" ] || { echo "FAIL: untouched $_label was incorrectly marked healed"; fails=1; }
+    done
+    # A valid response paired with a failed pi process must use its retry.
+    FAKE_CALLS="$_ctmp/calls-first-exit" FAKE_CLEAN_QWEN=1 FAKE_EXIT_17_FIRST_QWEN=1 PATH="$_ctmp:$PATH" "$0" --task first-exit-fixture --out-dir "$_ctmp/first-exit" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: first-attempt pi exit fixture exited $_src"; fails=1; }
+    [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls-first-exit" 2>/dev/null || true)" = 2 ] || { echo "FAIL: first-attempt pi exit did not trigger exactly one qwen retry"; fails=1; }
+    [ -f "$_ctmp/first-exit/qwen3-coder.md.healed" ] || { echo "FAIL: first-attempt pi exit was not visibly self-healed"; fails=1; }
+    # A failed pi process on the retry is not self-healed, even when its JSON is valid.
+    FAKE_CALLS="$_ctmp/calls-retry-exit" FAKE_CLEAN_QWEN=1 FAKE_EXIT_17_FIRST_QWEN=1 FAKE_EXIT_17_RETRY_QWEN=1 PATH="$_ctmp:$PATH" "$0" --task retry-exit-fixture --out-dir "$_ctmp/retry-exit" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" != 0 ] || { echo "FAIL: retry-attempt pi exit did not fail aggregate exit"; fails=1; }
+    [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls-retry-exit" 2>/dev/null || true)" = 2 ] || { echo "FAIL: retry-attempt pi exit did not invoke qwen exactly twice"; fails=1; }
+    [ ! -s "$_ctmp/retry-exit/qwen3-coder.md" ] || { echo "FAIL: failed retry-attempt pi exit left planner output looking clean"; fails=1; }
+    [ ! -f "$_ctmp/retry-exit/qwen3-coder.md.healed" ] || { echo "FAIL: retry-attempt pi exit was incorrectly marked healed"; fails=1; }
+    FAKE_CALLS="$_ctmp/calls-bad" FAKE_ALWAYS_BAD=1 PATH="$_ctmp:$PATH" "$0" --task failed-fixture --out-dir "$_ctmp/bad" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" != 0 ] || { echo "FAIL: doubly garbled planner did not fail aggregate exit"; fails=1; }
+    [ -s "$_ctmp/bad/qwen3-coder.md.raw" ] || { echo "FAIL: failed planner did not preserve raw output"; fails=1; }
+    FAKE_CALLS="$_ctmp/calls-collision" PATH="$_ctmp:$PATH" "$0" --task other-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: output-directory task collision exit $_src (want 2)"; fails=1; }
+    # The out-dir name itself is not a prior artifact; only its contents are.
+    FAKE_CALLS="$_ctmp/calls-named-dir" PATH="$_ctmp:$PATH" "$0" --task named-directory-task --out-dir "$_ctmp/fresh-plan.md" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: fresh .md-named output directory exit $_src (want 0)"; fails=1; }
+    [ -s "$_ctmp/fresh-plan.md/deepseek-r1.md" ] || { echo "FAIL: fresh .md-named output directory did not launch planners"; fails=1; }
+    # A large protected directory must refuse without a pipefail/SIGPIPE race.
+    mkdir -p "$_ctmp/many-artifacts"
+    printf 'prior evidence' > "$_ctmp/many-artifacts/qwen3-coder.md"
+    for _i in $(seq 1 5000); do : > "$_ctmp/many-artifacts/filler-$_i.md"; done
+    _many_err="$(PATH="$_ctmp:$PATH" "$0" --task other-many-task --out-dir "$_ctmp/many-artifacts" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: many-artifact output collision exit $_src (want 2)"; fails=1; }
+    echo "$_many_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: many-artifact output collision did not report unmarked output"; fails=1; }
+    [ "$(cat "$_ctmp/many-artifacts/qwen3-coder.md")" = "prior evidence" ] || { echo "FAIL: many-artifact output collision modified prior evidence"; fails=1; }
+    # An unreadable directory cannot be verified safe and must fail closed.
+    mkdir -p "$_ctmp/unreadable"
+    printf 'permission evidence' > "$_ctmp/unreadable/qwen3-coder.md"
+    chmod 0300 "$_ctmp/unreadable"
+    _permission_err="$(PATH="$_ctmp:$PATH" "$0" --task other-permission-task --out-dir "$_ctmp/unreadable" --timeout 30 2>&1)"
+    _src=$?
+    chmod 0700 "$_ctmp/unreadable"
+    [ "$_src" = 2 ] || { echo "FAIL: unreadable output collision exit $_src (want 2)"; fails=1; }
+    echo "$_permission_err" | grep -q "refusing to inspect planning output directory" || { echo "FAIL: unreadable output collision did not report inspection failure"; fails=1; }
+    [ "$(cat "$_ctmp/unreadable/qwen3-coder.md")" = "permission evidence" ] || { echo "FAIL: unreadable output collision modified evidence"; fails=1; }
+    # An unmarked raw diagnostic alone must prevent a different task from
+    # destroying evidence from a failed committee.
+    mkdir -p "$_ctmp/raw-only"
+    printf 'retained diagnostic' > "$_ctmp/raw-only/qwen3-coder.md.raw"
+    _raw_err="$(PATH="$_ctmp:$PATH" "$0" --task other-raw-task --out-dir "$_ctmp/raw-only" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: raw-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_raw_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: raw-only output collision did not report unmarked output"; fails=1; }
+    [ "$(cat "$_ctmp/raw-only/qwen3-coder.md.raw")" = "retained diagnostic" ] || { echo "FAIL: raw-only output collision modified diagnostic"; fails=1; }
+    # Even an empty diagnostic is evidence of a prior failed committee.
+    mkdir -p "$_ctmp/raw-empty"
+    : > "$_ctmp/raw-empty/qwen3-coder.md.raw"
+    _empty_raw_err="$(PATH="$_ctmp:$PATH" "$0" --task other-empty-raw-task --out-dir "$_ctmp/raw-empty" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: empty raw-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_empty_raw_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: empty raw-only output collision did not report unmarked output"; fails=1; }
+    [ -f "$_ctmp/raw-empty/qwen3-coder.md.raw" ] && [ ! -s "$_ctmp/raw-empty/qwen3-coder.md.raw" ] || { echo "FAIL: empty raw-only output collision modified diagnostic"; fails=1; }
+    # A protected-name symlink must not be followed and overwrite its target.
+    mkdir -p "$_ctmp/symlink-only"
+    printf 'external evidence' > "$_ctmp/external-evidence"
+    ln -s "$_ctmp/external-evidence" "$_ctmp/symlink-only/qwen3-coder.md"
+    _symlink_err="$(PATH="$_ctmp:$PATH" "$0" --task other-symlink-task --out-dir "$_ctmp/symlink-only" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: symlink-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_symlink_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: symlink-only output collision did not report unmarked output"; fails=1; }
+    [ "$(cat "$_ctmp/external-evidence")" = "external evidence" ] || { echo "FAIL: symlink-only output collision modified external evidence"; fails=1; }
+    # A protected-name directory must be refused before marker creation or launch.
+    mkdir -p "$_ctmp/directory-only/qwen3-coder.md"
+    _directory_err="$(PATH="$_ctmp:$PATH" "$0" --task other-directory-task --out-dir "$_ctmp/directory-only" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: directory-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_directory_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: directory-only output collision did not report unmarked output"; fails=1; }
+    [ ! -e "$_ctmp/directory-only/.plan-committee-task" ] || { echo "FAIL: directory-only output collision wrote task marker"; fails=1; }
+    [ ! -e "$_ctmp/directory-only/deepseek-r1.md" ] || { echo "FAIL: directory-only output collision launched planners"; fails=1; }
+    # The shared audit trail is also evidence of an unmarked prior committee.
+    mkdir -p "$_ctmp/audit-only"
+    printf 'retained audit record' > "$_ctmp/audit-only/audit.jsonl"
+    _audit_err="$(PATH="$_ctmp:$PATH" "$0" --task other-audit-task --out-dir "$_ctmp/audit-only" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: audit-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_audit_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: audit-only output collision did not report unmarked output"; fails=1; }
+    [ "$(cat "$_ctmp/audit-only/audit.jsonl")" = "retained audit record" ] || { echo "FAIL: audit-only output collision modified audit"; fails=1; }
+    # Force two independently launched calls through the marker-claim path at
+    # the same time. The delayed real find widens the old check-then-write
+    # race; atomic mkdir must admit exactly one task.
+    _real_find="$(command -v find)"
+    cat > "$_ctmp/find" <<'FAKEFIND'
+#!/usr/bin/env bash
+sleep "${FAKE_FIND_DELAY:-0}"
+exec "$FAKE_REAL_FIND" "$@"
+FAKEFIND
+    chmod +x "$_ctmp/find"
+    FAKE_CALLS="$_ctmp/calls-concurrent" FAKE_FIND_DELAY=1 FAKE_REAL_FIND="$_real_find" PATH="$_ctmp:$PATH" "$0" --task concurrent-a --out-dir "$_ctmp/concurrent" --timeout 30 >/dev/null 2>&1 &
+    _concurrent_a=$!
+    FAKE_CALLS="$_ctmp/calls-concurrent" FAKE_FIND_DELAY=1 FAKE_REAL_FIND="$_real_find" PATH="$_ctmp:$PATH" "$0" --task concurrent-b --out-dir "$_ctmp/concurrent" --timeout 30 >/dev/null 2>&1 &
+    _concurrent_b=$!
+    wait "$_concurrent_a"; _concurrent_a_rc=$?
+    wait "$_concurrent_b"; _concurrent_b_rc=$?
+    if ! { [ "$_concurrent_a_rc" = 0 ] && [ "$_concurrent_b_rc" = 2 ]; } && ! { [ "$_concurrent_a_rc" = 2 ] && [ "$_concurrent_b_rc" = 0 ]; }; then
+      echo "FAIL: concurrent output claims exited $_concurrent_a_rc and $_concurrent_b_rc (want one 0 and one 2)"
+      fails=1
+    fi
+    _concurrent_task="$(cat "$_ctmp/concurrent/.plan-committee-task" 2>/dev/null || true)"
+    case "$_concurrent_task" in concurrent-a|concurrent-b) ;; *) echo "FAIL: concurrent output claim wrote unexpected marker '$_concurrent_task'"; fails=1;; esac
+    # A held claim must fail closed after the bounded wait rather than proceed.
+    mkdir -p "$_ctmp/locked/.plan-committee-task.lock"
+    _locked_err="$("$0" --task locked-task --out-dir "$_ctmp/locked" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: held task-marker lock exit $_src (want 2)"; fails=1; }
+    echo "$_locked_err" | grep -q "could not acquire task-marker lock" || { echo "FAIL: held task-marker lock did not report acquisition failure"; fails=1; }
+    rm -rf "$_ctmp"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   *) echo "unknown arg: $1" >&2; exit 2;;
 esac; done
@@ -546,6 +802,7 @@ case "$timeout" in ''|*[!0-9]*) echo "--timeout must be a positive integer (seco
 [ "$timeout" -gt 0 ] || { echo "--timeout must be a positive integer (seconds)" >&2; exit 2; }
 
 mkdir -p "$out_dir"
+_claim_task_marker || exit $?
 
 # ---- launch all planners in parallel ----
 pids=(); labels=(); outs=()
@@ -553,10 +810,7 @@ for entry in "${PLANNERS[@]}"; do
   IFS='|' read -r label dimension model_id thinking <<< "$entry"
   out="$out_dir/$label.md"
   prompt="$(_planner_prompt "$label" "$task")"
-  "$SCRIPT_DIR/run-round.sh" \
-    --label "plan-$label" --log "$out" \
-    --timeout "$timeout" --audit "$out_dir/audit.jsonl" \
-    -- pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools -p "$prompt" &
+  _run_planner "$label" "$model_id" "$thinking" "$prompt" "$out" &
   pids+=($!); labels+=("$label"); outs+=("$out")
 done
 
@@ -570,7 +824,9 @@ done
 echo "=== Planning committee ==="
 for i in "${!labels[@]}"; do
   f="${outs[$i]}"
-  if [ -f "$f" ] && [ -s "$f" ]; then
+  if [ -f "$f.healed" ]; then
+    echo "  ~ ${labels[$i]} ($(wc -l < "$f") lines; self-healed after retry) -> $f"
+  elif [ -f "$f" ] && [ -s "$f" ]; then
     echo "  + ${labels[$i]} ($(wc -l < "$f") lines) -> $f"
   else
     echo "  - ${labels[$i]}: missing or empty"
