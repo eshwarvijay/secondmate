@@ -462,12 +462,20 @@ _planner_prompt() {
   fi
 }
 
+# Return 0 only when the unmarked output directory can be inspected and has no
+# committee artifacts; 1 means an artifact exists, 2 means inspection failed.
+_unmarked_output_dir_is_safe() {
+  local found
+  found="$(find "$out_dir" -mindepth 1 -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) -print -quit)" || return 2
+  [ -z "$found" ]
+}
+
 # Claim the output directory's task marker. mkdir is atomic, so the marker check and
 # write are serialized even when independent supervisors start simultaneously.
 _claim_task_marker() {
   local task_marker="$out_dir/.plan-committee-task"
   local task_lock="$out_dir/.plan-committee-task.lock"
-  local attempts=0 max_attempts=20 previous_task
+  local attempts=0 max_attempts=20 previous_task directory_status
 
   while ! mkdir "$task_lock" 2>/dev/null; do
     attempts=$((attempts + 1))
@@ -487,10 +495,17 @@ _claim_task_marker() {
       echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
       return 2
     fi
-  elif [ -n "$(find "$out_dir" -mindepth 1 -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) -print -quit)" ]; then
-    rmdir "$task_lock"
-    echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
-    return 2
+  else
+    _unmarked_output_dir_is_safe; directory_status=$?
+    if [ "$directory_status" -ne 0 ]; then
+      rmdir "$task_lock"
+      if [ "$directory_status" = 2 ]; then
+        echo "refusing to inspect planning output directory; pass a new --out-dir" >&2
+      else
+        echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
+      fi
+      return 2
+    fi
   fi
   if ! printf '%s' "$task" > "$task_marker"; then
     rmdir "$task_lock"
@@ -698,6 +713,16 @@ FAKEPI
     [ "$_src" = 2 ] || { echo "FAIL: many-artifact output collision exit $_src (want 2)"; fails=1; }
     echo "$_many_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: many-artifact output collision did not report unmarked output"; fails=1; }
     [ "$(cat "$_ctmp/many-artifacts/qwen3-coder.md")" = "prior evidence" ] || { echo "FAIL: many-artifact output collision modified prior evidence"; fails=1; }
+    # An unreadable directory cannot be verified safe and must fail closed.
+    mkdir -p "$_ctmp/unreadable"
+    printf 'permission evidence' > "$_ctmp/unreadable/qwen3-coder.md"
+    chmod 0300 "$_ctmp/unreadable"
+    _permission_err="$(PATH="$_ctmp:$PATH" "$0" --task other-permission-task --out-dir "$_ctmp/unreadable" --timeout 30 2>&1)"
+    _src=$?
+    chmod 0700 "$_ctmp/unreadable"
+    [ "$_src" = 2 ] || { echo "FAIL: unreadable output collision exit $_src (want 2)"; fails=1; }
+    echo "$_permission_err" | grep -q "refusing to inspect planning output directory" || { echo "FAIL: unreadable output collision did not report inspection failure"; fails=1; }
+    [ "$(cat "$_ctmp/unreadable/qwen3-coder.md")" = "permission evidence" ] || { echo "FAIL: unreadable output collision modified evidence"; fails=1; }
     # An unmarked raw diagnostic alone must prevent a different task from
     # destroying evidence from a failed committee.
     mkdir -p "$_ctmp/raw-only"
