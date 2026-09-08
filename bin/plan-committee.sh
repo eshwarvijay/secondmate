@@ -487,7 +487,7 @@ _claim_task_marker() {
       echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
       return 2
     fi
-  elif find "$out_dir" -mindepth 1 -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) | grep -q .; then
+  elif [ -n "$(find "$out_dir" -mindepth 1 -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) -print -quit)" ]; then
     rmdir "$task_lock"
     echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
     return 2
@@ -689,6 +689,15 @@ FAKEPI
     _src=$?
     [ "$_src" = 0 ] || { echo "FAIL: fresh .md-named output directory exit $_src (want 0)"; fails=1; }
     [ -s "$_ctmp/fresh-plan.md/deepseek-r1.md" ] || { echo "FAIL: fresh .md-named output directory did not launch planners"; fails=1; }
+    # A large protected directory must refuse without a pipefail/SIGPIPE race.
+    mkdir -p "$_ctmp/many-artifacts"
+    printf 'prior evidence' > "$_ctmp/many-artifacts/qwen3-coder.md"
+    for _i in $(seq 1 5000); do : > "$_ctmp/many-artifacts/filler-$_i.md"; done
+    _many_err="$(PATH="$_ctmp:$PATH" "$0" --task other-many-task --out-dir "$_ctmp/many-artifacts" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: many-artifact output collision exit $_src (want 2)"; fails=1; }
+    echo "$_many_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: many-artifact output collision did not report unmarked output"; fails=1; }
+    [ "$(cat "$_ctmp/many-artifacts/qwen3-coder.md")" = "prior evidence" ] || { echo "FAIL: many-artifact output collision modified prior evidence"; fails=1; }
     # An unmarked raw diagnostic alone must prevent a different task from
     # destroying evidence from a failed committee.
     mkdir -p "$_ctmp/raw-only"
