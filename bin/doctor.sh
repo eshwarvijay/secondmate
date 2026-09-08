@@ -762,9 +762,9 @@ EOF
 
   # Test 1: ok state -- sha and version both match
   d=$(mktemp -d)
-  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  sha=$(mk_marketplace "$d/mkt" "$version_line")
   j="$d/plugins.json"
-  mk_installed_json "$j" "$sha" "0.1.8"
+  mk_installed_json "$j" "$sha" "$version_line"
   name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
   [ "$name" = "secondmate plugin" ] || { echo "FAIL: expected ok state, got name '$name'"; exit 1; }
   rm -rf "$d"
@@ -780,16 +780,16 @@ EOF
 
   # Test 3: silent_drift state -- sha differs but version unchanged
   d=$(mktemp -d)
-  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  sha=$(mk_marketplace "$d/mkt" "$version_line")
   j="$d/plugins.json"
-  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.8"  # old sha, same version
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "$version_line"  # old sha, same version
   name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
   [ "$name" = "secondmate plugin (silent drift)" ] || { echo "FAIL: expected silent_drift state, got name '$name'"; exit 1; }
   rm -rf "$d"
 
   # Test 4: reload_pending state -- sha matches, installed_version differs from running
   d=$(mktemp -d)
-  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  sha=$(mk_marketplace "$d/mkt" "$version_line")
   j="$d/plugins.json"
   mk_installed_json "$j" "$sha" "0.1.7"  # same sha as marketplace (0.1.8), but version (0.1.7) != running (0.1.8)
   name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
@@ -808,9 +808,9 @@ EOF
 
   # Test 6: dirty marketplace tree abort
   d=$(mktemp -d)
-  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  sha=$(mk_marketplace "$d/mkt" "$version_line")
   j="$d/plugins.json"
-  mk_installed_json "$j" "$sha" "0.1.8"
+  mk_installed_json "$j" "$sha" "$version_line"
   # make a dirty change without committing
   echo "x" >> "$d/mkt/somefile.txt" 2>/dev/null || echo "initial" > "$d/mkt/somefile.txt"
   echo "x" >> "$d/mkt/somefile.txt"
@@ -834,9 +834,9 @@ EOF
 
   # Test 7: detached HEAD abort
   d=$(mktemp -d)
-  sha=$(mk_marketplace "$d/mkt" "0.1.8")
+  sha=$(mk_marketplace "$d/mkt" "$version_line")
   j="$d/plugins.json"
-  mk_installed_json "$j" "$sha" "0.1.8"
+  mk_installed_json "$j" "$sha" "$version_line"
   # create an origin remote that exists (a bare repo)
   origin_dir=$(mktemp -d)
   git -C "$origin_dir" init -q --bare 2>/dev/null
