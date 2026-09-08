@@ -524,6 +524,7 @@ _run_planner() {
     return 0
   fi
   [ -s "$out" ] && cp "$out" "$out.raw" || cp "$retry_raw" "$out.raw"
+  rm -f "$out"
   return 1
 }
 
@@ -670,10 +671,11 @@ FAKEPI
     [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls-first-exit" 2>/dev/null || true)" = 2 ] || { echo "FAIL: first-attempt pi exit did not trigger exactly one qwen retry"; fails=1; }
     [ -f "$_ctmp/first-exit/qwen3-coder.md.healed" ] || { echo "FAIL: first-attempt pi exit was not visibly self-healed"; fails=1; }
     # A failed pi process on the retry is not self-healed, even when its JSON is valid.
-    FAKE_CALLS="$_ctmp/calls-retry-exit" FAKE_EXIT_17_RETRY_QWEN=1 PATH="$_ctmp:$PATH" "$0" --task retry-exit-fixture --out-dir "$_ctmp/retry-exit" --timeout 30 >/dev/null 2>&1
+    FAKE_CALLS="$_ctmp/calls-retry-exit" FAKE_CLEAN_QWEN=1 FAKE_EXIT_17_FIRST_QWEN=1 FAKE_EXIT_17_RETRY_QWEN=1 PATH="$_ctmp:$PATH" "$0" --task retry-exit-fixture --out-dir "$_ctmp/retry-exit" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" != 0 ] || { echo "FAIL: retry-attempt pi exit did not fail aggregate exit"; fails=1; }
     [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls-retry-exit" 2>/dev/null || true)" = 2 ] || { echo "FAIL: retry-attempt pi exit did not invoke qwen exactly twice"; fails=1; }
+    [ ! -s "$_ctmp/retry-exit/qwen3-coder.md" ] || { echo "FAIL: failed retry-attempt pi exit left planner output looking clean"; fails=1; }
     [ ! -f "$_ctmp/retry-exit/qwen3-coder.md.healed" ] || { echo "FAIL: retry-attempt pi exit was incorrectly marked healed"; fails=1; }
     FAKE_CALLS="$_ctmp/calls-bad" FAKE_ALWAYS_BAD=1 PATH="$_ctmp:$PATH" "$0" --task failed-fixture --out-dir "$_ctmp/bad" --timeout 30 >/dev/null 2>&1
     _src=$?
