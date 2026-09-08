@@ -487,7 +487,7 @@ _claim_task_marker() {
       echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
       return 2
     fi
-  elif find "$out_dir" -maxdepth 1 \( -type f -o -type l \) \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) | grep -q .; then
+  elif find "$out_dir" -maxdepth 1 \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' -o -name 'audit.jsonl' \) | grep -q .; then
     rmdir "$task_lock"
     echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
     return 2
@@ -710,6 +710,14 @@ FAKEPI
     [ "$_src" = 2 ] || { echo "FAIL: symlink-only output collision exit $_src (want 2)"; fails=1; }
     echo "$_symlink_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: symlink-only output collision did not report unmarked output"; fails=1; }
     [ "$(cat "$_ctmp/external-evidence")" = "external evidence" ] || { echo "FAIL: symlink-only output collision modified external evidence"; fails=1; }
+    # A protected-name directory must be refused before marker creation or launch.
+    mkdir -p "$_ctmp/directory-only/qwen3-coder.md"
+    _directory_err="$(PATH="$_ctmp:$PATH" "$0" --task other-directory-task --out-dir "$_ctmp/directory-only" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: directory-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_directory_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: directory-only output collision did not report unmarked output"; fails=1; }
+    [ ! -e "$_ctmp/directory-only/.plan-committee-task" ] || { echo "FAIL: directory-only output collision wrote task marker"; fails=1; }
+    [ ! -e "$_ctmp/directory-only/deepseek-r1.md" ] || { echo "FAIL: directory-only output collision launched planners"; fails=1; }
     # The shared audit trail is also evidence of an unmarked prior committee.
     mkdir -p "$_ctmp/audit-only"
     printf 'retained audit record' > "$_ctmp/audit-only/audit.jsonl"
