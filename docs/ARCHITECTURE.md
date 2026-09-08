@@ -133,9 +133,14 @@ Each stage exists to close a specific failure mode.
 
 6. **Hold.** Every risky or outward-facing decision (merge, deploy, delete) becomes a durable record via
    `hold.py hold`, resolved only by `hold.py answer`. A SessionStart hook surfaces open holds at the start of
-   every session.
-   *Guards against:* a pending human decision being lost when a session dies. The human, not the agent, closes
-   the gate.
+   every session. `hold`/`answer` accept an optional `--sha` that binds a decision (and its id) to the exact
+   commit the human was shown; `answer` then must supply a matching `--sha`, so an approval can't be silently
+   reattached to a different, later commit. `hold.py next` hands back exactly one oldest-still-open decision
+   at a time, for callers (human or future multi-task dispatcher) that need to process holds one at a time,
+   in order, without racing each other over the full `open` list.
+   *Guards against:* a pending human decision being lost when a session dies (the human, not the agent,
+   closes the gate); an approval given for one code state being silently applied to a different one that
+   landed later; multiple concurrently-open holds being answered out of order or by the wrong caller.
 
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here.
@@ -280,7 +285,7 @@ Each stage exists to close a specific failure mode.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/hold.py` | durable human-gate decisions |
+| `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
