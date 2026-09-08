@@ -462,6 +462,44 @@ _planner_prompt() {
   fi
 }
 
+# Claim the output directory's task marker. mkdir is atomic, so the marker check and
+# write are serialized even when independent supervisors start simultaneously.
+_claim_task_marker() {
+  local task_marker="$out_dir/.plan-committee-task"
+  local task_lock="$out_dir/.plan-committee-task.lock"
+  local attempts=0 max_attempts=20 previous_task
+
+  while ! mkdir "$task_lock" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge "$max_attempts" ]; then
+      echo "refusing to use planning output directory: could not acquire task-marker lock" >&2
+      return 2
+    fi
+    sleep 0.1
+  done
+
+  # Never erase a different task's claim. A marker-less non-empty directory is
+  # unknown/unsafe rather than guessed reusable.
+  if [ -f "$task_marker" ]; then
+    previous_task="$(cat "$task_marker")"
+    if [ "$previous_task" != "$task" ]; then
+      rmdir "$task_lock"
+      echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
+      return 2
+    fi
+  elif find "$out_dir" -maxdepth 1 -name '*.md' -type f -size +0c | grep -q .; then
+    rmdir "$task_lock"
+    echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
+    return 2
+  fi
+  if ! printf '%s' "$task" > "$task_marker"; then
+    rmdir "$task_lock"
+    echo "refusing to use planning output directory: could not write task marker" >&2
+    return 2
+  fi
+  rmdir "$task_lock"
+}
+
 # Run and JSON-classify one planner. Return 0 for clean or self-healed, 1 failed.
 _run_planner() {
   local label="$1" model_id="$2" thinking="$3" prompt="$4" out="$5"
@@ -585,7 +623,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --model) model="$2"; shift 2;; -p) prompt="$2"; shift 2;; *) shift;; esac
 done
 echo "$model" >> "$FAKE_CALLS"
-if [ "$model" = qwen.qwen3-coder-next ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
+if { [ "$model" = qwen.qwen3-coder-next ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; } || { [ "${FAKE_DUAL_BAD:-}" = 1 ] && { [ "$model" = moonshot.kimi-k2-thinking ] || [ "$model" = qwen.qwen3-coder-next ]; } && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
   text='I'"'"'ll analyze the bug in `bin/plan-committee.sh` by walking through its concrete implementation steps. Let me first examine the file and related code.
 
 <tool_call>
@@ -603,6 +641,22 @@ FAKEPI
     [ "$_src" = 0 ] || { echo "FAIL: self-healed planner run exited $_src"; fails=1; }
     [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls" 2>/dev/null || true)" = 2 ] || { echo "FAIL: self-healed path did not retry exactly once"; fails=1; }
     [ -f "$_ctmp/out/qwen3-coder.md.healed" ] || { echo "FAIL: self-healed planner was not visibly marked"; fails=1; }
+    # Both tool-call-hardened models can independently need one retry; one
+    # model's failure must not consume the other's retry budget.
+    FAKE_CALLS="$_ctmp/calls-dual" FAKE_DUAL_BAD=1 PATH="$_ctmp:$PATH" "$0" --task dual-retry-fixture --out-dir "$_ctmp/dual" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: dual self-healed planner run exited $_src"; fails=1; }
+    for _model in moonshot.kimi-k2-thinking qwen.qwen3-coder-next; do
+      [ "$(grep -c "^$_model$" "$_ctmp/calls-dual" 2>/dev/null || true)" = 2 ] || { echo "FAIL: $_model did not retry exactly once in dual fixture"; fails=1; }
+    done
+    [ -f "$_ctmp/dual/kimi-k2.md.healed" ] || { echo "FAIL: kimi-k2 was not marked healed in dual fixture"; fails=1; }
+    [ -f "$_ctmp/dual/qwen3-coder.md.healed" ] || { echo "FAIL: qwen3-coder was not marked healed in dual fixture"; fails=1; }
+    for _model in us.deepseek.r1-v1:0 qwen.qwen3-next-80b-a3b mistral.mistral-large-3-675b-instruct zai.glm-5; do
+      [ "$(grep -c "^$_model$" "$_ctmp/calls-dual" 2>/dev/null || true)" = 1 ] || { echo "FAIL: untouched $_model was not invoked exactly once in dual fixture"; fails=1; }
+    done
+    for _label in deepseek-r1 qwen3-80b mistral-large3 glm5; do
+      [ ! -f "$_ctmp/dual/$_label.md.healed" ] || { echo "FAIL: untouched $_label was incorrectly marked healed"; fails=1; }
+    done
     FAKE_CALLS="$_ctmp/calls-bad" FAKE_ALWAYS_BAD=1 PATH="$_ctmp:$PATH" "$0" --task failed-fixture --out-dir "$_ctmp/bad" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" != 0 ] || { echo "FAIL: doubly garbled planner did not fail aggregate exit"; fails=1; }
@@ -610,6 +664,34 @@ FAKEPI
     FAKE_CALLS="$_ctmp/calls-collision" PATH="$_ctmp:$PATH" "$0" --task other-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" = 2 ] || { echo "FAIL: output-directory task collision exit $_src (want 2)"; fails=1; }
+    # Force two independently launched calls through the marker-claim path at
+    # the same time. The delayed real find widens the old check-then-write
+    # race; atomic mkdir must admit exactly one task.
+    _real_find="$(command -v find)"
+    cat > "$_ctmp/find" <<'FAKEFIND'
+#!/usr/bin/env bash
+sleep "${FAKE_FIND_DELAY:-0}"
+exec "$FAKE_REAL_FIND" "$@"
+FAKEFIND
+    chmod +x "$_ctmp/find"
+    FAKE_CALLS="$_ctmp/calls-concurrent" FAKE_FIND_DELAY=1 FAKE_REAL_FIND="$_real_find" PATH="$_ctmp:$PATH" "$0" --task concurrent-a --out-dir "$_ctmp/concurrent" --timeout 30 >/dev/null 2>&1 &
+    _concurrent_a=$!
+    FAKE_CALLS="$_ctmp/calls-concurrent" FAKE_FIND_DELAY=1 FAKE_REAL_FIND="$_real_find" PATH="$_ctmp:$PATH" "$0" --task concurrent-b --out-dir "$_ctmp/concurrent" --timeout 30 >/dev/null 2>&1 &
+    _concurrent_b=$!
+    wait "$_concurrent_a"; _concurrent_a_rc=$?
+    wait "$_concurrent_b"; _concurrent_b_rc=$?
+    if ! { [ "$_concurrent_a_rc" = 0 ] && [ "$_concurrent_b_rc" = 2 ]; } && ! { [ "$_concurrent_a_rc" = 2 ] && [ "$_concurrent_b_rc" = 0 ]; }; then
+      echo "FAIL: concurrent output claims exited $_concurrent_a_rc and $_concurrent_b_rc (want one 0 and one 2)"
+      fails=1
+    fi
+    _concurrent_task="$(cat "$_ctmp/concurrent/.plan-committee-task" 2>/dev/null || true)"
+    case "$_concurrent_task" in concurrent-a|concurrent-b) ;; *) echo "FAIL: concurrent output claim wrote unexpected marker '$_concurrent_task'"; fails=1;; esac
+    # A held claim must fail closed after the bounded wait rather than proceed.
+    mkdir -p "$_ctmp/locked/.plan-committee-task.lock"
+    _locked_err="$("$0" --task locked-task --out-dir "$_ctmp/locked" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: held task-marker lock exit $_src (want 2)"; fails=1; }
+    echo "$_locked_err" | grep -q "could not acquire task-marker lock" || { echo "FAIL: held task-marker lock did not report acquisition failure"; fails=1; }
     rm -rf "$_ctmp"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   *) echo "unknown arg: $1" >&2; exit 2;;
@@ -619,22 +701,7 @@ case "$timeout" in ''|*[!0-9]*) echo "--timeout must be a positive integer (seco
 [ "$timeout" -gt 0 ] || { echo "--timeout must be a positive integer (seconds)" >&2; exit 2; }
 
 mkdir -p "$out_dir"
-task_marker="$out_dir/.plan-committee-task"
-# Never erase a different task's still-useful committee. A marker-less non-empty
-# directory is treated as unknown/unsafe rather than guessing that it is reusable.
-if [ -f "$task_marker" ]; then
-  previous_task="$(cat "$task_marker")"
-  if [ "$previous_task" != "$task" ]; then
-    if find "$out_dir" -maxdepth 1 -name '*.md' -type f -size +0c | grep -q .; then
-      echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
-      exit 2
-    fi
-  fi
-elif find "$out_dir" -maxdepth 1 -name '*.md' -type f -size +0c | grep -q .; then
-  echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
-  exit 2
-fi
-printf '%s' "$task" > "$task_marker"
+_claim_task_marker || exit $?
 
 # ---- launch all planners in parallel ----
 pids=(); labels=(); outs=()
