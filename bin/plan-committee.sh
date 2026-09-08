@@ -503,20 +503,22 @@ _claim_task_marker() {
 # Run and JSON-classify one planner. Return 0 for clean or self-healed, 1 failed.
 _run_planner() {
   local label="$1" model_id="$2" thinking="$3" prompt="$4" out="$5"
-  local raw="$out.jsonl" retry_raw="$out.retry.jsonl" retry_prompt status
+  local raw="$out.jsonl" retry_raw="$out.retry.jsonl" retry_prompt status first_run_status retry_run_status
   rm -f "$out.healed" "$out.raw" "$raw" "$retry_raw"
   "$SCRIPT_DIR/run-round.sh" --label "plan-$label" --log "$raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
-    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$prompt" || true
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$prompt"
+  first_run_status=$?
   "$SCRIPT_DIR/committee-output.py" --input "$raw" --output "$out"; status=$?
-  [ "$status" = 0 ] && { rm -f "$raw"; return 0; }
+  [ "$first_run_status" = 0 ] && [ "$status" = 0 ] && { rm -f "$raw"; return 0; }
 
   # Preserve the first bad response while retrying with a deliberately changed prompt.
   [ -s "$out" ] && cp "$out" "$out.raw" || cp "$raw" "$out.raw"
   retry_prompt="$(_planner_prompt "$label" "$task" retry)"
   "$SCRIPT_DIR/run-round.sh" --label "plan-$label-retry" --log "$retry_raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
-    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$retry_prompt" || true
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$retry_prompt"
+  retry_run_status=$?
   "$SCRIPT_DIR/committee-output.py" --input "$retry_raw" --output "$out"; status=$?
-  if [ "$status" = 0 ]; then
+  if [ "$retry_run_status" = 0 ] && [ "$status" = 0 ]; then
     touch "$out.healed"
     rm -f "$raw" "$retry_raw"
     return 0
@@ -623,7 +625,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --model) model="$2"; shift 2;; -p) prompt="$2"; shift 2;; *) shift;; esac
 done
 echo "$model" >> "$FAKE_CALLS"
-if { [ "$model" = qwen.qwen3-coder-next ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; } || { [ "${FAKE_DUAL_BAD:-}" = 1 ] && { [ "$model" = moonshot.kimi-k2-thinking ] || [ "$model" = qwen.qwen3-coder-next ]; } && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
+if { [ "$model" = qwen.qwen3-coder-next ] && [ "${FAKE_CLEAN_QWEN:-}" != 1 ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; } || { [ "${FAKE_DUAL_BAD:-}" = 1 ] && { [ "$model" = moonshot.kimi-k2-thinking ] || [ "$model" = qwen.qwen3-coder-next ]; } && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
   text='I'"'"'ll analyze the bug in `bin/plan-committee.sh` by walking through its concrete implementation steps. Let me first examine the file and related code.
 
 <tool_call>
@@ -634,6 +636,10 @@ else
 1. Classify the final JSON assistant text before accepting it.'
 fi
 python3 -c 'import json,sys; print(json.dumps({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":sys.argv[1]}]}]}))' "$text"
+if [ "$model" = qwen.qwen3-coder-next ]; then
+  if [ "${FAKE_EXIT_17_FIRST_QWEN:-}" = 1 ] && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; then exit 17; fi
+  if [ "${FAKE_EXIT_17_RETRY_QWEN:-}" = 1 ] && [[ "$prompt" = *"IMPORTANT RETRY:"* ]]; then exit 17; fi
+fi
 FAKEPI
     chmod +x "$_ctmp/pi"
     FAKE_CALLS="$_ctmp/calls" PATH="$_ctmp:$PATH" "$0" --task fixture-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
@@ -657,6 +663,18 @@ FAKEPI
     for _label in deepseek-r1 qwen3-80b mistral-large3 glm5; do
       [ ! -f "$_ctmp/dual/$_label.md.healed" ] || { echo "FAIL: untouched $_label was incorrectly marked healed"; fails=1; }
     done
+    # A valid response paired with a failed pi process must use its retry.
+    FAKE_CALLS="$_ctmp/calls-first-exit" FAKE_CLEAN_QWEN=1 FAKE_EXIT_17_FIRST_QWEN=1 PATH="$_ctmp:$PATH" "$0" --task first-exit-fixture --out-dir "$_ctmp/first-exit" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: first-attempt pi exit fixture exited $_src"; fails=1; }
+    [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls-first-exit" 2>/dev/null || true)" = 2 ] || { echo "FAIL: first-attempt pi exit did not trigger exactly one qwen retry"; fails=1; }
+    [ -f "$_ctmp/first-exit/qwen3-coder.md.healed" ] || { echo "FAIL: first-attempt pi exit was not visibly self-healed"; fails=1; }
+    # A failed pi process on the retry is not self-healed, even when its JSON is valid.
+    FAKE_CALLS="$_ctmp/calls-retry-exit" FAKE_EXIT_17_RETRY_QWEN=1 PATH="$_ctmp:$PATH" "$0" --task retry-exit-fixture --out-dir "$_ctmp/retry-exit" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" != 0 ] || { echo "FAIL: retry-attempt pi exit did not fail aggregate exit"; fails=1; }
+    [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls-retry-exit" 2>/dev/null || true)" = 2 ] || { echo "FAIL: retry-attempt pi exit did not invoke qwen exactly twice"; fails=1; }
+    [ ! -f "$_ctmp/retry-exit/qwen3-coder.md.healed" ] || { echo "FAIL: retry-attempt pi exit was incorrectly marked healed"; fails=1; }
     FAKE_CALLS="$_ctmp/calls-bad" FAKE_ALWAYS_BAD=1 PATH="$_ctmp:$PATH" "$0" --task failed-fixture --out-dir "$_ctmp/bad" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" != 0 ] || { echo "FAIL: doubly garbled planner did not fail aggregate exit"; fails=1; }
