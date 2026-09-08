@@ -1950,6 +1950,73 @@ EOF
 
   rm -rf "$d" "$origin_dir"
 
+  # === Test K (git fetch failure): _heal_secondmate hard-aborts when origin is unreachable ===
+  d=$(mktemp -d)
+  mkt_dir="$d/mkt"
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  mkdir -p "$mkt_dir/.claude-plugin"
+  git -C "$mkt_dir" init -q -b main 2>/dev/null || true
+  git -C "$mkt_dir" config user.email t@t.com 2>/dev/null
+  git -C "$mkt_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$mkt_dir/.claude-plugin/plugin.json"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+
+  # Clean checkout (passes dirty-tree/detached-HEAD checks) with an unreachable origin remote,
+  # so the failure specifically comes from the git fetch step.
+  git -C "$mkt_dir" remote add origin "$d/does-not-exist-xyz" 2>/dev/null || true
+
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.7"
+
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --heal --yes 2>&1)
+  rc=$?
+
+  [ "$rc" -ne 0 ] || { echo "FAIL: Test K fetch-failure: heal should have failed (unreachable origin), got rc=$rc"; echo "output: $out" >&2; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q "\[FAIL\] git fetch failed" || { echo "FAIL: Test K fetch-failure: expected [FAIL] git fetch failed, got: $out"; rm -rf "$d"; exit 1; }
+
+  rm -rf "$d"
+
+  # === Test L (claude plugin update failure): _heal_secondmate hard-aborts when the CLI fails ===
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+
+  mk_installed_json "$j" "deadbeef00000000000000000000000000000000" "0.1.8"
+
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+echo "stub claude: simulating plugin update failure" >&2
+exit 1
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" PATH="$stub_dir:$PATH" "$script_abs" --heal --yes 2>&1)
+  rc=$?
+
+  [ "$rc" -ne 0 ] || { echo "FAIL: Test L update-failure: heal should have failed (claude plugin update failed), got rc=$rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  echo "$out" | grep -q "\[FAIL\] claude plugin update failed" || { echo "FAIL: Test L update-failure: expected [FAIL] claude plugin update failed, got: $out"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  rm -rf "$d" "$origin_dir" "$stub_dir"
+
   echo ok; exit 0
 fi
 
