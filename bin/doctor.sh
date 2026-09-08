@@ -791,7 +791,7 @@ EOF
   d=$(mktemp -d)
   sha=$(mk_marketplace "$d/mkt" "$version_line")
   j="$d/plugins.json"
-  mk_installed_json "$j" "$sha" "0.1.7"  # same sha as marketplace (0.1.8), but version (0.1.7) != running (0.1.8)
+  mk_installed_json "$j" "$sha" "${version_line}-old"  # guaranteed different from $version_line by construction, not by luck
   name=$(SM_SECONDMATE_MARKETPLACE_DIR="$d/mkt" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$d/lock" "$0" --json 2>/dev/null | python3 -c "import json,sys; r=[x for x in json.load(sys.stdin) if 'secondmate plugin' in x['name']]; print(r[0]['name'] if r else 'UNKNOWN')")
   [ "$name" = "secondmate plugin (reload pending)" ] || { echo "FAIL: expected reload_pending state, got name '$name'"; exit 1; }
   rm -rf "$d"
