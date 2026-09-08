@@ -487,7 +487,7 @@ _claim_task_marker() {
       echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
       return 2
     fi
-  elif find "$out_dir" -maxdepth 1 -name '*.md' -type f -size +0c | grep -q .; then
+  elif find "$out_dir" -maxdepth 1 -type f \( -name '*.md' -o -name '*.md.raw' -o -name '*.md.jsonl' -o -name '*.md.retry.jsonl' \) -size +0c | grep -q .; then
     rmdir "$task_lock"
     echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
     return 2
@@ -684,6 +684,15 @@ FAKEPI
     FAKE_CALLS="$_ctmp/calls-collision" PATH="$_ctmp:$PATH" "$0" --task other-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" = 2 ] || { echo "FAIL: output-directory task collision exit $_src (want 2)"; fails=1; }
+    # An unmarked raw diagnostic alone must prevent a different task from
+    # destroying evidence from a failed committee.
+    mkdir -p "$_ctmp/raw-only"
+    printf 'retained diagnostic' > "$_ctmp/raw-only/qwen3-coder.md.raw"
+    _raw_err="$(PATH="$_ctmp:$PATH" "$0" --task other-raw-task --out-dir "$_ctmp/raw-only" --timeout 30 2>&1)"
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: raw-only output collision exit $_src (want 2)"; fails=1; }
+    echo "$_raw_err" | grep -q "refusing to overwrite unmarked existing planning output" || { echo "FAIL: raw-only output collision did not report unmarked output"; fails=1; }
+    [ "$(cat "$_ctmp/raw-only/qwen3-coder.md.raw")" = "retained diagnostic" ] || { echo "FAIL: raw-only output collision modified diagnostic"; fails=1; }
     # Force two independently launched calls through the marker-claim path at
     # the same time. The delayed real find widens the old check-then-write
     # race; atomic mkdir must admit exactly one task.
