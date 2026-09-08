@@ -2,10 +2,17 @@
 """Extract and classify a planner response from pi's JSON event stream."""
 import argparse
 import json
+import re
 import sys
 
 # Keep this list extensible: each model family can expose a different tool dialect.
-BAD_TOKENS = ("<tool_call>", "<|tool_calls_section_begin|>", "<function=")
+# Match only known structural shapes, while tolerating serializer whitespace around
+# their delimiters.
+BAD_PATTERNS = (
+    re.compile(r"<\s*tool_call\s*>"),
+    re.compile(r"<\s*\|\s*tool_calls_section_begin\s*\|\s*>"),
+    re.compile(r"<\s*function\s*="),
+)
 
 
 def extract(messages):
@@ -37,7 +44,7 @@ def extract(messages):
         else:
             bad = True
     text = "\n".join(text_parts)
-    return text, bad or not text.strip() or any(token in text for token in BAD_TOKENS)
+    return text, bad or not text.strip() or any(pattern.search(text) for pattern in BAD_PATTERNS)
 
 
 def classify(stream):
@@ -93,6 +100,12 @@ def selfcheck():
     _, stopped = classify([_event(clean, stop="length")])
     if not stopped:
         failures.append("non-stop stopReason was not classified bad")
+    _, whitespace_tool_call = classify([_event("<tool_call > <function =read_file>")])
+    if not whitespace_tool_call:
+        failures.append("whitespace-variant tool call was not classified bad")
+    _, angle_bracket_prose = classify([_event("the value is <100 and the function=foo() call succeeds")])
+    if angle_bracket_prose:
+        failures.append("ordinary angle-bracket prose was incorrectly classified bad")
     null_messages = json.dumps({"type": "agent_end", "messages": None})
     null_text, null_bad = classify([null_messages])
     if null_text != "" or not null_bad:
