@@ -74,7 +74,7 @@ Each stage exists to close a specific failure mode.
    `plan-committee.sh` spawns 6 headless pi planners in parallel (DeepSeek-R1, Qwen3-Next-80B,
    Qwen3-Coder-Next, Kimi-K2-Thinking, Mistral-Large-3, GLM-5), each covering one dimension of the task.
    The supervisor also runs `/adhd` as a Claude sub-agent for rapid cognitive-frame divergence.
-   All outputs land in `.secondmate/planning/`. The supervisor reads them, synthesizes a single
+   All outputs land in `.secondmate/planning/`. Each planner is invoked in pi JSON mode and its final assistant text is extracted with multipart-aware parsing; known tool-call token dialects, unexpected content parts, empty output, and non-`stop` completion are rejected. A rejected response is retried once with a deliberately changed prompt; a successful retry is visibly marked as self-healed, while a second bad response preserves its raw text and fails the aggregate command. The directory records its task and refuses a different task's non-empty prior output rather than overwriting it. The supervisor reads the accepted outputs, synthesizes a single
    consolidated plan (with ponytail active — speculative ideas get cut), and routes to the right maker.
    *Guards against:* a single model's blind spots dominating the plan; over-engineered implementations
    from a single perspective.
@@ -272,7 +272,8 @@ Each stage exists to close a specific failure mode.
 | `bin/scope-guard.py` | confines a marker-activated maker session to its own worktree; denies credential-store commands and common Bash evasions |
 | `bin/mark-maker.sh` | the one shared call that drops the scope-guard marker (outside the worktree) — called by every maker-launch site; same convention for Claude and pi |
 | `bin/scope-guard-extension.ts` | pi extension version of scope-guard.py — uses `tool_call` event instead of PreToolUse, same enforcement rules |
-| `bin/plan-committee.sh` | 6 parallel pi planners → `.secondmate/planning/<label>.md` |
+| `bin/plan-committee.sh` | 6 parallel pi planners → `.secondmate/planning/<label>.md`; JSON-validates planner output, retries a rejected response once with a changed prompt, and protects prior-task output directories |
+| `bin/committee-output.py` | multipart-aware pi JSON final-text extraction and tool-call-garble classification for planners |
 | `bin/new-worktree.sh` | isolated worktree per maker; marks it via `mark-maker.sh` |
 | `bin/run-round.sh` | timeout + idle watchdog + audit (used by planners + maker + checker) |
 | `bin/loop-guard.sh` | stuck-loop abort + round/spawn caps |

@@ -163,6 +163,8 @@ BODY
 
 _prompt_qwen3_coder() {
   cat << 'BODY'
+IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
+
 Goal: Walk the concrete implementation steps and rate each one so the supervisor knows where the real difficulty is.
 
 Success means:
@@ -226,6 +228,8 @@ BODY
 
 _prompt_kimi_k2() {
   cat << 'BODY'
+IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
+
 Goal: Map every system this task touches and rate the blast radius and reversibility of each connection.
 
 Success means:
@@ -443,7 +447,7 @@ BODY
 }
 
 _planner_prompt() {
-  local label="$1" task="$2"
+  local label="$1" task="$2" retry="${3:-}"
   case "$label" in
     deepseek-r1)    _prompt_deepseek_r1   "$task" ;;
     qwen3-80b)      _prompt_qwen3_80b     "$task" ;;
@@ -453,6 +457,34 @@ _planner_prompt() {
     glm5)           _prompt_glm5          "$task" ;;
     *)              printf 'You are a planning agent. Analyze the task.\n\nTASK:\n%s\n' "$task" ;;
   esac
+  if [ "$retry" = retry ]; then
+    printf '\nIMPORTANT RETRY: The prior response was unusable tool-call-shaped text. Return the requested analysis now as plain prose/markdown only; do not emit tool syntax.\n'
+  fi
+}
+
+# Run and JSON-classify one planner. Return 0 for clean or self-healed, 1 failed.
+_run_planner() {
+  local label="$1" model_id="$2" thinking="$3" prompt="$4" out="$5"
+  local raw="$out.jsonl" retry_raw="$out.retry.jsonl" retry_prompt status
+  rm -f "$out.healed" "$out.raw" "$raw" "$retry_raw"
+  "$SCRIPT_DIR/run-round.sh" --label "plan-$label" --log "$raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$prompt" || true
+  "$SCRIPT_DIR/committee-output.py" --input "$raw" --output "$out"; status=$?
+  [ "$status" = 0 ] && { rm -f "$raw"; return 0; }
+
+  # Preserve the first bad response while retrying with a deliberately changed prompt.
+  [ -s "$out" ] && cp "$out" "$out.raw" || cp "$raw" "$out.raw"
+  retry_prompt="$(_planner_prompt "$label" "$task" retry)"
+  "$SCRIPT_DIR/run-round.sh" --label "plan-$label-retry" --log "$retry_raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$retry_prompt" || true
+  "$SCRIPT_DIR/committee-output.py" --input "$retry_raw" --output "$out"; status=$?
+  if [ "$status" = 0 ]; then
+    touch "$out.healed"
+    rm -f "$raw" "$retry_raw"
+    return 0
+  fi
+  [ -s "$out" ] && cp "$out" "$out.raw" || cp "$retry_raw" "$out.raw"
+  return 1
 }
 
 # ---- arg parsing ----
@@ -538,6 +570,47 @@ while [ $# -gt 0 ]; do case "$1" in
       echo "$_pp" | grep -q "$_m2" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m2'"; fails=1; }
       echo "$_pp" | grep -q "$_m3" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m3'"; fails=1; }
     done
+    "$SCRIPT_DIR/committee-output.py" --selfcheck >/dev/null || { echo "FAIL: committee-output real fixture classifier"; fails=1; }
+    _qwen_prompt="$(_planner_prompt qwen3-coder test-task-xyz)"
+    _kimi_prompt="$(_planner_prompt kimi-k2 test-task-xyz)"
+    echo "$_qwen_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: qwen3-coder missing no-tools hardening"; fails=1; }
+    echo "$_kimi_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: kimi-k2 missing no-tools hardening"; fails=1; }
+    # Exercise the actual launch/classify/retry path. The fake pi emits the captured qwen
+    # failure on attempt one and clean JSON on the deliberately changed retry prompt.
+    _ctmp="$(mktemp -d)"
+    cat > "$_ctmp/pi" <<'FAKEPI'
+#!/usr/bin/env bash
+model=""; prompt=""
+while [ $# -gt 0 ]; do
+  case "$1" in --model) model="$2"; shift 2;; -p) prompt="$2"; shift 2;; *) shift;; esac
+done
+echo "$model" >> "$FAKE_CALLS"
+if [ "$model" = qwen.qwen3-coder-next ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
+  text='I'"'"'ll analyze the bug in `bin/plan-committee.sh` by walking through its concrete implementation steps. Let me first examine the file and related code.
+
+<tool_call>
+<function=read_file>
+<item path="/Users/eshwar.vijay/secondmate/bin/plan-committee.sh">'
+else
+  text='### Implementation Steps
+1. Classify the final JSON assistant text before accepting it.'
+fi
+python3 -c 'import json,sys; print(json.dumps({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":sys.argv[1]}]}]}))' "$text"
+FAKEPI
+    chmod +x "$_ctmp/pi"
+    FAKE_CALLS="$_ctmp/calls" PATH="$_ctmp:$PATH" "$0" --task fixture-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 0 ] || { echo "FAIL: self-healed planner run exited $_src"; fails=1; }
+    [ "$(grep -c '^qwen.qwen3-coder-next$' "$_ctmp/calls" 2>/dev/null || true)" = 2 ] || { echo "FAIL: self-healed path did not retry exactly once"; fails=1; }
+    [ -f "$_ctmp/out/qwen3-coder.md.healed" ] || { echo "FAIL: self-healed planner was not visibly marked"; fails=1; }
+    FAKE_CALLS="$_ctmp/calls-bad" FAKE_ALWAYS_BAD=1 PATH="$_ctmp:$PATH" "$0" --task failed-fixture --out-dir "$_ctmp/bad" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" != 0 ] || { echo "FAIL: doubly garbled planner did not fail aggregate exit"; fails=1; }
+    [ -s "$_ctmp/bad/qwen3-coder.md.raw" ] || { echo "FAIL: failed planner did not preserve raw output"; fails=1; }
+    FAKE_CALLS="$_ctmp/calls-collision" PATH="$_ctmp:$PATH" "$0" --task other-task --out-dir "$_ctmp/out" --timeout 30 >/dev/null 2>&1
+    _src=$?
+    [ "$_src" = 2 ] || { echo "FAIL: output-directory task collision exit $_src (want 2)"; fails=1; }
+    rm -rf "$_ctmp"
     [ "$fails" = 0 ] && echo ok; exit "$fails";;
   *) echo "unknown arg: $1" >&2; exit 2;;
 esac; done
@@ -546,6 +619,22 @@ case "$timeout" in ''|*[!0-9]*) echo "--timeout must be a positive integer (seco
 [ "$timeout" -gt 0 ] || { echo "--timeout must be a positive integer (seconds)" >&2; exit 2; }
 
 mkdir -p "$out_dir"
+task_marker="$out_dir/.plan-committee-task"
+# Never erase a different task's still-useful committee. A marker-less non-empty
+# directory is treated as unknown/unsafe rather than guessing that it is reusable.
+if [ -f "$task_marker" ]; then
+  previous_task="$(cat "$task_marker")"
+  if [ "$previous_task" != "$task" ]; then
+    if find "$out_dir" -maxdepth 1 -name '*.md' -type f -size +0c | grep -q .; then
+      echo "refusing to overwrite planning output for a different task; pass a new --out-dir" >&2
+      exit 2
+    fi
+  fi
+elif find "$out_dir" -maxdepth 1 -name '*.md' -type f -size +0c | grep -q .; then
+  echo "refusing to overwrite unmarked existing planning output; pass a new --out-dir" >&2
+  exit 2
+fi
+printf '%s' "$task" > "$task_marker"
 
 # ---- launch all planners in parallel ----
 pids=(); labels=(); outs=()
@@ -553,10 +642,7 @@ for entry in "${PLANNERS[@]}"; do
   IFS='|' read -r label dimension model_id thinking <<< "$entry"
   out="$out_dir/$label.md"
   prompt="$(_planner_prompt "$label" "$task")"
-  "$SCRIPT_DIR/run-round.sh" \
-    --label "plan-$label" --log "$out" \
-    --timeout "$timeout" --audit "$out_dir/audit.jsonl" \
-    -- pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools -p "$prompt" &
+  _run_planner "$label" "$model_id" "$thinking" "$prompt" "$out" &
   pids+=($!); labels+=("$label"); outs+=("$out")
 done
 
@@ -570,7 +656,9 @@ done
 echo "=== Planning committee ==="
 for i in "${!labels[@]}"; do
   f="${outs[$i]}"
-  if [ -f "$f" ] && [ -s "$f" ]; then
+  if [ -f "$f.healed" ]; then
+    echo "  ~ ${labels[$i]} ($(wc -l < "$f") lines; self-healed after retry) -> $f"
+  elif [ -f "$f" ] && [ -s "$f" ]; then
     echo "  + ${labels[$i]} ($(wc -l < "$f") lines) -> $f"
   else
     echo "  - ${labels[$i]}: missing or empty"
