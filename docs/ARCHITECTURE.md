@@ -267,6 +267,40 @@ Each stage exists to close a specific failure mode.
 | Context bloats over a long run | prune-output + reasoning one-shots off the supervisor |
 | Ambiguous adjudication | machine-readable verdict envelope |
 | Maker touches files/credentials outside its scope | scope-guard.py (Claude) and scope-guard-extension.ts (pi), both marker-activated |
+| Two sub-agent-supervisors work the same task-id at once | claim-ledger.py's atomic, ownership-checked claim/release |
+
+## Primitives for parallel sub-agent-supervisors (building block, not yet wired into the loop)
+
+Today's loop is single-supervisor and sequential: one Sonnet supervisor drives one maker/checker/gate/merge
+cycle at a time. The next evolution is a supervisor that can spawn **N independent sub-agent-supervisors**,
+each running its own maker/checker/gate/merge loop for a different task in its own git worktree. `claim-ledger.py`
+is the first of three primitives being built toward that (the other two, a merge-sequencer and a dispatch-loop,
+are separate, later tasks):
+
+- `bin/claim-ledger.py` — before a sub-agent-supervisor starts work on a task-id, it must `claim` it. Claim key
+  is the task-id itself (this repo's existing one task-id : one worktree : one branch (`sm/<task-id>`)
+  convention), not a worktree path or a PID. The default ledger location is anchored to `git rev-parse
+  --git-common-dir` — the one physical location every worktree of a repo (primary checkout and every
+  linked worktree, same mechanism `bin/mark-maker.sh` uses) agrees on — rather than the caller's ambient
+  CWD; a plain CWD-relative default would give each herdr-launched sub-agent-supervisor (each running
+  with its CWD set to its own worktree) an unshared ledger, silently defeating the whole point. Anchored
+  at the common-dir's PARENT only when the common-dir's own basename is literally `.git` (a normal
+  repo's or linked worktree's shared .git directory); anchored AT the common-dir itself in every other
+  case (a bare repo, whose common-dir resolves to `.` under some other basename; a submodule, whose
+  common-dir's basename is the submodule's own name) -- otherwise two unrelated bare repos, or two
+  submodules of the same superproject, would collide on the same parent directory.
+  `release` requires BOTH a matching `--owner` label AND a matching `--token` (a `secrets.token_hex(16)`
+  minted by `claim`/`steal` and printed once) — the owner label alone is just a human-readable
+  double-check, not real proof, since any caller can repeat another caller's label string. `steal` is a
+  **human-supervised override only** — it requires a non-empty `--reason`, needs no token itself,
+  unconditionally closes whatever is open, and appends a distinct `stolen` event so the ledger's history
+  stays honest about what really happened. There is deliberately **no**
+  automated liveness/heartbeat/TTL check anywhere in the script: each real sub-agent runtime (a `herdr agent`,
+  an Agent-tool background agent) already has its own liveness mechanism, and a raw OS PID isn't even a
+  meaningful concept from this script's vantage point for some of those runtimes. The calling dispatch loop
+  is responsible for checking real liveness *before* ever invoking `--steal`. `status` and `steal` share one
+  fold-the-ledger-to-open-claims primitive, and `steal` re-folds it fresh, inside the same `fcntl` lock
+  `hold.py` uses, immediately before deciding — never trusting an earlier, separately-fetched `status` call.
 
 ## Component map
 
@@ -287,6 +321,7 @@ Each stage exists to close a specific failure mode.
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
+| `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block for a future multi-supervisor dispatch loop, not yet wired into today's sequential loop |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
