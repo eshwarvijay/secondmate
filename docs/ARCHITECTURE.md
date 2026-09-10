@@ -151,7 +151,14 @@ Each stage exists to close a specific failure mode.
 
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here. When more than one sub-agent-supervisor may finish and try to integrate around
-   the same time, integration goes through `bin/merge-sequencer.sh` rather than a bare `git merge`: it takes a
+   the same time, integration goes through `bin/merge-sequencer.sh` rather than a bare `git merge`: before doing
+   anything else, it validates that `--worktree` is an ACTUAL linked worktree of `--repo` — sharing the same
+   `git-common-dir` (compared via `pwd -P` so a symlinked tmp-dir prefix like macOS's `/tmp` → `/private/tmp`
+   can't cause a false mismatch), not merely an independent clone of the same repository. Commit SHAs are
+   portable across clones, so an independent clone could otherwise pass `verify-gate.sh`'s own freshness check
+   entirely against its own, possibly stale, local refs, while the real merge lands into `--repo`'s actual,
+   newer state — silently bypassing the whole "review is fresh relative to what actually gets merged"
+   guarantee. It then takes a
    singleton mkdir-based lock **anchored to `--repo` by default** (`<repo>/.secondmate/merge-sequencer.lock`,
    bounded wait, no auto-steal on a stuck lock — a human removes it manually), and **re-invokes
    `verify-gate.sh` fresh, inside that lock**, immediately before the actual merge. Anchoring the lock (and
@@ -192,7 +199,9 @@ Each stage exists to close a specific failure mode.
    between the last fresh check and the actual merge; a rebase silently invalidating an already-approved diff;
    a network/push hiccup triggering a destructive auto-revert of already-verified, already-landed code; merging
    an unreviewed `--branch` that never matched the actually-reviewed commit; destroying a pre-existing, unrelated
-   conflict on `$repo` that this invocation didn't create.
+   conflict on `$repo` that this invocation didn't create; an independent/stale clone passed as `--worktree`
+   defeating the freshness guarantee by passing `verify-gate.sh`'s check against its own stale local refs
+   while the real merge lands into `--repo`'s actual, different state.
 
 8. **Teardown.** Immediately after integration, close everything created for this task:
    ```bash
@@ -317,6 +326,7 @@ Each stage exists to close a specific failure mode.
 | Ambiguous adjudication | machine-readable verdict envelope |
 | Maker touches files/credentials outside its scope | scope-guard.py (Claude) and scope-guard-extension.ts (pi), both marker-activated |
 | Two sibling merges racing onto `main` at once | merge-sequencer.sh singleton lock + fresh re-gate inside it |
+| An independent/stale clone passed as `--worktree` silently bypassing the freshness guarantee | merge-sequencer.sh validates `--worktree` shares `--repo`'s `git-common-dir` (a real linked worktree) before doing anything else |
 | A network/push hiccup triggering a destructive auto-revert | merge-sequencer.sh never reverts an already-landed local merge on push failure |
 | `--branch` naming a different, never-reviewed commit than `--checked-sha` | merge-sequencer.sh's branch-vs-checked-sha identity check (`BRANCH_MISMATCH`) |
 | Destroying a pre-existing, unrelated conflict on the primary checkout | merge-sequencer.sh refuses before merging if `$repo` already has a `MERGE_HEAD`/is dirty; never calls `merge --abort` on a conflict it didn't start |
@@ -341,7 +351,7 @@ Each stage exists to close a specific failure mode.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); refuses/aborts cleanly on gate refusal or a real merge conflict from its own attempt only; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); refuses/aborts cleanly on gate refusal or a real merge conflict from its own attempt only; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |

@@ -568,6 +568,40 @@ HOOKEOF
   echo "$out15" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message in output, got: $out15"; fails=1; }
   [ "$(_ledger_count sm/push-fail PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record for sm/push-fail"; fails=1; }
 
+  # ---- Test 16: --worktree must be an ACTUAL linked worktree of --repo (sharing --repo's
+  # git-common-dir), never an independent clone -- an independent clone can pass verify-gate.sh's own
+  # freshness check against its own STALE local refs (commit SHAs are portable across clones) while the
+  # real merge lands into --repo's actual, newer state, silently bypassing the freshness guarantee.
+  IFS='|' read -r origin16 primary16 <<<"$(_setup_repo 16)"
+  git clone -q "$primary16" "$t/stale-clone16" >/dev/null 2>&1
+  git -C "$t/stale-clone16" checkout -q -b sm/stale-feature main
+  echo "feature-q" >> "$t/stale-clone16/file.txt"
+  git -C "$t/stale-clone16" commit -qam "feature q (committed on top of a stale clone's own main)"
+  sha16="$(git -C "$t/stale-clone16" rev-parse HEAD)"
+  # Fetch that exact commit into $repo too, so it resolves there with the SAME SHA (round 3's own
+  # branch-identity check must not be what refuses this -- this test isolates the git-common-dir issue
+  # specifically; realistically the sub-agent-supervisor's branch is normally visible to the primary
+  # checkout one way or another, which is exactly why the git-common-dir identity check, not branch
+  # resolvability, is the only thing standing between this and a silent bypass).
+  git -C "$primary16" fetch -q "$t/stale-clone16" sm/stale-feature:sm/stale-feature
+  # $repo's REAL main advances independently, with an unrelated, NON-CONFLICTING change the stale
+  # clone above never fetched and knows nothing about.
+  echo "unrelated-real-advance" >> "$primary16/other-file.txt"
+  git -C "$primary16" add other-file.txt
+  git -C "$primary16" commit -qam "real main genuinely advances, unrelated to the stale clone"
+  git -C "$primary16" push -q origin main
+  main_before16="$(git -C "$primary16" rev-parse main)"
+  origin16_before="$(git --git-dir="$origin16" rev-parse main 2>/dev/null || echo "")"
+  out16="$(_ms --repo "$primary16" --worktree "$t/stale-clone16" --branch sm/stale-feature --base main --checked-sha "$sha16" --wait-timeout 5 2>&1)"
+  rc16=$?
+  [ "$rc16" -eq 2 ] || { echo "FAIL: an independent clone passed as --worktree should be refused with rc=2, got $rc16: $out16"; fails=1; }
+  echo "$out16" | grep -qi "not a linked worktree" || { echo "FAIL: expected a clear 'not a linked worktree' explanation, got: $out16"; fails=1; }
+  echo "$out16" | grep -qi "PASS:\|REFUSE:" && { echo "FAIL: verify-gate.sh appears to have been reached at all -- the git-common-dir check must refuse BEFORE calling it, got: $out16"; fails=1; }
+  main_after16="$(git -C "$primary16" rev-parse main)"
+  [ "$main_after16" = "$main_before16" ] || { echo "FAIL: main was touched despite --worktree being an independent, stale clone (the exact bug being regression-tested)"; fails=1; }
+  origin16_after="$(git --git-dir="$origin16" rev-parse main 2>/dev/null || echo "")"
+  [ "$origin16_after" = "$origin16_before" ] || { echo "FAIL: origin main changed despite --worktree being an independent, stale clone"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -608,6 +642,22 @@ esac
 [ -d "$repo" ] || { echo "--repo $repo is not a directory" >&2; exit 2; }
 git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "--repo $repo is not a git working tree" >&2; exit 2; }
 [ -d "$worktree" ] || { echo "--worktree $worktree is not a directory" >&2; exit 2; }
+git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "--worktree $worktree is not a git working tree" >&2; exit 2; }
+
+# --worktree must be an ACTUAL linked worktree of --repo (sharing the same git-common-dir, i.e. the
+# same underlying object database via `git worktree add`), not merely a separate, independent clone of
+# the same repository. Commit SHAs are portable across clones, so an independent clone could pass
+# verify-gate.sh's own --checked-sha check while resolving --base entirely within its own, possibly
+# STALE, local refs -- verify-gate.sh would correctly report a clean pass relative to that clone's own
+# (stale) view, while the actual merge lands into --repo's real, newer state, silently bypassing the
+# whole 'review is fresh relative to what actually gets merged' guarantee. git-common-dir is the one
+# thing that's true for every genuine linked worktree and false for an independent clone.
+repo_common_dir="$(cd "$repo" 2>/dev/null && cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd -P)"
+worktree_common_dir="$(cd "$worktree" 2>/dev/null && cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd -P)"
+if [ -z "$repo_common_dir" ] || [ -z "$worktree_common_dir" ] || [ "$repo_common_dir" != "$worktree_common_dir" ]; then
+  echo "--worktree $worktree is not a linked worktree of --repo $repo (git-common-dir mismatch: repo='${repo_common_dir:-<unresolvable>}' worktree='${worktree_common_dir:-<unresolvable>}') -- refusing. --worktree must be created via 'git worktree add' against this exact --repo, not an independent clone (an independent clone can pass verify-gate.sh's own checks against its own, possibly stale, local refs while the actual merge lands somewhere entirely different)." >&2
+  exit 2
+fi
 
 # The actual merge/push happens in $repo, so $repo must actually have $base checked out --
 # otherwise the merge would silently land on whatever branch $repo happens to be on.
