@@ -187,17 +187,53 @@ def _selfcheck_live():
         opened = open_claims()
         assert opened["t2"]["owner"] == "agent-f", "steal must reopen the task-id under the new owner"
 
-        # TOCTOU guard: steal must re-fold the ledger FRESH, inside the lock, immediately before
-        # deciding -- never trusting an earlier, separately-fetched snapshot. Simulate a claim landing
-        # AFTER a stale snapshot was taken, and assert steal still sees it.
-        stale_snapshot = open_claims()
-        assert "race" not in stale_snapshot, "sanity: stale snapshot predates the race claim"
-        _append({"ev": "claimed", "task_id": "race", "owner": "sneaky", "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
-        code, _, _ = _run(["steal", "--task-id", "race", "--owner", "thief", "--reason", "toctou check"])
+        # TOCTOU guard, forced via a GENUINE concurrent race (not a pre-written ledger line the steal
+        # call then just reads normally -- that proves nothing, since nothing else is running while it
+        # reads). A background thread performs a full COMPETING steal on the same task-id, released the
+        # instant our own fold call returns, so its window to run lands exactly in the gap between our
+        # fold and our lock acquisition -- the real defect being guarded against. If steal ever folds
+        # BEFORE acquiring the lock again, the competitor can complete during that gap and our own
+        # recorded previous_owner will be stale; if steal folds INSIDE the lock (the fix), the
+        # competitor blocks on the same fcntl lock and cannot run until we're done.
+        import threading
+        _append({"ev": "claimed", "task_id": "race", "owner": "agent-a", "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        real_open_claims = open_claims
+        race_started = threading.Event()
+
+        def _slow_open_claims(recs=None):
+            result = real_open_claims(recs)
+            if "race" in result and not race_started.is_set():
+                race_started.set()  # let the competitor go, then hold this result open for a window
+                time.sleep(0.3)
+            return result
+
+        def _competitor():
+            race_started.wait(timeout=2)
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(["steal", "--task-id", "race", "--owner", "concurrent-winner", "--reason", "racing steal"])
+
+        t = threading.Thread(target=_competitor)
+        t.start()
+        globals()["open_claims"] = _slow_open_claims
+        try:
+            code, _, _ = _run(["steal", "--task-id", "race", "--owner", "victim-thief", "--reason", "toctou race"])
+        finally:
+            globals()["open_claims"] = real_open_claims
+        t.join(timeout=5)
+        assert not t.is_alive(), "competitor steal thread never finished -- test setup broken"
         assert code == 0
-        last_steal = [r for r in _recs() if r["ev"] == "stolen" and r["task_id"] == "race"][-1]
-        assert last_steal.get("previous_owner") == "sneaky", (
-            "steal must fold the ledger fresh inside the lock, not trust an earlier stale snapshot")
+
+        # Ledger append order under the fcntl lock IS the true chronological order (ts has only
+        # 1-second resolution, so it can't be trusted to order these two). Every 'stolen' record's
+        # previous_owner must match the owner of whichever record truly precedes it in ledger order.
+        race_recs = [r for r in _recs() if r["task_id"] == "race" and r["ev"] in ("claimed", "stolen")]
+        assert len(race_recs) == 3, "expected exactly claimed + 2 stolen records for 'race'"
+        for i in range(1, len(race_recs)):
+            if race_recs[i]["ev"] == "stolen" and "previous_owner" in race_recs[i]:
+                assert race_recs[i]["previous_owner"] == race_recs[i - 1]["owner"], (
+                    f"stolen record claims previous_owner={race_recs[i]['previous_owner']!r} but the ledger's "
+                    f"true immediately-preceding owner was {race_recs[i - 1]['owner']!r} -- steal must fold "
+                    f"the ledger fresh INSIDE the lock, not from a stale pre-lock snapshot")
 
         # task-id validation: empty, path separators, null bytes, bad chars, and over-length must all fail.
         for bad in ("", "../etc", "a/b", "a\0b", "bad id", "*", "a" * 129):
@@ -213,7 +249,6 @@ def _selfcheck_live():
         # real concurrency: N threads racing to claim the SAME task-id simultaneously must yield exactly
         # one winner, and the ledger must end up with exactly one 'claimed' record for it -- proves the
         # fcntl lock (and folding inside it) actually serializes the read-check-append, not just in theory.
-        import threading
         results = []
         barrier = threading.Barrier(8)
 
@@ -296,8 +331,9 @@ def main(argv):
         if not args.reason.strip():
             sys.exit("--reason must be non-empty -- steal is a human-supervised override and the ledger "
                       "must record why the claim was reclaimed")
-        opened = open_claims()  # MUTATION: folded BEFORE the lock -- stale snapshot, reintroduces TOCTOU
         with _ledger_lock():
+            # Fold FRESH, inside the lock, right before deciding -- never trust an earlier snapshot.
+            opened = open_claims()
             prev = opened.get(args.task_id)
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
             rec = {"ev": "stolen", "task_id": args.task_id, "owner": args.owner, "ts": ts,
