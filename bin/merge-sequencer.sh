@@ -86,7 +86,9 @@ _acquire_lock() {
 }
 
 # Append one JSONL record for this attempt. reason_code is a CLOSED enum -- never freeform --
-# so the ledger stays usable for automated triage later.
+# so the ledger stays usable for automated triage later. Returns nonzero if the write itself failed
+# (e.g. mkdir -p / the append redirect hit a non-directory in the way) -- callers must check this and
+# warn loudly rather than silently reporting overall success with a missing audit record.
 _append_ledger() {
   local reason_code="$1" merged_sha="${2:-}"
   mkdir -p "$(dirname "$LEDGER")" 2>/dev/null || true
@@ -104,6 +106,17 @@ if merged_sha:
     rec["merged_sha"] = merged_sha
 print(json.dumps(rec))
 EOF
+}
+
+# Thin wrapper every call site should use instead of _append_ledger directly: a ledger-write failure
+# must never be silent. The merge/push outcome is real and already happened (or genuinely didn't) --
+# this never changes the caller's own exit code, it only makes a lost audit record LOUD instead of
+# invisible.
+_append_ledger_or_warn() {
+  local reason_code="$1" merged_sha="${2:-}"
+  if ! _append_ledger "$reason_code" "$merged_sha"; then
+    echo "WARNING: failed to append the '$reason_code' record to the merge ledger ($LEDGER) -- the durable audit-trail record was NOT written for this attempt. This does not affect the actual git/merge/push outcome reported above/below, but the ledger is now missing an entry for it." >&2
+  fi
 }
 
 _usage() {
@@ -401,6 +414,57 @@ print(n)
   main_after10="$(git -C "$primary10" rev-parse main)"
   [ "$main_after10" = "$main_before10" ] || { echo "FAIL: main moved despite refusing on a pre-existing unrelated conflict"; fails=1; }
 
+  # ---- Test 11: the DEFAULT invocation (no --repo-anchored lock/ledger override, no .gitignore entry
+  # for .secondmate/ at all) on a genuinely clean repo must succeed -- the script's OWN lock directory
+  # must never trip its OWN round-3 dirty-repo guard. This deliberately exercises the real default path
+  # every other test above avoids by setting SM_LOOP_STATE outside the repo.
+  IFS='|' read -r origin11 primary11 <<<"$(_setup_repo 11)"
+  git -C "$primary11" worktree add -q "$t/wt11" -b sm/default-clean main
+  echo "feature-k" >> "$t/wt11/file.txt"
+  git -C "$t/wt11" commit -qam "feature k"
+  sha11="$(git -C "$t/wt11" rev-parse HEAD)"
+  [ -f "$primary11/.gitignore" ] && grep -q secondmate "$primary11/.gitignore" && { echo "FAIL: test fixture unexpectedly ignores .secondmate/ -- would mask the real bug"; fails=1; }
+  main_before11="$(git -C "$primary11" rev-parse main)"
+  out11="$(unset SM_LOOP_STATE SM_MERGE_LEDGER; bash "$MS" --repo "$primary11" --worktree "$t/wt11" --branch sm/default-clean --base main --checked-sha "$sha11" --wait-timeout 5 2>&1)"
+  rc11=$?
+  [ "$rc11" -eq 0 ] || { echo "FAIL: default invocation on a genuinely clean repo (no .secondmate/ .gitignore entry) expected rc=0, got $rc11: $out11"; fails=1; }
+  main_after11="$(git -C "$primary11" rev-parse main)"
+  [ "$main_after11" != "$main_before11" ] || { echo "FAIL: default invocation did not advance main despite claimed success"; fails=1; }
+  [ ! -d "$primary11/.secondmate/merge-sequencer.lock" ] || { echo "FAIL: default lock directory left behind after success"; fails=1; }
+  [ -f "$primary11/audit/merge-ledger.jsonl" ] || { echo "FAIL: expected the default (--repo-anchored) ledger at $primary11/audit/merge-ledger.jsonl"; fails=1; }
+  grep -q '"reason_code": *"SUCCESS"' "$primary11/audit/merge-ledger.jsonl" 2>/dev/null || { echo "FAIL: expected a SUCCESS record in the default ledger"; fails=1; }
+
+  # ---- Test 12: a ledger-write failure (the default ledger's directory colliding with a tracked
+  # regular FILE, not a directory) must NOT fail an otherwise-successful merge+push -- but must print a
+  # clear WARNING to stderr naming the ledger path, never silently vanish.
+  IFS='|' read -r origin12 primary12 <<<"$(_setup_repo 12)"
+  git -C "$primary12" worktree add -q "$t/wt12" -b sm/ledger-fail main
+  echo "feature-l" >> "$t/wt12/file.txt"
+  git -C "$t/wt12" commit -qam "feature l"
+  sha12="$(git -C "$t/wt12" rev-parse HEAD)"
+  # 'audit' is a tracked regular FILE, not a directory -- mkdir -p "$repo/audit" (the ledger's parent)
+  # can never succeed, so the ledger append must fail while the merge/push themselves are unaffected.
+  echo "not a directory" > "$primary12/audit"
+  git -C "$primary12" add audit
+  git -C "$primary12" commit -qam "add audit file (collides with default ledger dir)"
+  main_before12="$(git -C "$primary12" rev-parse main)"
+  lock_root12="$t/state12"   # keep the lock isolated/explicit so this test exercises ONLY the ledger failure
+  # SM_MERGE_LEDGER must be explicitly unset (not just left at the outer harness's own override) so the
+  # script computes its own --repo-anchored default -- otherwise this would silently write to
+  # ledger_default instead of exercising the actual bug. (No comments inside the $(...) below -- bash 3.2
+  # mis-parses an apostrophe inside a comment nested in a multi-line command substitution.)
+  out12="$(
+    export SM_LOOP_STATE="$lock_root12"
+    unset SM_MERGE_LEDGER
+    bash "$MS" --repo "$primary12" --worktree "$t/wt12" --branch sm/ledger-fail --base main --checked-sha "$sha12" --wait-timeout 5 2>&1
+  )"
+  rc12=$?
+  [ "$rc12" -eq 0 ] || { echo "FAIL: a ledger-write failure must not fail an otherwise-successful merge, got rc=$rc12: $out12"; fails=1; }
+  main_after12="$(git -C "$primary12" rev-parse main)"
+  [ "$main_after12" != "$main_before12" ] || { echo "FAIL: main did not advance despite the merge/push being unaffected by the ledger failure"; fails=1; }
+  echo "$out12" | grep -qi "WARNING" || { echo "FAIL: expected a WARNING about the ledger-write failure, got: $out12"; fails=1; }
+  echo "$out12" | grep -q "merge-ledger.jsonl" || { echo "FAIL: WARNING should name the ledger path, got: $out12"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -463,7 +527,7 @@ if ! _acquire_lock "$wait_timeout"; then
   # Best-effort, informational only -- no attempt was ever made, so this may be stale.
   pre_merge_base_sha="$(git -C "$repo" rev-parse --verify "${base}^{commit}" 2>/dev/null || echo "")"
   echo "ERROR: failed to acquire merge-sequencer lock ($LOCK_DIR) within ${wait_timeout}s -- another merge is in progress, or the lock is stuck. This is never auto-stolen; a human should investigate and remove it manually if stuck." >&2
-  _append_ledger LOCK_TIMEOUT ""
+  _append_ledger_or_warn LOCK_TIMEOUT ""
   exit 5
 fi
 
@@ -480,7 +544,7 @@ gate_rc=$?
 if [ "$gate_rc" -ne 0 ]; then
   _release_lock
   printf '%s\n' "$gate_output" >&2
-  _append_ledger GATE_REFUSE ""
+  _append_ledger_or_warn GATE_REFUSE ""
   exit 1
 fi
 
@@ -492,7 +556,7 @@ branch_sha="$(git -C "$repo" rev-parse --verify "${branch}^{commit}" 2>/dev/null
 if [ -z "$branch_sha" ] || [ "$branch_sha" != "$checked_sha" ]; then
   _release_lock
   echo "REFUSE: --branch '$branch' resolves to '${branch_sha:-<does not resolve>}', which does not match --checked-sha '$checked_sha' (the commit verify-gate.sh actually reviewed in --worktree '$worktree'). Refusing to merge a branch that was never verified as this exact commit." >&2
-  _append_ledger BRANCH_MISMATCH ""
+  _append_ledger_or_warn BRANCH_MISMATCH ""
   exit 1
 fi
 
@@ -507,7 +571,7 @@ if git -C "$repo" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
   echo "ERROR: $repo already has an in-progress merge (MERGE_HEAD present) that this invocation did not start -- refusing to touch it. A human must resolve or abort it directly in $repo before this can retry." >&2
   exit 2
 fi
-repo_dirty="$(git -C "$repo" status --porcelain)"
+repo_dirty="$(git -C "$repo" status --porcelain -- . ":(exclude)$(basename "$(dirname "$LOCK_DIR")")" 2>/dev/null)"
 if [ -n "$repo_dirty" ]; then
   _release_lock
   echo "ERROR: $repo is not in a clean, mergeable state (uncommitted changes present that this invocation did not create) -- refusing to touch it. A human must investigate $repo directly before this can retry." >&2
@@ -522,7 +586,7 @@ if [ "$merge_rc" -ne 0 ]; then
   _release_lock
   echo "MERGE CONFLICT merging '$branch' into '$base' in $repo (aborted, $repo left unchanged):" >&2
   printf '%s\n' "$merge_output" >&2
-  _append_ledger MERGE_CONFLICT ""
+  _append_ledger_or_warn MERGE_CONFLICT ""
   exit 3
 fi
 
@@ -535,11 +599,11 @@ if [ "$push_rc" -ne 0 ]; then
   echo "PUSH FAILED pushing '$base' to origin from $repo:" >&2
   printf '%s\n' "$push_output" >&2
   echo "NOTE: the local merge commit $merged_sha for '$branch' already landed on '$base' in $repo -- it was NOT reverted. Only the push to origin needs a manual retry, e.g.: git -C $repo push origin $base" >&2
-  _append_ledger PUSH_FAILED ""
+  _append_ledger_or_warn PUSH_FAILED ""
   exit 4
 fi
 
-_append_ledger SUCCESS "$merged_sha"
+_append_ledger_or_warn SUCCESS "$merged_sha"
 _release_lock
 echo "merged $branch -> $base as $merged_sha (pushed to origin)"
 exit 0
