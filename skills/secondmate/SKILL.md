@@ -301,11 +301,14 @@ c. **Run the existing solo secondmate SOP completely untouched** — plan-commit
    single task runs, only how it gets launched. A sub-supervisor is not a different kind of supervisor; it
    is this same SOP, running with its own claimed task-id.
 
-d. **Open its own `bin/hold.py hold --sha <checked-sha>` entry for the merge decision once verify-gate has
-   passed, and WAIT for a genuine human answer** — never assume, never auto-answer, matching the existing
-   single-task loop's Gate → Hold → Integrate contract exactly. The merge-or-not judgment call belongs to
-   that sub-supervisor and the human who answers its hold — it must NEVER defer that decision to the
-   top-level dispatcher, which has no visibility into that task's actual diff/findings.
+d. **Open its own `bin/hold.py hold --task <task-id> --q "..." --sha <checked-sha>` entry for the merge
+   decision once verify-gate has passed, and WAIT for a genuine human answer** — never assume, never
+   auto-answer, matching the existing single-task loop's Gate → Hold → Integrate contract exactly (e.g.
+   `bin/hold.py hold --task <task-id> --q "merge <task-id> (checker PASS, verify-gate PASS at
+   <checked-sha>)?" --sha <checked-sha>` — `--task` and `--q` are required, `--sha` is optional but should
+   always be supplied here so the hold is bound to the exact reviewed commit). The merge-or-not judgment
+   call belongs to that sub-supervisor and the human who answers its hold — it must NEVER defer that
+   decision to the top-level dispatcher, which has no visibility into that task's actual diff/findings.
 
 e. **Only once that hold is answered, merge: call `bin/merge-sequencer.sh` itself** with its own claimed
    `--branch`/`--worktree`/`--checked-sha`. It may legitimately queue behind a sibling sub-supervisor's own

@@ -404,10 +404,13 @@ task's state. Each sub-supervisor: claims its task-id first (`claim-ledger.py cl
 aborting with `SM_REFUSED:claim-failed` on failure); derives every downstream name deterministically from
 the task-id using this repo's existing convention (`sm/<task-id>` branch, `sm-<task-id>`/`sm-pi-<task-id>`
 agent name, `root_pane` from `herdr worktree create`); runs the existing solo SOP completely untouched;
-calls `merge-sequencer.sh` itself (legitimately queueing behind a sibling's concurrent merge attempt on
-the same `--repo` — the lock working as intended); opens its own `hold.py hold` entry for the merge
-decision (never deferring that judgment to the dispatcher); releases its claim on every terminal path; and
-emits exactly one completion tag, on its own line, as its final output: `SM_DONE_MERGED:<sha>`,
+once verify-gate has passed, opens its own `hold.py hold` entry for the merge decision and waits for a
+genuine human answer (never assuming, never auto-answering, never deferring that judgment to the
+dispatcher) — matching the existing single-task loop's Gate → Hold → Integrate contract exactly; only
+once that hold is answered does it call `merge-sequencer.sh` itself (legitimately queueing behind a
+sibling's concurrent merge attempt on the same `--repo` — the lock working as intended); releases its
+claim on every terminal path; and emits exactly one completion tag, on its own line, as its final output:
+`SM_DONE_MERGED:<sha>`,
 `SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`. `bin/dispatch-report.py` is how the dispatcher
 turns that final text into a decision without ever re-reading the sub-supervisor's prose itself: it
 recognizes the three tags anchored at start-of-line only (so a tag echoed mid-prose, e.g. from the
