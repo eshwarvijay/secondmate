@@ -26,11 +26,14 @@
 # Exit codes: 0 success | 1 gate refusal (verify-gate.sh REFUSE, or --branch does not resolve to the exact
 #             reviewed --checked-sha -- BRANCH_MISMATCH) | 2 usage error / precondition failure (never
 #             logged to the ledger -- includes $repo already having an in-progress merge or dirty state
-#             this invocation did not create) | 3 real git merge conflict (from THIS invocation's own merge
-#             attempt only) | 4 push failed (local merge already landed) | 5 lock timeout.
+#             this invocation did not create) | 3 THIS invocation's own 'git merge' failing -- either a
+#             real content conflict (MERGE_CONFLICT, 'git ls-files -u' non-empty) or a rejection with no
+#             actual conflict, e.g. a pre-merge-commit policy hook (MERGE_REJECTED, 'git ls-files -u'
+#             empty) -- both abort cleanly and leave $repo unchanged | 4 push failed (local merge already
+#             landed) | 5 lock timeout.
 #
 # Ledger reason_code is a CLOSED enum: SUCCESS | GATE_REFUSE | BRANCH_MISMATCH | MERGE_CONFLICT |
-#             PUSH_FAILED | LOCK_TIMEOUT -- never freeform.
+#             MERGE_REJECTED | PUSH_FAILED | LOCK_TIMEOUT -- never freeform.
 #
 # Settled scope (do not re-litigate): no internal auto-retry, no rebase-in-place on refusal, no
 # priority queue / fairness policy, no automatic stale-lock expiry/steal, single machine only.
@@ -602,6 +605,35 @@ HOOKEOF
   origin16_after="$(git --git-dir="$origin16" rev-parse main 2>/dev/null || echo "")"
   [ "$origin16_after" = "$origin16_before" ] || { echo "FAIL: origin main changed despite --worktree being an independent, stale clone"; fails=1; }
 
+  # ---- Test 17: a 'git merge' failure that is NOT a real content conflict (e.g. a repo-configured
+  # pre-merge-commit policy hook rejecting it) must be classified as MERGE_REJECTED, not MERGE_CONFLICT
+  # -- 'git ls-files -u' (no unmerged paths) is the ground truth distinguishing the two. Still aborts
+  # cleanly and leaves $repo unchanged either way.
+  IFS='|' read -r origin17 primary17 <<<"$(_setup_repo 17)"
+  git -C "$primary17" worktree add -q "$t/wt17" -b sm/hook-reject main
+  echo "feature-r" >> "$t/wt17/file.txt"
+  git -C "$t/wt17" commit -qam "feature r"
+  sha17="$(git -C "$t/wt17" rev-parse HEAD)"
+  mkdir -p "$primary17/.git/hooks"
+  cat > "$primary17/.git/hooks/pre-merge-commit" <<'HOOKEOF'
+#!/bin/sh
+echo "REJECTED BY POLICY: sign-off required (test hook)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$primary17/.git/hooks/pre-merge-commit"
+  before17="$(git -C "$primary17" rev-parse HEAD)"
+  out17="$(_ms --repo "$primary17" --worktree "$t/wt17" --branch sm/hook-reject --base main --checked-sha "$sha17" --wait-timeout 5 2>&1)"
+  rc17=$?
+  [ "$rc17" -eq 3 ] || { echo "FAIL: pre-merge-commit hook rejection expected rc=3, got $rc17: $out17"; fails=1; }
+  echo "$out17" | grep -qi "MERGE REJECTED" || { echo "FAIL: expected MERGE REJECTED framing (not generic conflict), got: $out17"; fails=1; }
+  echo "$out17" | grep -q "REJECTED BY POLICY" || { echo "FAIL: expected the hook's own policy message to appear verbatim, got: $out17"; fails=1; }
+  after17="$(git -C "$primary17" rev-parse HEAD)"
+  [ "$before17" = "$after17" ] || { echo "FAIL: primary HEAD moved despite hook rejection"; fails=1; }
+  [ -z "$(git -C "$primary17" status --porcelain)" ] || { echo "FAIL: primary left dirty after hook rejection (no abort?)"; fails=1; }
+  [ ! -e "$primary17/.git/MERGE_HEAD" ] || { echo "FAIL: MERGE_HEAD still present after hook rejection (merge not aborted)"; fails=1; }
+  [ "$(_ledger_count sm/hook-reject MERGE_REJECTED)" = "1" ] || { echo "FAIL: expected exactly one MERGE_REJECTED ledger record"; fails=1; }
+  [ "$(_ledger_count sm/hook-reject MERGE_CONFLICT)" = "0" ] || { echo "FAIL: a hook rejection must NOT be logged as MERGE_CONFLICT -- the whole point of the closed-enum distinction"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -742,11 +774,25 @@ fi
 merge_output="$(git -C "$repo" merge --no-ff "$branch" -m "$message" 2>&1)"
 merge_rc=$?
 if [ "$merge_rc" -ne 0 ]; then
+  # A failed 'git merge' does NOT always mean a genuine content conflict -- it can also fail for reasons
+  # that never even attempt a real three-way merge, most commonly a repo-configured 'pre-merge-commit'
+  # hook rejecting the merge by policy (sign-off requirements, commit-message linting, etc; a real,
+  # legitimate mechanism). 'git ls-files -u' listing unmerged paths is the ground truth for whether an
+  # actual content conflict occurred; if it's empty, git refused before ever writing conflicted index
+  # state, and this must be classified differently so a human/dispatcher reading the ledger reaches for
+  # the right remediation (fix the policy issue, not resolve a conflict that never existed).
+  unmerged_paths="$(git -C "$repo" ls-files -u 2>/dev/null)"
   git -C "$repo" merge --abort >/dev/null 2>&1 || true
   _release_lock
-  echo "MERGE CONFLICT merging '$branch' into '$base' in $repo (aborted, $repo left unchanged):" >&2
-  printf '%s\n' "$merge_output" >&2
-  _append_ledger_or_warn MERGE_CONFLICT ""
+  if [ -n "$unmerged_paths" ]; then
+    echo "MERGE CONFLICT merging '$branch' into '$base' in $repo (aborted, $repo left unchanged):" >&2
+    printf '%s\n' "$merge_output" >&2
+    _append_ledger_or_warn MERGE_CONFLICT ""
+  else
+    echo "MERGE REJECTED merging '$branch' into '$base' in $repo -- git refused before any real content conflict occurred (no unmerged paths; likely a pre-merge-commit hook or similar policy check). Aborted, $repo left unchanged. git's own output:" >&2
+    printf '%s\n' "$merge_output" >&2
+    _append_ledger_or_warn MERGE_REJECTED ""
+  fi
   exit 3
 fi
 

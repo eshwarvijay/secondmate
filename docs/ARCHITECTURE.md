@@ -185,13 +185,19 @@ Each stage exists to close a specific failure mode.
    unrelated path elsewhere in the repo that merely shares that name) — refusing immediately (exit 2) and never attempting its own
    merge if so, because a bare `git merge` failing for THAT reason looks identical to a fresh conflict, and
    calling `merge --abort` on a conflict this invocation never started would destroy a human's own unresolved
-   conflict resolution. A real git merge conflict from THIS invocation's own attempt (a genuinely different
+   conflict resolution. A failed `git merge` from THIS invocation's own attempt (a genuinely different
    failure class from a gate refusal — `verify-gate.sh` doesn't check mergeability) aborts cleanly and leaves
-   `main` untouched. The push to `origin` happens *inside the same lock*
+   `main` untouched — but WHICH reason code it's logged under depends on whether a real content conflict
+   actually happened: `git ls-files -u` (unmerged paths) non-empty means a genuine conflict (`MERGE_CONFLICT`);
+   empty means git refused before ever attempting a real three-way merge, most commonly a repo-configured
+   `pre-merge-commit` policy hook (sign-off requirements, commit-message linting, etc.) — classified as
+   `MERGE_REJECTED` instead, quoting git's own actual output, so a human/dispatcher reaches for the right
+   remediation (fix the policy issue) rather than a conflict-resolution path that was never applicable. The
+   push to `origin` happens *inside the same lock*
    as the local merge, closing an out-of-order-push race between siblings. A failed push never reverts an
    already-landed local merge — only the push needs a manual retry. Every attempt (success or failure) appends
    one JSONL record to `audit/merge-ledger.jsonl` with a closed reason-code enum
-   (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`PUSH_FAILED`/`LOCK_TIMEOUT`) for later automated triage.
+   (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`) for later automated triage.
    A ledger-write failure itself (e.g. its directory colliding with a tracked file) never fails an
    otherwise-successful merge — it prints a loud `WARNING` to stderr naming the ledger path rather than
    silently reporting overall success with a missing audit record.
@@ -327,6 +333,7 @@ Each stage exists to close a specific failure mode.
 | Maker touches files/credentials outside its scope | scope-guard.py (Claude) and scope-guard-extension.ts (pi), both marker-activated |
 | Two sibling merges racing onto `main` at once | merge-sequencer.sh singleton lock + fresh re-gate inside it |
 | An independent/stale clone passed as `--worktree` silently bypassing the freshness guarantee | merge-sequencer.sh validates `--worktree` shares `--repo`'s `git-common-dir` (a real linked worktree) before doing anything else |
+| A pre-merge-commit policy hook rejection misclassified as a content conflict | merge-sequencer.sh checks `git ls-files -u` to distinguish `MERGE_CONFLICT` from `MERGE_REJECTED` |
 | A network/push hiccup triggering a destructive auto-revert | merge-sequencer.sh never reverts an already-landed local merge on push failure |
 | `--branch` naming a different, never-reviewed commit than `--checked-sha` | merge-sequencer.sh's branch-vs-checked-sha identity check (`BRANCH_MISMATCH`) |
 | Destroying a pre-existing, unrelated conflict on the primary checkout | merge-sequencer.sh refuses before merging if `$repo` already has a `MERGE_HEAD`/is dirty; never calls `merge --abort` on a conflict it didn't start |
@@ -351,7 +358,7 @@ Each stage exists to close a specific failure mode.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); refuses/aborts cleanly on gate refusal or a real merge conflict from its own attempt only; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
