@@ -28,10 +28,13 @@ Ledger path resolution (first match wins):
   2. $SM_LOOP_STATE/claims.jsonl, if $SM_LOOP_STATE is set.
   3. Otherwise, anchored to `git rev-parse --git-common-dir` (the one physical location every worktree of
      the same repo -- including the primary checkout -- agrees on; same mechanism bin/mark-maker.sh uses
-     to distinguish primary vs. linked worktrees). For a normal (non-bare) repo, anchored at that
-     common-dir's PARENT (common-dir is `.git`, sibling to the worktree root). For a BARE repo,
-     `--git-common-dir` already resolves to '.' -- the bare repo IS its own common-dir -- so anchored AT
-     the common-dir itself, not its (arbitrary, possibly shared-by-unrelated-sibling-repos) parent. This
+     to distinguish primary vs. linked worktrees). Anchored at that common-dir's PARENT only when the
+     common-dir's own basename is literally `.git` -- the normal case (a primary checkout's or linked
+     worktree's shared .git directory). Anchored AT the common-dir itself in every OTHER case: a BARE
+     repo (`--git-common-dir` resolves to '.', i.e. the bare repo's own directory, under some other
+     basename) or a SUBMODULE (`--git-common-dir` resolves to something like '.git/modules/<name>' --
+     basename is the submodule's own name, not '.git') -- otherwise two unrelated bare repos, or two
+     submodules of the same superproject, would collide on the same arbitrary parent directory. This
      matters because every herdr-launched sub-agent-supervisor runs with its CWD set to its OWN linked
      worktree: a plain CWD-relative default would give each one an unshared ledger, defeating the entire
      point of this script. Falls back to a CWD-relative `.secondmate/claims.jsonl` (with a loud stderr
@@ -79,16 +82,18 @@ def _default_ledger_path():
             if not common_dir.is_absolute():
                 common_dir = pathlib.Path.cwd() / common_dir
             common_dir = common_dir.resolve()
-            # For a BARE repo, --git-common-dir already IS the one shared location (it resolves to
-            # '.', i.e. the bare repo's own directory) -- taking its PARENT would land outside the bare
-            # repo entirely, in whatever directory happens to contain it, colliding with any unrelated
-            # sibling bare repo placed nearby (same collision class applies to a submodule's git-dir
-            # living under a superproject's .git/modules/). Anchor AT common_dir itself when bare;
-            # only a non-bare repo's shared .git dir has a meaningful, distinguishing PARENT to anchor to.
-            is_bare = subprocess.run(["git", "rev-parse", "--is-bare-repository"],
-                                      capture_output=True, text=True)
-            bare = is_bare.returncode == 0 and is_bare.stdout.strip() == "true"
-            anchor = common_dir if bare else common_dir.parent
+            # Only take common_dir's PARENT when its own basename is literally '.git' -- the normal
+            # case: a primary checkout's or linked worktree's shared .git directory, whose PARENT is
+            # the one location every worktree of that repo agrees on. In every other case, anchor AT
+            # common_dir itself instead:
+            #   - a BARE repo: --git-common-dir resolves to '.', i.e. the bare repo's own directory,
+            #     under some OTHER basename (the repo's own name) -- taking its parent would land
+            #     outside the bare repo entirely, colliding with any unrelated sibling bare repo.
+            #   - a SUBMODULE: --git-common-dir resolves to something like '.git/modules/<name>' --
+            #     basename is the submodule's own name, not '.git'; taking its parent ('.git/modules/')
+            #     would collide with every OTHER submodule of the same superproject.
+            # One basename check covers both, with no extra `--is-bare-repository` subprocess call.
+            anchor = common_dir if common_dir.name != ".git" else common_dir.parent
             return anchor / ".secondmate" / "claims.jsonl"
     except OSError:
         pass  # git not installed/found -- fall through to the loud-warning CWD-relative fallback below
@@ -107,6 +112,12 @@ _BAD = 0  # count of malformed/incomplete ledger lines seen by the last _recs()
 # length -- mirrors the defensive posture in plan-committee.sh's _claim_task_marker (path-traversal /
 # symlink / self-name-matching bugs found and fixed there earlier this session).
 _TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+# every REAL token is minted via secrets.token_hex(16) -- a 32-character lowercase hex string. A
+# claimed/stolen record whose token doesn't match this exact shape (e.g. a NUL byte, which IS a
+# non-empty string but which no real CLI could ever supply back as a --token argv value) is just as
+# unwedgeable as a missing token, so it must be treated the same way: malformed, not a valid open claim.
+_TOKEN_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
 def _valid_task_id(task_id):
@@ -132,11 +143,13 @@ def _recs():
         valid = (isinstance(o, dict) and ev in ("claimed", "released", "stolen")
                  and isinstance(o.get("task_id"), str) and isinstance(o.get("owner"), str))
         if valid and ev in ("claimed", "stolen"):
-            # A tokenless claimed/stolen record can never be released (no caller can supply a token
-            # equal to a missing field) -- it would permanently wedge that task-id open except through
-            # --steal. Treat it as malformed/incomplete, exactly like any other broken line, instead of
-            # a valid open claim.
-            valid = bool(o.get("token")) and isinstance(o.get("token"), str)
+            # A tokenless (or non-token-shaped) claimed/stolen record can never be released -- no real
+            # CLI can supply a --token that equals a missing field OR an un-argv-able value like an
+            # embedded NUL byte -- it would permanently wedge that task-id open except through --steal.
+            # Treat it as malformed/incomplete, exactly like any other broken line, instead of a valid
+            # open claim. Require the EXACT secrets.token_hex(16) shape, not just "non-empty string".
+            token = o.get("token")
+            valid = isinstance(token, str) and bool(_TOKEN_RE.match(token))
         if valid:
             recs.append(o)
         else:
@@ -369,6 +382,23 @@ def _selfcheck_live():
         code, out, _ = _run(["claim", "--task-id", "tokenless", "--owner", "agent-fresh"])
         assert code == 0, "the task-id must be immediately claimable fresh, not wedged by the tokenless record"
 
+        # Round-5 Bug B regression: a NUL-byte token IS a non-empty string, so the old "non-empty
+        # string" check would have wrongly accepted it -- but no real CLI can ever supply a --token
+        # argv value containing an embedded NUL byte, so a record carrying one is just as permanently
+        # unwedgeable as a missing token. It must be rejected by the exact secrets.token_hex(16) shape
+        # check, not just truthiness.
+        bad_before = _BAD
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"ev": "claimed", "task_id": "nultoken", "owner": "agent-z",
+                                 "token": "\u0000", "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}) + "\n")
+        assert "nultoken" not in open_claims(), "a NUL-byte-token claimed record must NOT fold into an open claim"
+        code, out, _ = _run(["status"])
+        assert code == 0 and "nultoken" not in out, "status must not show a NUL-byte-token record as open"
+        _recs()  # refresh _BAD as a side effect
+        assert _BAD > bad_before, "a NUL-byte-token claimed record must be counted as malformed (_BAD)"
+        code, out, _ = _run(["claim", "--task-id", "nultoken", "--owner", "agent-fresh"])
+        assert code == 0, "the task-id must be immediately claimable fresh, not wedged by the NUL-byte-token record"
+
         # real concurrency: N threads racing to claim the SAME task-id simultaneously must yield exactly
         # one winner, and the ledger must end up with exactly one 'claimed' record for it -- proves the
         # fcntl lock (and folding inside it) actually serializes the read-check-append, not just in theory.
@@ -497,6 +527,68 @@ def _selfcheck_bare_repos_dont_collide():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _selfcheck_submodules_dont_collide():
+    # Round-5 Bug A regression: for a SUBMODULE, `git rev-parse --git-common-dir` resolves to something
+    # like '.git/modules/<name>' -- basename is the submodule's own name, NOT '.git'. The bare-repo-only
+    # special case from round 4 did not cover this: it fell through to the normal 'anchor at parent'
+    # branch, and TWO DIFFERENT submodules of the same superproject ('.git/modules/one',
+    # '.git/modules/two') both resolve to the SAME parent ('.git/modules/'), colliding. Two independent
+    # submodules under one superproject must resolve to two DIFFERENT default ledgers.
+    tmp = tempfile.mkdtemp(prefix="claim-ledger-submodulecheck-")
+    try:
+        lib = os.path.join(tmp, "lib")
+        subprocess.run(["git", "init", "-q", "-b", "main", lib], check=True)
+        subprocess.run(["git", "-C", lib, "config", "user.email", "a@a"], check=True)
+        subprocess.run(["git", "-C", lib, "config", "user.name", "a"], check=True)
+        with open(os.path.join(lib, "f"), "w") as f:
+            f.write("x")
+        subprocess.run(["git", "-C", lib, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", lib, "commit", "-q", "-m", "init"], check=True)
+
+        super_repo = os.path.join(tmp, "super")
+        subprocess.run(["git", "init", "-q", "-b", "main", super_repo], check=True)
+        subprocess.run(["git", "-C", super_repo, "config", "user.email", "a@a"], check=True)
+        subprocess.run(["git", "-C", super_repo, "config", "user.name", "a"], check=True)
+        with open(os.path.join(super_repo, "g"), "w") as f:
+            f.write("y")
+        subprocess.run(["git", "-C", super_repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", super_repo, "commit", "-q", "-m", "init"], check=True)
+        # local-path submodules need file protocol explicitly allowed (git disables it by default).
+        subprocess.run(["git", "-C", super_repo, "-c", "protocol.file.allow=always",
+                         "submodule", "add", "-q", lib, "sub1"], check=True)
+        subprocess.run(["git", "-C", super_repo, "-c", "protocol.file.allow=always",
+                         "submodule", "add", "-q", lib, "sub2"], check=True)
+        subprocess.run(["git", "-C", super_repo, "commit", "-q", "-m", "add submodules"], check=True)
+
+        sub1 = os.path.join(super_repo, "sub1")
+        sub2 = os.path.join(super_repo, "sub2")
+        env = {k: v for k, v in os.environ.items() if k not in ("SM_CLAIM_LEDGER", "SM_LOOP_STATE")}
+
+        def _cli(cwd, argv):
+            return subprocess.run([sys.executable, _SCRIPT_PATH] + argv, cwd=cwd, env=env,
+                                   capture_output=True, text=True)
+
+        p1 = _cli(sub1, ["claim", "--task-id", "sub-task", "--owner", "supervisor-a"])
+        assert p1.returncode == 0, f"claim inside submodule 1 should succeed: {p1.stderr}"
+        p2 = _cli(sub2, ["claim", "--task-id", "sub-task", "--owner", "supervisor-b"])
+        assert p2.returncode == 0, (
+            "claim inside an UNRELATED submodule of the same superproject, same task-id, must succeed "
+            f"independently -- if it's rejected, the two submodules collided on the same default "
+            f"ledger: {p2.stderr}")
+
+        common1 = subprocess.run(["git", "-C", sub1, "rev-parse", "--git-common-dir"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        common2 = subprocess.run(["git", "-C", sub2, "rev-parse", "--git-common-dir"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        ledger1 = (pathlib.Path(sub1) / common1).resolve() / ".secondmate" / "claims.jsonl"
+        ledger2 = (pathlib.Path(sub2) / common2).resolve() / ".secondmate" / "claims.jsonl"
+        assert ledger1.exists(), f"expected submodule 1's default ledger at {ledger1}"
+        assert ledger2.exists(), f"expected submodule 2's default ledger at {ledger2}"
+        assert ledger1 != ledger2, "the two submodules must NOT share a default ledger"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main(argv):
     p = argparse.ArgumentParser(description="atomic task-id claims for concurrent sub-agent-supervisors")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -604,6 +696,7 @@ def main(argv):
         _selfcheck_default_ledger_path()
         _selfcheck_no_git_fallback_warns()
         _selfcheck_bare_repos_dont_collide()
+        _selfcheck_submodules_dont_collide()
         print("ok")
 
 

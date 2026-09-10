@@ -284,9 +284,11 @@ are separate, later tasks):
   linked worktree, same mechanism `bin/mark-maker.sh` uses) agrees on — rather than the caller's ambient
   CWD; a plain CWD-relative default would give each herdr-launched sub-agent-supervisor (each running
   with its CWD set to its own worktree) an unshared ledger, silently defeating the whole point. Anchored
-  at the common-dir's PARENT for a normal repo, but AT the common-dir itself for a bare repo (a bare
-  repo's common-dir already resolves to '.', so taking its parent would land in whatever arbitrary
-  directory contains it, colliding with any unrelated sibling bare repo placed nearby).
+  at the common-dir's PARENT only when the common-dir's own basename is literally `.git` (a normal
+  repo's or linked worktree's shared .git directory); anchored AT the common-dir itself in every other
+  case (a bare repo, whose common-dir resolves to `.` under some other basename; a submodule, whose
+  common-dir's basename is the submodule's own name) -- otherwise two unrelated bare repos, or two
+  submodules of the same superproject, would collide on the same parent directory.
   `release` requires BOTH a matching `--owner` label AND a matching `--token` (a `secrets.token_hex(16)`
   minted by `claim`/`steal` and printed once) — the owner label alone is just a human-readable
   double-check, not real proof, since any caller can repeat another caller's label string. `steal` is a
