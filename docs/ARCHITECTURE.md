@@ -152,9 +152,14 @@ Each stage exists to close a specific failure mode.
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here. When more than one sub-agent-supervisor may finish and try to integrate around
    the same time, integration goes through `bin/merge-sequencer.sh` rather than a bare `git merge`: it takes a
-   singleton mkdir-based lock (`${SM_LOOP_STATE:-.secondmate}/merge-sequencer.lock`, bounded wait, no
-   auto-steal on a stuck lock — a human removes it), and **re-invokes `verify-gate.sh` fresh, inside that
-   lock**, immediately before the actual merge. That fresh re-invocation — not the lock itself — is the entire
+   singleton mkdir-based lock **anchored to `--repo` by default** (`<repo>/.secondmate/merge-sequencer.lock`,
+   bounded wait, no auto-steal on a stuck lock — a human removes it manually), and **re-invokes
+   `verify-gate.sh` fresh, inside that lock**, immediately before the actual merge. Anchoring the lock (and
+   the ledger) to `--repo` rather than to the calling process's own ambient CWD matters because the realistic
+   invocation pattern is a sub-agent-supervisor running with its CWD set to its OWN worktree (as every maker
+   launched via herdr already does) — two siblings each invoking `merge-sequencer.sh` from within their own
+   worktree but targeting the same `--repo` must resolve to the same lock, or they never actually serialize
+   against each other at all. That fresh re-invocation — not the lock itself — is the entire
    correctness guarantee: `verify-gate.sh`'s own `git rev-parse` of `--base` is executed at call time, which is
    already fresh for this repo's real topology (one local `.git` shared by the primary checkout and every
    worktree). The lock's job is efficiency/ordering/clean-failure UX. On a fresh refusal it prints `verify-gate.sh`'s

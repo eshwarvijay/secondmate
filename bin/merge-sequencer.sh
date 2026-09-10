@@ -13,10 +13,15 @@
 #     [--test CMD] [--message MSG] [--wait-timeout SECONDS]
 #   merge-sequencer.sh --selfcheck
 #
-# Lock:   ${SM_LOOP_STATE:-.secondmate}/merge-sequencer.lock (mkdir-based singleton; a different path
-#         from bin/caffeinate-guard.sh's own lock -- SM_CAFFEINATE_ROOT/guard.pid + .start.lock -- by design).
-# Ledger: ${SM_MERGE_LEDGER:-audit/merge-ledger.jsonl} -- one JSONL record per ATTEMPT (durable, not
-#         ephemeral .secondmate/ state), matching bin/log-round.sh's audit/metrics.jsonl precedent.
+# Lock:   ${SM_LOOP_STATE:-<repo>/.secondmate}/merge-sequencer.lock (mkdir-based singleton; anchored to
+#         --repo by DEFAULT, not to the calling process's own ambient CWD -- every invocation targeting the
+#         same --repo must resolve to the same lock regardless of which worktree/directory it happens to be
+#         run from (the real invocation pattern: a sub-agent-supervisor's natural CWD is its OWN worktree).
+#         A different path from bin/caffeinate-guard.sh's own lock -- SM_CAFFEINATE_ROOT/guard.pid +
+#         .start.lock -- by design.
+# Ledger: ${SM_MERGE_LEDGER:-<repo>/audit/merge-ledger.jsonl} -- same --repo-anchoring rationale as the lock.
+#         One JSONL record per ATTEMPT (durable, not ephemeral .secondmate/ state), matching
+#         bin/log-round.sh's audit/metrics.jsonl precedent.
 #
 # Exit codes: 0 success | 1 gate refusal | 2 usage error (never logged to the ledger) |
 #             3 real git merge conflict | 4 push failed (local merge already landed) | 5 lock timeout.
@@ -28,8 +33,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERIFY_GATE="$SCRIPT_DIR/verify-gate.sh"
 
-LOCK_DIR="${SM_LOOP_STATE:-.secondmate}/merge-sequencer.lock"
-LEDGER="${SM_MERGE_LEDGER:-audit/merge-ledger.jsonl}"
+# LOCK_DIR/LEDGER are resolved AFTER argument parsing (once --repo is known) and anchored to $repo by
+# default -- see the comment above _acquire_lock's first call site for why: resolving these relative to
+# the calling process's own ambient CWD (as an earlier revision did) would let two sub-agent-supervisors,
+# each invoked from within their OWN worktree but targeting the SAME --repo, silently resolve to two
+# different locks and never actually serialize against each other at all.
 LOCK_HELD=0
 
 _release_lock() {
@@ -302,6 +310,36 @@ print(n)
   after_ledger_lines="$(wc -l < "$ledger_default" 2>/dev/null || echo 0)"
   [ "$before_ledger_lines" = "$after_ledger_lines" ] || { echo "FAIL: a rejected (usage-error) call still wrote to the ledger"; fails=1; }
 
+  # ---- Test 8: lock/ledger defaults are anchored to --repo, NOT to the calling process's own ambient
+  # CWD. This is the realistic invocation pattern this script exists for: a sub-agent-supervisor's natural
+  # CWD is its OWN worktree (every maker launched via herdr runs with CWD set to its own worktree), while
+  # --repo is the one thing every concurrent caller actually shares. SM_LOOP_STATE/SM_MERGE_LEDGER are left
+  # UNSET here (unlike every other test above) so the script must compute its own --repo-anchored default
+  # -- an env-var override would mask the exact bug this test regression-guards.
+  IFS='|' read -r origin8 primary8 <<<"$(_setup_repo 8)"
+  git -C "$primary8" worktree add -q "$t/wt8" -b sm/cwd-anchor main
+  echo "feature-h" >> "$t/wt8/file.txt"
+  git -C "$t/wt8" commit -qam "feature h"
+  sha8="$(git -C "$t/wt8" rev-parse HEAD)"
+  other_cwd="$t/elsewhere8"
+  mkdir -p "$other_cwd"
+  default_lock8="$primary8/.secondmate/merge-sequencer.lock"
+  default_ledger8="$primary8/audit/merge-ledger.jsonl"
+  bogus_lock8="$other_cwd/.secondmate/merge-sequencer.lock"
+  mkdir -p "$default_lock8"   # simulate a sibling merge already in flight, at the CORRECT --repo-anchored path
+  main_before8="$(git -C "$primary8" rev-parse main)"
+  out8="$(cd "$other_cwd" && unset SM_LOOP_STATE SM_MERGE_LEDGER && bash "$MS" \
+    --repo "$primary8" --worktree "$t/wt8" --branch sm/cwd-anchor --base main --checked-sha "$sha8" \
+    --wait-timeout 2 2>&1)"
+  rc8=$?
+  [ "$rc8" -eq 5 ] || { echo "FAIL: different-CWD invocation targeting the same --repo expected LOCK_TIMEOUT (rc=5), got $rc8: $out8"; fails=1; }
+  main_after8="$(git -C "$primary8" rev-parse main)"
+  [ "$main_after8" = "$main_before8" ] || { echo "FAIL: different-CWD invocation proceeded past a lock it should have shared (main was touched) -- lock is NOT anchored to --repo"; fails=1; }
+  [ ! -d "$bogus_lock8" ] || { echo "FAIL: a separate lock dir was created relative to the calling process's CWD instead of --repo (the exact bug being regression-tested)"; fails=1; }
+  [ -d "$default_lock8" ] || { echo "FAIL: the pre-existing --repo-anchored lock was removed (should never be stolen)"; fails=1; }
+  grep -q '"reason_code": *"LOCK_TIMEOUT"' "$default_ledger8" 2>/dev/null || { echo "FAIL: expected a LOCK_TIMEOUT record in the --repo-anchored default ledger ($default_ledger8)"; fails=1; }
+  rm -rf "$default_lock8"
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -352,6 +390,12 @@ if [ "$repo_branch" != "$base" ]; then
 fi
 
 [ -n "$message" ] || message="Merge $branch"
+
+# Anchored to $repo by default -- see header comment. Two callers pointing at the SAME --repo (however
+# each one spells that path, and regardless of each one's own ambient CWD) resolve to the SAME lock and
+# ledger, because mkdir/open operate on the OS-resolved location, not the literal string.
+LOCK_DIR="${SM_LOOP_STATE:-$repo/.secondmate}/merge-sequencer.lock"
+LEDGER="${SM_MERGE_LEDGER:-$repo/audit/merge-ledger.jsonl}"
 
 # ============================== acquire lock ==============================
 if ! _acquire_lock "$wait_timeout"; then
