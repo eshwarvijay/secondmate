@@ -4,15 +4,35 @@
 """claim-ledger.py -- atomic task-id claims so concurrently-running sub-agent-supervisors (each in its own
 git worktree) never work the same task at once.
 
-  claim-ledger.py claim   --task-id ID --owner LABEL              -> claims ID iff no open claim exists
-  claim-ledger.py release --task-id ID --owner LABEL              -> closes ID's open claim (owner must match)
-  claim-ledger.py steal   --task-id ID --owner LABEL --reason TXT -> human-supervised override: unconditionally
-                                                                      closes whatever is open on ID (if anything)
-                                                                      and reopens it under LABEL
-  claim-ledger.py status | list                                   -> lists all currently-open claims
-  claim-ledger.py selfcheck                                       -> asserts the fold + drives the real CLI paths
+  claim-ledger.py claim   --task-id ID --owner LABEL                        -> claims ID iff no open claim
+                                                                                exists; prints a --token the
+                                                                                caller must save to release it
+  claim-ledger.py release --task-id ID --owner LABEL --token TOK            -> closes ID's open claim, but
+                                                                                ONLY if both --owner AND
+                                                                                --token match the open claim
+  claim-ledger.py steal   --task-id ID --owner LABEL --reason TXT           -> human-supervised override:
+                                                                                unconditionally closes whatever
+                                                                                is open on ID (if anything) and
+                                                                                reopens it under LABEL; no
+                                                                                --token required to perform the
+                                                                                steal itself (it's the escape
+                                                                                hatch), but the new claim it
+                                                                                opens gets its own fresh token
+  claim-ledger.py status | list                                            -> lists all currently-open claims
+                                                                                (owner/claimed_at -- never a token)
+  claim-ledger.py selfcheck                                                -> asserts the fold + drives the
+                                                                                real CLI paths
 
-Ledger path: $SM_CLAIM_LEDGER, else ${SM_LOOP_STATE:-.secondmate}/claims.jsonl.
+Ledger path resolution (first match wins):
+  1. $SM_CLAIM_LEDGER, if set -- used exactly as given.
+  2. $SM_LOOP_STATE/claims.jsonl, if $SM_LOOP_STATE is set.
+  3. Otherwise, anchored to `git rev-parse --git-common-dir`'s PARENT directory (the one physical location
+     every worktree of the same repo -- including the primary checkout -- agrees on; same mechanism
+     bin/mark-maker.sh uses to distinguish primary vs. linked worktrees). This matters because every
+     herdr-launched sub-agent-supervisor runs with its CWD set to its OWN linked worktree: a plain
+     CWD-relative default would give each one an unshared ledger, defeating the entire point of this
+     script. Falls back to a CWD-relative `.secondmate/claims.jsonl` (with a loud stderr warning) only if
+     not inside a git repo at all.
 
 Claim key is task-id -- this repo's convention is one task-id : one worktree : one branch (sm/<task-id>),
 so task-id is the natural claim key. NOT a worktree path, NOT a PID.
@@ -23,17 +43,51 @@ OS PID means nothing for an Agent-tool background agent, for instance). Each rea
 has its own liveness mechanism (`herdr agent get <name>`, Agent-tool completion events). The reclaim path is
 `steal`, which is a mandatory-reason, human-supervised override -- the CALLER (a dispatch loop) is
 responsible for checking real liveness via whatever mechanism fits its runtime BEFORE ever invoking --steal.
+
+Ownership on `release` is enforced with a real, unguessable secret (a `secrets.token_hex(16)` minted by
+`claim`/`steal` and printed once), not just a caller-supplied --owner label a bug or a mislabeled caller
+could trivially repeat -- --owner alone is kept only as a human-readable double-check, not the real gate.
 """
-import json, sys, os, time, re, argparse, pathlib, contextlib, io, tempfile, shutil
+import json, sys, os, time, re, secrets, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
 try:
     import fcntl
 except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
     fcntl = None
 
-LEDGER = pathlib.Path(os.environ.get(
-    "SM_CLAIM_LEDGER",
-    str(pathlib.Path(os.environ.get("SM_LOOP_STATE", ".secondmate")) / "claims.jsonl"),
-))
+_SCRIPT_PATH = os.path.abspath(__file__)
+
+
+def _default_ledger_path():
+    """Resolve the ledger path when SM_CLAIM_LEDGER and SM_LOOP_STATE are both unset. Anchoring to plain
+    CWD would defeat the entire point of this script: every herdr-launched sub-agent-supervisor runs with
+    its CWD set to its OWN linked worktree, so two supervisors working the same repo would each get a
+    different, unshared claims.jsonl and both 'succeed' at claiming the same task-id. `git rev-parse
+    --git-common-dir` resolves to the ONE shared .git dir for the primary checkout AND every one of its
+    linked worktrees (same primary-vs-worktree mechanism bin/mark-maker.sh uses) -- its parent is the one
+    physical location every worktree of this repo agrees on, regardless of which one is the caller's CWD."""
+    if os.environ.get("SM_CLAIM_LEDGER"):
+        return pathlib.Path(os.environ["SM_CLAIM_LEDGER"])
+    if os.environ.get("SM_LOOP_STATE"):
+        return pathlib.Path(os.environ["SM_LOOP_STATE"]) / "claims.jsonl"
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            common_dir = pathlib.Path(out.stdout.strip())
+            if not common_dir.is_absolute():
+                common_dir = pathlib.Path.cwd() / common_dir
+            anchor = common_dir.resolve().parent
+            return anchor / ".secondmate" / "claims.jsonl"
+    except OSError:
+        pass  # git not installed/found -- fall through to the loud-warning CWD-relative fallback below
+    sys.stderr.write(
+        "WARNING: claim-ledger.py could not resolve a git-common-dir (not inside a git repo, or git not "
+        "found) -- falling back to a CWD-relative ./.secondmate/claims.jsonl, which will NOT be shared "
+        "across other worktrees/CWDs. Set SM_CLAIM_LEDGER to a shared path for real cross-worktree "
+        "collision prevention.\n")
+    return pathlib.Path(".secondmate") / "claims.jsonl"
+
+
+LEDGER = _default_ledger_path()
 _BAD = 0  # count of malformed/incomplete ledger lines seen by the last _recs()
 
 # task-id must be a safe bare identifier: no path separators, no null bytes, no empty string, bounded
@@ -120,6 +174,15 @@ def _run(argv):
     return code, out.getvalue().strip(), exc
 
 
+def _token_from_output(out):
+    # both claim's and steal's success message end in 'token=<hex>' -- pull it out for a subsequent
+    # release call, exactly as a real caller would have to save it from the CLI's own printed output.
+    for tok in out.split():
+        if tok.startswith("token="):
+            return tok[len("token="):]
+    return None
+
+
 def _selfcheck_live():
     # Runs the *actual* CLI paths (main -> claim/release/steal/status) against a scratch ledger in a
     # temp dir, so this selfcheck would fail if the real ownership check / TOCTOU-safe steal fold /
@@ -130,10 +193,13 @@ def _selfcheck_live():
     LEDGER = pathlib.Path(tmpdir) / "claims.jsonl"
     try:
         # basic claim -> visible in status -> release -> gone from status.
-        code, _, _ = _run(["claim", "--task-id", "t1", "--owner", "agent-a"])
+        code, out, _ = _run(["claim", "--task-id", "t1", "--owner", "agent-a"])
         assert code == 0, "first claim on an unclaimed task-id should succeed"
+        tok_a = _token_from_output(out)
+        assert tok_a, "claim must print a token the caller can later use to release"
         code, out, _ = _run(["status"])
         assert code == 0 and "t1" in out and "agent-a" in out, "status must show the open claim"
+        assert tok_a not in out, "status must NEVER print the claim token"
 
         # collision: a different owner claiming an already-open task-id must fail, and append nothing.
         pre_len = len(_recs())
@@ -145,25 +211,38 @@ def _selfcheck_live():
         code, _, exc = _run(["claim", "--task-id", "t1", "--owner", "agent-a"])
         assert code != 0, "re-claiming an already-open task-id must fail even for the same owner"
 
-        # ownership check on release: a different owner's release must be rejected (IDOR-style guard).
+        # ownership check on release: a different owner's release must be rejected (IDOR-style guard),
+        # even if they happen to supply SOME token (they can't know the real one).
         pre_len = len(_recs())
-        code, _, exc = _run(["release", "--task-id", "t1", "--owner", "agent-b"])
+        code, _, exc = _run(["release", "--task-id", "t1", "--owner", "agent-b", "--token", "guessed-or-irrelevant"])
         assert code != 0, "release by a non-owning owner must be rejected"
         assert "agent-b" not in str(exc) or "agent-a" in str(exc), "rejection should name the real owner"
         assert len(_recs()) == pre_len, "a rejected release must not append any record"
         assert "t1" in open_claims(), "claim must stay open after a rejected release"
 
-        # release by the true owner succeeds, and the task-id becomes claimable again.
-        code, _, _ = _run(["release", "--task-id", "t1", "--owner", "agent-a"])
-        assert code == 0, "release by the true owner must succeed"
+        # token check on release: the CORRECT --owner with a WRONG (or missing) --token must be
+        # rejected exactly like a wrong-owner attempt -- a repeated/guessed owner label alone must not
+        # be enough to release someone else's claim.
+        pre_len = len(_recs())
+        code, _, exc = _run(["release", "--task-id", "t1", "--owner", "agent-a", "--token", "not-the-real-token"])
+        assert code != 0, "release with the right owner but the WRONG token must be rejected"
+        assert len(_recs()) == pre_len, "a token-mismatched release must not append any record"
+        assert "t1" in open_claims(), "claim must stay open after a token-mismatched release"
+        assert tok_a not in str(exc), "the rejection must not leak the real token"
+
+        # release by the true owner WITH the correct token succeeds, and the task-id becomes claimable
+        # again.
+        code, _, _ = _run(["release", "--task-id", "t1", "--owner", "agent-a", "--token", tok_a])
+        assert code == 0, "release by the true owner with the correct token must succeed"
         assert "t1" not in open_claims(), "released task-id must not show as open"
-        code, _, _ = _run(["claim", "--task-id", "t1", "--owner", "agent-c"])
+        code, out, _ = _run(["claim", "--task-id", "t1", "--owner", "agent-c"])
         assert code == 0, "a released task-id must be claimable again by anyone"
+        tok_c = _token_from_output(out)
 
         # release with no open claim at all must fail cleanly.
-        code, _, _ = _run(["release", "--task-id", "t1", "--owner", "agent-c"])
+        code, _, _ = _run(["release", "--task-id", "t1", "--owner", "agent-c", "--token", tok_c])
         assert code == 0
-        code, _, _ = _run(["release", "--task-id", "t1", "--owner", "agent-c"])
+        code, _, _ = _run(["release", "--task-id", "t1", "--owner", "agent-c", "--token", tok_c])
         assert code != 0, "releasing a task-id with no open claim must fail"
 
         # steal requires a non-empty --reason.
@@ -209,8 +288,12 @@ def _selfcheck_live():
 
         def _competitor():
             race_started.wait(timeout=2)
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(["steal", "--task-id", "race", "--owner", "concurrent-winner", "--reason", "racing steal"])
+            # NOTE: deliberately NOT wrapped in contextlib.redirect_stdout here -- that context manager
+            # mutates a single global (sys.stdout) via save/restore, which is not safe to enter/exit
+            # concurrently from two threads at once (it can leave sys.stdout pointing at a stale,
+            # already-thrown-away StringIO after both threads finish). A little print noise on real
+            # stdout during selfcheck is harmless; a silently corrupted sys.stdout is not.
+            main(["steal", "--task-id", "race", "--owner", "concurrent-winner", "--reason", "racing steal"])
 
         t = threading.Thread(target=_competitor)
         t.start()
@@ -274,6 +357,70 @@ def _selfcheck_live():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _selfcheck_default_ledger_path():
+    # Bug A regression test: with SM_CLAIM_LEDGER and SM_LOOP_STATE both unset, two claim-ledger.py
+    # invocations from DIFFERENT CWDs inside the SAME git repo (the primary checkout + a linked
+    # worktree) must resolve to the IDENTICAL default ledger file -- otherwise two sub-agent-supervisors,
+    # each in their own worktree (the normal herdr setup), could each 'succeed' at claiming the same
+    # task-id in blissful ignorance of each other. Only a real subprocess per CWD can test this
+    # faithfully -- a frozen in-process global can't model 'a different process started elsewhere'.
+    tmp = tempfile.mkdtemp(prefix="claim-ledger-pathcheck-")
+    try:
+        repo = os.path.join(tmp, "repo")
+        subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
+        subprocess.run(["git", "-C", repo, "config", "user.email", "a@a"], check=True)
+        subprocess.run(["git", "-C", repo, "config", "user.name", "a"], check=True)
+        with open(os.path.join(repo, "f"), "w") as f:
+            f.write("x")
+        subprocess.run(["git", "-C", repo, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "init"], check=True)
+        wt = os.path.join(tmp, "wt")
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "feat", wt, "main"], check=True)
+
+        env = {k: v for k, v in os.environ.items() if k not in ("SM_CLAIM_LEDGER", "SM_LOOP_STATE")}
+
+        def _cli(cwd, argv):
+            return subprocess.run([sys.executable, _SCRIPT_PATH] + argv, cwd=cwd, env=env,
+                                   capture_output=True, text=True)
+
+        p1 = _cli(repo, ["claim", "--task-id", "shared-task", "--owner", "supervisor-a"])
+        assert p1.returncode == 0, f"claim from the primary checkout should succeed: {p1.stderr}"
+        p2 = _cli(wt, ["claim", "--task-id", "shared-task", "--owner", "supervisor-b"])
+        assert p2.returncode != 0, (
+            "claim from a DIFFERENT worktree of the SAME repo, same task-id, must be rejected -- if it "
+            "succeeds, the two CWDs resolved to two different (unshared) default ledger files")
+
+        common_dir = subprocess.run(["git", "-C", repo, "rev-parse", "--git-common-dir"],
+                                     capture_output=True, text=True, check=True).stdout.strip()
+        common_dir_path = pathlib.Path(common_dir)
+        if not common_dir_path.is_absolute():
+            common_dir_path = pathlib.Path(repo) / common_dir_path
+        expected = common_dir_path.resolve().parent / ".secondmate" / "claims.jsonl"
+        assert expected.exists(), f"expected the shared default ledger to land at {expected}"
+        recs = [json.loads(line) for line in expected.read_text().splitlines() if line.strip()]
+        assert any(r.get("task_id") == "shared-task" and r.get("owner") == "supervisor-a" for r in recs), (
+            "the shared default ledger did not record the expected claim")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _selfcheck_no_git_fallback_warns():
+    # Outside any git repo (SM_CLAIM_LEDGER/SM_LOOP_STATE both unset), the CWD-relative fallback must
+    # still work, but must warn loudly on stderr -- never silently succeed with an unshared ledger.
+    tmp = tempfile.mkdtemp(prefix="claim-ledger-nogit-")
+    try:
+        env = {k: v for k, v in os.environ.items() if k not in ("SM_CLAIM_LEDGER", "SM_LOOP_STATE")}
+        p = subprocess.run([sys.executable, _SCRIPT_PATH, "claim", "--task-id", "t", "--owner", "a"],
+                            cwd=tmp, env=env, capture_output=True, text=True)
+        assert p.returncode == 0, f"claim outside a git repo should still work via the fallback: {p.stderr}"
+        assert "WARNING" in p.stderr and "git" in p.stderr.lower(), (
+            "the no-git fallback must warn loudly on stderr, not silently succeed")
+        assert (pathlib.Path(tmp) / ".secondmate" / "claims.jsonl").exists(), (
+            "fallback ledger should land at ./.secondmate/claims.jsonl relative to the CWD")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main(argv):
     p = argparse.ArgumentParser(description="atomic task-id claims for concurrent sub-agent-supervisors")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -285,6 +432,7 @@ def main(argv):
     r = sub.add_parser("release")
     r.add_argument("--task-id", required=True)
     r.add_argument("--owner", required=True)
+    r.add_argument("--token", required=True)
 
     s = sub.add_parser("steal")
     s.add_argument("--task-id", required=True)
@@ -311,8 +459,11 @@ def main(argv):
                 sys.exit(f"task-id {args.task_id} is already claimed by {existing['owner']} "
                          f"(since {existing.get('ts', '?')}) -- release it first, or --steal with a reason")
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-            _append({"ev": "claimed", "task_id": args.task_id, "owner": args.owner, "ts": ts})
-        print(f"claimed {args.task_id} for {args.owner}")
+            # a real, unguessable secret -- --owner alone is just a human-readable label a bug or a
+            # mislabeled caller could trivially repeat; this token is the actual release-time proof.
+            token = secrets.token_hex(16)
+            _append({"ev": "claimed", "task_id": args.task_id, "owner": args.owner, "token": token, "ts": ts})
+        print(f"claimed {args.task_id} for {args.owner} token={token}")
 
     elif args.cmd == "release":
         with _ledger_lock():
@@ -323,6 +474,10 @@ def main(argv):
             if existing["owner"] != args.owner:
                 sys.exit(f"task-id {args.task_id} is claimed by {existing['owner']}, not {args.owner} "
                          f"-- refusing release (use --steal with a reason if this is a deliberate override)")
+            if existing.get("token") != args.token:
+                sys.exit(f"task-id {args.task_id}'s claim token does not match the supplied --token -- "
+                         f"refusing release (wrong or missing token; use --steal with a reason if this is a "
+                         f"deliberate override)")
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
             _append({"ev": "released", "task_id": args.task_id, "owner": args.owner, "ts": ts})
         print(f"released {args.task_id}")
@@ -336,15 +491,19 @@ def main(argv):
             opened = open_claims()
             prev = opened.get(args.task_id)
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-            rec = {"ev": "stolen", "task_id": args.task_id, "owner": args.owner, "ts": ts,
+            # steal itself needs no --token (it's the no-proof-required human-override escape hatch),
+            # but the claim it OPENS is a normal new claim and needs its own fresh token too, or its new
+            # owner could never `release` it through the ownership-checked path afterward.
+            token = secrets.token_hex(16)
+            rec = {"ev": "stolen", "task_id": args.task_id, "owner": args.owner, "token": token, "ts": ts,
                    "reason": args.reason}
             if prev is not None:
                 rec["previous_owner"] = prev["owner"]
             _append(rec)
         if prev is not None:
-            print(f"stole {args.task_id} from {prev['owner']} for {args.owner}: {args.reason}")
+            print(f"stole {args.task_id} from {prev['owner']} for {args.owner} token={token}: {args.reason}")
         else:
-            print(f"claimed (via steal, no prior open claim) {args.task_id} for {args.owner}: {args.reason}")
+            print(f"claimed (via steal, no prior open claim) {args.task_id} for {args.owner} token={token}: {args.reason}")
 
     elif args.cmd in ("status", "list"):
         opened = open_claims()
@@ -366,6 +525,8 @@ def main(argv):
         assert _valid_task_id("sm-abc_123") and not _valid_task_id("../x") and not _valid_task_id("") \
             and not _valid_task_id("a/b") and not _valid_task_id("a" * 129), "task-id validation broken"
         _selfcheck_live()
+        _selfcheck_default_ledger_path()
+        _selfcheck_no_git_fallback_warns()
         print("ok")
 
 

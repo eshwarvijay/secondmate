@@ -279,10 +279,17 @@ are separate, later tasks):
 
 - `bin/claim-ledger.py` — before a sub-agent-supervisor starts work on a task-id, it must `claim` it. Claim key
   is the task-id itself (this repo's existing one task-id : one worktree : one branch (`sm/<task-id>`)
-  convention), not a worktree path or a PID. `release` only succeeds for the owner that holds the claim
-  (an ownership check closes an IDOR-style class of bug). `steal` is a **human-supervised override only** —
-  it requires a non-empty `--reason`, unconditionally closes whatever is open, and appends a distinct `stolen`
-  event so the ledger's history stays honest about what really happened. There is deliberately **no**
+  convention), not a worktree path or a PID. The default ledger location is anchored to `git rev-parse
+  --git-common-dir`'s parent — the one physical location every worktree of a repo (primary checkout and
+  every linked worktree, same mechanism `bin/mark-maker.sh` uses) agrees on — rather than the caller's
+  ambient CWD; a plain CWD-relative default would give each herdr-launched sub-agent-supervisor (each
+  running with its CWD set to its own worktree) an unshared ledger, silently defeating the whole point.
+  `release` requires BOTH a matching `--owner` label AND a matching `--token` (a `secrets.token_hex(16)`
+  minted by `claim`/`steal` and printed once) — the owner label alone is just a human-readable
+  double-check, not real proof, since any caller can repeat another caller's label string. `steal` is a
+  **human-supervised override only** — it requires a non-empty `--reason`, needs no token itself,
+  unconditionally closes whatever is open, and appends a distinct `stolen` event so the ledger's history
+  stays honest about what really happened. There is deliberately **no**
   automated liveness/heartbeat/TTL check anywhere in the script: each real sub-agent runtime (a `herdr agent`,
   an Agent-tool background agent) already has its own liveness mechanism, and a raw OS PID isn't even a
   meaningful concept from this script's vantage point for some of those runtimes. The calling dispatch loop
@@ -309,7 +316,7 @@ are separate, later tasks):
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
-| `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; same `fcntl` ledger-lock idiom as `hold.py`; building block for a future multi-supervisor dispatch loop, not yet wired into today's sequential loop |
+| `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block for a future multi-supervisor dispatch loop, not yet wired into today's sequential loop |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
