@@ -59,8 +59,9 @@ flowchart TD
     VD -->|pass| GT{verify-gate.sh: clean, exact-SHA, tests}
     GT -->|refuse| MK
     GT -->|pass| HD{hold.py: your approval}
-    HD -->|merge| INT[integrate]
+    HD -->|merge| MS[merge-sequencer.sh:<br/>lock, re-gate fresh, merge, push]
     HD -->|hold or abandon| STOP([stop])
+    MS --> INT[integrate]
     INT --> TD[Teardown: close panes, worktree, branch]
     TD --> AU[Audit trail: flow.md, decision.md]
     AU --> Cap
@@ -131,6 +132,12 @@ Each stage exists to close a specific failure mode.
    *Guards against:* the deadliest hole in naive loops, a maker pushing new commits after the checker approved,
    so you merge unreviewed code. If the head moved, the gate refuses and demands a re-check.
 
+   *A note on concurrency:* if the supervisor ever runs multiple independent sub-agent-supervisors in
+   parallel (each finishing its own task's maker/checker/gate loop in its own worktree/branch around the
+   same time), `verify-gate.sh` itself is unmodified and still called exactly as it already exists — but the
+   *integration* step (6/7 below) routes through `bin/merge-sequencer.sh` instead of a bare `git merge`, so
+   concurrent landings onto the same `main` are serialized rather than racing.
+
 6. **Hold.** Every risky or outward-facing decision (merge, deploy, delete) becomes a durable record via
    `hold.py hold`, resolved only by `hold.py answer`. A SessionStart hook surfaces open holds at the start of
    every session. `hold`/`answer` accept an optional `--sha` that binds a decision (and its id) to the exact
@@ -143,7 +150,25 @@ Each stage exists to close a specific failure mode.
    landed later; multiple concurrently-open holds being answered out of order or by the wrong caller.
 
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
-   report and never reach here.
+   report and never reach here. When more than one sub-agent-supervisor may finish and try to integrate around
+   the same time, integration goes through `bin/merge-sequencer.sh` rather than a bare `git merge`: it takes a
+   singleton mkdir-based lock (`${SM_LOOP_STATE:-.secondmate}/merge-sequencer.lock`, bounded wait, no
+   auto-steal on a stuck lock — a human removes it), and **re-invokes `verify-gate.sh` fresh, inside that
+   lock**, immediately before the actual merge. That fresh re-invocation — not the lock itself — is the entire
+   correctness guarantee: `verify-gate.sh`'s own `git rev-parse` of `--base` is executed at call time, which is
+   already fresh for this repo's real topology (one local `.git` shared by the primary checkout and every
+   worktree). The lock's job is efficiency/ordering/clean-failure UX. On a fresh refusal it prints `verify-gate.sh`'s
+   output verbatim and exits — no internal retry, no rebase-in-place, because a rebased diff is by definition a
+   new, unapproved diff; the calling supervisor re-diffs and gets a fresh checker approval instead. A real git
+   merge conflict (a genuinely different failure class from a gate refusal — `verify-gate.sh` doesn't check
+   mergeability) aborts cleanly and leaves `main` untouched. The push to `origin` happens *inside the same lock*
+   as the local merge, closing an out-of-order-push race between siblings. A failed push never reverts an
+   already-landed local merge — only the push needs a manual retry. Every attempt (success or failure) appends
+   one JSONL record to `audit/merge-ledger.jsonl` with a closed reason-code enum
+   (`SUCCESS`/`GATE_REFUSE`/`MERGE_CONFLICT`/`PUSH_FAILED`/`LOCK_TIMEOUT`) for later automated triage.
+   *Guards against:* two sibling integrations racing onto the same `main`; a checker approval going stale
+   between the last fresh check and the actual merge; a rebase silently invalidating an already-approved diff;
+   a network/push hiccup triggering a destructive auto-revert of already-verified, already-landed code.
 
 8. **Teardown.** Immediately after integration, close everything created for this task:
    ```bash
@@ -267,6 +292,8 @@ Each stage exists to close a specific failure mode.
 | Context bloats over a long run | prune-output + reasoning one-shots off the supervisor |
 | Ambiguous adjudication | machine-readable verdict envelope |
 | Maker touches files/credentials outside its scope | scope-guard.py (Claude) and scope-guard-extension.ts (pi), both marker-activated |
+| Two sibling merges racing onto `main` at once | merge-sequencer.sh singleton lock + fresh re-gate inside it |
+| A network/push hiccup triggering a destructive auto-revert | merge-sequencer.sh never reverts an already-landed local merge on push failure |
 
 ## Component map
 
@@ -286,6 +313,7 @@ Each stage exists to close a specific failure mode.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; refuses/aborts cleanly on gate refusal or real merge conflict; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |

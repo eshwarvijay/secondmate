@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.11-4C8BF5?style=flat-square" alt="version 0.1.11" />
+  <img src="https://img.shields.io/badge/version-0.1.12-4C8BF5?style=flat-square" alt="version 0.1.12" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -85,6 +85,7 @@ flowchart LR
 | `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, keyed by the worktree's realpath; refuses to mark anything but an isolated linked worktree (never the primary checkout) |
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open` / `next`); `hold`/`answer` support an optional `--sha` that binds a decision to the exact commit it applies to, and `next` hands back exactly one oldest-open decision at a time |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
+| `bin/merge-sequencer.sh` | Serializes concurrent merges to `main` from multiple independent sub-agent-supervisors finishing around the same time: mkdir-based singleton lock (bounded wait, no auto-steal) → re-invokes `bin/verify-gate.sh` **fresh, inside the lock** immediately before merging (the actual freshness guarantee — the lock is ordering/UX, not correctness) → `git merge --no-ff` in the primary checkout → `git push origin <base>` still inside the same lock (no out-of-order-push race) → releases. One clean, non-retrying exit per outcome (`GATE_REFUSE`/`MERGE_CONFLICT`/`PUSH_FAILED`/`LOCK_TIMEOUT`/`SUCCESS`), each appended to `audit/merge-ledger.jsonl` |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract; streams pi's `--mode json` output through `checker-progress.py` for live progress visibility |
 | `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused |
 | `bin/checker-progress.py` | Filter pi's `--mode json` output: prints one progress line per tool execution to stderr (live activity), extracts final assistant message text from `agent_end` and writes to stdout (exactly as `--mode text` would); handles malformed JSON lines gracefully; preserves exit code propagation via pipefail
@@ -173,12 +174,13 @@ credentials only you can supply.
 | `SM_COMMITTEE_PROVIDER` | `amazon-bedrock` | planner provider for `plan-committee.sh` |
 | `SM_COMMITTEE_TIMEOUT` | `300` | per-planner wall-clock timeout in seconds |
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
-| `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
+| `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir; also where `bin/merge-sequencer.sh` places its `merge-sequencer.lock` (ephemeral per-batch state, distinct from `bin/caffeinate-guard.sh`'s own lock under `SM_CAFFEINATE_ROOT`) |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
 | `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
 | `SM_CAFFEINATE_ROOT` | `~/.secondmate-caffeinate` | where `caffeinate-guard.sh` stores the session-scoped guard PID file (PID + fingerprint) |
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
+| `SM_MERGE_LEDGER` | `./audit/merge-ledger.jsonl` | append-only per-attempt merge ledger written by `bin/merge-sequencer.sh` (`SUCCESS`/`GATE_REFUSE`/`MERGE_CONFLICT`/`PUSH_FAILED`/`LOCK_TIMEOUT`) |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 
@@ -200,7 +202,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/plan-committee.sh --selfcheck && bin/doctor.sh --selfcheck && bin/scope-guard.py selfcheck \
   && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck \
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
-  && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
+  && bin/hold.py selfcheck && bin/committee-output.py --selfcheck && bin/merge-sequencer.sh --selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```
