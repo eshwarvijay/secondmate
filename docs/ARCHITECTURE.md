@@ -164,16 +164,28 @@ Each stage exists to close a specific failure mode.
    already fresh for this repo's real topology (one local `.git` shared by the primary checkout and every
    worktree). The lock's job is efficiency/ordering/clean-failure UX. On a fresh refusal it prints `verify-gate.sh`'s
    output verbatim and exits — no internal retry, no rebase-in-place, because a rebased diff is by definition a
-   new, unapproved diff; the calling supervisor re-diffs and gets a fresh checker approval instead. A real git
-   merge conflict (a genuinely different failure class from a gate refusal — `verify-gate.sh` doesn't check
-   mergeability) aborts cleanly and leaves `main` untouched. The push to `origin` happens *inside the same lock*
+   new, unapproved diff; the calling supervisor re-diffs and gets a fresh checker approval instead. Right after
+   the gate passes, it independently confirms **`--branch` itself resolves to exactly `--checked-sha`** —
+   `verify-gate.sh` only vouches for `--worktree`'s own HEAD, it has no opinion on the separate `--branch`
+   argument that is actually merged, so without this check `--branch` could name any other, never-reviewed
+   branch and this script would merge that instead of the reviewed commit; a mismatch refuses (`BRANCH_MISMATCH`,
+   exit 1) exactly like a gate refusal. It then confirms `$repo` itself isn't already mid an unrelated,
+   in-progress merge or otherwise dirty for a reason this invocation didn't cause (checks for a pre-existing
+   `MERGE_HEAD` and a non-clean `git status`) — refusing immediately (exit 2) and never attempting its own
+   merge if so, because a bare `git merge` failing for THAT reason looks identical to a fresh conflict, and
+   calling `merge --abort` on a conflict this invocation never started would destroy a human's own unresolved
+   conflict resolution. A real git merge conflict from THIS invocation's own attempt (a genuinely different
+   failure class from a gate refusal — `verify-gate.sh` doesn't check mergeability) aborts cleanly and leaves
+   `main` untouched. The push to `origin` happens *inside the same lock*
    as the local merge, closing an out-of-order-push race between siblings. A failed push never reverts an
    already-landed local merge — only the push needs a manual retry. Every attempt (success or failure) appends
    one JSONL record to `audit/merge-ledger.jsonl` with a closed reason-code enum
-   (`SUCCESS`/`GATE_REFUSE`/`MERGE_CONFLICT`/`PUSH_FAILED`/`LOCK_TIMEOUT`) for later automated triage.
+   (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`PUSH_FAILED`/`LOCK_TIMEOUT`) for later automated triage.
    *Guards against:* two sibling integrations racing onto the same `main`; a checker approval going stale
    between the last fresh check and the actual merge; a rebase silently invalidating an already-approved diff;
-   a network/push hiccup triggering a destructive auto-revert of already-verified, already-landed code.
+   a network/push hiccup triggering a destructive auto-revert of already-verified, already-landed code; merging
+   an unreviewed `--branch` that never matched the actually-reviewed commit; destroying a pre-existing, unrelated
+   conflict on `$repo` that this invocation didn't create.
 
 8. **Teardown.** Immediately after integration, close everything created for this task:
    ```bash
@@ -299,6 +311,8 @@ Each stage exists to close a specific failure mode.
 | Maker touches files/credentials outside its scope | scope-guard.py (Claude) and scope-guard-extension.ts (pi), both marker-activated |
 | Two sibling merges racing onto `main` at once | merge-sequencer.sh singleton lock + fresh re-gate inside it |
 | A network/push hiccup triggering a destructive auto-revert | merge-sequencer.sh never reverts an already-landed local merge on push failure |
+| `--branch` naming a different, never-reviewed commit than `--checked-sha` | merge-sequencer.sh's branch-vs-checked-sha identity check (`BRANCH_MISMATCH`) |
+| Destroying a pre-existing, unrelated conflict on the primary checkout | merge-sequencer.sh refuses before merging if `$repo` already has a `MERGE_HEAD`/is dirty; never calls `merge --abort` on a conflict it didn't start |
 
 ## Component map
 
@@ -318,7 +332,7 @@ Each stage exists to close a specific failure mode.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; refuses/aborts cleanly on gate refusal or real merge conflict; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state; refuses/aborts cleanly on gate refusal or a real merge conflict from its own attempt only; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |

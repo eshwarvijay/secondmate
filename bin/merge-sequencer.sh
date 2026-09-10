@@ -23,8 +23,14 @@
 #         One JSONL record per ATTEMPT (durable, not ephemeral .secondmate/ state), matching
 #         bin/log-round.sh's audit/metrics.jsonl precedent.
 #
-# Exit codes: 0 success | 1 gate refusal | 2 usage error (never logged to the ledger) |
-#             3 real git merge conflict | 4 push failed (local merge already landed) | 5 lock timeout.
+# Exit codes: 0 success | 1 gate refusal (verify-gate.sh REFUSE, or --branch does not resolve to the exact
+#             reviewed --checked-sha -- BRANCH_MISMATCH) | 2 usage error / precondition failure (never
+#             logged to the ledger -- includes $repo already having an in-progress merge or dirty state
+#             this invocation did not create) | 3 real git merge conflict (from THIS invocation's own merge
+#             attempt only) | 4 push failed (local merge already landed) | 5 lock timeout.
+#
+# Ledger reason_code is a CLOSED enum: SUCCESS | GATE_REFUSE | BRANCH_MISMATCH | MERGE_CONFLICT |
+#             PUSH_FAILED | LOCK_TIMEOUT -- never freeform.
 #
 # Settled scope (do not re-litigate): no internal auto-retry, no rebase-in-place on refusal, no
 # priority queue / fairness policy, no automatic stale-lock expiry/steal, single machine only.
@@ -340,6 +346,61 @@ print(n)
   grep -q '"reason_code": *"LOCK_TIMEOUT"' "$default_ledger8" 2>/dev/null || { echo "FAIL: expected a LOCK_TIMEOUT record in the --repo-anchored default ledger ($default_ledger8)"; fails=1; }
   rm -rf "$default_lock8"
 
+  # ---- Test 9: --branch must resolve to EXACTLY --checked-sha, the commit verify-gate.sh actually
+  # reviewed in --worktree. A reviewed 'good' worktree/SHA plus a completely different, never-reviewed
+  # --branch string must be refused (BRANCH_MISMATCH), not silently merged instead of the reviewed commit.
+  IFS='|' read -r origin9 primary9 <<<"$(_setup_repo 9)"
+  git -C "$primary9" worktree add -q "$t/wt9-good" -b sm/good main
+  echo "good-content" >> "$t/wt9-good/file.txt"
+  git -C "$t/wt9-good" commit -qam "good"
+  good_sha9="$(git -C "$t/wt9-good" rev-parse HEAD)"
+  git -C "$primary9" worktree add -q "$t/wt9-evil" -b sm/evil main
+  echo "evil-content" >> "$t/wt9-evil/file2.txt"
+  git -C "$t/wt9-evil" add file2.txt
+  git -C "$t/wt9-evil" commit -qam "evil (never reviewed)"
+  main_before9="$(git -C "$primary9" rev-parse main)"
+  out9="$(_ms --repo "$primary9" --worktree "$t/wt9-good" --branch sm/evil --base main --checked-sha "$good_sha9" --wait-timeout 5 2>&1)"
+  rc9=$?
+  [ "$rc9" -eq 1 ] || { echo "FAIL: branch/checked-sha mismatch expected rc=1, got $rc9: $out9"; fails=1; }
+  echo "$out9" | grep -q "does not match --checked-sha" || { echo "FAIL: branch mismatch output missing expected explanation"; fails=1; }
+  main_after9="$(git -C "$primary9" rev-parse main)"
+  [ "$main_after9" = "$main_before9" ] || { echo "FAIL: main was touched despite branch/checked-sha mismatch"; fails=1; }
+  [ ! -f "$primary9/file2.txt" ] || { echo "FAIL: unreviewed 'evil' branch content landed on main -- the exact bug being regression-tested"; fails=1; }
+  [ "$(_ledger_count sm/evil BRANCH_MISMATCH)" = "1" ] || { echo "FAIL: expected exactly one BRANCH_MISMATCH ledger record for sm/evil"; fails=1; }
+
+  # ---- Test 10: a PRE-EXISTING, unrelated in-progress conflicted merge on --repo (e.g. a human's own
+  # unresolved conflict resolution) must be detected and refused BEFORE this invocation's own git merge
+  # ever runs -- and 'git merge --abort' must NEVER be called against a conflict this invocation didn't
+  # start, since that would destroy state that was never this script's to touch.
+  IFS='|' read -r origin10 primary10 <<<"$(_setup_repo 10)"
+  git -C "$primary10" worktree add -q "$t/wt10" -b sm/precond main
+  echo "feature-j" >> "$t/wt10/file.txt"
+  git -C "$t/wt10" commit -qam "feature j"
+  sha10="$(git -C "$t/wt10" rev-parse HEAD)"
+  # simulate a human's own pre-existing, unrelated, unresolved conflict directly on primary10 -- this
+  # invocation must never touch it.
+  git -C "$primary10" checkout -qb human-side main
+  echo "human-conflict" > "$primary10/file.txt"
+  git -C "$primary10" commit -qam "human side"
+  git -C "$primary10" checkout -q main
+  echo "main-conflict" > "$primary10/file.txt"
+  git -C "$primary10" commit -qam "main side"
+  git -C "$primary10" merge --no-ff human-side -m "human's in-progress merge" >/dev/null 2>&1 || true
+  git -C "$primary10" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || { echo "FAIL: test setup did not produce a pre-existing MERGE_HEAD (fixture broken)"; fails=1; }
+  merge_head_before10="$(git -C "$primary10" rev-parse MERGE_HEAD 2>/dev/null || echo "")"
+  file_before10="$(cat "$primary10/file.txt" 2>/dev/null || echo "")"
+  main_before10="$(git -C "$primary10" rev-parse main)"
+  out10="$(_ms --repo "$primary10" --worktree "$t/wt10" --branch sm/precond --base main --checked-sha "$sha10" --wait-timeout 5 2>&1)"
+  rc10=$?
+  [ "$rc10" -eq 2 ] || { echo "FAIL: pre-existing unrelated conflict expected rc=2, got $rc10: $out10"; fails=1; }
+  git -C "$primary10" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || { echo "FAIL: pre-existing MERGE_HEAD was destroyed -- the exact bug being regression-tested"; fails=1; }
+  merge_head_after10="$(git -C "$primary10" rev-parse MERGE_HEAD 2>/dev/null || echo "")"
+  [ "$merge_head_after10" = "$merge_head_before10" ] || { echo "FAIL: pre-existing MERGE_HEAD changed ($merge_head_before10 -> $merge_head_after10)"; fails=1; }
+  file_after10="$(cat "$primary10/file.txt" 2>/dev/null || echo "")"
+  [ "$file_after10" = "$file_before10" ] || { echo "FAIL: pre-existing conflict markers were altered (merge --abort ran against a conflict this invocation didn't start)"; fails=1; }
+  main_after10="$(git -C "$primary10" rev-parse main)"
+  [ "$main_after10" = "$main_before10" ] || { echo "FAIL: main moved despite refusing on a pre-existing unrelated conflict"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -421,6 +482,37 @@ if [ "$gate_rc" -ne 0 ]; then
   printf '%s\n' "$gate_output" >&2
   _append_ledger GATE_REFUSE ""
   exit 1
+fi
+
+# Bug A fix: verify-gate.sh only confirms --worktree's own HEAD matches --checked-sha -- it has no
+# opinion on --branch at all. Without this check, --branch could be ANY string (a completely different,
+# never-reviewed branch) and this script would happily merge that instead of the reviewed commit.
+# --branch is the thing actually merged, so it must resolve to EXACTLY the reviewed commit.
+branch_sha="$(git -C "$repo" rev-parse --verify "${branch}^{commit}" 2>/dev/null || echo "")"
+if [ -z "$branch_sha" ] || [ "$branch_sha" != "$checked_sha" ]; then
+  _release_lock
+  echo "REFUSE: --branch '$branch' resolves to '${branch_sha:-<does not resolve>}', which does not match --checked-sha '$checked_sha' (the commit verify-gate.sh actually reviewed in --worktree '$worktree'). Refusing to merge a branch that was never verified as this exact commit." >&2
+  _append_ledger BRANCH_MISMATCH ""
+  exit 1
+fi
+
+# Bug B fix: a bare 'git merge' failing does NOT always mean THIS invocation created a fresh
+# conflict -- $repo may already have an unrelated, in-progress conflicted merge (e.g. a human's own
+# unresolved conflict resolution) sitting there from before this invocation ever started. If so, git
+# itself will refuse to even start our merge, and treating that identically to a fresh conflict would
+# make us call `git merge --abort`, DESTROYING a conflict state that was never ours to touch. Detect
+# and refuse BEFORE attempting our own merge -- never call --abort on a merge we didn't start.
+if git -C "$repo" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  _release_lock
+  echo "ERROR: $repo already has an in-progress merge (MERGE_HEAD present) that this invocation did not start -- refusing to touch it. A human must resolve or abort it directly in $repo before this can retry." >&2
+  exit 2
+fi
+repo_dirty="$(git -C "$repo" status --porcelain)"
+if [ -n "$repo_dirty" ]; then
+  _release_lock
+  echo "ERROR: $repo is not in a clean, mergeable state (uncommitted changes present that this invocation did not create) -- refusing to touch it. A human must investigate $repo directly before this can retry." >&2
+  printf '%s\n' "$repo_dirty" >&2
+  exit 2
 fi
 
 merge_output="$(git -C "$repo" merge --no-ff "$branch" -m "$message" 2>&1)"
