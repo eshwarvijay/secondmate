@@ -301,14 +301,16 @@ c. **Run the existing solo secondmate SOP completely untouched** — plan-commit
    single task runs, only how it gets launched. A sub-supervisor is not a different kind of supervisor; it
    is this same SOP, running with its own claimed task-id.
 
-d. **Call `bin/merge-sequencer.sh` itself** with its own claimed `--branch`/`--worktree`/`--checked-sha`
-   when ready to merge. It may legitimately queue behind a sibling sub-supervisor's own concurrent merge
-   attempt on the same `--repo` — that is the singleton lock working exactly as intended, not a bug to
-   diagnose or work around.
+d. **Open its own `bin/hold.py hold --sha <checked-sha>` entry for the merge decision once verify-gate has
+   passed, and WAIT for a genuine human answer** — never assume, never auto-answer, matching the existing
+   single-task loop's Gate → Hold → Integrate contract exactly. The merge-or-not judgment call belongs to
+   that sub-supervisor and the human who answers its hold — it must NEVER defer that decision to the
+   top-level dispatcher, which has no visibility into that task's actual diff/findings.
 
-e. **Open its own `bin/hold.py hold --sha <checked-sha>` entry for the merge decision.** The merge-or-not
-   judgment call belongs to that sub-supervisor and the human who answers its hold — it must NEVER defer
-   that decision to the top-level dispatcher, which has no visibility into that task's actual diff/findings.
+e. **Only once that hold is answered, merge: call `bin/merge-sequencer.sh` itself** with its own claimed
+   `--branch`/`--worktree`/`--checked-sha`. It may legitimately queue behind a sibling sub-supervisor's own
+   concurrent merge attempt on the same `--repo` — that is the singleton lock working exactly as intended,
+   not a bug to diagnose or work around.
 
 f. **Release its claim on every terminal path** — success, refusal, or stuck — via `bin/claim-ledger.py
    release --task-id <task-id> --owner sm-<task-id> --token <token>`. A claim released only on the happy
