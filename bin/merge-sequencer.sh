@@ -85,6 +85,37 @@ _acquire_lock() {
   done
 }
 
+# Prints the path of $2 relative to repo dir $1, for use as a git pathspec (git resolves bare
+# pathspecs relative to the effective cwd, which is $1 since every git call here uses `-C "$1"`).
+# Deliberately EXACT-PATH, not basename -- a basename-only exclusion (an earlier revision's bug) would
+# swallow any unrelated path in the repo that merely shares that NAME, which is wrong. Prints NOTHING
+# or something starting with "$1" -- callers should treat an empty result as "no exclusion needed/possible"
+# and omit the pathspec entirely, never fall back to passing an absolute, out-of-repo path as a literal
+# pathspec: git treats that as a real filesystem path and fatally errors 'outside repository' rather than
+# just harmlessly not matching (verified empirically) -- so "no pathspec at all" is the correct no-op, not
+# a special string.
+_repo_relative_path() {
+  local repo_abs target_abs
+  repo_abs="$(cd "$1" 2>/dev/null && pwd)" || return
+  if target_abs="$(cd "$(dirname "$2")" 2>/dev/null && pwd)"; then
+    target_abs="$target_abs/$(basename "$2")"
+  else
+    # target's parent doesn't exist yet (e.g. the ledger's directory before any append has ever
+    # happened) -- fall back to pure string-prefix matching against $1 as given, since LOCK_DIR/LEDGER
+    # are constructed as "$repo/..." verbatim in the default (no-override) case; nothing can be "dirty"
+    # under a directory that doesn't exist, so an empty result here is always safe either way.
+    case "$2" in
+      "$1"/*) target_abs="$repo_abs/${2#"$1"/}" ;;
+      *) return ;;
+    esac
+  fi
+  case "$target_abs" in
+    "$repo_abs"/*) echo "${target_abs#"$repo_abs"/}" ;;
+    "$repo_abs") echo "." ;;
+    *) return ;;
+  esac
+}
+
 # Append one JSONL record for this attempt. reason_code is a CLOSED enum -- never freeform --
 # so the ledger stays usable for automated triage later. Returns nonzero if the write itself failed
 # (e.g. mkdir -p / the append redirect hit a non-directory in the way) -- callers must check this and
@@ -465,6 +496,78 @@ print(n)
   echo "$out12" | grep -qi "WARNING" || { echo "FAIL: expected a WARNING about the ledger-write failure, got: $out12"; fails=1; }
   echo "$out12" | grep -q "merge-ledger.jsonl" || { echo "FAIL: WARNING should name the ledger path, got: $out12"; fails=1; }
 
+  # ---- Test 13: the dirty-check's own-artifact exclusion must be EXACT-PATH, not basename. A legitimate
+  # SM_LOOP_STATE override whose basename happens to be 'foo' must NEVER swallow a genuinely dirty,
+  # completely unrelated TRACKED file living in a DIFFERENT 'foo/' directory that actually lives inside
+  # the repo -- a basename-only exclusion (an earlier revision's bug) would incorrectly match it.
+  IFS='|' read -r origin13 primary13 <<<"$(_setup_repo 13)"
+  git -C "$primary13" worktree add -q "$t/wt13" -b sm/basename-collision main
+  echo "feature-m" >> "$t/wt13/file.txt"
+  git -C "$t/wt13" commit -qam "feature m"
+  sha13="$(git -C "$t/wt13" rev-parse HEAD)"
+  mkdir -p "$primary13/foo"
+  echo "tracked" > "$primary13/foo/tracked.txt"
+  git -C "$primary13" add foo/tracked.txt
+  git -C "$primary13" commit -qam "add unrelated foo/ dir (inside the repo, nothing to do with the lock)"
+  echo "real dirty change" >> "$primary13/foo/tracked.txt"
+  lock_root13="$t/state13-root/foo"   # a legitimate override whose OWN basename also happens to be 'foo'
+  main_before13="$(git -C "$primary13" rev-parse main)"
+  out13="$(SM_LOOP_STATE="$lock_root13" bash "$MS" --repo "$primary13" --worktree "$t/wt13" --branch sm/basename-collision --base main --checked-sha "$sha13" --wait-timeout 5 2>&1)"
+  rc13=$?
+  [ "$rc13" -eq 2 ] || { echo "FAIL: real unrelated dirty content in a same-named 'foo/' dir must still refuse, got rc=$rc13: $out13"; fails=1; }
+  main_after13="$(git -C "$primary13" rev-parse main)"
+  [ "$main_after13" = "$main_before13" ] || { echo "FAIL: main was touched despite real unrelated dirty content being wrongly swallowed by a basename collision"; fails=1; }
+
+  # ---- Test 14: two SEQUENTIAL successful merges against the SAME repo, both using the real DEFAULT
+  # configuration (no env overrides, no pre-existing .gitignore for .secondmate/ or audit/). The second
+  # must succeed exactly like the first, not be refused because of the first merge's own leftover
+  # untracked audit/ ledger artifact (Bug B: only the lock was ever excluded, never the ledger).
+  IFS='|' read -r origin14 primary14 <<<"$(_setup_repo 14)"
+  git -C "$primary14" worktree add -q "$t/wt14a" -b sm/seq-a main
+  echo "feature-n" >> "$t/wt14a/file.txt"
+  git -C "$t/wt14a" commit -qam "feature n"
+  sha14a="$(git -C "$t/wt14a" rev-parse HEAD)"
+  out14a="$(unset SM_LOOP_STATE SM_MERGE_LEDGER; bash "$MS" --repo "$primary14" --worktree "$t/wt14a" --branch sm/seq-a --base main --checked-sha "$sha14a" --wait-timeout 5 2>&1)"
+  rc14a=$?
+  [ "$rc14a" -eq 0 ] || { echo "FAIL: first sequential default merge expected rc=0, got $rc14a: $out14a"; fails=1; }
+  git -C "$primary14" worktree add -q "$t/wt14b" -b sm/seq-b main
+  echo "feature-o" > "$t/wt14b/file2.txt"
+  git -C "$t/wt14b" add file2.txt
+  git -C "$t/wt14b" commit -qam "feature o"
+  sha14b="$(git -C "$t/wt14b" rev-parse HEAD)"
+  main_before14b="$(git -C "$primary14" rev-parse main)"
+  out14b="$(unset SM_LOOP_STATE SM_MERGE_LEDGER; bash "$MS" --repo "$primary14" --worktree "$t/wt14b" --branch sm/seq-b --base main --checked-sha "$sha14b" --wait-timeout 5 2>&1)"
+  rc14b=$?
+  [ "$rc14b" -eq 0 ] || { echo "FAIL: second sequential default merge expected rc=0, got $rc14b: $out14b (first merge's own audit/ ledger artifact wrongly refused it)"; fails=1; }
+  main_after14b="$(git -C "$primary14" rev-parse main)"
+  [ "$main_after14b" != "$main_before14b" ] || { echo "FAIL: second sequential default merge did not advance main"; fails=1; }
+  grep -q '"reason_code": *"SUCCESS"' "$primary14/audit/merge-ledger.jsonl" 2>/dev/null || { echo "FAIL: expected SUCCESS records in the default ledger after two sequential merges"; fails=1; }
+
+  # ---- Test 15: PUSH_FAILED has real, automated regression coverage -- a bare origin with a rejecting
+  # pre-receive hook makes 'git push' fail deterministically AFTER a genuinely successful local merge.
+  IFS='|' read -r origin15 primary15 <<<"$(_setup_repo 15)"
+  cat > "$origin15/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "rejected by pre-receive hook (test)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin15/hooks/pre-receive"
+  git -C "$primary15" worktree add -q "$t/wt15" -b sm/push-fail main
+  echo "feature-p" >> "$t/wt15/file.txt"
+  git -C "$t/wt15" commit -qam "feature p"
+  sha15="$(git -C "$t/wt15" rev-parse HEAD)"
+  main_before15="$(git -C "$primary15" rev-parse main)"
+  origin15_before="$(git --git-dir="$origin15" rev-parse main 2>/dev/null || echo "")"
+  out15="$(_ms --repo "$primary15" --worktree "$t/wt15" --branch sm/push-fail --base main --checked-sha "$sha15" --wait-timeout 5 2>&1)"
+  rc15=$?
+  [ "$rc15" -eq 4 ] || { echo "FAIL: rejected push expected rc=4, got $rc15: $out15"; fails=1; }
+  main_after15="$(git -C "$primary15" rev-parse main)"
+  [ "$main_after15" != "$main_before15" ] || { echo "FAIL: local merge commit was not retained despite the push being rejected"; fails=1; }
+  origin15_after="$(git --git-dir="$origin15" rev-parse main 2>/dev/null || echo "")"
+  [ "$origin15_after" = "$origin15_before" ] || { echo "FAIL: origin main changed despite the push being rejected"; fails=1; }
+  echo "$out15" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message in output, got: $out15"; fails=1; }
+  [ "$(_ledger_count sm/push-fail PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record for sm/push-fail"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -571,7 +674,14 @@ if git -C "$repo" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
   echo "ERROR: $repo already has an in-progress merge (MERGE_HEAD present) that this invocation did not start -- refusing to touch it. A human must resolve or abort it directly in $repo before this can retry." >&2
   exit 2
 fi
-repo_dirty="$(git -C "$repo" status --porcelain -- . ":(exclude)$(basename "$(dirname "$LOCK_DIR")")" 2>/dev/null)"
+repo_dirty="$(
+  lock_excl="$(_repo_relative_path "$repo" "$LOCK_DIR")"
+  ledger_excl="$(_repo_relative_path "$repo" "$LEDGER")"
+  excl_args=()
+  [ -n "$lock_excl" ] && excl_args+=(":(exclude,literal)$lock_excl")
+  [ -n "$ledger_excl" ] && excl_args+=(":(exclude,literal)$ledger_excl")
+  git -C "$repo" status --porcelain -- . "${excl_args[@]+"${excl_args[@]}"}" 2>/dev/null
+)"
 if [ -n "$repo_dirty" ]; then
   _release_lock
   echo "ERROR: $repo is not in a clean, mergeable state (uncommitted changes present that this invocation did not create) -- refusing to touch it. A human must investigate $repo directly before this can retry." >&2

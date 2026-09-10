@@ -171,9 +171,11 @@ Each stage exists to close a specific failure mode.
    branch and this script would merge that instead of the reviewed commit; a mismatch refuses (`BRANCH_MISMATCH`,
    exit 1) exactly like a gate refusal. It then confirms `$repo` itself isn't already mid an unrelated,
    in-progress merge or otherwise dirty for a reason this invocation didn't cause (checks for a pre-existing
-   `MERGE_HEAD` and a non-clean `git status` — with the lock directory it just created under
-   `--repo/.secondmate/` deliberately excluded via a git pathspec, so the script's own lock artifact never
-   trips its own dirty-check) — refusing immediately (exit 2) and never attempting its own
+   `MERGE_HEAD` and a non-clean `git status` — with the EXACT paths of both self-created artifacts (the
+   lock directory under `--repo/.secondmate/` AND the ledger file under `--repo/audit/`) deliberately
+   excluded via a literal git pathspec, so neither one ever trips this script's own dirty-check;
+   deliberately exact-path, not basename, since a basename-only exclusion would wrongly swallow any
+   unrelated path elsewhere in the repo that merely shares that name) — refusing immediately (exit 2) and never attempting its own
    merge if so, because a bare `git merge` failing for THAT reason looks identical to a fresh conflict, and
    calling `merge --abort` on a conflict this invocation never started would destroy a human's own unresolved
    conflict resolution. A real git merge conflict from THIS invocation's own attempt (a genuinely different
@@ -318,7 +320,7 @@ Each stage exists to close a specific failure mode.
 | A network/push hiccup triggering a destructive auto-revert | merge-sequencer.sh never reverts an already-landed local merge on push failure |
 | `--branch` naming a different, never-reviewed commit than `--checked-sha` | merge-sequencer.sh's branch-vs-checked-sha identity check (`BRANCH_MISMATCH`) |
 | Destroying a pre-existing, unrelated conflict on the primary checkout | merge-sequencer.sh refuses before merging if `$repo` already has a `MERGE_HEAD`/is dirty; never calls `merge --abort` on a conflict it didn't start |
-| The script's own lock directory tripping its own dirty-repo guard | merge-sequencer.sh's dirty-check excludes the lock directory it just created via a git pathspec |
+| The script's own lock directory or ledger file tripping its own dirty-repo guard | merge-sequencer.sh's dirty-check excludes the EXACT paths of both self-created artifacts (lock dir + ledger file) via a literal git pathspec — never a basename match, which would wrongly swallow any unrelated same-named path elsewhere in the repo |
 | A ledger-write failure silently reported as full success with no audit record | merge-sequencer.sh prints a loud `WARNING` naming the ledger path; the merge/push outcome is unaffected either way |
 
 ## Component map
@@ -339,7 +341,7 @@ Each stage exists to close a specific failure mode.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding its own lock directory from that check); refuses/aborts cleanly on gate refusal or a real merge conflict from its own attempt only; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); refuses/aborts cleanly on gate refusal or a real merge conflict from its own attempt only; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
