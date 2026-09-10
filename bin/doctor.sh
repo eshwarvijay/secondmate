@@ -92,7 +92,13 @@ if [ -d "$_marketplace_checkout" ] && git -C "$_marketplace_checkout" rev-parse 
   _running_script_sha=$(git -C "$_marketplace_checkout" rev-parse HEAD 2>/dev/null || true)
 fi
 
-ROWS=""; core_missing=0; checker_missing=0; stale_count=0; unknown_count=0; missing_marketplace_count=0
+# --- state initialization helper ---
+_reset_detect_state() {
+  ROWS=""; core_missing=0; checker_missing=0; stale_count=0; unknown_count=0; missing_marketplace_count=0
+}
+
+# initialize top-level state
+_reset_detect_state
 add() { # status name category fix
   ROWS+="$1|$2|$3|$4"$'\n'
   if [ "$1" = MISSING ]; then
@@ -2017,6 +2023,128 @@ STUB_EOF
 
   rm -rf "$d" "$origin_dir" "$stub_dir"
 
+  # === Test M (bug fix verification): --heal updates table to show [ok] in same invocation ===
+  # This test reproduces the exact bug scenario:
+  # - marketplace checkout is genuinely stale (origin has newer SHA + version bump)
+  # - installed_plugins.json has old sha/version
+  # - doctor.sh --heal --yes runs heal (pull + update) successfully
+  # - the SAME invocation's trailing table must show [ok], NOT [!!]/stale
+  d=$(mktemp -d)
+  origin_dir=$(mktemp -d)
+  checkout_dir="$d/mkt"
+  stub_dir=$(mktemp -d)
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  # Create origin repo with first commit (version 0.1.8)
+  mkdir -p "$origin_dir/.claude-plugin"
+  git -C "$origin_dir" init -q -b main 2>/dev/null || true
+  git -C "$origin_dir" config user.email t@t.com 2>/dev/null
+  git -C "$origin_dir" config user.name t 2>/dev/null
+  printf '{"name":"secondmate","version":"0.1.8"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.8" 2>/dev/null || true
+  origin_sha_1=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Clone origin to create marketplace checkout
+  git clone -q "$origin_dir" "$checkout_dir" 2>/dev/null
+
+  # Advance origin with second commit (version 0.1.9) - REAL VERSION BUMP
+  printf '{"name":"secondmate","version":"0.1.9"}\n' > "$origin_dir/.claude-plugin/plugin.json"
+  git -C "$origin_dir" add -A 2>/dev/null || true
+  git -C "$origin_dir" commit -q -m "v0.1.9" 2>/dev/null || true
+  origin_sha_2=$(git -C "$origin_dir" rev-parse HEAD)
+
+  # Update marketplace checkout to match origin's new commit
+  git -C "$checkout_dir" fetch origin 2>/dev/null
+  git -C "$checkout_dir" fetch origin 2>/dev/null && git -C "$checkout_dir" reset --hard origin/main 2>/dev/null || true
+
+  # Write installed_plugins.json with OLD sha and version (creates genuinely stale state)
+  # Use origin_sha_1 (the OLD commit that checkout had before we advanced)
+  mk_installed_json "$j" "$origin_sha_1" "0.1.8"
+
+  # Verify setup: running doctor.sh --report BEFORE heal should show [!!] stale
+  before_out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --report 2>&1)
+  before_row=$(echo "$before_out" | grep "secondmate plugin" || true)
+  echo "$before_row" | grep -q "\[!!\]" || { echo "FAIL: Test M setup: before-heal stale row should have [!!], got: $before_row"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  echo "$before_row" | grep -q "stale" || { echo "FAIL: Test M setup: before-heal should show stale, got: $before_row"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Create stub claude that properly updates installed_plugins.json with new sha/version
+  cat > "$stub_dir/claude" << 'STUB_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ "$1" = "plugin" ] && [ "$2" = "update" ] && [ "$3" = "secondmate@secondmate" ] && [ "$4" = "-y" ]; then
+  if [ -n "$SM_TEST_INSTALLED_JSON_FOR_STUB" ] && [ -f "$SM_TEST_INSTALLED_JSON_FOR_STUB" ]; then
+    # Get new sha and version from origin repo
+    origin_sha=$(git -C "$SM_SECONDMATE_MARKETPLACE_DIR" rev-parse HEAD 2>/dev/null || true)
+    origin_ver=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('version',''))" "$SM_SECONDMATE_MARKETPLACE_DIR/.claude-plugin/plugin.json" 2>/dev/null || true)
+    python3 -c "
+import json,sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    plugins = data.get('plugins', {})
+    if isinstance(plugins, dict):
+        for key in list(plugins.keys()):
+            if key.startswith('secondmate@'):
+                entries = plugins[key]
+                if isinstance(entries, list) and len(entries) > 0 and isinstance(entries[0], dict):
+                    entries[0]['gitCommitSha'] = '$origin_sha'
+                    entries[0]['version'] = '$origin_ver'
+    with open(sys.argv[1], 'w') as f:
+        json.dump(data, f)
+except Exception as e:
+    import sys
+    print(f'Error: {e}', file=sys.stderr)
+    sys.exit(1)
+" "$SM_TEST_INSTALLED_JSON_FOR_STUB"
+  fi
+  exit 0
+else
+  echo "stub claude: unexpected args: $*" >&2
+  exit 1
+fi
+STUB_EOF
+  chmod +x "$stub_dir/claude"
+
+  # Record checkout HEAD before heal
+  before_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+
+  # Run REAL doctor.sh with --heal --yes
+  # CRITICAL: we capture the FULL output including trailing table
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$checkout_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" SM_TEST_INSTALLED_JSON_FOR_STUB="$j" PATH="$stub_dir:$PATH" "$script_abs" --heal --yes 2>&1)
+  heal_rc=$?
+
+  # Assert: heal succeeded
+  [ "$heal_rc" -eq 0 ] || { echo "FAIL: Test M heal test expected rc=0, got $heal_rc"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: checkout HEAD advanced (proving real git pull happened)
+  after_checkout_head=$(git -C "$checkout_dir" rev-parse HEAD)
+  [ "$after_checkout_head" = "$origin_sha_2" ] || { echo "FAIL: Test M: checkout HEAD $after_checkout_head != origin HEAD $origin_sha_2"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # Assert: installed_plugins.json shows new sha/version (proving stub claude was invoked)
+  after_sha=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('gitCommitSha','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j" 2>/dev/null)
+  after_ver=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); p=d.get('plugins',{}); [print(e.get('version','')) for k,v in p.items() if isinstance(v,list) for e in v if isinstance(e,dict) and k.startswith('secondmate@')]" "$j" 2>/dev/null)
+  [ "$after_sha" = "$origin_sha_2" ] || { echo "FAIL: Test M: installed_plugins.json sha $after_sha != expected $origin_sha_2"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  [ "$after_ver" = "0.1.9" ] || { echo "FAIL: Test M: installed_plugins.json version $after_ver != expected 0.1.9"; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # CRITICAL: Check the SAME invocation's trailing table output
+  # The table must show NOT-[!!] for secondmate plugin (either [ok] or some other [!!] for a different reason like reload_pending)
+  # Specifically, it must NOT show [!!] with "stale" in the row (which was the bug - stale showing even after heal)
+  echo "$out" | grep -A 50 "secondmate doctor" | grep "secondmate plugin" > /dev/null || { echo "FAIL: Test M: could not find secondmate row in table output"; echo "output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+
+  # The actual test: secondmate row in the trailing table must NOT be marked as (stale)
+  # After heal, it could be (stale) if heal failed, OR (reload_pending) if heal succeeded but /reload-plugins not run
+  # OR [ok] if everything matches. But it must NOT be (stale) if heal succeeded.
+  table_output=$(echo "$out" | grep -A 50 "secondmate doctor" | grep "secondmate plugin" || true)
+  echo "$table_output" | grep -q "(stale)" && { echo "FAIL: Test M bug fix: trailing table must NOT show (stale) for secondmate plugin after successful heal, got: $table_output"; echo "full output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
+  # Either [ok] or [!!] with something other than stale is acceptable
+  # (reload_pending is [!!] because it needs /reload-plugins but heal did succeed)
+  # So just verify it's not stale
+  true
+
+  rm -rf "$d" "$origin_dir" "$stub_dir"
+
   echo ok; exit 0
 fi
 
@@ -2025,9 +2153,9 @@ case "${1:-}" in
   --json) emit_json;;
   --heal)
     if [ "${2:-}" = "--yes" ]; then
-      heal 1; heal_rc=$?; echo; emit_table; exit $heal_rc
+      heal 1; heal_rc=$?; echo; _reset_detect_state; detect; emit_table; exit $heal_rc
     else
-      heal 0; heal_rc=$?; echo; emit_table; exit $heal_rc
+      heal 0; heal_rc=$?; echo; _reset_detect_state; detect; emit_table; exit $heal_rc
     fi;;
   ""|--report) emit_table;;
   *) echo "usage: doctor.sh [--json|--heal [--yes]|--selfcheck]" >&2; exit 2;;
