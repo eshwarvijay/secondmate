@@ -289,11 +289,16 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
   Start by splitting off the SAME dedicated workspace's root_pane (not off the supervisor's pane):
   ```bash
   ck=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split --pane <root_pane_id> --dir down)
-  herdr pane run "$ck" "${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh \
-    --lens qa/coverage --addendum-text '...' \
-    --diff-base <base-ref> --repo <wt> \
-    --live-text '<what changed this round>' \
-    -- -p 'Review the change.' ; echo ___SM_R<N>_DONE_\$?"
+  # Write the full checker invocation to a script file first — herdr pane run's argv-to-PTY-line
+  # reconstruction does not preserve shell quoting for multi-token/multi-command strings
+  cat > /tmp/checker-<task-id>-r<N>.sh << SCRIPT_EOF
+${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh \
+  --lens qa/coverage --addendum-text '...' \
+  --diff-base <base-ref> --repo <wt> \
+  --live-text '<what changed this round>' \
+  -- -p 'Review the change.' ; echo ___SM_R<N>_DONE_\$?
+SCRIPT_EOF
+  herdr pane run "$ck" bash /tmp/checker-<task-id>-r<N>.sh
   herdr pane wait-output "$ck" --regex "___SM_R<N>_DONE_[0-9]+" --timeout 600000
   herdr pane read "$ck" --source recent-unwrapped --lines 400 > /tmp/sm-checker.out
   ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py /tmp/sm-checker.out
