@@ -265,6 +265,87 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
    Append, never rewrite. Commit separately in the primary repo — they do not touch the worktree and cannot stale the checked SHA.
    Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as context. Skip for trivial one-shot edits.
 
+## Fan-out to concurrent sub-supervisors (hard-capped at 2)
+
+Everything above is the default: one supervisor, one task, one loop at a time. This section is an
+**opt-in** variant for the one specific case where a human hands you 2 genuinely independent tasks and
+wants them run concurrently — it is never automatic, and the single-task loop above remains the default
+for everything else, including most multi-task requests (queue them sequentially through the normal loop
+unless the human explicitly wants concurrency).
+
+**Mechanism.** Make ONE Agent-tool call carrying AT MOST 2 tool-use blocks — a **hard cap**, not a
+tunable parameter. There is no N>2 variant of this pattern; if there are more than 2 independent tasks,
+run 2 now and queue the rest for the next round. Each of the (at most 2) tool-use blocks launches a
+**FRESH** sub-agent — never `fork`. `fork` inherits the dispatcher's own conversation context, which is
+wrong here: each sub-supervisor must reach its own triage/routing/verdict judgment calls from a clean,
+unpolluted context with its own autonomous Bash/herdr access, not one contaminated by a sibling task's
+planning, findings, or in-flight state.
+
+**Each sub-supervisor's prompt must instruct it to, in this order:**
+
+a. **Claim first, as its literal first action.** Run `bin/claim-ledger.py claim --task-id <task-id>
+   --owner sm-<task-id>` before anything else. If the claim fails, abort immediately and emit
+   `SM_REFUSED:claim-failed` as its final output — do not proceed, do not retry, do not fall back to
+   `--steal`. `--steal` is a human-supervised override and stays exactly that under this pattern too: a
+   sub-supervisor must never call it itself.
+
+b. **Derive every downstream name deterministically from `<task-id>`, using this repo's own existing
+   convention — never invent a new one:**
+   - branch: `sm/<task-id>`
+   - worktree label / agent name: `sm-<task-id>` (Claude maker) or `sm-pi-<task-id>` (pi maker)
+   - pane: whatever `herdr worktree create` returns as `.result.root_pane.pane_id` — never independently
+     named or guessed.
+
+c. **Run the existing solo secondmate SOP completely untouched** — plan-committee, maker routing, checker
+   rounds, verify-gate, exactly as described everywhere above. This pattern changes nothing about how a
+   single task runs, only how it gets launched. A sub-supervisor is not a different kind of supervisor; it
+   is this same SOP, running with its own claimed task-id.
+
+d. **Open its own `bin/hold.py hold --task <task-id> --q "..." --sha <checked-sha>` entry for the merge
+   decision once verify-gate has passed, and WAIT for a genuine human answer** — never assume, never
+   auto-answer, matching the existing single-task loop's Gate → Hold → Integrate contract exactly (e.g.
+   `bin/hold.py hold --task <task-id> --q "merge <task-id> (checker PASS, verify-gate PASS at
+   <checked-sha>)?" --sha <checked-sha>` — `--task` and `--q` are required, `--sha` is optional but should
+   always be supplied here so the hold is bound to the exact reviewed commit). The merge-or-not judgment
+   call belongs to that sub-supervisor and the human who answers its hold — it must NEVER defer that
+   decision to the top-level dispatcher, which has no visibility into that task's actual diff/findings.
+
+e. **Only once that hold is answered, merge: call `bin/merge-sequencer.sh` itself** with its own claimed
+   `--branch`/`--worktree`/`--checked-sha`. It may legitimately queue behind a sibling sub-supervisor's own
+   concurrent merge attempt on the same `--repo` — that is the singleton lock working exactly as intended,
+   not a bug to diagnose or work around.
+
+f. **Release its claim on every terminal path** — success, refusal, or stuck — via `bin/claim-ledger.py
+   release --task-id <task-id> --owner sm-<task-id> --token <token>`. A claim released only on the happy
+   path leaks on every other path.
+
+g. **Emit exactly ONE completion tag, on its own line, as its literal final output:**
+   `SM_DONE_MERGED:<sha>`, `SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`. Nothing after it,
+   nothing instead of it.
+
+**The dispatcher's (top-level supervisor's) own role is a hard boundary — state it to yourself explicitly
+before fanning out:** you only launch the (at most 2) sub-agents and, once each finishes, parse its final
+text with `bin/dispatch-report.py`. You NEVER re-read a sub-supervisor's prose to make your own judgment
+call about what happened — the tag is the only signal you act on. On `SM_STUCK_NEED_HUMAN`, your only
+allowed action is relaying that sub-supervisor's own reported reason to the real human, verbatim — never
+attempting to resolve it yourself, even if you think you know how.
+
+```
+${CLAUDE_PLUGIN_ROOT}/bin/dispatch-report.py <sub-supervisor-final-output-file>
+# exit 0 = SM_DONE_MERGED   -> integration for that task-id is done
+# exit 1 = SM_REFUSED       -> relay the refusal reason to the human, task-id never started
+# exit 2 = SM_STUCK_NEED_HUMAN -> relay the reported reason verbatim to the human; do not resolve it yourself
+# exit 3 = no tag found at all -> treat as a parse failure and escalate; do not guess what happened
+```
+
+**Named limitation — no liveness/reaping, by design, matching `claim-ledger.py`'s own existing
+disclosure style.** This pattern has NO liveness/reaping mechanism of any kind. If a sub-supervisor's
+process dies mid-task (crash, killed pane, disconnected agent), its claim is **not** automatically
+released and its worktree is **not** automatically cleaned up. A human must notice and manually run
+`bin/claim-ledger.py release` (or, if truly abandoned, `--steal` with a reason) plus manual worktree
+teardown. Closing this gap — a liveness/reaping diagnostic that can tell a genuinely dead sub-supervisor
+apart from one that is merely slow — is a separate, deferred future task, not part of this one.
+
 ## Visible orchestration in herdr (when HERDR_ENV=1)
 
 By default the maker and checker run headless (in-process sub-agent + background scripts) — the captain can't

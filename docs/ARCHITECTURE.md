@@ -344,10 +344,10 @@ Each stage exists to close a specific failure mode.
 ## Primitives for parallel sub-agent-supervisors (building blocks, not yet wired into the loop)
 
 Today's loop is single-supervisor and sequential: one Sonnet supervisor drives one maker/checker/gate/merge
-cycle at a time. The next evolution is a supervisor that can spawn **N independent sub-agent-supervisors**,
-each running its own maker/checker/gate/merge loop for a different task in its own git worktree. `claim-ledger.py`
-and `merge-sequencer.sh` are the first two of three primitives being built toward that (the third, a
-dispatch-loop, is a separate, later task):
+cycle at a time. The next evolution is a supervisor that can fan out to a small number of independent
+sub-agent-supervisors, each running its own maker/checker/gate/merge loop for a different task in its own
+git worktree. `claim-ledger.py` and `merge-sequencer.sh` are the first two of the three primitives; the
+third — the fan-out pattern itself plus `bin/dispatch-report.py` — is described below, now delivered:
 
 - `bin/claim-ledger.py` — before a sub-agent-supervisor starts work on a task-id, it must `claim` it. Claim key
   is the task-id itself (this repo's existing one task-id : one worktree : one branch (`sm/<task-id>`)
@@ -392,6 +392,40 @@ dispatch-loop, is a separate, later task):
   (anchored the same way as the lock); a ledger-write failure warns loudly on stderr rather than either
   failing the whole operation or silently vanishing.
 
+### The third primitive: fan-out to concurrent sub-supervisors + `bin/dispatch-report.py`
+
+Documented in `skills/secondmate/SKILL.md`'s "Fan-out to concurrent sub-supervisors (hard-capped at 2)"
+section — an **opt-in** pattern for the one case where a human hands the supervisor 2 genuinely
+independent tasks and wants them run concurrently; the single-task loop above stays the default for
+everything else. Mechanically it is ONE Agent-tool call carrying AT MOST 2 tool-use blocks (a hard cap,
+not a tunable N), each a FRESH (never `fork`) sub-agent, so each sub-supervisor reaches its own
+triage/routing/verdict judgment calls from a clean context instead of one contaminated by a sibling
+task's state. Each sub-supervisor: claims its task-id first (`claim-ledger.py claim`, never `--steal`,
+aborting with `SM_REFUSED:claim-failed` on failure); derives every downstream name deterministically from
+the task-id using this repo's existing convention (`sm/<task-id>` branch, `sm-<task-id>`/`sm-pi-<task-id>`
+agent name, `root_pane` from `herdr worktree create`); runs the existing solo SOP completely untouched;
+once verify-gate has passed, opens its own `hold.py hold` entry for the merge decision and waits for a
+genuine human answer (never assuming, never auto-answering, never deferring that judgment to the
+dispatcher) — matching the existing single-task loop's Gate → Hold → Integrate contract exactly; only
+once that hold is answered does it call `merge-sequencer.sh` itself (legitimately queueing behind a
+sibling's concurrent merge attempt on the same `--repo` — the lock working as intended); releases its
+claim on every terminal path; and emits exactly one completion tag, on its own line, as its final output:
+`SM_DONE_MERGED:<sha>`,
+`SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`. `bin/dispatch-report.py` is how the dispatcher
+turns that final text into a decision without ever re-reading the sub-supervisor's prose itself: it
+recognizes the three tags anchored at start-of-line only (so a tag echoed mid-prose, e.g. from the
+sub-supervisor's own instructions being quoted back, can't be mistaken for the real signal), takes the
+LAST matching line if several appear, and exits `0`/`1`/`2`/`3` (done / refused / stuck / no-tag-found —
+its own code, more cautious than even "stuck", since it means the parser can't tell what happened at
+all). On `SM_STUCK_NEED_HUMAN` the dispatcher's only allowed action is relaying that sub-supervisor's own
+reported reason to the human verbatim, never resolving it itself.
+
+**Named limitation, deliberately not solved here:** this pattern has no liveness/reaping mechanism. If a
+sub-supervisor's process dies mid-task, its claim is not automatically released and its worktree is not
+automatically cleaned up — a human must notice and manually run `claim-ledger.py release`/`--steal` plus
+manual worktree teardown. A liveness/reaping diagnostic that could close this gap is a separate, deferred
+future task, not part of this one.
+
 ## Component map
 
 | Path | Guarantee |
@@ -412,7 +446,8 @@ dispatch-loop, is a separate, later task):
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
 | `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
-| `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block for a future multi-supervisor dispatch loop, not yet wired into today's sequential loop |
+| `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block used by the fan-out pattern (SKILL.md) |
+| `bin/dispatch-report.py` | parses a sub-supervisor's final output for the fan-out pattern — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line (a tag embedded mid-prose does not match), last matching line wins if several appear; exits `0`/`1`/`2`/`3` (done / refused / stuck / no-tag-found); the dispatcher acts only on this exit code, never on the sub-supervisor's prose |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
