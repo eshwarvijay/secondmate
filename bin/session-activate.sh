@@ -22,7 +22,7 @@ When the trigger holds, the mandatory sequence is:
   3. `herdr worktree create` → worktree + root_pane BEFORE touching any file
   4. Route maker per step 0d: Claude (complex) or pi+Qwen --thinking medium (simple)
   5. Names are task-scoped: sm-<task-id> / sm-pi-<task-id> — never shared globals
-  6. Checker via herdr pane run + pane wait-output (unique ___SM_R<N>_DONE_ markers)
+  6. Checker via herdr pane run + pane wait-output (unique ___SM_R<N>_DONE_ markers) — any checker invocation carrying more than one shell token/command must be written to a script file on disk first and invoked as `herdr pane run <pane> bash <script-path>`, never as an inline multi-command string (the argv-to-PTY-line reconstruction doesn't preserve quoting, causing it to silently run in the wrong cwd and produce false refusals)
   7. verify-gate → human hold → integrate → TEARDOWN (worktree remove + branch delete + pane close)
 
 **Plan = intent + constraints, not a recipe.**
