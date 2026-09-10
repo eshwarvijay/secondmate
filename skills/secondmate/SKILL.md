@@ -291,7 +291,7 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
   ck=$(${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh split --pane <root_pane_id> --dir down)
   # Write the full checker invocation to a script file first — herdr pane run's argv-to-PTY-line
   # reconstruction does not preserve shell quoting for multi-token/multi-command strings
-  cat > /tmp/checker-<task-id>-r<N>.sh << 'SCRIPT_EOF'
+  cat > /tmp/checker-<task-id>-r<N>.sh << SCRIPT_EOF
 ${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh \
   --lens qa/coverage --addendum-text '...' \
   --diff-base <base-ref> --repo <wt> \
