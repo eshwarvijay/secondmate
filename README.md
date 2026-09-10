@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.15-4C8BF5?style=flat-square" alt="version 0.1.15" />
+  <img src="https://img.shields.io/badge/version-0.1.16-4C8BF5?style=flat-square" alt="version 0.1.16" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -86,6 +86,7 @@ flowchart LR
 | `bin/hold.py` | Durable human-gate decisions (`hold` / `answer` / `open` / `next`); `hold`/`answer` support an optional `--sha` that binds a decision to the exact commit it applies to, and `next` hands back exactly one oldest-open decision at a time |
 | `bin/claim-ledger.py` | Atomic task-id claims for concurrently-running sub-agent-supervisors, each in its own worktree — `claim`/`release --token`/`steal --reason`/`status`, append-only JSONL guarded by the same `fcntl`-based ledger lock as `hold.py`; defaults to the shared `git rev-parse --git-common-dir` location so every worktree of a repo agrees on one ledger (not a CWD-relative path); `release` requires a real `secrets.token_hex` proof minted by `claim`/`steal`, not just a repeatable `--owner` label; `steal` is a mandatory-reason human override that re-folds the ledger fresh inside the lock (no TOCTOU) |
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
+| `bin/merge-sequencer.sh` | Serializes concurrent merges to `main` from multiple independent sub-agent-supervisors finishing around the same time: validates **`--worktree` is an ACTUAL linked worktree of `--repo`** (matching `git-common-dir`, resolved via `pwd -P`) before doing anything else, refusing an independent/stale clone that could otherwise pass `verify-gate.sh`'s freshness check against its own stale local refs while the real merge lands somewhere else entirely → mkdir-based singleton lock **anchored to `--repo` by default** (`<repo>/.secondmate/merge-sequencer.lock`, bounded wait, no auto-steal) — not to the calling process's own ambient CWD, since a sub-agent-supervisor's natural CWD is its own worktree, not `--repo` — → re-invokes `bin/verify-gate.sh` **fresh, inside the lock** immediately before merging (the actual freshness guarantee — the lock is ordering/UX, not correctness) → checks **`--branch` itself resolves to exactly `--checked-sha`** (verify-gate.sh only vouches for `--worktree`'s HEAD, not for whatever string `--branch` happens to be — refuses `BRANCH_MISMATCH` otherwise) → checks `$repo` isn't already mid an unrelated in-progress merge or dirty for a reason this invocation didn't cause (refuses before ever touching it, never calls `merge --abort` on a conflict it didn't start; **the dirty-check excludes the EXACT paths of both self-created artifacts (its own lock directory AND ledger file), never a basename match**, so neither self-created artifact ever trips its own guard, and a genuinely unrelated same-named path elsewhere in the repo still correctly refuses) → `git merge --no-ff` in the primary checkout → `git push origin <base>` still inside the same lock (no out-of-order-push race) → releases. One clean, non-retrying exit per outcome (`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`/`SUCCESS`), each appended to `<repo>/audit/merge-ledger.jsonl` (a ledger-write failure never fails an otherwise-successful merge -- it prints a loud stderr `WARNING` naming the ledger path instead of silently vanishing) |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract; streams pi's `--mode json` output through `checker-progress.py` for live progress visibility |
 | `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused |
 | `bin/checker-progress.py` | Filter pi's `--mode json` output: prints one progress line per tool execution to stderr (live activity), extracts final assistant message text from `agent_end` and writes to stdout (exactly as `--mode text` would); handles malformed JSON lines gracefully; preserves exit code propagation via pipefail
@@ -175,12 +176,13 @@ credentials only you can supply.
 | `SM_COMMITTEE_TIMEOUT` | `300` | per-planner wall-clock timeout in seconds |
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_CLAIM_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `.secondmate/claims.jsonl` -- the common-dir's parent when its own basename is `.git` (a normal repo/worktree), else the common-dir itself (a bare repo or a submodule) (or `$SM_LOOP_STATE/claims.jsonl` if set, else a CWD-relative fallback with a loud warning outside any git repo) | task-id claim ledger for `bin/claim-ledger.py`, shared across every worktree of the same repo |
-| `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
+| `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir. `bin/merge-sequencer.sh` uses this same var as an override, but its own **default** lock lives at `<repo>/.secondmate/merge-sequencer.lock` (anchored to `--repo`, not to `./`) so every caller targeting the same `--repo` shares the same lock regardless of its own ambient CWD — distinct from `bin/caffeinate-guard.sh`'s own lock under `SM_CAFFEINATE_ROOT` |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
 | `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
 | `SM_CAFFEINATE_ROOT` | `~/.secondmate-caffeinate` | where `caffeinate-guard.sh` stores the session-scoped guard PID file (PID + fingerprint) |
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
+| `SM_MERGE_LEDGER` | `<repo>/audit/merge-ledger.jsonl` | append-only per-attempt merge ledger written by `bin/merge-sequencer.sh` (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`); like the lock, anchored to `--repo` by default so every caller targeting the same `--repo` writes to the same ledger |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 
@@ -203,7 +205,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/mark-maker.sh --selfcheck && bin/new-worktree.sh --selfcheck && bin/herdr-pane.sh --selfcheck \
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
   && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
-  && bin/claim-ledger.py selfcheck \
+  && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```
