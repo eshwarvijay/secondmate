@@ -26,13 +26,16 @@ git worktree) never work the same task at once.
 Ledger path resolution (first match wins):
   1. $SM_CLAIM_LEDGER, if set -- used exactly as given.
   2. $SM_LOOP_STATE/claims.jsonl, if $SM_LOOP_STATE is set.
-  3. Otherwise, anchored to `git rev-parse --git-common-dir`'s PARENT directory (the one physical location
-     every worktree of the same repo -- including the primary checkout -- agrees on; same mechanism
-     bin/mark-maker.sh uses to distinguish primary vs. linked worktrees). This matters because every
-     herdr-launched sub-agent-supervisor runs with its CWD set to its OWN linked worktree: a plain
-     CWD-relative default would give each one an unshared ledger, defeating the entire point of this
-     script. Falls back to a CWD-relative `.secondmate/claims.jsonl` (with a loud stderr warning) only if
-     not inside a git repo at all.
+  3. Otherwise, anchored to `git rev-parse --git-common-dir` (the one physical location every worktree of
+     the same repo -- including the primary checkout -- agrees on; same mechanism bin/mark-maker.sh uses
+     to distinguish primary vs. linked worktrees). For a normal (non-bare) repo, anchored at that
+     common-dir's PARENT (common-dir is `.git`, sibling to the worktree root). For a BARE repo,
+     `--git-common-dir` already resolves to '.' -- the bare repo IS its own common-dir -- so anchored AT
+     the common-dir itself, not its (arbitrary, possibly shared-by-unrelated-sibling-repos) parent. This
+     matters because every herdr-launched sub-agent-supervisor runs with its CWD set to its OWN linked
+     worktree: a plain CWD-relative default would give each one an unshared ledger, defeating the entire
+     point of this script. Falls back to a CWD-relative `.secondmate/claims.jsonl` (with a loud stderr
+     warning) only if not inside a git repo at all.
 
 Claim key is task-id -- this repo's convention is one task-id : one worktree : one branch (sm/<task-id>),
 so task-id is the natural claim key. NOT a worktree path, NOT a PID.
@@ -75,7 +78,17 @@ def _default_ledger_path():
             common_dir = pathlib.Path(out.stdout.strip())
             if not common_dir.is_absolute():
                 common_dir = pathlib.Path.cwd() / common_dir
-            anchor = common_dir.resolve().parent
+            common_dir = common_dir.resolve()
+            # For a BARE repo, --git-common-dir already IS the one shared location (it resolves to
+            # '.', i.e. the bare repo's own directory) -- taking its PARENT would land outside the bare
+            # repo entirely, in whatever directory happens to contain it, colliding with any unrelated
+            # sibling bare repo placed nearby (same collision class applies to a submodule's git-dir
+            # living under a superproject's .git/modules/). Anchor AT common_dir itself when bare;
+            # only a non-bare repo's shared .git dir has a meaningful, distinguishing PARENT to anchor to.
+            is_bare = subprocess.run(["git", "rev-parse", "--is-bare-repository"],
+                                      capture_output=True, text=True)
+            bare = is_bare.returncode == 0 and is_bare.stdout.strip() == "true"
+            anchor = common_dir if bare else common_dir.parent
             return anchor / ".secondmate" / "claims.jsonl"
     except OSError:
         pass  # git not installed/found -- fall through to the loud-warning CWD-relative fallback below
@@ -93,7 +106,7 @@ _BAD = 0  # count of malformed/incomplete ledger lines seen by the last _recs()
 # task-id must be a safe bare identifier: no path separators, no null bytes, no empty string, bounded
 # length -- mirrors the defensive posture in plan-committee.sh's _claim_task_marker (path-traversal /
 # symlink / self-name-matching bugs found and fixed there earlier this session).
-_TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 
 
 def _valid_task_id(task_id):
@@ -115,8 +128,16 @@ def _recs():
             o = json.loads(line)
         except ValueError:
             _BAD += 1; continue
-        if (isinstance(o, dict) and o.get("ev") in ("claimed", "released", "stolen")
-                and isinstance(o.get("task_id"), str) and isinstance(o.get("owner"), str)):
+        ev = o.get("ev") if isinstance(o, dict) else None
+        valid = (isinstance(o, dict) and ev in ("claimed", "released", "stolen")
+                 and isinstance(o.get("task_id"), str) and isinstance(o.get("owner"), str))
+        if valid and ev in ("claimed", "stolen"):
+            # A tokenless claimed/stolen record can never be released (no caller can supply a token
+            # equal to a missing field) -- it would permanently wedge that task-id open except through
+            # --steal. Treat it as malformed/incomplete, exactly like any other broken line, instead of
+            # a valid open claim.
+            valid = bool(o.get("token")) and isinstance(o.get("token"), str)
+        if valid:
             recs.append(o)
         else:
             _BAD += 1
@@ -275,7 +296,8 @@ def _selfcheck_live():
         # recorded previous_owner will be stale; if steal folds INSIDE the lock (the fix), the
         # competitor blocks on the same fcntl lock and cannot run until we're done.
         import threading
-        _append({"ev": "claimed", "task_id": "race", "owner": "agent-a", "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        _append({"ev": "claimed", "task_id": "race", "owner": "agent-a", "token": secrets.token_hex(16),
+                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
         real_open_claims = open_claims
         race_started = threading.Event()
 
@@ -318,8 +340,10 @@ def _selfcheck_live():
                     f"true immediately-preceding owner was {race_recs[i - 1]['owner']!r} -- steal must fold "
                     f"the ledger fresh INSIDE the lock, not from a stale pre-lock snapshot")
 
-        # task-id validation: empty, path separators, null bytes, bad chars, and over-length must all fail.
-        for bad in ("", "../etc", "a/b", "a\0b", "bad id", "*", "a" * 129):
+        # task-id validation: empty, path separators, null bytes, bad chars, embedded newline (Bug C:
+        # regex '$' matches just before a trailing \n, not only true end-of-string), and over-length
+        # must all fail.
+        for bad in ("", "../etc", "a/b", "a\0b", "bad id", "*", "a" * 129, "ok\n"):
             code, _, _ = _run(["claim", "--task-id", bad, "--owner", "agent-x"])
             assert code != 0, f"invalid task-id {bad!r} must be rejected"
 
@@ -328,6 +352,22 @@ def _selfcheck_live():
             f.write("not json at all\n")
         code, out, _ = _run(["status"])
         assert code == 0 and "malformed" in out.lower(), "status must surface malformed-line corruption"
+
+        # Bug B regression: a tokenless 'claimed' record (e.g. a leftover/malformed/hand-edited ledger
+        # line predating the token requirement) must be treated as malformed/incomplete -- NOT as a
+        # valid open claim, since no caller could ever supply a token equal to a missing field, which
+        # would permanently wedge the task-id except through --steal.
+        bad_before = _BAD
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"ev": "claimed", "task_id": "tokenless", "owner": "agent-z",
+                                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}) + "\n")
+        assert "tokenless" not in open_claims(), "a tokenless claimed record must NOT fold into an open claim"
+        code, out, _ = _run(["status"])
+        assert code == 0 and "tokenless" not in out, "status must not show a tokenless record as open"
+        _recs()  # refresh _BAD as a side effect
+        assert _BAD > bad_before, "a tokenless claimed record must be counted as malformed (_BAD)"
+        code, out, _ = _run(["claim", "--task-id", "tokenless", "--owner", "agent-fresh"])
+        assert code == 0, "the task-id must be immediately claimable fresh, not wedged by the tokenless record"
 
         # real concurrency: N threads racing to claim the SAME task-id simultaneously must yield exactly
         # one winner, and the ledger must end up with exactly one 'claimed' record for it -- proves the
@@ -417,6 +457,42 @@ def _selfcheck_no_git_fallback_warns():
             "the no-git fallback must warn loudly on stderr, not silently succeed")
         assert (pathlib.Path(tmp) / ".secondmate" / "claims.jsonl").exists(), (
             "fallback ledger should land at ./.secondmate/claims.jsonl relative to the CWD")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _selfcheck_bare_repos_dont_collide():
+    # Bug A regression: for a BARE repo, `git rev-parse --git-common-dir` returns '.' (the bare repo IS
+    # its own common-dir) -- taking its PARENT (as the non-bare case correctly does) lands OUTSIDE the
+    # bare repo entirely, in whatever directory happens to contain it, colliding with any unrelated
+    # sibling bare repo placed nearby (same collision class as a submodule's git-dir under a
+    # superproject's .git/modules/). Two independent bare repos under the same parent directory must
+    # resolve to two DIFFERENT default ledgers.
+    tmp = tempfile.mkdtemp(prefix="claim-ledger-barecheck-")
+    try:
+        bare1 = os.path.join(tmp, "repo1.git")
+        bare2 = os.path.join(tmp, "repo2.git")
+        subprocess.run(["git", "init", "-q", "--bare", bare1], check=True)
+        subprocess.run(["git", "init", "-q", "--bare", bare2], check=True)
+
+        env = {k: v for k, v in os.environ.items() if k not in ("SM_CLAIM_LEDGER", "SM_LOOP_STATE")}
+
+        def _cli(cwd, argv):
+            return subprocess.run([sys.executable, _SCRIPT_PATH] + argv, cwd=cwd, env=env,
+                                   capture_output=True, text=True)
+
+        p1 = _cli(bare1, ["claim", "--task-id", "bare-task", "--owner", "supervisor-a"])
+        assert p1.returncode == 0, f"claim inside bare repo 1 should succeed: {p1.stderr}"
+        p2 = _cli(bare2, ["claim", "--task-id", "bare-task", "--owner", "supervisor-b"])
+        assert p2.returncode == 0, (
+            "claim inside an UNRELATED bare repo, same task-id, must succeed independently -- if it's "
+            f"rejected, the two bare repos collided on the same default ledger: {p2.stderr}")
+
+        ledger1 = pathlib.Path(bare1) / ".secondmate" / "claims.jsonl"
+        ledger2 = pathlib.Path(bare2) / ".secondmate" / "claims.jsonl"
+        assert ledger1.exists(), f"expected bare repo 1's default ledger at {ledger1}"
+        assert ledger2.exists(), f"expected bare repo 2's default ledger at {ledger2}"
+        assert ledger1.resolve() != ledger2.resolve(), "the two bare repos must NOT share a default ledger"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -527,6 +603,7 @@ def main(argv):
         _selfcheck_live()
         _selfcheck_default_ledger_path()
         _selfcheck_no_git_fallback_warns()
+        _selfcheck_bare_repos_dont_collide()
         print("ok")
 
 

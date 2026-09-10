@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.13-4C8BF5?style=flat-square" alt="version 0.1.13" />
+  <img src="https://img.shields.io/badge/version-0.1.14-4C8BF5?style=flat-square" alt="version 0.1.14" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
 </p>
@@ -174,7 +174,7 @@ credentials only you can supply.
 | `SM_COMMITTEE_PROVIDER` | `amazon-bedrock` | planner provider for `plan-committee.sh` |
 | `SM_COMMITTEE_TIMEOUT` | `300` | per-planner wall-clock timeout in seconds |
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
-| `SM_CLAIM_LEDGER` | shared `git rev-parse --git-common-dir`'s parent `/.secondmate/claims.jsonl` (or `$SM_LOOP_STATE/claims.jsonl` if set, else a CWD-relative fallback with a loud warning outside any git repo) | task-id claim ledger for `bin/claim-ledger.py`, shared across every worktree of the same repo |
+| `SM_CLAIM_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `.secondmate/claims.jsonl` -- parent dir for a normal repo, the common-dir itself for a bare repo (or `$SM_LOOP_STATE/claims.jsonl` if set, else a CWD-relative fallback with a loud warning outside any git repo) | task-id claim ledger for `bin/claim-ledger.py`, shared across every worktree of the same repo |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
 | `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |

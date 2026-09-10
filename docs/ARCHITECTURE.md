@@ -280,10 +280,13 @@ are separate, later tasks):
 - `bin/claim-ledger.py` — before a sub-agent-supervisor starts work on a task-id, it must `claim` it. Claim key
   is the task-id itself (this repo's existing one task-id : one worktree : one branch (`sm/<task-id>`)
   convention), not a worktree path or a PID. The default ledger location is anchored to `git rev-parse
-  --git-common-dir`'s parent — the one physical location every worktree of a repo (primary checkout and
-  every linked worktree, same mechanism `bin/mark-maker.sh` uses) agrees on — rather than the caller's
-  ambient CWD; a plain CWD-relative default would give each herdr-launched sub-agent-supervisor (each
-  running with its CWD set to its own worktree) an unshared ledger, silently defeating the whole point.
+  --git-common-dir` — the one physical location every worktree of a repo (primary checkout and every
+  linked worktree, same mechanism `bin/mark-maker.sh` uses) agrees on — rather than the caller's ambient
+  CWD; a plain CWD-relative default would give each herdr-launched sub-agent-supervisor (each running
+  with its CWD set to its own worktree) an unshared ledger, silently defeating the whole point. Anchored
+  at the common-dir's PARENT for a normal repo, but AT the common-dir itself for a bare repo (a bare
+  repo's common-dir already resolves to '.', so taking its parent would land in whatever arbitrary
+  directory contains it, colliding with any unrelated sibling bare repo placed nearby).
   `release` requires BOTH a matching `--owner` label AND a matching `--token` (a `secrets.token_hex(16)`
   minted by `claim`/`steal` and printed once) — the owner label alone is just a human-readable
   double-check, not real proof, since any caller can repeat another caller's label string. `steal` is a
