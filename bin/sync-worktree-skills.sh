@@ -23,9 +23,11 @@
 # session-specific state that would be actively wrong to duplicate into a fresh worktree.
 #
 # Idempotency + non-overwrite guarantee, in one check: a skill directory that ALREADY EXISTS at its
-# target path (even empty) is always skipped entirely, before any copy work starts for it. "Missing"
-# means the directory does not exist at all. This is deliberately the ONLY check -- it makes re-running
-# this script against the same worktree a safe no-op, and it means real tracked content that `git
+# target path (even empty, even a dangling symlink -- checked via -e OR -L, since -e alone follows
+# symlinks and would misreport a dangling one as absent) is always skipped entirely, before any copy
+# work starts for it. "Missing" means nothing exists at that path at all, no entry of any kind. This is
+# deliberately the ONLY check -- it makes re-running this script against the same worktree a safe
+# no-op, and it means real tracked content (including a tracked symlink, dangling or not) that `git
 # worktree add` already populated normally is never touched.
 #
 # Copy mechanics: each missing skill is copied (via `cp -R -p` -- portable across GNU/BSD, and `-p`
@@ -140,6 +142,14 @@ EOF
   echo "SENSITIVE_OUTSIDE_CONTENT" > "$t/external-secret/leaked.txt"
   ln -s "$t/external-secret" "$t/primary/.claude/skills/leaky"
 
+  # the dangling-symlink-as-already-present case independently reproduced by the checker/supervisor: a
+  # skill path that is TRACKED as a dangling symlink (committed into git, so it propagates normally to
+  # the worktree via git worktree add), which the primary later swaps for a real gitignored directory
+  # at that SAME path. The pre-fix bug: `[ -e "$target" ]` follows symlinks, so a dangling symlink
+  # already sitting at the worktree's target path was misreported as "nothing there", and the script
+  # proceeded to `mv` a real directory onto that path, failing with "Not a directory".
+  ln -s "../../nonexistent-target-for-epsilon" "$t/primary/.claude/skills/epsilon"
+
   cat > "$t/primary/.gitignore" <<'EOF'
 **/.claude/skills/
 **/.agents/skills/
@@ -148,9 +158,22 @@ EOF
   # force-add beta despite the broad ignore pattern above -- mirrors how a real repo can have one
   # specific already-tracked skill committed even while a broader ignore pattern covers the directory.
   git -C "$t/primary" add -f .claude/skills/beta/SKILL.md
+  # force-add epsilon too -- it must be TRACKED (as a dangling symlink) so it propagates via the
+  # upcoming git worktree add exactly like a real repo's committed symlink would.
+  git -C "$t/primary" add -f .claude/skills/epsilon
   git -C "$t/primary" commit -qm init >/dev/null
 
   git -C "$t/primary" worktree add -q -b feat "$t/wt" main
+
+  # NOW simulate the primary swapping that same path for a real gitignored directory -- AFTER the
+  # worktree already exists with the tracked dangling symlink checked out at the same relative path.
+  # This is deliberately NOT committed (the real repo scenario is exactly this kind of uncommitted,
+  # gitignored local swap) -- the sync script must never care about primary's git status, only about
+  # what's genuinely on disk at each path.
+  epsilon_target_before="$(readlink "$t/wt/.claude/skills/epsilon")"
+  rm "$t/primary/.claude/skills/epsilon"
+  mkdir -p "$t/primary/.claude/skills/epsilon"
+  echo "epsilon real content (must NOT overwrite the worktree's tracked dangling symlink)" > "$t/primary/.claude/skills/epsilon/SKILL.md"
 
   # --- reproduce the bug precondition for real, before testing the fix ---
   [ ! -e "$t/wt/subproject/.claude/skills/alpha" ] \
@@ -161,6 +184,10 @@ EOF
     || { echo "FAIL: fixture broken -- delta (dangling-symlink skill) unexpectedly already present in the fresh worktree"; fails=1; }
   [ ! -e "$t/wt/.claude/skills/leaky" ] \
     || { echo "FAIL: fixture broken -- leaky (outside-primary symlink skill) unexpectedly already present in the fresh worktree"; fails=1; }
+  [ -L "$t/wt/.claude/skills/epsilon" ] \
+    || { echo "FAIL: fixture broken -- epsilon (tracked dangling symlink) missing from the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/epsilon" ] \
+    || { echo "FAIL: fixture broken -- epsilon's symlink target unexpectedly resolves to something"; fails=1; }
   [ -f "$t/wt/.claude/skills/beta/SKILL.md" ] \
     || { echo "FAIL: fixture broken -- tracked beta missing from the fresh worktree"; fails=1; }
 
@@ -203,6 +230,17 @@ EOF
     || { echo "FAIL: SENSITIVE_OUTSIDE_CONTENT (from outside the primary checkout) leaked into the worktree"; fails=1; }
   grep -qi 'leaky' "$t/err1" || { echo "FAIL: no stderr warning mentioning leaky for the outside-primary symlink"; fails=1; }
   grep -qi 'outside' "$t/err1" || { echo "FAIL: warning for leaky does not mention it resolves outside the primary checkout"; fails=1; }
+
+  # epsilon (a tracked dangling symlink already present at the target path in the worktree, later
+  # superseded by a real gitignored directory of the SAME name in primary) must be treated as "already
+  # present" and left COMPLETELY untouched: still a symlink, still pointing at the exact same (still
+  # unresolvable) target as before the sync ever ran. The bug this guards: `-e` alone follows symlinks
+  # and misreports a dangling one as absent, so the script would otherwise try to `mv` a real directory
+  # onto this path and fail with "Not a directory" -- exit 1 for the WHOLE run, not just this one entry.
+  [ -L "$t/wt/.claude/skills/epsilon" ] || { echo "FAIL: epsilon's tracked dangling symlink was replaced (no longer a symlink) after sync"; fails=1; }
+  [ "$(readlink "$t/wt/.claude/skills/epsilon")" = "$epsilon_target_before" ] \
+    || { echo "FAIL: epsilon's symlink target changed after sync (was '$epsilon_target_before', now '$(readlink "$t/wt/.claude/skills/epsilon" 2>/dev/null)')"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/epsilon" ] || { echo "FAIL: epsilon unexpectedly resolves to something after sync (should still be dangling)"; fails=1; }
 
   # tracked beta (already present before the script ever ran) left completely untouched.
   [ "$(cat "$t/wt/.claude/skills/beta/SKILL.md")" = "tracked content" ] \
@@ -314,8 +352,16 @@ while IFS= read -r -d '' skills_dir; do
   while IFS= read -r -d '' skill_dir; do
     name="$(basename "$skill_dir")"
     target="$worktree/$relparent/$name"
-    [ -e "$target" ] && continue   # already present (even empty) -- never touch it; the whole
-                                    # idempotency + non-overwrite guarantee lives in this one check.
+    # -e follows symlinks (lstat vs stat): a DANGLING symlink already present at $target would make -e
+    # report false (as if nothing were there), so this ALSO checks -L (lstat semantics, detects the
+    # symlink entry's own existence regardless of whether it resolves to anything) -- otherwise the
+    # script would proceed to _sync_one_skill and try to `mv` a real directory onto an existing
+    # dangling-symlink path, which fails with "Not a directory" (reproduced: a tracked dangling symlink
+    # at a skill's path in the worktree, later superseded by a real gitignored directory of the same
+    # name in primary). An existing entry -- even a broken/dangling one -- is "already present": skip.
+    { [ -e "$target" ] || [ -L "$target" ]; } && continue   # already present (even empty, even a
+                                    # dangling symlink) -- never touch it; the whole idempotency +
+                                    # non-overwrite guarantee lives in this one check.
     src_dir="$skill_dir"
     if [ -L "$skill_dir" ]; then
       if resolved="$(_resolve_skill_symlink "$skill_dir")"; then
