@@ -28,7 +28,7 @@ grep -E '^### `/scope-guard-' "$DOCS_FILE" 2>/dev/null | sed -E 's#.*`/(scope-gu
 #     {
 # Use perl with /g to extract all matches (works across multiline reformatting)
 # Quote style support: double-quote ("), single-quote ('), backtick (`) - must match open/close
-# NOTE: This is text-based extraction, not an AST parser; comments/dead-code may produce false results in either direction
+# NOTE: This is text-based extraction, not an AST parser; comments/dead-code may produce false results in either direction; command names containing embedded quote characters of a different type (e.g. single-quoted name with embedded double-quote) are also not correctly extracted
 cat "$EXT_FILE" | tr '\n' ' ' | tr -s ' ' ' ' | grep 'pi\.registerCommand' | perl -ne 'print "$2\n" while /pi\.registerCommand\s*\(\s*(["\x27`])([^"\x27`]*)\1/g' > "$TMPDIR/reg_commands.txt" || true
 
 echo "Doc commands found:"
