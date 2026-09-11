@@ -22,7 +22,12 @@ trap 'rm -rf "$TMPDIR"' EXIT
 grep -E '^### `/scope-guard-' "$DOCS_FILE" 2>/dev/null | sed -E 's#.*`/(scope-guard-[^`]+)`.*#\1#' > "$TMPDIR/doc_commands.txt" || true
 
 # Extract registered commands: pi.registerCommand("scope-guard-...", ...)
-grep -E 'pi\.registerCommand\(' "$EXT_FILE" | sed -E 's/.*pi\.registerCommand\("([^"]+)".*/\1/' > "$TMPDIR/reg_commands.txt" || true
+# Use tr to flatten to one line per command, then extract first quoted string after the opening paren
+# This handles both inline: pi.registerCommand("cmd", { and multi-line: pi.registerCommand(
+#     "cmd",
+#     {
+# Use perl with /g to extract all matches (works across multiline reformatting)
+cat "$EXT_FILE" | tr '\n' ' ' | tr '  ' ' ' | grep 'pi\.registerCommand' | perl -ne 'print "$1\n" while /pi\.registerCommand\s*\(\s*"([^"]+)"/g' > "$TMPDIR/reg_commands.txt" || true
 
 echo "Doc commands found:"
 cat "$TMPDIR/doc_commands.txt"
