@@ -48,6 +48,15 @@
 # directory (broken/dangling, or pointing at a plain file) is skipped with a clear stderr warning --
 # never treated as a fatal error for the whole run.
 #
+# Security-relevant: a resolved symlink target is ALSO required to land INSIDE the primary checkout's
+# own tree (a prefix check against the already-canonicalized $primary). A .claude/skills/<name> symlink
+# pointing OUTSIDE the primary checkout entirely (e.g. an absolute path like /tmp/external-secret, or
+# anywhere via `..` escaping) would otherwise get silently resolved and its content materialized into
+# every fresh maker worktree -- exactly the kind of unintended exfiltration a maker/checker session
+# should never be able to trigger just by adding a symlink. An out-of-tree resolution is treated
+# EXACTLY like a dangling symlink: skipped with a clear stderr warning, never copied, never fails the
+# whole run over one such entry.
+#
 # Named, accepted limitations (no fix planned -- do not "improve" these without a fresh design):
 #   - ONE-TIME copy at worktree-creation time, not an ongoing sync. A file watcher, periodic re-sync,
 #     manifest file, or git filter/sparse-checkout mechanism is explicitly out of scope. Skills modified
@@ -123,6 +132,14 @@ EOF
   # the primary checkout. Must warn clearly on stderr and skip gracefully, never abort the whole run.
   ln -s "../../nonexistent-target-for-delta" "$t/primary/.claude/skills/delta"
 
+  # the security-relevant case independently reproduced by the checker/supervisor: a skill entry that
+  # is a symlink resolving OUTSIDE the primary checkout entirely (here, an absolute path to a sibling
+  # scratch dir -- mirrors the real repro of .claude/skills/leaky -> /tmp/external-secret). Its content
+  # must NEVER be materialized into the worktree, and a clear warning must be printed instead.
+  mkdir -p "$t/external-secret"
+  echo "SENSITIVE_OUTSIDE_CONTENT" > "$t/external-secret/leaked.txt"
+  ln -s "$t/external-secret" "$t/primary/.claude/skills/leaky"
+
   cat > "$t/primary/.gitignore" <<'EOF'
 **/.claude/skills/
 **/.agents/skills/
@@ -142,6 +159,8 @@ EOF
     || { echo "FAIL: fixture broken -- gamma (symlinked skill) unexpectedly already present in the fresh worktree"; fails=1; }
   [ ! -e "$t/wt/.claude/skills/delta" ] \
     || { echo "FAIL: fixture broken -- delta (dangling-symlink skill) unexpectedly already present in the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/leaky" ] \
+    || { echo "FAIL: fixture broken -- leaky (outside-primary symlink skill) unexpectedly already present in the fresh worktree"; fails=1; }
   [ -f "$t/wt/.claude/skills/beta/SKILL.md" ] \
     || { echo "FAIL: fixture broken -- tracked beta missing from the fresh worktree"; fails=1; }
 
@@ -173,6 +192,17 @@ EOF
   # synced fine despite delta being broken).
   [ ! -e "$t/wt/.claude/skills/delta" ] || { echo "FAIL: delta (dangling symlink) should have been skipped, not synced"; fails=1; }
   grep -qi 'delta' "$t/err1" || { echo "FAIL: no stderr warning mentioning delta for the dangling symlink"; fails=1; }
+
+  # leaky (a symlink resolving OUTSIDE the primary checkout entirely -- the security-relevant bug
+  # independently reproduced by the checker/supervisor) must NEVER be materialized into the worktree,
+  # anywhere, and its sensitive content must never leak into the worktree either. A clear warning
+  # naming it and explaining it's outside the primary checkout must be printed instead, and this must
+  # not abort the rest of the run.
+  [ ! -e "$t/wt/.claude/skills/leaky" ] || { echo "FAIL: leaky (outside-primary symlink) should have been skipped, not synced"; fails=1; }
+  ! grep -rq 'SENSITIVE_OUTSIDE_CONTENT' "$t/wt" 2>/dev/null \
+    || { echo "FAIL: SENSITIVE_OUTSIDE_CONTENT (from outside the primary checkout) leaked into the worktree"; fails=1; }
+  grep -qi 'leaky' "$t/err1" || { echo "FAIL: no stderr warning mentioning leaky for the outside-primary symlink"; fails=1; }
+  grep -qi 'outside' "$t/err1" || { echo "FAIL: warning for leaky does not mention it resolves outside the primary checkout"; fails=1; }
 
   # tracked beta (already present before the script ever ran) left completely untouched.
   [ "$(cat "$t/wt/.claude/skills/beta/SKILL.md")" = "tracked content" ] \
@@ -234,8 +264,13 @@ done
 git -C "$primary" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "sync-worktree-skills: --primary is not a git checkout: $primary" >&2; exit 1; }
 
-primary="$(cd "$primary" && pwd)"
-worktree="$(cd "$worktree" && pwd)"
+# -P (physical path, resolving symlinks like macOS's /var -> /private/var) so this canonical form
+# agrees exactly with python3's os.path.realpath() below, used for the within-primary-checkout security
+# check on a resolved skill symlink -- a plain (logical) `pwd` here would falsely reject a symlink whose
+# resolved target IS legitimately inside $primary, just because the two paths took different logical-vs-
+# physical routes through an OS-level symlink outside anyone's control.
+primary="$(cd "$primary" && pwd -P)"
+worktree="$(cd "$worktree" && pwd -P)"
 
 # Copies one missing skill directory into the worktree via a temp-dir-then-atomic-mv two-step, so a
 # kill mid-operation never leaves a half-written directory visible at the real target path. The temp
@@ -284,7 +319,15 @@ while IFS= read -r -d '' skills_dir; do
     src_dir="$skill_dir"
     if [ -L "$skill_dir" ]; then
       if resolved="$(_resolve_skill_symlink "$skill_dir")"; then
-        src_dir="$resolved"
+        case "$resolved" in
+          "$primary"|"$primary"/*)
+            src_dir="$resolved"
+            ;;
+          *)
+            echo "sync-worktree-skills: WARNING: skill entry '$skill_dir' resolves to '$resolved', which is OUTSIDE the primary checkout ($primary) -- refusing to copy it, skipping" >&2
+            continue
+            ;;
+        esac
       else
         echo "sync-worktree-skills: WARNING: skill entry '$skill_dir' is a symlink that does not resolve to a real directory -- skipping" >&2
         continue

@@ -13,11 +13,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${1:-}" = "--selfcheck" ]; then
   t="$(mktemp -d)"; git init -q -b main "$t/proj" >/dev/null
   git -C "$t/proj" config user.email a@a; git -C "$t/proj" config user.name a
-  echo x > "$t/proj/f"; git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init
+  echo x > "$t/proj/f"
+  # gitignored project-local skill fixture, so this selfcheck actually exercises the sync-worktree-
+  # skills.sh wiring call below (real bug found by the checker: replacing that wiring line with a
+  # no-op ':' still printed 'ok' here, because nothing asserted the synced skill's presence).
+  mkdir -p "$t/proj/.claude/skills/wiring-check"
+  echo "wiring-check content" > "$t/proj/.claude/skills/wiring-check/SKILL.md"
+  echo '**/.claude/skills/' > "$t/proj/.gitignore"
+  git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init
   fails=0
   rc=0; "$0" --repo "$t/proj" --task 'x/../../escape' >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: traversal task not rejected ($rc)"; fails=1; }
   rc=0; out="$(SM_WT_ROOT="$t/wts" "$0" --repo "$t/proj" --task good 2>/dev/null)" || rc=$?
   { [ "$rc" = 0 ] && [ -d "$t/wts/proj-good" ]; } || { echo "FAIL: normal spawn ($rc)"; fails=1; }
+  # real regression coverage for the sync-worktree-skills.sh wiring call: the gitignored skill fixture
+  # above must have been backfilled into the resulting worktree by the ACTUAL new-worktree.sh run
+  # above -- not a mock, not a separate reimplementation of the sync logic.
+  [ -f "$t/wts/proj-good/.claude/skills/wiring-check/SKILL.md" ] \
+    || { echo "FAIL: sync-worktree-skills.sh wiring broken -- gitignored .claude/skills/wiring-check not present in the new worktree"; fails=1; }
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
