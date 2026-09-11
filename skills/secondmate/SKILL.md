@@ -161,11 +161,13 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      wt=$(echo "$result" | jq -r '.result.worktree.path')
      root_pane=$(echo "$result" | jq -r '.result.root_pane.pane_id')
      ${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd "$wt"  # REQUIRED: mark before starting the maker
+     ${CLAUDE_PLUGIN_ROOT}/bin/sync-worktree-skills.sh --primary <repo> --worktree "$wt"  # copy gitignored .claude/skills/ into the new worktree
      ${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start  # prevent sleep during session execution
      ```
      Creates the git worktree AND a herdr workspace/tab/pane in one call. **Must call mark-maker.sh** before starting
      any maker agent in this worktree (finding #5 fix) — otherwise scope-guard.py won't activate.
      **Must call `${CLAUDE_PLUGIN_ROOT}/bin/caffeinate-guard.sh start`** to prevent system sleep during the session (default 8-hour ceiling via -t).
+     **Must call `sync-worktree-skills.sh`** too: project-local `.claude/skills/` is commonly gitignored, so neither `git worktree add` (used internally by `herdr worktree create`) nor `herdr worktree create` itself ever brings it into a fresh worktree on their own.
 
 3. **Guard the round** — wrap each maker/checker invocation and track loop health:
    - `${CLAUDE_PLUGIN_ROOT}/bin/run-round.sh --label <id> -- <cmd>` (wall-clock timeout, idle watchdog, audit record even on kill).

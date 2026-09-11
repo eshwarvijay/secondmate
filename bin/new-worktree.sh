@@ -49,6 +49,10 @@ case "$wt_root_abs/" in "$primary"/*) echo "isolation failed: SM_WT_ROOT ($wt_ro
 [ "$wt" != "$primary" ] || { echo "isolation assertion failed: worktree == primary checkout" >&2; exit 1; }
 [ -e "$wt" ] && { echo "worktree already exists: $wt" >&2; exit 1; }
 git -C "$repo" worktree add -b "$branch" "$wt" "$base" >&2
+# backfill gitignored project-local .claude/skills/ into the fresh worktree -- git worktree add above
+# only ever populates tracked content, so a gitignored project-local skill (a real, confirmed convention)
+# would otherwise be genuinely absent here (see sync-worktree-skills.sh's header for the full bug).
+"$SCRIPT_DIR/sync-worktree-skills.sh" --primary "$primary" --worktree "$wt" >&2
 # mark this worktree as a maker session (never the primary checkout) so scope-guard.py's PreToolUse hook
 # activates in it -- via the one shared marking call so this can't drift out of sync with the other
 # maker-launch sites (see mark-maker.sh for why the marker lives OUTSIDE the worktree entirely).
