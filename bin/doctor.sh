@@ -94,7 +94,7 @@ fi
 
 # --- state initialization helper ---
 _reset_detect_state() {
-  ROWS=""; core_missing=0; checker_missing=0; stale_count=0; unknown_count=0; missing_marketplace_count=0
+  ROWS=""; core_missing=0; checker_missing=0; stale_count=0; reload_pending_count=0; unknown_count=0; missing_marketplace_count=0
 }
 
 # initialize top-level state
@@ -108,6 +108,8 @@ add() { # status name category fix
     [ "$2" = "secondmate plugin (marketplace)" ] && missing_marketplace_count=$((missing_marketplace_count + 1))
   elif [ "$1" = STALE ]; then
     stale_count=$((stale_count + 1))
+  elif [ "$1" = RELOAD_PENDING ]; then
+    reload_pending_count=$((reload_pending_count + 1))
   elif [ "$1" = UNKNOWN ]; then
     unknown_count=$((unknown_count + 1))
   fi
@@ -230,7 +232,7 @@ _detect_secondmate_staleness() {
       ;;
     reload_pending)
       fix_cmd="claude /reload-plugins (reload into running session)"
-      add STALE "secondmate plugin (reload pending)" companion "$fix_cmd"
+      add RELOAD_PENDING "secondmate plugin (reload pending)" companion "$fix_cmd"
       ;;
     missing)
       fix_cmd="claude plugin marketplace add eshwarvijay/secondmate"
@@ -642,6 +644,7 @@ emit_table() {
   elif [ "$missing_marketplace_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin marketplace checkout is missing (claude plugin marketplace add eshwarvijay/secondmate)"
   elif [ "$unknown_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin state is unknown/unverifiable -- check installed_plugins.json"
   elif [ "$stale_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin needs healing (doctor.sh --heal)"
+  elif [ "$reload_pending_count" -gt 0 ]; then echo "STATUS: ready, but secondmate plugin needs a session reload (claude /reload-plugins)"
   else echo "STATUS: ready (core plus checker harness present)"; fi
 }
 
@@ -2260,6 +2263,56 @@ STUB_EOF
   echo "$table_output" | grep -q "(stale)" && { echo "FAIL: Test N bug fix: trailing table must NOT show (stale) for secondmate plugin after successful heal, got: $table_output"; echo "full output: $out" >&2; rm -rf "$d" "$origin_dir" "$stub_dir"; exit 1; }
 
   rm -rf "$d" "$origin_dir" "$stub_dir"
+
+  # === Test O (reload_pending state): STATUS line distinguishes reload_pending from stale ===
+  # This tests that a genuinely reload_pending state (SHA matches, version differs,
+  # heal already happened on disk but /reload-plugins not yet run) produces a
+  # different STATUS message than a stale state (needs healing).
+  # The row output for reload_pending already shows [!!] with the correct fix command.
+  # This test verifies the bottom STATUS line now mentions "session reload" and "reload-plugins",
+  # NOT "needs healing" (which is what stale/silent_drift share).
+  d=$(mktemp -d)
+  mkt_dir="$d/mkt"
+  j="$d/plugins.json"
+  lock_dir="$d/lock"
+
+  # Build reload_pending fixture: use exact shape of existing Test 4 fixture
+  # - SHA in marketplace matches installed_sha in installed_plugins.json
+  # - But running_version (from this worktree's plugin.json) differs from installed_version
+  mkdir -p "$mkt_dir/.claude-plugin"
+  git -C "$mkt_dir" init -q -b main 2>/dev/null || true
+  git -C "$mkt_dir" config user.email t@t.com 2>/dev/null
+  git -C "$mkt_dir" config user.name t 2>/dev/null
+  # marketplace has the CURRENT version_line (this worktree)
+  printf '{"name":"secondmate","version":"%s"}\n' "$version_line" > "$mkt_dir/.claude-plugin/plugin.json"
+  git -C "$mkt_dir" add -A 2>/dev/null || true
+  git -C "$mkt_dir" commit -q -m "v$version_line" 2>/dev/null || true
+  sha=$(git -C "$mkt_dir" rev-parse HEAD)
+
+  # installed_plugins.json has the SAME SHA but OLD version (e.g. "0.1.0-old")
+  # This guarantees installed_version differs from running_version, creating reload_pending
+  mk_installed_json "$j" "$sha" "${version_line}-old"
+
+  # Run doctor.sh --report (NOT --json) to get table output with STATUS line
+  out=$(SM_SECONDMATE_MARKETPLACE_DIR="$mkt_dir" SM_INSTALLED_PLUGINS_JSON="$j" SM_DOCTOR_LOCK_DIR="$lock_dir" "$script_abs" --report 2>&1)
+
+  # The secondmate row must still show [!!] (already-correct behavior from Test 4)
+  secondmate_row=$(echo "$out" | grep "secondmate plugin (reload pending)" || true)
+  echo "$secondmate_row" | grep -q "\[!!\]" || { echo "FAIL: Test O reload_pending row should have [!!], got: $secondmate_row"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+
+  # The fix command must still show /reload-plugins (already-correct behavior from Test 4)
+  echo "$secondmate_row" | grep -q "reload-plugins" || { echo "FAIL: Test O reload_pending row fix command should mention reload-plugins, got: $secondmate_row"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+
+  # The STATUS line must mention a session reload
+  status_line=$(echo "$out" | grep "^STATUS:" || true)
+  [ -n "$status_line" ] || { echo "FAIL: Test O reload_pending STATUS line not found"; echo "full output:"; echo "$out" >&2; rm -rf "$d"; exit 1; }
+  echo "$status_line" | grep -q "session reload" || { echo "FAIL: Test O reload_pending STATUS should mention session reload, got: $status_line"; rm -rf "$d"; exit 1; }
+  echo "$status_line" | grep -q "reload-plugins" || { echo "FAIL: Test O reload_pending STATUS should mention reload-plugins, got: $status_line"; rm -rf "$d"; exit 1; }
+
+  # The STATUS line must NOT contain "needs healing" (this distinguishes it from stale)
+  echo "$status_line" | grep -q "needs healing" && { echo "FAIL: Test O reload_pending STATUS must NOT mention needs healing, got: $status_line"; rm -rf "$d"; exit 1; }
+
+  rm -rf "$d"
 
   echo ok; exit 0
 fi
