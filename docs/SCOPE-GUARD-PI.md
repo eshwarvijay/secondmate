@@ -41,10 +41,6 @@ Check scope guard marker status for the current worktree. Shows:
 - Whether scope guard is active
 - Marker path location
 
-### `/scope-guard-marker`
-
-Print the marker file path for the current worktree.
-
 ## Fail-Open vs Fail-Closed
 
 The design follows the same pattern as `scope-guard.py`:

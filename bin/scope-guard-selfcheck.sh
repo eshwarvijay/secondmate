@@ -226,3 +226,43 @@ echo "  pi --extension /Users/eshwar.vijay/.herdr/worktrees/secondmate/sm-pi-sco
 echo "  Then try: /scope-guard-status"
 echo "  And try: read /etc/passwd (should be blocked)"
 echo "  And try: write brandnew.txt inside worktree (should be ALLOWED)"
+
+# Symmetric doc/registration consistency check
+echo ""
+echo "=== doc/command consistency check ==="
+DOCS_FILE="docs/SCOPE-GUARD-PI.md"
+EXT_FILE="bin/scope-guard-extension.ts"
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Extract doc commands: lines matching ### `/scope-guard-...`
+grep -E '^### `/scope-guard-' "$DOCS_FILE" 2>/dev/null | sed -E 's/.*`/(scope-guard-[^`]+).*/\1/' > "$TMPDIR/doc_commands.txt" || true
+
+# Extract registered commands: pi.registerCommand("scope-guard-...", ...)
+grep -E 'pi\.registerCommand\(' "$EXT_FILE" | sed -E 's/.*pi\.registerCommand\("([^"]+)".*/\1/' > "$TMPDIR/reg_commands.txt" || true
+
+echo "Doc commands found:"
+cat "$TMPDIR/doc_commands.txt"
+echo ""
+echo "Registered commands found:"
+cat "$TMPDIR/reg_commands.txt"
+echo ""
+
+# Check for doc commands without registration
+MISSING_REG=$(grep -vxFf "$TMPDIR/reg_commands.txt" "$TMPDIR/doc_commands.txt" 2>/dev/null || true)
+MISSING_DOC=$(grep -vxFf "$TMPDIR/doc_commands.txt" "$TMPDIR/reg_commands.txt" 2>/dev/null || true)
+
+if [[ -n "$MISSING_REG" ]] || [[ -n "$MISSING_DOC" ]]; then
+  if [[ -n "$MISSING_REG" ]]; then
+    echo "FAIL: Doc commands without registration:"
+    echo "$MISSING_REG"
+  fi
+  if [[ -n "$MISSING_DOC" ]]; then
+    echo "FAIL: Registered commands without doc:"
+    echo "$MISSING_DOC"
+  fi
+  exit 1
+fi
+
+echo "PASS: All doc/command pairs are symmetrically consistent"
