@@ -1,3 +1,5 @@
 .secondmate/
 decisions.jsonl
 decisions.jsonl.lock
+audit/merge-ledger.jsonl
+audit/metrics.jsonl
