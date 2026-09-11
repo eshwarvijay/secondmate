@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# sync-worktree-skills.sh -- backfills gitignored project-local .claude/skills/ directories into a
+# freshly created git worktree.
+#
+# The bug this fixes: project-local Claude Code skills live in .claude/skills/<name>/ directories -- a
+# convention distinct from secondmate's own marketplace-based plugin skills. In real repos,
+# .claude/skills/ is commonly gitignored (confirmed: a real user repo has `**/.claude/skills/` in its
+# .gitignore), possibly at ANY depth in a monorepo. `git worktree add` -- used both by
+# new-worktree.sh's headless path AND by the external `herdr worktree create` tool secondmate doesn't
+# own -- only ever populates a new worktree from committed, tracked content; gitignored files never
+# propagate. So a maker/supervisor session operating inside a secondmate-created worktree hits
+# "Unknown skill: ..." for a project-local skill that exists fine in the primary checkout, simply
+# because the directory is genuinely absent from the worktree.
+#
+#   sync-worktree-skills.sh --primary <path> --worktree <path>
+#   sync-worktree-skills.sh --selfcheck
+#
+# Scope is deliberately narrow: .claude/skills/ ONLY, at any depth under --primary (monorepo-safe --
+# e.g. <repo>/some-subproject/.claude/skills/<name>/). This does NOT sync any other gitignored
+# .claude/* path (settings.json, settings.local.json, session-state files like
+# compaction_log.txt/task_state.md/session_handoff.md/loop_*_state.md) -- an explicit human decision
+# after reviewing a real repo's .gitignore: those other files are either sensitive local config or
+# session-specific state that would be actively wrong to duplicate into a fresh worktree.
+#
+# Idempotency + non-overwrite guarantee, in one check: a skill directory that ALREADY EXISTS at its
+# target path (even empty, even a dangling symlink -- checked via -e OR -L, since -e alone follows
+# symlinks and would misreport a dangling one as absent) is always skipped entirely, before any copy
+# work starts for it. "Missing" means nothing exists at that path at all, no entry of any kind. This is
+# deliberately the ONLY check -- it makes re-running this script against the same worktree a safe
+# no-op, and it means real tracked content (including a tracked symlink, dangling or not) that `git
+# worktree add` already populated normally is never touched.
+#
+# Copy mechanics: each missing skill is copied (via `cp -R -p` -- portable across GNU/BSD, and `-p`
+# preserves permission/mode bits including executable bits on helper scripts; no `-L`, so a symlink
+# INSIDE a copied skill directory is preserved as a symlink rather than dereferenced, which matters
+# because bin/scope-guard.py's existing symlink-resolution-before-bounds-check already denies a maker
+# reading through such a symlink if it points outside the worktree) into a temp directory created
+# WITHIN the destination worktree, then `mv`'d atomically into its final path -- so a kill mid-copy
+# never leaves a half-written directory visible at the real target path.
+#
+# A DIFFERENT case from the internal-symlink one above: the skill's own top-level entry directly under
+# .claude/skills/ can itself be a symlink, not a plain directory -- a real, confirmed monorepo pattern
+# (e.g. .claude/skills/<name> -> ../../.agents/skills/<name>, splitting a project-local skill's real
+# content into a separate, often ALSO-gitignored directory elsewhere in the same checkout). Such an
+# entry is resolved (following the whole chain, wherever it actually leads within the checkout) to its
+# real target directory, and THAT real directory's real content is what gets copied and materialized as
+# a genuine directory at .claude/skills/<name>/ in the worktree -- never left as a symlink there, since
+# a symlink pointing at a target that is itself gitignored (and therefore also absent from the fresh
+# worktree) would just be a dangling link. A top-level entry that is a symlink NOT resolving to a real
+# directory (broken/dangling, or pointing at a plain file) is skipped with a clear stderr warning --
+# never treated as a fatal error for the whole run.
+#
+# Security-relevant: a resolved symlink target is ALSO required to land INSIDE the primary checkout's
+# own tree (a prefix check against the already-canonicalized $primary). A .claude/skills/<name> symlink
+# pointing OUTSIDE the primary checkout entirely (e.g. an absolute path like /tmp/external-secret, or
+# anywhere via `..` escaping) would otherwise get silently resolved and its content materialized into
+# every fresh maker worktree -- exactly the kind of unintended exfiltration a maker/checker session
+# should never be able to trigger just by adding a symlink. An out-of-tree resolution is treated
+# EXACTLY like a dangling symlink: skipped with a clear stderr warning, never copied, never fails the
+# whole run over one such entry.
+#
+# Named, accepted limitations (no fix planned -- do not "improve" these without a fresh design):
+#   - ONE-TIME copy at worktree-creation time, not an ongoing sync. A file watcher, periodic re-sync,
+#     manifest file, or git filter/sparse-checkout mechanism is explicitly out of scope. Skills modified
+#     in the primary AFTER a worktree's sync ran will not propagate automatically.
+#   - Worktrees created BEFORE this script existed do not retroactively benefit -- though a human can
+#     manually re-run this script against an already-existing worktree to backfill it (this script is
+#     safe to call standalone for exactly that purpose).
+#   - No size caps, quotas, checksum validation, or locking/concurrency-race protection. None of these
+#     are warranted for this narrow use case: small directories, one synchronous invocation per fresh
+#     worktree.
+set -euo pipefail
+
+if [ "${1:-}" = "--selfcheck" ]; then
+  fails=0
+  t="$(mktemp -d)"
+
+  # --- primary repo fixture, matching the real reproduced bug shape ---
+  git init -q -b main "$t/primary" >/dev/null
+  git -C "$t/primary" config user.email a@a; git -C "$t/primary" config user.name a
+
+  # a nested (monorepo-style) gitignored skill, "alpha", with real non-trivial content plus a helper
+  # script whose executable bit must survive the copy.
+  mkdir -p "$t/primary/subproject/.claude/skills/alpha"
+  cat > "$t/primary/subproject/.claude/skills/alpha/SKILL.md" <<'EOF'
+---
+name: alpha
+description: fixture skill for sync-worktree-skills.sh selfcheck -- real, non-trivial content used to
+  verify byte-identical copying through the actual copy code path (not a reimplementation of it).
+---
+# Alpha skill
+
+This is real content, several lines long, so a truncated or corrupted copy would be detectable by a
+plain byte-for-byte diff against the primary checkout's original file.
+
+- line one of a checklist
+- line two of a checklist
+- line three of a checklist
+EOF
+  cat > "$t/primary/subproject/.claude/skills/alpha/helper.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "alpha helper"
+EOF
+  chmod +x "$t/primary/subproject/.claude/skills/alpha/helper.sh"
+
+  # a git-TRACKED (committed, NOT gitignored) skill "beta" that must propagate to the worktree the
+  # normal way (via git worktree add itself) and must be left completely untouched by this script.
+  mkdir -p "$t/primary/.claude/skills/beta"
+  echo "tracked content" > "$t/primary/.claude/skills/beta/SKILL.md"
+
+  # the EXACT real-world shape that motivated this whole task and was independently confirmed against
+  # a real repo (archie/agent-analytics): a skill entry directly under .claude/skills/ that is ITSELF a
+  # symlink (not a plain directory), pointing at its real content in a SEPARATE, ALSO-gitignored
+  # directory elsewhere in the same primary checkout (.agents/skills/<name>/, mirroring that repo's own
+  # convention). After sync, the worktree must have REAL, materialized, byte-identical content at
+  # .claude/skills/gamma/ -- never a symlink, never a dangling link.
+  mkdir -p "$t/primary/.agents/skills/gamma"
+  cat > "$t/primary/.agents/skills/gamma/SKILL.md" <<'EOF'
+---
+name: gamma
+description: fixture skill whose REAL content lives outside .claude/skills entirely -- the
+  .claude/skills/gamma entry is a symlink to this directory, reproducing the real archie/
+  agent-analytics repo's emil-design-eng skill (a symlink into .agents/skills/, which is itself a
+  separate gitignored directory).
+---
+# Gamma skill (real content lives in .agents/skills/gamma)
+This file must be materialized as REAL content at .claude/skills/gamma/SKILL.md in the worktree after
+sync -- not left as a symlink (whose target would itself be missing from a fresh worktree, since
+.agents/skills/ is also gitignored).
+EOF
+  ln -s "../../.agents/skills/gamma" "$t/primary/.claude/skills/gamma"
+
+  # a dangling symlink entry -- a skill "delta" whose symlink target does not exist ANYWHERE, even in
+  # the primary checkout. Must warn clearly on stderr and skip gracefully, never abort the whole run.
+  ln -s "../../nonexistent-target-for-delta" "$t/primary/.claude/skills/delta"
+
+  # the security-relevant case independently reproduced by the checker/supervisor: a skill entry that
+  # is a symlink resolving OUTSIDE the primary checkout entirely (here, an absolute path to a sibling
+  # scratch dir -- mirrors the real repro of .claude/skills/leaky -> /tmp/external-secret). Its content
+  # must NEVER be materialized into the worktree, and a clear warning must be printed instead.
+  mkdir -p "$t/external-secret"
+  echo "SENSITIVE_OUTSIDE_CONTENT" > "$t/external-secret/leaked.txt"
+  ln -s "$t/external-secret" "$t/primary/.claude/skills/leaky"
+
+  # the dangling-symlink-as-already-present case independently reproduced by the checker/supervisor: a
+  # skill path that is TRACKED as a dangling symlink (committed into git, so it propagates normally to
+  # the worktree via git worktree add), which the primary later swaps for a real gitignored directory
+  # at that SAME path. The pre-fix bug: `[ -e "$target" ]` follows symlinks, so a dangling symlink
+  # already sitting at the worktree's target path was misreported as "nothing there", and the script
+  # proceeded to `mv` a real directory onto that path, failing with "Not a directory".
+  ln -s "../../nonexistent-target-for-epsilon" "$t/primary/.claude/skills/epsilon"
+
+  cat > "$t/primary/.gitignore" <<'EOF'
+**/.claude/skills/
+**/.agents/skills/
+EOF
+  git -C "$t/primary" add -A
+  # force-add beta despite the broad ignore pattern above -- mirrors how a real repo can have one
+  # specific already-tracked skill committed even while a broader ignore pattern covers the directory.
+  git -C "$t/primary" add -f .claude/skills/beta/SKILL.md
+  # force-add epsilon too -- it must be TRACKED (as a dangling symlink) so it propagates via the
+  # upcoming git worktree add exactly like a real repo's committed symlink would.
+  git -C "$t/primary" add -f .claude/skills/epsilon
+  git -C "$t/primary" commit -qm init >/dev/null
+
+  git -C "$t/primary" worktree add -q -b feat "$t/wt" main
+
+  # NOW simulate the primary swapping that same path for a real gitignored directory -- AFTER the
+  # worktree already exists with the tracked dangling symlink checked out at the same relative path.
+  # This is deliberately NOT committed (the real repo scenario is exactly this kind of uncommitted,
+  # gitignored local swap) -- the sync script must never care about primary's git status, only about
+  # what's genuinely on disk at each path.
+  epsilon_target_before="$(readlink "$t/wt/.claude/skills/epsilon")"
+  rm "$t/primary/.claude/skills/epsilon"
+  mkdir -p "$t/primary/.claude/skills/epsilon"
+  echo "epsilon real content (must NOT overwrite the worktree's tracked dangling symlink)" > "$t/primary/.claude/skills/epsilon/SKILL.md"
+
+  # --- reproduce the bug precondition for real, before testing the fix ---
+  [ ! -e "$t/wt/subproject/.claude/skills/alpha" ] \
+    || { echo "FAIL: fixture broken -- alpha unexpectedly already present in the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/gamma" ] \
+    || { echo "FAIL: fixture broken -- gamma (symlinked skill) unexpectedly already present in the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/delta" ] \
+    || { echo "FAIL: fixture broken -- delta (dangling-symlink skill) unexpectedly already present in the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/leaky" ] \
+    || { echo "FAIL: fixture broken -- leaky (outside-primary symlink skill) unexpectedly already present in the fresh worktree"; fails=1; }
+  [ -L "$t/wt/.claude/skills/epsilon" ] \
+    || { echo "FAIL: fixture broken -- epsilon (tracked dangling symlink) missing from the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/epsilon" ] \
+    || { echo "FAIL: fixture broken -- epsilon's symlink target unexpectedly resolves to something"; fails=1; }
+  [ -f "$t/wt/.claude/skills/beta/SKILL.md" ] \
+    || { echo "FAIL: fixture broken -- tracked beta missing from the fresh worktree"; fails=1; }
+
+  # --- run the real fix ---
+  if ! "$0" --primary "$t/primary" --worktree "$t/wt" >/dev/null 2>"$t/err1"; then
+    echo "FAIL: first sync run exited nonzero: $(cat "$t/err1")"; fails=1
+  fi
+
+  # alpha now exists at the correct nested path, byte-identical, executable bit preserved.
+  [ -f "$t/wt/subproject/.claude/skills/alpha/SKILL.md" ] || { echo "FAIL: alpha SKILL.md not synced"; fails=1; }
+  diff -q "$t/primary/subproject/.claude/skills/alpha/SKILL.md" "$t/wt/subproject/.claude/skills/alpha/SKILL.md" >/dev/null \
+    || { echo "FAIL: alpha SKILL.md content differs after sync"; fails=1; }
+  diff -q "$t/primary/subproject/.claude/skills/alpha/helper.sh" "$t/wt/subproject/.claude/skills/alpha/helper.sh" >/dev/null \
+    || { echo "FAIL: alpha helper.sh content differs after sync"; fails=1; }
+  [ -x "$t/wt/subproject/.claude/skills/alpha/helper.sh" ] \
+    || { echo "FAIL: alpha helper.sh executable bit not preserved"; fails=1; }
+
+  # gamma (a symlinked skill entry, the exact real-world reproduced shape) now exists at the correct
+  # target path as REAL, materialized, byte-identical content -- NOT a symlink, and definitely not a
+  # dangling symlink pointing at a target absent from the worktree.
+  [ -e "$t/wt/.claude/skills/gamma" ] || { echo "FAIL: gamma (symlinked skill) not synced at all"; fails=1; }
+  [ ! -L "$t/wt/.claude/skills/gamma" ] || { echo "FAIL: gamma was synced as a symlink, not materialized as a real directory"; fails=1; }
+  [ -d "$t/wt/.claude/skills/gamma" ] || { echo "FAIL: gamma is not a real directory after sync"; fails=1; }
+  diff -q "$t/primary/.agents/skills/gamma/SKILL.md" "$t/wt/.claude/skills/gamma/SKILL.md" >/dev/null \
+    || { echo "FAIL: gamma SKILL.md content differs from its real (resolved) source after sync"; fails=1; }
+
+  # delta (a dangling-symlink skill entry) is skipped gracefully -- absent from the worktree, warned
+  # about clearly on stderr, and must NOT have aborted the rest of the run (alpha/gamma above still
+  # synced fine despite delta being broken).
+  [ ! -e "$t/wt/.claude/skills/delta" ] || { echo "FAIL: delta (dangling symlink) should have been skipped, not synced"; fails=1; }
+  grep -qi 'delta' "$t/err1" || { echo "FAIL: no stderr warning mentioning delta for the dangling symlink"; fails=1; }
+
+  # leaky (a symlink resolving OUTSIDE the primary checkout entirely -- the security-relevant bug
+  # independently reproduced by the checker/supervisor) must NEVER be materialized into the worktree,
+  # anywhere, and its sensitive content must never leak into the worktree either. A clear warning
+  # naming it and explaining it's outside the primary checkout must be printed instead, and this must
+  # not abort the rest of the run.
+  [ ! -e "$t/wt/.claude/skills/leaky" ] || { echo "FAIL: leaky (outside-primary symlink) should have been skipped, not synced"; fails=1; }
+  ! grep -rq 'SENSITIVE_OUTSIDE_CONTENT' "$t/wt" 2>/dev/null \
+    || { echo "FAIL: SENSITIVE_OUTSIDE_CONTENT (from outside the primary checkout) leaked into the worktree"; fails=1; }
+  grep -qi 'leaky' "$t/err1" || { echo "FAIL: no stderr warning mentioning leaky for the outside-primary symlink"; fails=1; }
+  grep -qi 'outside' "$t/err1" || { echo "FAIL: warning for leaky does not mention it resolves outside the primary checkout"; fails=1; }
+
+  # epsilon (a tracked dangling symlink already present at the target path in the worktree, later
+  # superseded by a real gitignored directory of the SAME name in primary) must be treated as "already
+  # present" and left COMPLETELY untouched: still a symlink, still pointing at the exact same (still
+  # unresolvable) target as before the sync ever ran. The bug this guards: `-e` alone follows symlinks
+  # and misreports a dangling one as absent, so the script would otherwise try to `mv` a real directory
+  # onto this path and fail with "Not a directory" -- exit 1 for the WHOLE run, not just this one entry.
+  [ -L "$t/wt/.claude/skills/epsilon" ] || { echo "FAIL: epsilon's tracked dangling symlink was replaced (no longer a symlink) after sync"; fails=1; }
+  [ "$(readlink "$t/wt/.claude/skills/epsilon")" = "$epsilon_target_before" ] \
+    || { echo "FAIL: epsilon's symlink target changed after sync (was '$epsilon_target_before', now '$(readlink "$t/wt/.claude/skills/epsilon" 2>/dev/null)')"; fails=1; }
+  [ ! -e "$t/wt/.claude/skills/epsilon" ] || { echo "FAIL: epsilon unexpectedly resolves to something after sync (should still be dangling)"; fails=1; }
+
+  # tracked beta (already present before the script ever ran) left completely untouched.
+  [ "$(cat "$t/wt/.claude/skills/beta/SKILL.md")" = "tracked content" ] \
+    || { echo "FAIL: tracked beta content changed"; fails=1; }
+
+  # --- idempotency: a second run against the same worktree is a genuine no-op ---
+  before_snapshot="$(cd "$t/wt" && find . -type f -not -path './.git/*' -exec sh -c 'echo "$1"; cat "$1"' _ {} \; | sort)"
+  if ! "$0" --primary "$t/primary" --worktree "$t/wt" >/dev/null 2>"$t/err2"; then
+    echo "FAIL: second (idempotent) sync run exited nonzero: $(cat "$t/err2")"; fails=1
+  fi
+  after_snapshot="$(cd "$t/wt" && find . -type f -not -path './.git/*' -exec sh -c 'echo "$1"; cat "$1"' _ {} \; | sort)"
+  [ "$before_snapshot" = "$after_snapshot" ] || { echo "FAIL: second run changed the worktree (not idempotent)"; fails=1; }
+  [ -z "$(find "$t/wt" -maxdepth 1 -name '.claude-skills-sync-tmp.*' 2>/dev/null)" ] \
+    || { echo "FAIL: leftover tmp dir after sync"; fails=1; }
+
+  # --- safe no-op: a primary checkout with NO .claude/skills anywhere ---
+  git init -q -b main "$t/empty-primary" >/dev/null
+  git -C "$t/empty-primary" config user.email a@a; git -C "$t/empty-primary" config user.name a
+  echo x > "$t/empty-primary/f"; git -C "$t/empty-primary" add -A; git -C "$t/empty-primary" commit -qm init >/dev/null
+  git -C "$t/empty-primary" worktree add -q -b feat "$t/empty-wt" main
+  before_empty="$(find "$t/empty-wt" -type f -not -path '*/.git/*' | sort)"
+  rc=0; "$0" --primary "$t/empty-primary" --worktree "$t/empty-wt" >/dev/null 2>"$t/err3" || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL: no-skills-anywhere case should exit 0, got $rc: $(cat "$t/err3")"; fails=1; }
+  after_empty="$(find "$t/empty-wt" -type f -not -path '*/.git/*' | sort)"
+  [ "$before_empty" = "$after_empty" ] || { echo "FAIL: no-skills-anywhere case changed the worktree"; fails=1; }
+
+  # --- invalid inputs must fail loudly, not silently no-op ---
+  rc=0; "$0" --primary "$t/does-not-exist" --worktree "$t/wt" >/dev/null 2>"$t/err4" || rc=$?
+  { [ "$rc" != 0 ] && [ -s "$t/err4" ]; } || { echo "FAIL: nonexistent --primary should exit nonzero with a message (rc=$rc)"; fails=1; }
+
+  rc=0; "$0" --primary "$t/primary" --worktree "$t/does-not-exist" >/dev/null 2>"$t/err5" || rc=$?
+  { [ "$rc" != 0 ] && [ -s "$t/err5" ]; } || { echo "FAIL: nonexistent --worktree should exit nonzero with a message (rc=$rc)"; fails=1; }
+
+  mkdir -p "$t/not-a-repo"
+  rc=0; "$0" --primary "$t/not-a-repo" --worktree "$t/wt" >/dev/null 2>"$t/err6" || rc=$?
+  { [ "$rc" != 0 ] && [ -s "$t/err6" ]; } || { echo "FAIL: non-git --primary should exit nonzero with a message (rc=$rc)"; fails=1; }
+
+  touch "$t/afile"
+  rc=0; "$0" --primary "$t/primary" --worktree "$t/afile" >/dev/null 2>"$t/err7" || rc=$?
+  [ "$rc" != 0 ] || { echo "FAIL: --worktree pointing at a plain file should exit nonzero"; fails=1; }
+
+  rm -rf "$t"
+  [ "$fails" = 0 ] && echo ok
+  exit "$fails"
+fi
+
+primary="" worktree=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --primary) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; primary="$2"; shift 2;;
+    --worktree) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; worktree="$2"; shift 2;;
+    *) echo "unknown arg: $1" >&2; exit 2;;
+  esac
+done
+[ -n "$primary" ] && [ -n "$worktree" ] || { echo "need --primary PATH --worktree PATH" >&2; exit 2; }
+
+[ -d "$primary" ] || { echo "sync-worktree-skills: --primary is not a directory: $primary" >&2; exit 1; }
+[ -d "$worktree" ] || { echo "sync-worktree-skills: --worktree is not a directory: $worktree" >&2; exit 1; }
+git -C "$primary" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || { echo "sync-worktree-skills: --primary is not a git checkout: $primary" >&2; exit 1; }
+
+# -P (physical path, resolving symlinks like macOS's /var -> /private/var) so this canonical form
+# agrees exactly with python3's os.path.realpath() below, used for the within-primary-checkout security
+# check on a resolved skill symlink -- a plain (logical) `pwd` here would falsely reject a symlink whose
+# resolved target IS legitimately inside $primary, just because the two paths took different logical-vs-
+# physical routes through an OS-level symlink outside anyone's control.
+primary="$(cd "$primary" && pwd -P)"
+worktree="$(cd "$worktree" && pwd -P)"
+
+# Copies one missing skill directory into the worktree via a temp-dir-then-atomic-mv two-step, so a
+# kill mid-operation never leaves a half-written directory visible at the real target path. The temp
+# dir is created WITHIN the destination worktree (per spec) and cleaned up via a function-local RETURN
+# trap on every exit path out of this function, success or failure alike. $src_dir is the REAL directory
+# to copy content FROM -- for a plain skill directory that's just $skill_dir itself, but for a
+# skill entry that is itself a symlink, the caller has already resolved it to its real target (see the
+# main loop below); $name is the skill's name as it must appear at the target path (the symlink's own
+# basename, NOT necessarily the resolved target's basename).
+_sync_one_skill() {
+  local src_dir="$1" target="$2" name="$3" tmp
+  tmp="$(mktemp -d "$worktree/.claude-skills-sync-tmp.XXXXXX")" \
+    || { echo "sync-worktree-skills: mktemp failed while syncing $src_dir" >&2; return 1; }
+  trap 'rm -rf "$tmp"' RETURN
+  cp -R -p "$src_dir" "$tmp/$name" \
+    || { echo "sync-worktree-skills: failed to copy $src_dir" >&2; return 1; }
+  mkdir -p "$(dirname "$target")" \
+    || { echo "sync-worktree-skills: failed to create $(dirname "$target")" >&2; return 1; }
+  mv "$tmp/$name" "$target" \
+    || { echo "sync-worktree-skills: failed to move synced copy into $target" >&2; return 1; }
+}
+
+# Resolves a skill entry that is itself a symlink to its real target directory, following the whole
+# chain (os.path.realpath, via python3 -- already a hard dependency elsewhere in this plugin, e.g.
+# bin/scope-guard.py -- rather than readlink -f/-- realpath, whose flag support differs between GNU and
+# BSD). Prints the resolved path on success. Prints nothing and returns nonzero if the entry does not
+# resolve to an existing real directory (dangling symlink, cyclic symlink, or a symlink to a plain file).
+_resolve_skill_symlink() {
+  local link="$1" resolved
+  resolved="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$link" 2>/dev/null)" || return 1
+  [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
+  printf '%s\n' "$resolved"
+}
+
+fails=0
+while IFS= read -r -d '' skills_dir; do
+  # relparent is the path of this .claude/skills directory relative to $primary (e.g. ".claude/skills"
+  # or "some-subproject/.claude/skills") -- computed by substring, not shell pattern-matching, so any
+  # glob-special characters that happen to appear in $primary itself can't corrupt the result.
+  relparent="${skills_dir:$((${#primary} + 1))}"
+  while IFS= read -r -d '' skill_dir; do
+    name="$(basename "$skill_dir")"
+    target="$worktree/$relparent/$name"
+    # -e follows symlinks (lstat vs stat): a DANGLING symlink already present at $target would make -e
+    # report false (as if nothing were there), so this ALSO checks -L (lstat semantics, detects the
+    # symlink entry's own existence regardless of whether it resolves to anything) -- otherwise the
+    # script would proceed to _sync_one_skill and try to `mv` a real directory onto an existing
+    # dangling-symlink path, which fails with "Not a directory" (reproduced: a tracked dangling symlink
+    # at a skill's path in the worktree, later superseded by a real gitignored directory of the same
+    # name in primary). An existing entry -- even a broken/dangling one -- is "already present": skip.
+    { [ -e "$target" ] || [ -L "$target" ]; } && continue   # already present (even empty, even a
+                                    # dangling symlink) -- never touch it; the whole idempotency +
+                                    # non-overwrite guarantee lives in this one check.
+    src_dir="$skill_dir"
+    if [ -L "$skill_dir" ]; then
+      if resolved="$(_resolve_skill_symlink "$skill_dir")"; then
+        case "$resolved" in
+          "$primary"|"$primary"/*)
+            src_dir="$resolved"
+            ;;
+          *)
+            echo "sync-worktree-skills: WARNING: skill entry '$skill_dir' resolves to '$resolved', which is OUTSIDE the primary checkout ($primary) -- refusing to copy it, skipping" >&2
+            continue
+            ;;
+        esac
+      else
+        echo "sync-worktree-skills: WARNING: skill entry '$skill_dir' is a symlink that does not resolve to a real directory -- skipping" >&2
+        continue
+      fi
+    fi
+    if ! _sync_one_skill "$src_dir" "$target" "$name"; then
+      fails=1
+    fi
+  done < <(find "$skills_dir" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) -print0)
+done < <(find "$primary" -type d -path '*/.claude/skills' -print0)
+
+exit "$fails"
