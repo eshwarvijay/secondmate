@@ -9,6 +9,54 @@
 
 set -euo pipefail
 
+# Symmetric doc/registration consistency check (RUN FIRST, before pi tests)
+# Checks that every doc heading under '## Commands' has a matching pi.registerCommand call
+echo "=== doc/command consistency check (RUN FIRST) ==="
+DOCS_FILE="docs/SCOPE-GUARD-PI.md"
+EXT_FILE="bin/scope-guard-extension.ts"
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Extract doc commands: lines matching ### `/scope-guard-...`
+grep -E '^### `/scope-guard-' "$DOCS_FILE" 2>/dev/null | sed -E 's#.*`/(scope-guard-[^`]+)`.*#\1#' > "$TMPDIR/doc_commands.txt" || true
+
+# Extract registered commands: pi.registerCommand("scope-guard-...", ...)
+# Use tr to flatten to one line per command, then extract first quoted string after the opening paren
+# This handles both inline: pi.registerCommand("cmd", { and multi-line: pi.registerCommand(
+#     "cmd",
+#     {
+# Use perl with /g to extract all matches (works across multiline reformatting)
+# Quote style support: double-quote ("), single-quote ('), backtick (`) - must match open/close
+# NOTE: This is text-based extraction, not an AST parser; comments/dead-code may produce false results in either direction; command names containing embedded quote characters of a different type (e.g. single-quoted name with embedded double-quote) are also not correctly extracted
+cat "$EXT_FILE" | tr '\n' ' ' | tr -s ' ' ' ' | grep 'pi\.registerCommand' | perl -ne 'print "$2\n" while /pi\.registerCommand\s*\(\s*(["\x27`])([^"\x27`]*)\1/g' > "$TMPDIR/reg_commands.txt" || true
+
+echo "Doc commands found:"
+cat "$TMPDIR/doc_commands.txt"
+echo ""
+echo "Registered commands found:"
+cat "$TMPDIR/reg_commands.txt"
+echo ""
+
+# Check for doc commands without registration
+MISSING_REG=$(grep -vxFf "$TMPDIR/reg_commands.txt" "$TMPDIR/doc_commands.txt" 2>/dev/null || true)
+MISSING_DOC=$(grep -vxFf "$TMPDIR/doc_commands.txt" "$TMPDIR/reg_commands.txt" 2>/dev/null || true)
+
+if [[ -n "$MISSING_REG" ]] || [[ -n "$MISSING_DOC" ]]; then
+  if [[ -n "$MISSING_REG" ]]; then
+    echo "FAIL: Doc commands without registration:"
+    echo "$MISSING_REG"
+  fi
+  if [[ -n "$MISSING_DOC" ]]; then
+    echo "FAIL: Registered commands without doc:"
+    echo "$MISSING_DOC"
+  fi
+  exit 1
+fi
+
+echo "PASS: All doc/command pairs are symmetrically consistent"
+echo ""
+
 # Create test directory structure
 TEST_DIR=$(mktemp -d)
 PROJECT_DIR="$TEST_DIR/proj"
