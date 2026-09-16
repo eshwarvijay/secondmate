@@ -80,7 +80,7 @@ This is the spec the maker receives.
 - **Complex** (needs judgment mid-task, MCP tools, ambiguous sub-steps) → Claude maker:
   After step 2 Spawn creates `<wt>`, start the Claude maker directly on the root_pane from `herdr worktree create`:
   ```bash
-  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits || { echo "herdr agent start failed — abort" >&2; exit 1; }
+  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
 ## Known failure patterns — DO NOT SKIP
@@ -357,7 +357,7 @@ headless path). Every split uses `--no-focus` so the captain's focus never moves
 
 - **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
-  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode acceptEdits || { echo "herdr agent start failed — abort" >&2; exit 1; }
+  herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
 ## Known failure patterns — DO NOT SKIP
