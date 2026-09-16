@@ -176,6 +176,7 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      `loop-guard.sh reset` on a new task or human interjection.
 
 4. **Check** — after the maker commits, trim bulky logs then run the cross-model checker:
+   - **Strict rule: when `HERDR_ENV=1`, the checker MUST run in a visible herdr pane — headless is prohibited.** Use the "Checker pane" recipe under "Visible orchestration in herdr" below, not the plain invocation shown in this step. The plain `launch-checker.sh` call below is ONLY for when `HERDR_ENV` is not `1`, or `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` fails.
    - `${CLAUDE_PLUGIN_ROOT}/bin/prune-output.sh` on big command output before feeding it in.
    - `${CLAUDE_PLUGIN_ROOT}/bin/launch-checker.sh --addendum-text "TASK/SPEC/HAMMER/INVARIANTS ..." --diff-base <base-ref> --repo <wt> --live-text "<what changed this round + what to focus on>" -- -p "review the change described in the LIVE block"`
      — edit-locked (`--exclude-tools edit,write`), verdict-envelope injected automatically. **Layered, freshest LAST:** (1) static
@@ -350,10 +351,11 @@ apart from one that is merely slow — is a separate, deferred future task, not 
 
 ## Visible orchestration in herdr (when HERDR_ENV=1)
 
-By default the maker and checker run headless (in-process sub-agent + background scripts) — the captain can't
-watch them. Inside herdr, run the loop in VISIBLE side-by-side panes. You stay in your pane and drive the
-others via the herdr CLI. First check: `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` (if it fails, use the
-headless path). Every split uses `--no-focus` so the captain's focus never moves.
+**Strict rule: whenever `HERDR_ENV=1`, the checker MUST run in a visible pane — headless checker execution is
+prohibited in that case**, not just an optional alternative (see step 4's "Check" section above). The maker
+runs directly on the worktree's root_pane the same way. You stay in your pane and drive the others via the
+herdr CLI. First check: `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` (if it fails — and only then — fall
+back to the headless path). Every split uses `--no-focus` so the captain's focus never moves.
 
 - **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
