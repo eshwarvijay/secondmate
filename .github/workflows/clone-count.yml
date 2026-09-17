@@ -1,0 +1,63 @@
+name: clone-count
+
+# GitHub only keeps 14 days of clone traffic. This merges the API response
+# into a persisted history file so the total keeps accumulating. Runs weekly:
+# safe because 7-day cadence < 14-day window, so no day is ever missed.
+on:
+  schedule:
+    - cron: "17 3 * * 1"   # weekly, Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clone-count
+  cancel-in-progress: false
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Merge clone traffic into history
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh api "repos/${{ github.repository }}/traffic/clones" \
+            --jq '[.clones[] | select(.count>0) | {key: .timestamp[0:10], value: .count}] | from_entries' > fresh.json
+
+          # merge: fresh wins for overlapping days (it's the authoritative recent count)
+          jq -s '.[0] * .[1]' .github/clone-history.json fresh.json > merged.json
+          mv merged.json .github/clone-history.json
+          rm fresh.json
+
+          total=$(jq 'add // 0' .github/clone-history.json)
+          echo "Total clones: $total"
+          jq -n --arg t "$total" \
+            '{schemaVersion:1, label:"clones", message:$t, color:"6E56CF"}' \
+            > .github/badge-clones.json
+
+      - name: Render chart
+        run: python3 .github/make-chart.py .github/clone-history.json .github/clones-chart.svg
+
+      - name: Bump chart cache-buster in README
+        run: |
+          set -euo pipefail
+
+          # GitHub's image proxy caches by URL, so bump ?v=N to force a re-fetch.
+          v=$(grep -oE 'clones-chart\.svg\?v=[0-9]+' README.md | grep -oE '[0-9]+$' | head -1)
+          sed -i "s/clones-chart\.svg?v=$v/clones-chart.svg?v=$((v+1))/" README.md
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/clone-history.json .github/badge-clones.json .github/clones-chart.svg README.md
+          git commit -m "chore: update clone count" || echo "no changes"
+          git push
