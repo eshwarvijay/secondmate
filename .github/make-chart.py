@@ -64,10 +64,11 @@ def build_svg(history: dict) -> str:
         running += history[d]
         cum.append(running)
 
-    total = running or 1
+    total = running          # actual cumulative total, used for the displayed label
+    denom = total or 1       # division-safe denominator for y-axis scaling only
     n = len(cum)
     x = lambda i: PAD_L + (PLOT_W * i / (n - 1) if n > 1 else PLOT_W / 2)
-    y = lambda v: PAD_T + PLOT_H - PLOT_H * v / total
+    y = lambda v: PAD_T + PLOT_H - PLOT_H * v / denom
     pts = [(x(i), y(v)) for i, v in enumerate(cum)]
     path = _smooth(pts)
     area = f"{path} L {pts[-1][0]:.1f},{BASE} L {pts[0][0]:.1f},{BASE} Z"
@@ -114,6 +115,8 @@ def selftest():
     assert "no downloads recorded yet" in empty, empty
     assert f'width="{W}" height="{H}"' in empty, empty
     assert ">0<" in empty, empty
+    zero_day = build_svg({"2026-06-24": 0})
+    assert ">0<" in zero_day and ">1<" not in zero_day, zero_day  # real total is 0, not the div-guard's 1
     print("ok")
 
 
