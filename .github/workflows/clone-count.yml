@@ -22,8 +22,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Merge clone traffic into history
+        # NOTE: GITHUB_TOKEN/github.token CANNOT access the Traffic API family under any
+        # permissions configuration. Directly tested against eshwarvijay/secondmate: failed with
+        # 'Resource not accessible by integration (HTTP 403)' BOTH before AND after setting
+        # default_workflow_permissions to write. This is a known GitHub platform limitation.
+        # Use a real personal access token (PAT) with sufficient access:
+        # - Classic PAT: requires 'repo' scope
+        # - Fine-grained PAT: requires 'Administration: Read-only' permission (NOT 'Contents: Read')
+        # Set once per repository: gh secret set TRAFFIC_PAT --repo eshwarvijay/secondmate
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.TRAFFIC_PAT }}
         run: |
           set -euo pipefail
 
