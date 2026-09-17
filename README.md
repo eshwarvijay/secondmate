@@ -13,6 +13,11 @@
   <img src="https://img.shields.io/badge/version-0.1.22-4C8BF5?style=flat-square" alt="version 0.1.22" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
+  <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/clones-chart.svg?v=1" alt="plugin downloads over time" width="600">
 </p>
 
 ---

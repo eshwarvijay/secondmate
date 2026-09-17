@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="260" viewBox="0 0 760 260" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">
+  <defs>
+    <linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5436DA" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#5436DA" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7a5cff"/>
+      <stop offset="1" stop-color="#5436DA"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="760" height="260" rx="14" fill="#faf9ff"/>
+  <text x="52" y="24" font-size="14" font-weight="700" fill="#1b1240">plugin downloads</text>
+  <line x1="52" y1="220" x2="704" y2="220" stroke="#8a8aa0" stroke-opacity="0.18" stroke-dasharray="3 4"/>
+  <text x="42" y="224" text-anchor="end" font-size="11" fill="#8a8aa0">0</text>
+  <text x="380.0" y="132.0" text-anchor="middle" font-size="13" fill="#8a8aa0">no downloads recorded yet</text>
+  <text x="696.0" y="210.0" text-anchor="end" font-size="15" font-weight="800" fill="#5436DA">0</text>
+</svg>
