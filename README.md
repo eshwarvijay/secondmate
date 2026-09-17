@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/clones-chart.svg?v=1" alt="plugin downloads over time" width="600">
+  <img src="https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/clones-chart.svg?v=2" alt="plugin downloads over time" width="600">
 </p>
 
 ---

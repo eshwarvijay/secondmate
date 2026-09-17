@@ -11,8 +11,12 @@
   </defs>
   <rect x="0" y="0" width="760" height="260" rx="14" fill="#faf9ff"/>
   <text x="52" y="24" font-size="14" font-weight="700" fill="#1b1240">plugin downloads</text>
-  <line x1="52" y1="220" x2="704" y2="220" stroke="#8a8aa0" stroke-opacity="0.18" stroke-dasharray="3 4"/>
-  <text x="42" y="224" text-anchor="end" font-size="11" fill="#8a8aa0">0</text>
-  <text x="380.0" y="132.0" text-anchor="middle" font-size="13" fill="#8a8aa0">no downloads recorded yet</text>
-  <text x="696.0" y="210.0" text-anchor="end" font-size="15" font-weight="800" fill="#5436DA">0</text>
+  <line x1="52" y1="132.0" x2="704" y2="132.0" stroke="#8a8aa0" stroke-opacity="0.18" stroke-dasharray="3 4"/><text x="42" y="136.0" text-anchor="end" font-size="11" fill="#8a8aa0">385</text><line x1="52" y1="44.0" x2="704" y2="44.0" stroke="#8a8aa0" stroke-opacity="0.18" stroke-dasharray="3 4"/><text x="42" y="48.0" text-anchor="end" font-size="11" fill="#8a8aa0">770</text>
+  <text x="52" y="246" font-size="11" fill="#8a8aa0">2026-09-03</text>
+  <text x="704" y="246" text-anchor="end" font-size="11" fill="#8a8aa0">2026-09-16</text>
+  <path d="M 52.0,220.0 C 59.8,218.9 83.0,215.6 98.6,213.1 C 114.1,210.7 129.6,208.1 145.1,205.4 C 160.7,202.6 176.2,199.4 191.7,196.7 C 207.2,193.9 222.8,193.8 238.3,188.9 C 253.8,184.0 269.3,174.4 284.9,167.4 C 300.4,160.5 315.9,152.2 331.4,147.1 C 347.0,142.0 362.5,141.7 378.0,136.8 C 393.5,131.9 409.0,124.2 424.6,117.6 C 440.1,111.0 455.6,103.0 471.1,97.5 C 486.7,92.0 502.2,88.7 517.7,84.7 C 533.2,80.7 548.8,76.7 564.3,73.5 C 579.8,70.3 595.3,68.1 610.9,65.5 C 626.4,62.9 641.9,61.5 657.4,57.9 C 673.0,54.4 696.2,46.3 704.0,44.0 L 704.0,220 L 52.0,220 Z" fill="url(#area)"/>
+  <path d="M 52.0,220.0 C 59.8,218.9 83.0,215.6 98.6,213.1 C 114.1,210.7 129.6,208.1 145.1,205.4 C 160.7,202.6 176.2,199.4 191.7,196.7 C 207.2,193.9 222.8,193.8 238.3,188.9 C 253.8,184.0 269.3,174.4 284.9,167.4 C 300.4,160.5 315.9,152.2 331.4,147.1 C 347.0,142.0 362.5,141.7 378.0,136.8 C 393.5,131.9 409.0,124.2 424.6,117.6 C 440.1,111.0 455.6,103.0 471.1,97.5 C 486.7,92.0 502.2,88.7 517.7,84.7 C 533.2,80.7 548.8,76.7 564.3,73.5 C 579.8,70.3 595.3,68.1 610.9,65.5 C 626.4,62.9 641.9,61.5 657.4,57.9 C 673.0,54.4 696.2,46.3 704.0,44.0" fill="none" stroke="url(#stroke)" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="704.0" cy="44.0" r="6" fill="#5436DA" fill-opacity="0.18"/>
+  <circle cx="704.0" cy="44.0" r="3.5" fill="#5436DA"/>
+  <text x="696.0" y="34.0" text-anchor="end" font-size="15" font-weight="800" fill="#5436DA">770</text>
 </svg>
