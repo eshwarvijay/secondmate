@@ -282,7 +282,12 @@ run 2 now and queue the rest for the next round. Each of the (at most 2) tool-us
 **FRESH** sub-agent — never `fork`. `fork` inherits the dispatcher's own conversation context, which is
 wrong here: each sub-supervisor must reach its own triage/routing/verdict judgment calls from a clean,
 unpolluted context with its own autonomous Bash/herdr access, not one contaminated by a sibling task's
-planning, findings, or in-flight state.
+planning, findings, or in-flight state. **Name each Agent-tool call `sm-<task-id>`** — never leave `name`
+unset, which defaults to a generic, indistinguishable label (e.g. just the subagent_type). This outer,
+dispatcher-level name is distinct from step (b) below's inner maker naming (`sm-<task-id>`/`sm-pi-<task-id>`),
+which is decided later once the sub-supervisor itself routes to a maker — use plain `sm-<task-id>` here
+regardless of which maker that sub-supervisor ends up choosing internally. The name is also the handle used
+to resume a sub-supervisor later via `SendMessage` (passing it as the `to` field) once its hold is answered.
 
 **Each sub-supervisor's prompt must instruct it to, in this order:**
 
