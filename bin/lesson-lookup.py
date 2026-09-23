@@ -33,22 +33,48 @@ def parse_frontmatter(content):
     body = content[end_marker + 5:]  # skip '\n---\n' and leading newline in body
     
     fm = {}
-    for line in frontmatter_text.splitlines():
-        line = line.strip()
+    lines = frontmatter_text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
         if not line or ':' not in line:
+            i += 1
             continue
         key, _, value = line.partition(':')
         key = key.strip()
         value = value.strip()
         
         if key == 'tags':
-            # Handle comma-separated or bracketed list
-            value = value.strip('[]').strip()
-            if value.startswith('"') or value.startswith("'"):
-                # Quoted list - simple parse
-                tags = re.findall(r'["\']([^"\']+)["\']', value)
+            # Check if this is a multi-line YAML list (value is empty, next lines are '- item')
+            if not value:
+                tags = []
+                i += 1
+                # Collect subsequent indented dash-prefixed lines
+                while i < len(lines):
+                    tag_line = lines[i]
+                    stripped = tag_line.strip()
+                    # Match '  - <tag>' or '- <tag>' patterns
+                    if stripped.startswith('- '):
+                        tag_value = stripped[2:].strip()
+                        if tag_value:
+                            tags.append(tag_value)
+                        i += 1
+                    elif stripped == '':
+                        i += 1
+                    else:
+                        # Not a tag line, stop collecting
+                        break
+                fm['tags'] = tags
+                # Don't do i += 1 at the end of outer loop - already done in inner
+                continue
             else:
-                tags = [t.strip() for t in value.split(',') if t.strip()]
+                # Handle comma-separated or bracketed list
+                value = value.strip('[]').strip()
+                if value.startswith('"') or value.startswith("'"):
+                    # Quoted list - simple parse
+                    tags = re.findall(r'["\']([^"\']+)["\']', value)
+                else:
+                    tags = [t.strip() for t in value.split(',') if t.strip()]
             fm['tags'] = tags
         elif key == 'evidence':
             fm['evidence'] = value.upper()
@@ -57,6 +83,7 @@ def parse_frontmatter(content):
         else:
             # Simple string value
             fm[key] = value
+        i += 1
     
     return fm, body
 
@@ -369,6 +396,73 @@ This is valid.
         assert output.startswith('## Known failure patterns — DO NOT SKIP'), f"Should get fallback header:\n{output[:100]}"
         assert 'git commit' in output, f"Should contain original content:\n{output}"
     
+    # Test 5: Tag-based scoring beats body-text when body is identical but tags differ
+    def test_tag_scoring_beats_body():
+        """Test that tag-based scoring works when body text is identical but tags differ."""
+        tmpdir = tempfile.mkdtemp(prefix='lesson-selfcheck-')
+        try:
+            # Two non-E4 lessons with IDENTICAL body text but DIFFERENT tags
+            # The lesson with matching tags should rank higher
+            generic_body = """This lesson has generic content and should be scored based on tags, not body text."""
+            
+            # This lesson has 'testing' in tags
+            with_tags = f"""---
+tags:
+  - testing
+  - specific
+evidence: E0
+earned-in: test
+---
+{generic_body}
+"""
+            (pathlib.Path(tmpdir) / 'with-tags.md').write_text(with_tags)
+            
+            # This lesson has 'unrelated' in tags (no overlap with task)
+            without_tags = f"""---
+tags:
+  - unrelated
+  - generic
+evidence: E0
+earned-in: test
+---
+{generic_body}
+"""
+            (pathlib.Path(tmpdir) / 'without-tags.md').write_text(without_tags)
+            
+            # Also add one E4 to ensure it's included
+            e4_lesson = """---
+tags:
+  - maker
+evidence: E4
+earned-in: test
+---
+This is an E4 lesson that must always appear.
+"""
+            (pathlib.Path(tmpdir) / 'e4.md').write_text(e4_lesson)
+            
+            os.environ['SM_LESSONS_DIR'] = tmpdir
+            
+            out = io.StringIO()
+            with redirect_stdout(out):
+                sys.argv = ['lesson-lookup.py', '--task', 'testing and regression issues']
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            output = out.getvalue()
+            
+            # Both non-E4 lessons should be present (cap not reached)
+            assert 'generic content' in output, f"Lessons should be in output:\n{output}"
+            # The lesson with 'testing' tag should be ranked higher
+            # Verify the tagged one appears before the untaged one (by position in output)
+            tagged_pos = output.find('specific')
+            untagged_pos = output.find('generic')
+            assert tagged_pos < untagged_pos, f"Tagged lesson should rank higher than untagged:\n{output}"
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+    
     # Run all tests
     import os, io
     from contextlib import redirect_stdout, redirect_stderr
@@ -399,6 +493,11 @@ This is valid.
             assert fm is not None, f"Failed to parse frontmatter in {fpath}"
             assert fm.get('evidence') == 'E4', f"Expected E4 evidence in {fpath}, got {fm.get('evidence')}"
             assert fm.get('earned-in') == 'seed', f"Expected 'seed' earned-in in {fpath}, got {fm.get('earned-in')}"
+            # CRITICAL: Assert tags are NOT empty (this test catches the bug we fixed)
+            tags = fm.get('tags', [])
+            assert len(tags) > 0, f"Tags should not be empty in {fpath}, got {tags}"
+            # At least one tag should be a known category or related tag
+            assert any(t in tags for t in ['maker', 'debugging', 'testing', 'workflow', 'scope', 'focus']), f"Expected at least one known tag in {fpath}, got {tags}"
     
     test_real_seed_files()
     
