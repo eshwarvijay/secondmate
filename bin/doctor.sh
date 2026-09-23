@@ -194,7 +194,8 @@ if not isinstance(override, dict):
     sys.exit(1)
 
 max_tokens = override.get('maxTokens')
-if not isinstance(max_tokens, (int, float)):
+# Finding 1 fix: explicitly exclude bool (Python's bool is subclass of int)
+if not isinstance(max_tokens, (int, float)) or isinstance(max_tokens, bool):
     sys.exit(1)
 
 if max_tokens > threshold:
@@ -247,7 +248,8 @@ for entry in models:
         continue
     if entry.get('id') == model_id:
         max_tokens = entry.get('maxTokens')
-        if isinstance(max_tokens, (int, float)) and max_tokens <= threshold:
+        # Finding 1 fix: explicitly exclude bool (Python's bool is subclass of int)
+        if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens <= threshold:
             sys.exit(0)
         sys.exit(1)
 
@@ -3073,6 +3075,60 @@ if not found:
     sys.exit(1)
 "
   [ $? -eq 0 ] || { echo "FAIL: Test P8 deepseek-r1 not created correctly after heal --yes"; rm -rf "$d"; exit 1; }
+  
+  rm -rf "$d"
+
+  # Test P9: test for round-2 Finding 1 (fresh HOME/no-.pi-directory) regression
+  # Fix: create a COMPLETELY fresh temp HOME with NO .pi directory at all,
+  # run doctor.sh --heal --yes, assert both kimi-k3 and deepseek-r1 entries were created
+  # This tests the os.makedirs fix from round 2 that creates the parent directory
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  # DO NOT mkdir -p $d/.pi/agent - that's the exact bug fixture!
+  
+  home_backup="$HOME"
+  HOME="$d"
+  # Run doctor.sh --heal --yes against completely fresh HOME (no .pi directory)
+  out=$("$script_abs" --heal --yes 2>&1)
+  HOME="$home_backup"
+  
+  # Both fixes should have succeeded
+  echo "$out" | grep -q "kimi-k3 Bedrock override fixed" || { echo "FAIL: Test P9 heal --yes didn't fix kimi-k3, output: $out"; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q "deepseek-r1 Bedrock override fixed" || { echo "FAIL: Test P9 heal --yes didn't fix deepseek-r1, output: $out"; rm -rf "$d"; exit 1; }
+  
+  # Verify kimi-k3 maxTokens was corrected to safe target (120000)
+  python3 -c "
+import json
+data = json.load(open('$j'))
+val = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {}).get('maxTokens')
+if val != 120000:
+    print(f'FAIL: Test P9 expected kimi-k3 maxTokens=120000, got {val}')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P9 kimi-k3 not corrected after heal --yes"; rm -rf "$d"; exit 1; }
+  
+  # Verify deepseek-r1 entry was created in models[]
+  python3 -c "
+import json
+data = json.load(open('$j'))
+models = data.get('providers', {}).get('amazon-bedrock', {}).get('models', [])
+if not isinstance(models, list):
+    print('FAIL: Test P9 expected models array')
+    sys.exit(1)
+found = False
+for entry in models:
+    if isinstance(entry, dict) and entry.get('id') == 'us.deepseek.r1-v1:0':
+        maxTokens = entry.get('maxTokens')
+        if not isinstance(maxTokens, (int, float)) or maxTokens > 32768:
+            print(f'FAIL: Test P9 expected deepseek-r1 maxTokens<=32768, got {maxTokens}')
+            sys.exit(1)
+        found = True
+        break
+if not found:
+    print('FAIL: Test P9 expected deepseek-r1 entry in models[]')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P9 deepseek-r1 not created correctly after heal --yes"; rm -rf "$d"; exit 1; }
   
   rm -rf "$d"
 
