@@ -3348,6 +3348,59 @@ if not found:
   
   rm -rf "$d"
 
+  # Test P12: regression test for round-6/7 apostrophe-in-HOME-path fix
+  d="$(mktemp -d)/apos'''home"
+  mkdir -p "$d/.pi/agent"
+  j="$d/.pi/agent/models.json"
+  P12_JSON_PATH="$j" python3 -c "
+import json, os
+jp = os.environ['P12_JSON_PATH']
+data = {
+    'providers': {
+        'amazon-bedrock': {
+            'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 200000}},
+            'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 50000}]
+        }
+    }
+}
+with open(jp, 'w') as f:
+    json.dump(data, f)
+"
+  home_backup="$HOME"
+  HOME="$d"
+  out=$("$script_abs" --heal --yes 2>&1)
+  HOME="$home_backup"
+  echo "$out" | grep -q "kimi-k3 Bedrock override fixed" || { echo "FAIL: Test P12 heal didn't fix kimi-k3, output: $out"; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q "deepseek-r1 Bedrock override fixed" || { echo "FAIL: Test P12 heal didn't fix deepseek-r1, output: $out"; rm -rf "$d"; exit 1; }
+  P12_JSON_PATH="$j" python3 -c "
+import json, os, sys
+jp = os.environ['P12_JSON_PATH']
+data = json.load(open(jp))
+val = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {}).get('maxTokens')
+if val != 120000:
+    print(f'FAIL: Test P12 expected kimi-k3 maxTokens=120000, got {val}')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P12 kimi-k3 not correctly fixed"; rm -rf "$d"; exit 1; }
+  P12_JSON_PATH="$j" python3 -c "
+import json, os, sys
+jp = os.environ['P12_JSON_PATH']
+data = json.load(open(jp))
+models = data.get('providers', {}).get('amazon-bedrock', {}).get('models', [])
+for entry in models:
+    if isinstance(entry, dict) and entry.get('id') == 'us.deepseek.r1-v1:0':
+        val = entry.get('maxTokens')
+        if val != 30000:
+            print(f'FAIL: Test P12 expected deepseek-r1 maxTokens=30000, got {val}')
+            sys.exit(1)
+        break
+else:
+    print('FAIL: Test P12 deepseek-r1 entry not found')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P12 deepseek-r1 not correctly fixed"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
   echo ok; exit 0
 fi
 
