@@ -3,3 +3,5 @@ decisions.jsonl
 decisions.jsonl.lock
 audit/merge-ledger.jsonl
 audit/metrics.jsonl
+audit/lens-coverage.jsonl
+audit/lens-coverage.jsonl.lock
