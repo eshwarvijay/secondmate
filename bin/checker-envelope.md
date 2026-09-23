@@ -4,15 +4,22 @@
 End every review with a fenced JSON block, on its own, as the final output:
 
 ```json
-{"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"..."}
+{"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"...","lens_coverage":{"...":true,...}}
 ```
 
 - `verdict`: `pass` = no CONFIRMED defects; `fail` = at least one CONFIRMED defect;
   `refused` = you could not review (out of scope, missing input, denied action);
   `error` = a tool/environment failure stopped you.
 - `findings`: terse one-line CONFIRMED/SUSPECTED items with file:line and the concrete
-  triggering input; empty array if none.
+  triggering input; empty array if none. **ENFORCED**: every `fail` verdict's findings must
+  either (a) contain a `file:line` token (e.g., `file.py:42` or `file.py:42,99`), or (b) use the
+  explicit escape hatch `[NOLOC]` for a genuinely location‑less finding. An empty findings
+  array on a `fail` verdict is invalid.
 - `diagnostic`: any environment/tool failure detail, kept SEPARATE from findings; "" if none.
+- `lens_coverage`: **OPTIONAL** additive field listing which lenses you exercised. When
+  one or more lenses were injected for this review (you are told their exact names),
+  include `"lens_coverage": {"<lens‑name>": true, ...}` reporting every lens you
+  considered. Its absence is fine when no lenses were used.
 
 The supervisor branches on `verdict` mechanically, so it must be exact, valid JSON, and last.
 

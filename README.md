@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.27-4C8BF5?style=flat-square" alt="version 0.1.27" />
+  <img src="https://img.shields.io/badge/version-0.1.28-4C8BF5?style=flat-square" alt="version 0.1.28" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -93,7 +93,7 @@ flowchart LR
 | `bin/verify-gate.sh` | Pre-integration gate: clean tree, non-empty diff, **exact-SHA** match, tests |
 | `bin/merge-sequencer.sh` | Serializes concurrent merges to `main` from multiple independent sub-agent-supervisors finishing around the same time: validates **`--worktree` is an ACTUAL linked worktree of `--repo`** (matching `git-common-dir`, resolved via `pwd -P`) before doing anything else, refusing an independent/stale clone that could otherwise pass `verify-gate.sh`'s freshness check against its own stale local refs while the real merge lands somewhere else entirely → mkdir-based singleton lock **anchored to `--repo` by default** (`<repo>/.secondmate/merge-sequencer.lock`, bounded wait, no auto-steal) — not to the calling process's own ambient CWD, since a sub-agent-supervisor's natural CWD is its own worktree, not `--repo` — → re-invokes `bin/verify-gate.sh` **fresh, inside the lock** immediately before merging (the actual freshness guarantee — the lock is ordering/UX, not correctness) → checks **`--branch` itself resolves to exactly `--checked-sha`** (verify-gate.sh only vouches for `--worktree`'s HEAD, not for whatever string `--branch` happens to be — refuses `BRANCH_MISMATCH` otherwise) → checks `$repo` isn't already mid an unrelated in-progress merge or dirty for a reason this invocation didn't cause (refuses before ever touching it, never calls `merge --abort` on a conflict it didn't start; **the dirty-check excludes the EXACT paths of both self-created artifacts (its own lock directory AND ledger file), never a basename match**, so neither self-created artifact ever trips its own guard, and a genuinely unrelated same-named path elsewhere in the repo still correctly refuses) → `git merge --no-ff` in the primary checkout → `git push origin <base>` still inside the same lock (no out-of-order-push race) → releases. One clean, non-retrying exit per outcome (`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`/`SUCCESS`), each appended to `<repo>/audit/merge-ledger.jsonl` (a ledger-write failure never fails an otherwise-successful merge -- it prints a loud stderr `WARNING` naming the ledger path instead of silently vanishing) |
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract; streams pi's `--mode json` output through `checker-progress.py` for live progress visibility |
-| `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused |
+| `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused·ambiguous; with `--lenses <list>` cross-checks lens coverage; enforces findings validation for `fail` verdicts (must have file:line or `[NOLOC]`) |
 | `bin/dispatch-report.py` | Parses a sub-supervisor's final output for the fan-out pattern below — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line so a tag echoed mid-prose (e.g. from the sub-supervisor's own instructions) can't be mistaken for the real signal; last matching line wins → exit `0` done / `1` refused / `2` stuck / `3` no tag found (its own, more-cautious-than-stuck code) |
 | `bin/checker-progress.py` | Filter pi's `--mode json` output: prints one progress line per tool execution to stderr (live activity), extracts final assistant message text from `agent_end` and writes to stdout (exactly as `--mode text` would); handles malformed JSON lines gracefully; preserves exit code propagation via pipefail
 | `bin/loop-guard.sh` | Stuck-loop abort + per-run round cap + global spawn cap |
@@ -195,6 +195,7 @@ credentials only you can supply.
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
 | `SM_MERGE_LEDGER` | `<repo>/audit/merge-ledger.jsonl` | append-only per-attempt merge ledger written by `bin/merge-sequencer.sh` (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`); like the lock, anchored to `--repo` by default so every caller targeting the same `--repo` writes to the same ledger |
+| `SM_LENS_COVERAGE_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `audit/lens-coverage.jsonl` -- the common-dir's parent when its own basename is `.git` (a normal repo/worktree), else the common-dir itself (a bare repo or a submodule) | lens-coverage ledger written by `bin/verdict.py` when `--lenses` is used, shared across every worktree of the same repo |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 
@@ -219,7 +220,8 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
   && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
   && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
-  && bin/dispatch-report.py selfcheck && bin/lesson-lookup.py selfcheck \
+  && bin/dispatch-report.py selfcheck && bin/launch-checker.sh --selfcheck \
+  && bin/lesson-lookup.py selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```
