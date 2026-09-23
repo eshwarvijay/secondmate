@@ -406,8 +406,8 @@ if not isinstance(models, list):
     bedrock['models'] = []
     models = bedrock['models']
 
-# Build the correct entry for deepseek-r1
-# Note: baseUrl is hardcoded to us-east-1 - this is the universal baseUrl for ALL Bedrock models per pi's own bundled catalog
+# Fix Finding: MERGE canonical fields into existing entry (don't replace the whole object)
+# Preserve any custom fields a user might have added
 new_entry = {
     'id': model_id,
     'api': 'bedrock-converse-stream',
@@ -418,16 +418,18 @@ new_entry = {
     'maxTokens': safe_target
 }
 
-# Replace existing entry with same id, or append if not present
+# Look for existing entry with the same id
 found = False
-for i, entry in enumerate(models):
+for entry in models:
     if isinstance(entry, dict) and entry.get('id') == model_id:
-        models[i] = new_entry
+        # Merge canonical fields into existing entry, preserving custom keys
+        entry.update(new_entry)
         found = True
         break
 
+# If no existing entry found, append the canonical new entry
 if not found:
-    models.append(new_entry)
+    models.append(dict(new_entry))  # dict() to copy
 
 # Validate the JSON is still valid
 json.dumps(data)
@@ -3223,6 +3225,74 @@ print('NOT_FOUND')
     
     [ "$status" = "MISSING" ] || { echo "FAIL: Test P10 with maxTokens=$invalid_val expected MISSING, got $status"; rm -rf "$d"; exit 1; }
   done
+  rm -rf "$d"
+
+  # Test P11: _bedrock_fix_deepseek_r1 preserves custom fields (round 5 finding)
+  # Before fix: full object replacement destroyed any custom keys
+  # After fix: merge preserves custom keys like 'customKey': 'must-survive'
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  
+  # Create deepseek-r1 entry with wrong maxTokens and a custom field
+  python3 -c "
+import json
+data = {
+    'providers': {
+        'amazon-bedrock': {
+            'models': [{
+                'id': 'us.deepseek.r1-v1:0',
+                'maxTokens': 99999,  # wrong value
+                'customKey': 'must-survive',  # must be preserved
+                'api': 'custom-api',
+                'contextWindow': 128000
+            }]
+        }
+    }
+}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  
+  home_backup="$HOME"
+  HOME="$d"
+  out=$(SM_CHECKER_HARNESS=pi "$script_abs" --heal --yes 2>&1)
+  HOME="$home_backup"
+  
+  # Verify heal succeeded
+  echo "$out" | grep -q "deepseek-r1 Bedrock override fixed" || { echo "FAIL: Test P11 heal --yes didn't fix deepseek-r1, output: $out"; rm -rf "$d"; exit 1; }
+  
+  # Verify custom field survived
+  python3 -c "
+import json
+data = json.load(open('$j'))
+models = data.get('providers', {}).get('amazon-bedrock', {}).get('models', [])
+found = False
+for entry in models:
+    if isinstance(entry, dict) and entry.get('id') == 'us.deepseek.r1-v1:0':
+        # Verify canonical fields are correct
+        if entry.get('maxTokens') != 30000:
+            print(f'FAIL: Test P11 expected maxTokens=30000, got {entry.get(\"maxTokens\")}')
+            sys.exit(1)
+        # Verify custom field survived
+        if entry.get('customKey') != 'must-survive':
+            print(f'FAIL: Test P11 expected customKey=must-survive, got {entry.get(\"customKey\")}')
+            sys.exit(1)
+        # Verify other canonical fields are correct
+        if entry.get('api') != 'bedrock-converse-stream':
+            print(f'FAIL: Test P11 expected api=bedrock-converse-stream, got {entry.get(\"api\")}')
+            sys.exit(1)
+        if entry.get('baseUrl') != 'https://bedrock-runtime.us-east-1.amazonaws.com':
+            print(f'FAIL: Test P11 expected baseUrl, got {entry.get(\"baseUrl\")}')
+            sys.exit(1)
+        found = True
+        break
+if not found:
+    print('FAIL: Test P11 deepseek-r1 entry not found')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P11 deepseek-r1 custom field not preserved"; rm -rf "$d"; exit 1; }
+  
   rm -rf "$d"
 
   echo ok; exit 0
