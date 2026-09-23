@@ -319,6 +319,11 @@ json.dumps(data)
 
 # Write atomically: temp file, validate, then mv
 try:
+    # Finding 1 fix: create parent directory if it doesn't exist
+    temp_dir = os.path.dirname(temp_file)
+    if temp_dir:
+        os.makedirs(temp_dir, exist_ok=True)
+    
     with open(temp_file, 'w') as f:
         json.dump(data, f, indent=2)
     
@@ -416,6 +421,11 @@ json.dumps(data)
 
 # Write atomically: temp file, validate, then mv
 try:
+    # Finding 1 fix: create parent directory if it doesn't exist
+    temp_dir = os.path.dirname(temp_file)
+    if temp_dir:
+        os.makedirs(temp_dir, exist_ok=True)
+    
     with open(temp_file, 'w') as f:
         json.dump(data, f, indent=2)
     
@@ -1184,6 +1194,8 @@ heal() {
 
   # Handle Bedrock model override fixes (special case - need to parse the name for model type)
   _heal_bedrock_overrides "$yes"
+  heal_result=$?
+  [ "$heal_result" -ne 0 ] && heal_failed=1
   
   # Bug 4 fix: return failure if secondmate heal failed
   if [ "$heal_failed" -eq 1 ]; then
@@ -2932,14 +2944,16 @@ print('NOT_FOUND')
   rm -rf "$d"
 
   # Test P6: heal actually fixes a wrong value without destroying other content
+  # Finding 3 fix: add sibling keys (customName, contextWindow) to the override object
+  # to actually catch the 'whole-object-replace destroys sibling keys' bug
   d=$(mktemp -d)
   j="$d/.pi/agent/models.json"
   mkdir -p "$d/.pi/agent"
-  # Create models.json with wrong kimi-k3 value AND unrelated content that must be preserved
+  # Create models.json with wrong kimi-k3 value AND sibling keys that MUST be preserved
   python3 -c "
 import json
 data = {'other_provider': {'models': []}, 'providers': {'amazon-bedrock': {
-    'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 200000}},
+    'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 200000, 'customName': 'test-label', 'contextWindow': 999999}},
     'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000, 'api': 'bedrock-converse-stream', 'baseUrl': 'https://bedrock-runtime.us-east-1.amazonaws.com', 'name': 'DeepSeek R1', 'reasoning': True, 'contextWindow': 128000}]
 }}}
 with open('$j', 'w') as f:
@@ -2959,15 +2973,25 @@ with open('$j', 'w') as f:
   grep -q '"other_provider"' "$j" || { echo "FAIL: Test P6 unrelated content (other_provider) lost after heal"; rm -rf "$d"; exit 1; }
   
   # Verify kimi-k3 maxTokens was corrected to safe target (120000)
+  # AND sibling keys were preserved (Finding 3 fix: this catches the whole-object-replace bug)
   python3 -c "
 import json
 data = json.load(open('$j'))
-val = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {}).get('maxTokens')
-if val != 120000:
-    print(f'FAIL: Test P6 expected maxTokens=120000, got {val}')
+override = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {})
+maxTokens = override.get('maxTokens')
+customName = override.get('customName')
+contextWindow = override.get('contextWindow')
+if maxTokens != 120000:
+    print(f'FAIL: Test P6 expected maxTokens=120000, got {maxTokens}')
+    sys.exit(1)
+if customName != 'test-label':
+    print(f'FAIL: Test P6 expected customName=test-label preserved, got {customName}')
+    sys.exit(1)
+if contextWindow != 999999:
+    print(f'FAIL: Test P6 expected contextWindow=999999 preserved, got {contextWindow}')
     sys.exit(1)
 "
-  [ $? -eq 0 ] || { echo "FAIL: Test P6 kimi-k3 maxTokens not corrected"; rm -rf "$d"; exit 1; }
+  [ $? -eq 0 ] || { echo "FAIL: Test P6 kimi-k3 override not corrected or sibling keys lost"; rm -rf "$d"; exit 1; }
   
   rm -rf "$d"
 
@@ -3013,19 +3037,42 @@ with open('$j', 'w') as f:
   out=$("$script_abs" --heal --yes 2>&1)
   HOME="$home_backup"
   
-  # Verify heal happened
+  # Verify kimi-k3 heal happened
   echo "$out" | grep -q "kimi-k3 Bedrock override fixed" || { echo "FAIL: Test P8 heal --yes didn't fix kimi-k3, output: $out"; rm -rf "$d"; exit 1; }
   
-  # Verify file was updated
+  # Verify kimi-k3 file was updated
   python3 -c "
 import json
 data = json.load(open('$j'))
 val = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {}).get('maxTokens')
 if val != 120000:
-    print(f'FAIL: Test P8 expected maxTokens=120000 after heal, got {val}')
+    print(f'FAIL: Test P8 expected kimi-k3 maxTokens=120000 after heal, got {val}')
     sys.exit(1)
 "
   [ $? -eq 0 ] || { echo "FAIL: Test P8 kimi-k3 not corrected after heal --yes"; rm -rf "$d"; exit 1; }
+  
+  # Finding 3 fix: verify deepseek-r1 entry was also created correctly
+  python3 -c "
+import json
+data = json.load(open('$j'))
+models = data.get('providers', {}).get('amazon-bedrock', {}).get('models', [])
+if not isinstance(models, list):
+    print('FAIL: Test P8 expected models array')
+    sys.exit(1)
+found = False
+for entry in models:
+    if isinstance(entry, dict) and entry.get('id') == 'us.deepseek.r1-v1:0':
+        maxTokens = entry.get('maxTokens')
+        if not isinstance(maxTokens, (int, float)) or maxTokens > 32768:
+            print(f'FAIL: Test P8 expected deepseek-r1 maxTokens<=32768, got {maxTokens}')
+            sys.exit(1)
+        found = True
+        break
+if not found:
+    print('FAIL: Test P8 expected deepseek-r1 entry in models[]')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P8 deepseek-r1 not created correctly after heal --yes"; rm -rf "$d"; exit 1; }
   
   rm -rf "$d"
 
