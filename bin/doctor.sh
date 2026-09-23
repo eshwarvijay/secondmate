@@ -100,10 +100,13 @@ _reset_detect_state() {
 # --- Bedrock model override helpers ---
 # Extract model-id from PLANNERS array by label (pipe-delimited: label|dimension|model-id|thinking-level)
 # Usage: _bedrock_get_model_id "kimi-k3" -> outputs global.moonshotai.kimi-k3 or empty
+# Bug 3 fix: plan-committee.sh path is now overridable via SM_PLANCOMMITTEE_PATH env var
+# for test fixtures (matching the existing convention: SM_SECONDMATE_MARKETPLACE_DIR, etc.)
 _bedrock_get_model_id() {
   local label="$1"
+  # Bug 3 fix: default to real script_dir/plan-committee.sh but allow override via env var
   local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local source_file="$script_dir/plan-committee.sh"
+  local source_file="${SM_PLANCOMMITTEE_PATH:-$script_dir/plan-committee.sh}"
   
   if [ ! -f "$source_file" ]; then
     return 1
@@ -256,6 +259,9 @@ sys.exit(1)
 
 # Build safe JSON merge for kimi-k3 with atomic write
 # Usage: _bedrock_fix_kimi_k3 <json_path> <model_id> -> 0 on success
+# Fix: read the EXISTING per-model override object first (default to {} if absent or not a dict),
+# set only the maxTokens key on it, then assign that same object back — preserving any other keys already there
+# (Bug 1 fix: previous version REPLACED the whole object instead of merging into it)
 _bedrock_fix_kimi_k3() {
   local json_path="$1"
   local model_id="$2"
@@ -266,7 +272,6 @@ _bedrock_fix_kimi_k3() {
 import json
 import sys
 import os
-import tempfile
 
 json_path = '''$json_path'''
 model_id = '''$model_id'''
@@ -302,8 +307,12 @@ if not isinstance(model_overrides, dict):
     bedrock['modelOverrides'] = {}
     model_overrides = bedrock['modelOverrides']
 
-# Write the override
-model_overrides[model_id] = {'maxTokens': safe_target}
+# Bug 1 fix: read existing override object (default to {}), set only maxTokens, preserve all other keys
+existing_override = model_overrides.get(model_id, {})
+if not isinstance(existing_override, dict):
+    existing_override = {}
+existing_override['maxTokens'] = safe_target
+model_overrides[model_id] = existing_override
 
 # Validate the JSON is still valid
 json.dumps(data)
@@ -1162,6 +1171,9 @@ heal() {
     [ "$name" = "secondmate plugin (stale)" ] && continue
     [ "$name" = "secondmate plugin (silent drift)" ] && continue
     [ "$name" = "secondmate plugin (reload pending)" ] && continue
+    # Bug 2 fix: skip Bedrock rows here too - they are handled by bespoke _heal_bedrock_overrides
+    [ "$name" = "pi Bedrock override: kimi-k3" ] && continue
+    [ "$name" = "pi Bedrock override: deepseek-r1" ] && continue
     [ -z "$fix" ] && { echo "SKIP  $name — no known auto-fix; provide its source (see README) and set the matching SM_* var"; continue; }
     if [ "$yes" = 1 ]; then echo ">> healing $name: $fix"; bash -c "$fix" || echo "   (failed — do it manually: $fix)"
     else
@@ -2879,10 +2891,45 @@ with open('$j', 'w') as f:
   rm -rf "$d"
 
   # Test P5: malformed PLANNERS -> both rows UNKNOWN (not silent pass)
-  # This test is skipped because testing malformed PLANNERS would require
-  # copying and modifying the plan-committee.sh script, which is fragile and
-  # outside the scope of selfcheck.
-  echo "[SKIP] Test P5: malformed PLANNERS - skipped (would require script copy/patch)"
+  # Bug 3 fix: create a temp fixture file with malformed/missing PLANNERS, point at via SM_PLANCOMMITTEE_PATH
+  d=$(mktemp -d)
+  broken_script="$d/broken-plan.sh"
+  # Create a plan-committee.sh that has NO PLANNERS array at all (malformed from the parser's view)
+  cat > "$broken_script" << 'BROKEN_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+# No PLANNERS array - this is malformed
+PROVIDER="amazon-bedrock"
+BROKEN_EOF
+  
+  # Use --json to verify status is UNKNOWN (not MISSING, not silent pass)
+  SM_PLANCOMMITTEE_PATH="$broken_script" SM_CHECKER_HARNESS=pi "$script_abs" --json 2>/dev/null > "$d/report.json"
+  
+  # Check kimi-k3 is UNKNOWN
+  kimi_status=$(python3 -c "
+import json,sys
+data=json.load(open('$d/report.json'))
+for x in data:
+    if x['name']=='pi Bedrock override: kimi-k3':
+        print(x['status'])
+        sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+  [ "$kimi_status" = "UNKNOWN" ] || { echo "FAIL: Test P5 expected kimi-k3 UNKNOWN, got '$kimi_status'"; rm -rf "$d"; exit 1; }
+  
+  # Check deepseek-r1 is UNKNOWN
+  deepseek_status=$(python3 -c "
+import json,sys
+data=json.load(open('$d/report.json'))
+for x in data:
+    if x['name']=='pi Bedrock override: deepseek-r1':
+        print(x['status'])
+        sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+  [ "$deepseek_status" = "UNKNOWN" ] || { echo "FAIL: Test P5 expected deepseek-r1 UNKNOWN, got '$deepseek_status'"; rm -rf "$d"; exit 1; }
+  
+  rm -rf "$d"
 
   # Test P6: heal actually fixes a wrong value without destroying other content
   d=$(mktemp -d)
