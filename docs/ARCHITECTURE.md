@@ -73,7 +73,8 @@ Each stage exists to close a specific failure mode.
 
 0. **Plan Committee** *(runs unconditionally before triage for every task)*.
    `plan-committee.sh` spawns 6 headless pi planners in parallel (DeepSeek-R1, Qwen3-Next-80B,
-   Qwen3-Coder-Next, Kimi-K2-Thinking, Mistral-Large-3, GLM-5), each covering one dimension of the task.
+   Qwen3-Coder-Next, Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3),
+   Mistral-Large-3, GLM-5), each covering one dimension of the task.
    The supervisor also runs `/adhd` as a Claude sub-agent for rapid cognitive-frame divergence.
    All outputs land in `.secondmate/planning/`. Each planner is invoked in pi JSON mode and its final assistant text is extracted with multipart-aware parsing; known tool-call token dialects, unexpected content parts, empty output, and non-`stop` completion are rejected. A rejected response is retried once with a deliberately changed prompt; a successful retry is visibly marked as self-healed, while a second bad response preserves its raw text and fails the aggregate command. The directory records its task and refuses a different task's non-empty prior output rather than overwriting it. The supervisor reads the accepted outputs, synthesizes a single
    consolidated plan (with ponytail active — speculative ideas get cut), and routes to the right maker.

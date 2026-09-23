@@ -13,12 +13,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVIDER="${SM_COMMITTEE_PROVIDER:-amazon-bedrock}"
 
 # label|dimension|model-id|thinking-level
-# ponytail: thinking=high only for native reasoning models (R1, Kimi-K2), off for others
+# ponytail: thinking=high only for native reasoning models (R1, Kimi K3), off for others
 PLANNERS=(
   "deepseek-r1|Failure modes, edge cases, and what can go wrong|us.deepseek.r1-v1:0|high"
   "qwen3-80b|Technical architecture and system design trade-offs|qwen.qwen3-next-80b-a3b|off"
   "qwen3-coder|Implementation feasibility and concrete code path|qwen.qwen3-coder-next|off"
-  "kimi-k2|Holistic long-context risk and integration review|moonshot.kimi-k2-thinking|high"
+  "kimi-k3|Holistic long-context risk and integration review|global.moonshotai.kimi-k3|high"
   "mistral-large3|Security surface, adversarial gaps, and attack vectors|mistral.mistral-large-3-675b-instruct|off"
   "glm5|Structured requirements, product angle, and user-facing concerns|zai.glm-5|off"
 )
@@ -226,7 +226,7 @@ BODY
   printf '\nTASK:\n%s\n' "$1"
 }
 
-_prompt_kimi_k2() {
+_prompt_kimi_k3() {
   cat << 'BODY'
 IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
 
@@ -452,7 +452,7 @@ _planner_prompt() {
     deepseek-r1)    _prompt_deepseek_r1   "$task" ;;
     qwen3-80b)      _prompt_qwen3_80b     "$task" ;;
     qwen3-coder)    _prompt_qwen3_coder   "$task" ;;
-    kimi-k2)        _prompt_kimi_k2       "$task" ;;
+    kimi-k3)        _prompt_kimi_k3       "$task" ;;
     mistral-large3) _prompt_mistral_large3 "$task" ;;
     glm5)           _prompt_glm5          "$task" ;;
     *)              printf 'You are a planning agent. Analyze the task.\n\nTASK:\n%s\n' "$task" ;;
@@ -610,7 +610,7 @@ while [ $# -gt 0 ]; do case "$1" in
       deepseek-r1)    echo "Failure Scenarios|Most Dangerous Assumption|Severity | Justification" ;;
       qwen3-80b)      echo "Rabbit hole|Scorecard|Appetite" ;;
       qwen3-coder)    echo "Do Not Hand-Roll|Hardest Step|Error Handling Contract" ;;
-      kimi-k2)        echo "Integration Surface|Silent Changes|Rollback Assessment" ;;
+      kimi-k3)        echo "Integration Surface|Silent Changes|Rollback Assessment" ;;
       mistral-large3) echo "Attack Surface|Most Exploitable Vector|Design Controls" ;;
       glm5)           echo "Requirements Grading|Non-Goals|Success Metrics" ;;
     esac; }
@@ -628,9 +628,9 @@ while [ $# -gt 0 ]; do case "$1" in
     done
     "$SCRIPT_DIR/committee-output.py" --selfcheck >/dev/null || { echo "FAIL: committee-output real fixture classifier"; fails=1; }
     _qwen_prompt="$(_planner_prompt qwen3-coder test-task-xyz)"
-    _kimi_prompt="$(_planner_prompt kimi-k2 test-task-xyz)"
+    _kimi_prompt="$(_planner_prompt kimi-k3 test-task-xyz)"
     echo "$_qwen_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: qwen3-coder missing no-tools hardening"; fails=1; }
-    echo "$_kimi_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: kimi-k2 missing no-tools hardening"; fails=1; }
+    echo "$_kimi_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: kimi-k3 missing no-tools hardening"; fails=1; }
     # Exercise the actual launch/classify/retry path. The fake pi emits the captured qwen
     # failure on attempt one and clean JSON on the deliberately changed retry prompt.
     _ctmp="$(mktemp -d)"
@@ -641,7 +641,7 @@ while [ $# -gt 0 ]; do
   case "$1" in --model) model="$2"; shift 2;; -p) prompt="$2"; shift 2;; *) shift;; esac
 done
 echo "$model" >> "$FAKE_CALLS"
-if { [ "$model" = qwen.qwen3-coder-next ] && [ "${FAKE_CLEAN_QWEN:-}" != 1 ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; } || { [ "${FAKE_DUAL_BAD:-}" = 1 ] && { [ "$model" = moonshot.kimi-k2-thinking ] || [ "$model" = qwen.qwen3-coder-next ]; } && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
+if { [ "$model" = qwen.qwen3-coder-next ] && [ "${FAKE_CLEAN_QWEN:-}" != 1 ] && { [ "${FAKE_ALWAYS_BAD:-}" = 1 ] || [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; } || { [ "${FAKE_DUAL_BAD:-}" = 1 ] && { [ "$model" = global.moonshotai.kimi-k3 ] || [ "$model" = qwen.qwen3-coder-next ]; } && [[ "$prompt" != *"IMPORTANT RETRY:"* ]]; }; then
   text='I'"'"'ll analyze the bug in `bin/plan-committee.sh` by walking through its concrete implementation steps. Let me first examine the file and related code.
 
 <tool_call>
@@ -668,10 +668,10 @@ FAKEPI
     FAKE_CALLS="$_ctmp/calls-dual" FAKE_DUAL_BAD=1 PATH="$_ctmp:$PATH" "$0" --task dual-retry-fixture --out-dir "$_ctmp/dual" --timeout 30 >/dev/null 2>&1
     _src=$?
     [ "$_src" = 0 ] || { echo "FAIL: dual self-healed planner run exited $_src"; fails=1; }
-    for _model in moonshot.kimi-k2-thinking qwen.qwen3-coder-next; do
+    for _model in global.moonshotai.kimi-k3 qwen.qwen3-coder-next; do
       [ "$(grep -c "^$_model$" "$_ctmp/calls-dual" 2>/dev/null || true)" = 2 ] || { echo "FAIL: $_model did not retry exactly once in dual fixture"; fails=1; }
     done
-    [ -f "$_ctmp/dual/kimi-k2.md.healed" ] || { echo "FAIL: kimi-k2 was not marked healed in dual fixture"; fails=1; }
+    [ -f "$_ctmp/dual/kimi-k3.md.healed" ] || { echo "FAIL: kimi-k3 was not marked healed in dual fixture"; fails=1; }
     [ -f "$_ctmp/dual/qwen3-coder.md.healed" ] || { echo "FAIL: qwen3-coder was not marked healed in dual fixture"; fails=1; }
     for _model in us.deepseek.r1-v1:0 qwen.qwen3-next-80b-a3b mistral.mistral-large-3-675b-instruct zai.glm-5; do
       [ "$(grep -c "^$_model$" "$_ctmp/calls-dual" 2>/dev/null || true)" = 1 ] || { echo "FAIL: untouched $_model was not invoked exactly once in dual fixture"; fails=1; }
