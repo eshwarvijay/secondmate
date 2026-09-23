@@ -219,7 +219,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
   && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
   && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
-  && bin/dispatch-report.py selfcheck \
+  && bin/dispatch-report.py selfcheck && bin/lesson-lookup.py selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```

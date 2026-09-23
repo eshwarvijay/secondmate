@@ -489,6 +489,7 @@ This is an E4 lesson that must always appear.
     test_non_e4_scoring()
     test_malformed_skip()
     test_fallback_on_missing()
+    test_tag_scoring_beats_body()  # test that tag-based scoring beats filename tie-break
     
     # Test 5: All 4 real shipped seed files parse correctly and are evidence:E4
     def test_real_seed_files():
