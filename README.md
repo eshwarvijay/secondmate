@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.25-4C8BF5?style=flat-square" alt="version 0.1.25" />
+  <img src="https://img.shields.io/badge/version-0.1.26-4C8BF5?style=flat-square" alt="version 0.1.26" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -105,7 +105,7 @@ flowchart LR
 | `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the free-text `audit/flow.md`/`audit/decision.md` |
 | `bin/caffeinate-guard.sh` | Prevents macOS sleep during session execution via `start`/`stop` commands; session-scoped single guard process with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times); **accepted limitation: host-wide singleton = multiple concurrent sessions on same machine not supported** |
 | `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
-| `bin/doctor.sh` | Pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals. |
+| `bin/doctor.sh` | Pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects AWS Bedrock model-metadata overrides (kimi-k3, deepseek-r1 maxTokens values) for pi's local models.json and fixes them; detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals. |
 
 **Commands:** `/secondmate-doctor` · `/secondmate-reason` · `/secondmate-verify` · `/loop-task`
 
