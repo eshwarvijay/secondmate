@@ -90,18 +90,31 @@ def _valid_verdicts(text):
 
 def _finding_has_location(finding):
     """True if finding contains [NOLOC] or a real file:line token (e.g. file.py:42 or file.py:42,99).
-    A file:line token must not be a URL's host:port (e.g. https://bugs.example:443): the [^\\s:]+
-    path-matching group stops at the FIRST colon it meets, so for a scheme://host:port URL, the
-    scheme (e.g. 'https:') is consumed by its own failed match attempt and the real match starts
-    right at the '//' that follows -- verified empirically, every such match starts with '//',
-    while no legitimate relative file path ever does. Reject any candidate match starting with
-    '//'; a finding can still have a later, real file:line match after a leading URL and still
-    count as valid (the loop checks every candidate, not just the first)."""
+    Two structural exclusions rule out colon-number patterns that aren't real code locations,
+    without enumerating specific non-file strings (this repo's own 'generalize, don't enumerate'
+    lesson from the fix-plan-committee-tool-call task):
+      - A candidate starting with '//' is a URL's host:port, not a path (e.g. https://x:443 --
+        the [^\\s:]+ group stops at the scheme's own colon, so the actual match starts at the
+        '//' that follows -- verified empirically, every such match starts with '//', which no
+        real relative file path ever does).
+      - A candidate with no letters at all is a bare number pattern, not a path (e.g. a timestamp
+        '10:30' or a ratio '16:9' -- no real file path is purely numeric).
+    Accepted, deliberately unclosed gap: a domain/email-shaped string with letters and a port
+    (e.g. 'user@example.com:25') still passes this shape-only heuristic. This function checks
+    output SHAPE, not semantics, and is a quality heuristic on top of human supervisor review,
+    not a security boundary -- closing every conceivable non-file colon-number string requires
+    real semantic understanding this stdlib regex heuristic cannot have. A finding can still have
+    a later, real file:line match after an excluded candidate and count as valid (the loop checks
+    every candidate, not just the first)."""
     if "[NOLOC]" in finding:
         return True
     for m in re.finditer(r'[^\s:]+:\d+(?:,\d+)*', finding):
-        if not m.group(0).startswith("//"):
-            return True
+        path = m.group(0)
+        if path.startswith("//"):
+            continue  # URL host:port
+        if not re.search(r'[A-Za-z]', path):
+            continue  # purely numeric (timestamp, ratio, etc.), not a path
+        return True
     return False
 
 
@@ -270,6 +283,12 @@ def main(argv):
         assert rv('x\n```json\n{"verdict":"fail","findings":["https://bugs.example:443"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
         # ...but a finding with a URL AND a real file:line reference still passes
         assert rv('x\n```json\n{"verdict":"fail","findings":["see https://bugs.example:443 and bin/doctor.sh:12"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # A bare timestamp (purely numeric colon-pattern) must NOT count as a file:line location
+        assert rv('x\n```json\n{"verdict":"fail","findings":["observed at 10:30 UTC"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
+        # A bare ratio (purely numeric colon-pattern) must NOT count as a file:line location
+        assert rv('x\n```json\n{"verdict":"fail","findings":["aspect ratio 16:9 is wrong"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
+        # ...but a finding with a timestamp AND a real file:line reference still passes
+        assert rv('x\n```json\n{"verdict":"fail","findings":["at 10:30 see bin/doctor.sh:12"],"diagnostic":""}\n```\ny') == ("fail", 1)
         # Empty findings on fail should be ambiguous
         assert rv('finding: `{"verdict":"pass"}` example\n```json\n{"verdict":"fail","findings":[]}\n```') == ("ambiguous", 2)  # empty findings on fail
         # Non-string finding should be ambiguous
