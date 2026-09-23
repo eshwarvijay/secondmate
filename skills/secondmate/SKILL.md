@@ -83,11 +83,7 @@ This is the spec the maker receives.
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in." --wait --timeout 600000
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 600000
   ```
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
@@ -98,11 +94,7 @@ This is the spec the maker receives.
     -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
   herdr agent prompt sm-pi-<task-id> "<plan>
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in." --wait --timeout 600000
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
   worktree **must have been marked** by calling `${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd <wt>` BEFORE
@@ -119,11 +111,7 @@ This is the spec the maker receives.
   If `HERDR_ENV` is not 1, fall back to headless:
   `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan>
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in."`
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
   A good plan gives:
@@ -208,26 +196,14 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan>
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in." --wait --timeout 600000`
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
      - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
      - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan>
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in."`
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")"`
      - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan>
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in." --wait --timeout 600000`
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
    - **On `error` or `refused`** — do not retry via the maker. Inspect the checker output, fix the checker
@@ -367,11 +343,7 @@ back to the headless path). Every split uses `--no-focus` so the captain's focus
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
-## Known failure patterns — DO NOT SKIP
-- A maker must literally execute git commit as its own final action before replying DONE — multiple times a maker replied DONE (or went idle) with real, uncommitted changes still sitting in the working tree. Claiming done is not the same as having committed.
-- A selfcheck/regression test must call the actual function or code path it claims to test, not a separate reimplementation of the same logic — before shipping a new test, mutation-test it yourself: temporarily break the real fix, confirm the test then fails, then restore the fix. A test that still passes after the fix it's supposed to guard is removed is not a real test.
-- Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.
-- Avoid long ad-hoc debugging one-liners typed directly at an interactive prompt for anything involving loops, symlinks, or recursion — write a small throwaway script file instead and run that. A shell syntax mistake in an inline one-liner can leave a runaway loop that doesn't actually stop, burning time and context without you noticing until it's very deep in." --wait --timeout 600000
+$({CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 600000
   ```
   If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
