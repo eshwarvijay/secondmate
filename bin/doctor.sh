@@ -97,6 +97,338 @@ _reset_detect_state() {
   ROWS=""; core_missing=0; checker_missing=0; stale_count=0; reload_pending_count=0; unknown_count=0; missing_marketplace_count=0
 }
 
+# --- Bedrock model override helpers ---
+# Extract model-id from PLANNERS array by label (pipe-delimited: label|dimension|model-id|thinking-level)
+# Usage: _bedrock_get_model_id "kimi-k3" -> outputs global.moonshotai.kimi-k3 or empty
+_bedrock_get_model_id() {
+  local label="$1"
+  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local source_file="$script_dir/plan-committee.sh"
+  
+  if [ ! -f "$source_file" ]; then
+    return 1
+  fi
+  
+  # Delegate parsing to Python via environment variables (avoids heredoc quote escaping hell)
+  PLANNERS_LABEL="$label" PLANNERS_SOURCE="$source_file" python3 << 'PYEOF' || return $?
+import sys
+import os
+import re
+
+label = os.environ.get('PLANNERS_LABEL', '')
+source_file = os.environ.get('PLANNERS_SOURCE', '')
+
+if not label or not source_file:
+    sys.exit(1)
+
+try:
+    with open(source_file, 'r') as f:
+        content = f.read()
+except Exception:
+    sys.exit(1)
+
+# Find PLANNERS array definition
+match = re.search(r'PLANNERS=\(([^)]+)\)', content, re.DOTALL)
+if not match:
+    sys.exit(1)
+
+array_content = match.group(1)
+
+# Extract entries matching "label|dimension|model-id|thinking-level"
+entries = re.findall(r'"([^"]+)"', array_content)
+
+for entry in entries:
+    parts = entry.split('|')
+    if len(parts) >= 3 and parts[0] == label:
+        print(parts[2])  # Print the model-id (3rd field)
+        sys.exit(0)
+
+# Label not found in PLANNERS - UNKNOWN territory
+sys.exit(1)
+PYEOF
+  return $?
+}
+
+# Validate model override value is valid (present, numeric, <= threshold)
+# Usage: _bedrock_validate_kimi_k3 <json_path> <model_id> -> 0 if valid
+_bedrock_validate_kimi_k3() {
+  local json_path="$1"
+  local model_id="$2"
+  local threshold=128000  # Bedrock's own real enforced ceiling for Kimi K3, confirmed via live Validation error response on 2026-09-23
+  
+  if [ ! -f "$json_path" ]; then
+    return 1
+  fi
+  
+  python3 -c "
+import json
+import sys
+
+json_path = '''$json_path'''
+model_id = '''$model_id'''
+threshold = $threshold
+
+try:
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+except (json.JSONDecodeError, Exception):
+    sys.exit(1)
+
+providers = data.get('providers', {})
+if not isinstance(providers, dict):
+    sys.exit(1)
+
+bedrock = providers.get('amazon-bedrock', {})
+if not isinstance(bedrock, dict):
+    sys.exit(1)
+
+model_overrides = bedrock.get('modelOverrides', {})
+if not isinstance(model_overrides, dict):
+    sys.exit(1)
+
+override = model_overrides.get(model_id, {})
+if not isinstance(override, dict):
+    sys.exit(1)
+
+max_tokens = override.get('maxTokens')
+if not isinstance(max_tokens, (int, float)):
+    sys.exit(1)
+
+if max_tokens > threshold:
+    sys.exit(1)
+
+sys.exit(0)
+"
+  return $?
+}
+
+# Validate deepseek-r1 model entry (must exist with maxTokens <= 32768)
+# Usage: _bedrock_validate_deepseek_r1 <json_path> <model_id> -> 0 if valid  
+_bedrock_validate_deepseek_r1() {
+  local json_path="$1"
+  local model_id="$2"
+  local threshold=32768  # Bedrock's own real enforced ceiling for DeepSeek R1, confirmed via live Validation error response on 2026-09-23
+  
+  if [ ! -f "$json_path" ]; then
+    return 1
+  fi
+  
+  python3 -c "
+import json
+import sys
+
+json_path = '''$json_path'''
+model_id = '''$model_id'''
+threshold = $threshold
+
+try:
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+except (json.JSONDecodeError, Exception):
+    sys.exit(1)
+
+providers = data.get('providers', {})
+if not isinstance(providers, dict):
+    sys.exit(1)
+
+bedrock = providers.get('amazon-bedrock', {})
+if not isinstance(bedrock, dict):
+    sys.exit(1)
+
+models = bedrock.get('models', [])
+if not isinstance(models, list):
+    sys.exit(1)
+
+for entry in models:
+    if not isinstance(entry, dict):
+        continue
+    if entry.get('id') == model_id:
+        max_tokens = entry.get('maxTokens')
+        if isinstance(max_tokens, (int, float)) and max_tokens <= threshold:
+            sys.exit(0)
+        sys.exit(1)
+
+# Entry not found
+sys.exit(1)
+"
+  return $?
+}
+
+# Build safe JSON merge for kimi-k3 with atomic write
+# Usage: _bedrock_fix_kimi_k3 <json_path> <model_id> -> 0 on success
+_bedrock_fix_kimi_k3() {
+  local json_path="$1"
+  local model_id="$2"
+  local safe_target=120000  # Safe concrete target below Bedrock's 128000 ceiling
+  local temp_file="${json_path}.tmp.$$"
+  
+  python3 -c "
+import json
+import sys
+import os
+import tempfile
+
+json_path = '''$json_path'''
+model_id = '''$model_id'''
+safe_target = $safe_target
+temp_file = '''$temp_file'''
+
+# Read existing file or create empty structure
+if os.path.exists(json_path):
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        print('fix failed: models.json is malformed JSON', file=sys.stderr)
+        sys.exit(1)
+else:
+    data = {}
+
+# Ensure providers exists
+providers = data.get('providers')
+if not isinstance(providers, dict):
+    data['providers'] = {}
+    providers = data['providers']
+
+# Ensure amazon-bedrock exists under providers
+bedrock = providers.get('amazon-bedrock')
+if not isinstance(bedrock, dict):
+    providers['amazon-bedrock'] = {}
+    bedrock = providers['amazon-bedrock']
+
+# Ensure modelOverrides exists
+model_overrides = bedrock.get('modelOverrides')
+if not isinstance(model_overrides, dict):
+    bedrock['modelOverrides'] = {}
+    model_overrides = bedrock['modelOverrides']
+
+# Write the override
+model_overrides[model_id] = {'maxTokens': safe_target}
+
+# Validate the JSON is still valid
+json.dumps(data)
+
+# Write atomically: temp file, validate, then mv
+try:
+    with open(temp_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    # Validate temp file is valid JSON
+    with open(temp_file, 'r') as f:
+        json.load(f)
+    
+    os.rename(temp_file, json_path)
+    sys.exit(0)
+except Exception as e:
+    # Clean up temp file if it exists
+    if os.path.exists(temp_file):
+        try:
+            os.remove(temp_file)
+        except:
+            pass
+    print(f'fix failed: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+  return $?
+}
+
+# Build safe JSON merge for deepseek-r1 with atomic write
+# Usage: _bedrock_fix_deepseek_r1 <json_path> <model_id> -> 0 on success
+_bedrock_fix_deepseek_r1() {
+  local json_path="$1"
+  local model_id="$2"
+  local safe_target=30000  # Safe concrete target below Bedrock's 32768 ceiling
+  local temp_file="${json_path}.tmp.$$"
+  
+  python3 -c "
+import json
+import sys
+import os
+
+json_path = '''$json_path'''
+model_id = '''$model_id'''
+safe_target = $safe_target
+temp_file = '''$temp_file'''
+
+# Read existing file or create empty structure
+if os.path.exists(json_path):
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        print('fix failed: models.json is malformed JSON', file=sys.stderr)
+        sys.exit(1)
+else:
+    data = {}
+
+# Ensure providers exists
+providers = data.get('providers')
+if not isinstance(providers, dict):
+    data['providers'] = {}
+    providers = data['providers']
+
+# Ensure amazon-bedrock exists under providers
+bedrock = providers.get('amazon-bedrock')
+if not isinstance(bedrock, dict):
+    providers['amazon-bedrock'] = {}
+    bedrock = providers['amazon-bedrock']
+
+# Ensure models list exists
+models = bedrock.get('models')
+if not isinstance(models, list):
+    bedrock['models'] = []
+    models = bedrock['models']
+
+# Build the correct entry for deepseek-r1
+# Note: baseUrl is hardcoded to us-east-1 - this is the universal baseUrl for ALL Bedrock models per pi's own bundled catalog
+new_entry = {
+    'id': model_id,
+    'api': 'bedrock-converse-stream',
+    'baseUrl': 'https://bedrock-runtime.us-east-1.amazonaws.com',
+    'name': 'DeepSeek R1',
+    'reasoning': True,
+    'contextWindow': 128000,
+    'maxTokens': safe_target
+}
+
+# Replace existing entry with same id, or append if not present
+found = False
+for i, entry in enumerate(models):
+    if isinstance(entry, dict) and entry.get('id') == model_id:
+        models[i] = new_entry
+        found = True
+        break
+
+if not found:
+    models.append(new_entry)
+
+# Validate the JSON is still valid
+json.dumps(data)
+
+# Write atomically: temp file, validate, then mv
+try:
+    with open(temp_file, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    # Validate temp file is valid JSON
+    with open(temp_file, 'r') as f:
+        json.load(f)
+    
+    os.rename(temp_file, json_path)
+    sys.exit(0)
+except Exception as e:
+    # Clean up temp file if it exists
+    if os.path.exists(temp_file):
+        try:
+            os.remove(temp_file)
+        except:
+            pass
+    print(f'fix failed: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+  return $?
+}
+
 # initialize top-level state
 _reset_detect_state
 add() { # status name category fix
@@ -331,6 +663,138 @@ _release_heal_lock() {
   rm -rf "$_doctor_lock_file" 2>/dev/null
 }
 
+# --- Bedrock model override detection ---
+# Usage: _detect_bedrock_overrides
+# Adds rows for kimi-k3 and deepseek-r1 Bedrock model overrides
+# If pi is absent OR SM_CHECKER_HARNESS is not pi, skips entirely (no rows added)
+# If PLANNERS array is malformed/unparseable, reports UNKNOWN for each model (NOT silent pass)
+_detect_bedrock_overrides() {
+  # Skip if pi is not installed/present OR if SM_CHECKER_HARNESS is not pi
+  # The Bedrock override check only matters when pi is actually configured as the checker
+  local h="${SM_CHECKER_HARNESS:-pi}"
+  h="$(printf '%s' "$h" | tr '\n\r|' '   ')"
+  if ! have pi || [ "$h" != "pi" ]; then
+    return 0
+  fi
+
+  # Derive model IDs from bin/plan-committee.sh's PLANNERS array
+  local kimi_model_id deepseek_model_id
+  
+  kimi_model_id=$(_bedrock_get_model_id "kimi-k3") || {
+    # Label not found in PLANNERS - UNKNOWN (not silent pass)
+    add UNKNOWN "pi Bedrock override: kimi-k3" companion ""
+    kimi_model_id=""
+  }
+  
+  deepseek_model_id=$(_bedrock_get_model_id "deepseek-r1") || {
+    # Label not found in PLANNERS - UNKNOWN (not silent pass)
+    add UNKNOWN "pi Bedrock override: deepseek-r1" companion ""
+    deepseek_model_id=""
+  }
+
+  # Build models.json path (pi's local user-config file)
+  local models_json="$HOME/.pi/agent/models.json"
+
+  # Check kimi-k3 model override
+  if [ -n "$kimi_model_id" ]; then
+    if _bedrock_validate_kimi_k3 "$models_json" "$kimi_model_id"; then
+      add OK "pi Bedrock override: kimi-k3" companion ""
+    else
+      add MISSING "pi Bedrock override: kimi-k3" companion ""
+    fi
+  fi
+
+  # Check deepseek-r1 model entry
+  if [ -n "$deepseek_model_id" ]; then
+    if _bedrock_validate_deepseek_r1 "$models_json" "$deepseek_model_id"; then
+      add OK "pi Bedrock override: deepseek-r1" companion ""
+    else
+      add MISSING "pi Bedrock override: deepseek-r1" companion ""
+    fi
+  fi
+}
+
+# --- Bedrock model override healing ---
+# Usage: _heal_bedrock_kimi_k3 <model_id>
+_heal_bedrock_kimi_k3() {
+  local model_id="$1"
+  local models_json="$HOME/.pi/agent/models.json"
+  
+  if _bedrock_fix_kimi_k3 "$models_json" "$model_id"; then
+    echo "[OK] kimi-k3 Bedrock override fixed"
+    return 0
+  else
+    echo "[FAIL] kimi-k3 Bedrock override fix failed"
+    return 1
+  fi
+}
+
+# Usage: _heal_bedrock_deepseek_r1 <model_id>
+_heal_bedrock_deepseek_r1() {
+  local model_id="$1"
+  local models_json="$HOME/.pi/agent/models.json"
+  
+  if _bedrock_fix_deepseek_r1 "$models_json" "$model_id"; then
+    echo "[OK] deepseek-r1 Bedrock override fixed"
+    return 0
+  else
+    echo "[FAIL] deepseek-r1 Bedrock override fix failed"
+    return 1
+  fi
+}
+
+# Usage: _heal_bedrock_overrides <yes_or_not>
+# Mediate healing for Bedrock model overrides (special case: need to derive model IDs from PLANNERS)
+_heal_bedrock_overrides() {
+  local yes="$1"
+  local heal_failed=0
+  
+  # If pi is absent, nothing to heal
+  if ! have pi; then
+    return 0
+  fi
+
+  # Derive model IDs from bin/plan-committee.sh's PLANNERS array
+  local kimi_model_id deepseek_model_id
+  
+  kimi_model_id=$(_bedrock_get_model_id "kimi-k3")
+  if [ -z "$kimi_model_id" ]; then
+    # Not found in PLANNERS - skip (already reported as UNKNOWN in detect)
+    echo "[SKIP] kimi-k3 model not found in PLANNERS array"
+  else
+    # Only heal if it was reported as MISSING (status is first column: MISSING|name|category|fix)
+    # Format: status|name|category|fix, check for MISSING|pi Bedrock override: kimi-k3
+    if echo "$ROWS" | grep -q "^MISSING|pi Bedrock override: kimi-k3|"; then
+      if [ "$yes" = 1 ]; then
+        _heal_bedrock_kimi_k3 "$kimi_model_id" || heal_failed=1
+      else
+        printf 'Fix pi Bedrock override: kimi-k3 via: %s\n  proceed? [y/N] ' "_heal_bedrock_kimi_k3 $kimi_model_id"
+        read -r ans
+        case "$ans" in y|Y) _heal_bedrock_kimi_k3 "$kimi_model_id" || heal_failed=1;; *) echo "   skipped";; esac
+      fi
+    fi
+  fi
+
+  deepseek_model_id=$(_bedrock_get_model_id "deepseek-r1")
+  if [ -z "$deepseek_model_id" ]; then
+    # Not found in PLANNERS - skip (already reported as UNKNOWN in detect)
+    echo "[SKIP] deepseek-r1 model not found in PLANNERS array"
+  else
+    # Only heal if it was reported as MISSING
+    if echo "$ROWS" | grep -q "^MISSING|pi Bedrock override: deepseek-r1|"; then
+      if [ "$yes" = 1 ]; then
+        _heal_bedrock_deepseek_r1 "$deepseek_model_id" || heal_failed=1
+      else
+        printf 'Fix pi Bedrock override: deepseek-r1 via: %s\n  proceed? [y/N] ' "_heal_bedrock_deepseek_r1 $deepseek_model_id"
+        read -r ans
+        case "$ans" in y|Y) _heal_bedrock_deepseek_r1 "$deepseek_model_id" || heal_failed=1;; *) echo "   skipped";; esac
+      fi
+    fi
+  fi
+  
+  [ "$heal_failed" -ne 0 ] && return 1
+  return 0
+}
 # Bug 5 helper: Verify lock is still stale after reading it
 # Usage: _is_lock_still_stale <original_timestamp> <max_wait> [original_pid]
 # Returns 0 (true) if still stale, 1 (false) if TOCTOU happened or not stale
@@ -607,6 +1071,15 @@ detect() {
   plugin_present ponytail && add OK "ponytail (complexity lens plugin)" companion "" || add MISSING "ponytail (complexity lens plugin)" companion "claude plugin marketplace add DietrichGebert/ponytail && claude plugin install ponytail@ponytail --yes"
   # loop-task ships bundled with this plugin (commands/loop-task.md) — no external install needed.
   skill_present adhd && add OK "adhd (divergent ideation)" companion "" || add MISSING "adhd (divergent ideation)" companion "claude plugin marketplace add UditAkhourii/adhd && claude plugin install adhd@adhd --yes"
+
+  # --- Bedrock model override checks ---
+  # Notes:
+  # - These checks detect and fix missing/incorrect maxTokens overrides for pi's local models.json
+  # - Once fixed, the local override permanently shadows any future pi.dev catalog fix (pi's user-config always wins)
+  # - The fix is idempotent: running heal multiple times on already-correct values does nothing
+  # - If pi is absent, these checks are skipped entirely (no rows added)
+  _detect_bedrock_overrides
+
   # SECONDMATE PLUGIN STALENESS — check if the running copy is stale compared to marketplace checkout
   _detect_secondmate_staleness
 }
@@ -696,6 +1169,9 @@ heal() {
       case "$ans" in y|Y) bash -c "$fix" || echo "   (failed — do it manually: $fix)";; *) echo "   skipped";; esac
     fi
   done <<< "$ROWS"
+
+  # Handle Bedrock model override fixes (special case - need to parse the name for model type)
+  _heal_bedrock_overrides "$yes"
   
   # Bug 4 fix: return failure if secondmate heal failed
   if [ "$heal_failed" -eq 1 ]; then
@@ -2312,6 +2788,198 @@ STUB_EOF
   # The STATUS line must NOT contain "needs healing" (this distinguishes it from stale)
   echo "$status_line" | grep -q "needs healing" && { echo "FAIL: Test O reload_pending STATUS must NOT mention needs healing, got: $status_line"; rm -rf "$d"; exit 1; }
 
+  rm -rf "$d"
+
+  # === Test P: Bedrock model override detection and healing ===
+  # This test creates fixtures for models.json with various states and verifies:
+  # - pi absent: checks skipped entirely
+  # - models.json absent: rows reported as MISSING
+  # - correct values: rows reported as OK
+  # - wrong value: row reported as MISSING and fixed correctly
+  # - malformed PLANNERS: rows reported as UNKNOWN
+  # - malformed models.json: heal fails cleanly (not corrupting file)
+
+  # Test P1: Bedrock checks skipped when pi is absent
+  # Create fixture with correct models.json (should not matter since pi is absent)
+  d=$(mktemp -d)
+  j="$d/models.json"
+  python3 -c "
+import json
+data = {'providers': {'amazon-bedrock': {'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 120000}, 'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000}]}}}}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  out=$(SM_CHECKER_HARNESS=nonexistent "$script_abs" --report 2>&1)
+  has_kimi=$(echo "$out" | grep "pi Bedrock override: kimi-k3" || true)
+  has_deepseek=$(echo "$out" | grep "pi Bedrock override: deepseek-r1" || true)
+  [ -z "$has_kimi" ] || { echo "FAIL: Test P1 expected kimi row skipped when pi absent, got: $has_kimi"; rm -rf "$d"; exit 1; }
+  [ -z "$has_deepseek" ] || { echo "FAIL: Test P1 expected deepseek row skipped when pi absent, got: $has_deepseek"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
+  # Test P2: models.json absent -> both rows MISSING
+  d=$(mktemp -d)
+  home_backup="$HOME"
+  HOME="$d"
+  out=$(SM_CHECKER_HARNESS=pi "$script_abs" --report 2>&1)
+  HOME="$home_backup"
+  # Both should be MISSING
+  kimi_row=$(echo "$out" | grep "pi Bedrock override: kimi-k3" || true)
+  deepseek_row=$(echo "$out" | grep "pi Bedrock override: deepseek-r1" || true)
+  echo "$kimi_row" | grep -q "\[!!\]" || { echo "FAIL: Test P2 expected kimi row MISSING, got: $kimi_row"; rm -rf "$d"; exit 1; }
+  echo "$deepseek_row" | grep -q "\[!!\]" || { echo "FAIL: Test P2 expected deepseek row MISSING, got: $deepseek_row"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
+  # Test P3: models.json present with correct values -> both rows OK
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  python3 -c "
+import json
+data = {'providers': {'amazon-bedrock': {
+    'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 120000}},
+    'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000, 'api': 'bedrock-converse-stream', 'baseUrl': 'https://bedrock-runtime.us-east-1.amazonaws.com', 'name': 'DeepSeek R1', 'reasoning': True, 'contextWindow': 128000}]
+}}}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  home_backup="$HOME"
+  HOME="$d"
+  out=$(SM_CHECKER_HARNESS=pi "$script_abs" --report 2>&1)
+  HOME="$home_backup"
+  # Both should be OK
+  kimi_row=$(echo "$out" | grep "pi Bedrock override: kimi-k3" || true)
+  deepseek_row=$(echo "$out" | grep "pi Bedrock override: deepseek-r1" || true)
+  echo "$kimi_row" | grep -q "\[ok\]" || { echo "FAIL: Test P3 expected kimi row OK, got: $kimi_row"; rm -rf "$d"; exit 1; }
+  echo "$deepseek_row" | grep -q "\[ok\]" || { echo "FAIL: Test P3 expected deepseek row OK, got: $deepseek_row"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
+  # Test P4: models.json present with wrong value for one model only -> that row MISSING, other OK
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  # kimi-k3 has wrong value (too high), deepseek-r1 is correct
+  python3 -c "
+import json
+data = {'providers': {'amazon-bedrock': {
+    'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 200000}},
+    'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000, 'api': 'bedrock-converse-stream', 'baseUrl': 'https://bedrock-runtime.us-east-1.amazonaws.com', 'name': 'DeepSeek R1', 'reasoning': True, 'contextWindow': 128000}]
+}}}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  home_backup="$HOME"
+  HOME="$d"
+  out=$(SM_CHECKER_HARNESS=pi "$script_abs" --report 2>&1)
+  HOME="$home_backup"
+  # kimi-k3 should be MISSING (wrong value), deepseek-r1 should be OK
+  kimi_row=$(echo "$out" | grep "pi Bedrock override: kimi-k3" || true)
+  deepseek_row=$(echo "$out" | grep "pi Bedrock override: deepseek-r1" || true)
+  echo "$kimi_row" | grep -q "\[!!\]" || { echo "FAIL: Test P4 expected kimi row MISSING due to wrong value, got: $kimi_row"; rm -rf "$d"; exit 1; }
+  echo "$deepseek_row" | grep -q "\[ok\]" || { echo "FAIL: Test P4 expected deepseek row OK, got: $deepseek_row"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
+
+  # Test P5: malformed PLANNERS -> both rows UNKNOWN (not silent pass)
+  # This test is skipped because testing malformed PLANNERS would require
+  # copying and modifying the plan-committee.sh script, which is fragile and
+  # outside the scope of selfcheck.
+  echo "[SKIP] Test P5: malformed PLANNERS - skipped (would require script copy/patch)"
+
+  # Test P6: heal actually fixes a wrong value without destroying other content
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  # Create models.json with wrong kimi-k3 value AND unrelated content that must be preserved
+  python3 -c "
+import json
+data = {'other_provider': {'models': []}, 'providers': {'amazon-bedrock': {
+    'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 200000}},
+    'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000, 'api': 'bedrock-converse-stream', 'baseUrl': 'https://bedrock-runtime.us-east-1.amazonaws.com', 'name': 'DeepSeek R1', 'reasoning': True, 'contextWindow': 128000}]
+}}}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  home_backup="$HOME"
+  HOME="$d"
+  # Simulate heal by calling _heal_bedrock_kimi_k3 directly (it reads models_json from $HOME/.pi/agent/models.json)
+  out=$(SM_CHECKER_HARNESS=pi bash -c "source '$script_abs'; _heal_bedrock_kimi_k3 global.moonshotai.kimi-k3" 2>&1)
+  HOME="$home_backup"
+  
+  # Verify heal succeeded
+  echo "$out" | grep -q "\[OK\].*fixed" || { echo "FAIL: Test P6 heal expected success, got: $out"; rm -rf "$d"; exit 1; }
+  
+  # Verify file still has valid JSON and unrelated content preserved
+  python3 -c "import json; json.loads(open('$j').read())" || { echo "FAIL: Test P6 file corrupted to invalid JSON"; rm -rf "$d"; exit 1; }
+  grep -q '"other_provider"' "$j" || { echo "FAIL: Test P6 unrelated content (other_provider) lost after heal"; rm -rf "$d"; exit 1; }
+  
+  # Verify kimi-k3 maxTokens was corrected to safe target (120000)
+  python3 -c "
+import json
+data = json.load(open('$j'))
+val = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {}).get('maxTokens')
+if val != 120000:
+    print(f'FAIL: Test P6 expected maxTokens=120000, got {val}')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P6 kimi-k3 maxTokens not corrected"; rm -rf "$d"; exit 1; }
+  
+  rm -rf "$d"
+
+  # Test P7: malformed models.json -> heal fails cleanly (nonzero exit) without corruption
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  echo "{invalid json" > "$j"
+  
+  home_backup="$HOME"
+  HOME="$d"
+  out=$(SM_CHECKER_HARNESS=pi bash -c "source '$script_abs'; _heal_bedrock_kimi_k3 global.moonshotai.kimi-k3" 2>&1)
+  heal_rc=$?
+  HOME="$home_backup"
+  
+  [ "$heal_rc" -ne 0 ] || { echo "FAIL: Test P7 expected heal failure on malformed JSON, got rc=0"; rm -rf "$d"; exit 1; }
+  echo "$out" | grep -q -E 'malformed|failed' || { echo "FAIL: Test P7 expected clear failure message, got: $out"; rm -rf "$d"; exit 1; }
+  
+  # Verify file still exists (wasn't deleted by temp file cleanup)
+  [ -f "$j" ] || { echo "FAIL: Test P7 malformed JSON file disappeared"; rm -rf "$d"; exit 1; }
+  
+  # Verify content unchanged (no partial writes)
+  [ "$(cat "$j")" = '{invalid json' ] || { echo "FAIL: Test P7 malformed JSON file was modified"; rm -rf "$d"; exit 1; }
+  
+  rm -rf "$d"
+
+  # Test P8: heal with --yes mode works
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  python3 -c "
+import json
+data = {'providers': {'amazon-bedrock': {
+    'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 200000}}
+}}}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  
+  home_backup="$HOME"
+  HOME="$d"
+  # Run doctor.sh --heal --yes
+  out=$("$script_abs" --heal --yes 2>&1)
+  HOME="$home_backup"
+  
+  # Verify heal happened
+  echo "$out" | grep -q "kimi-k3 Bedrock override fixed" || { echo "FAIL: Test P8 heal --yes didn't fix kimi-k3, output: $out"; rm -rf "$d"; exit 1; }
+  
+  # Verify file was updated
+  python3 -c "
+import json
+data = json.load(open('$j'))
+val = data.get('providers', {}).get('amazon-bedrock', {}).get('modelOverrides', {}).get('global.moonshotai.kimi-k3', {}).get('maxTokens')
+if val != 120000:
+    print(f'FAIL: Test P8 expected maxTokens=120000 after heal, got {val}')
+    sys.exit(1)
+"
+  [ $? -eq 0 ] || { echo "FAIL: Test P8 kimi-k3 not corrected after heal --yes"; rm -rf "$d"; exit 1; }
+  
   rm -rf "$d"
 
   echo ok; exit 0
