@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.26-4C8BF5?style=flat-square" alt="version 0.1.26" />
+  <img src="https://img.shields.io/badge/version-0.1.27-4C8BF5?style=flat-square" alt="version 0.1.27" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -102,6 +102,11 @@ flowchart LR
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |
 | `bin/sync-worktree-skills.sh` | Backfills gitignored project-local `.claude/skills/` directories (a common convention, distinct from this plugin's own marketplace skills) into a freshly created worktree — `git worktree add` only ever populates tracked content, so a gitignored skill is otherwise genuinely absent, causing "Unknown skill" errors for any maker/supervisor operating there; resolves a skill that's itself a symlink to its real target anywhere in the checkout and materializes real content (never a symlink) in the worktree, refuses anything resolving outside the primary checkout, and never touches an already-present target (even a dangling symlink) — one-time copy at worktree-creation time, wired into both `bin/new-worktree.sh` and the herdr-based Spawn step |
 | `bin/reason.sh` | Read-only, tool-free reasoning one-shot on a reasoning model |
+| `bin/lesson-lookup.py` | Retrieves known failure patterns from the lesson store as a retrievable checklist — reads `bin/lessons/**/*.md` with YAML-shaped frontmatter, scores non-E4 lessons by term overlap, always includes E4 (proven-core) lessons, outputs the exact header `## Known failure patterns — DO NOT SKIP` with selected lessons as bullets; falls back to original 4 seed lessons if the store is unavailable |
+| `bin/lessons/` | Directory of failure pattern lessons in Markdown with frontmatter (`tags`, `evidence: E4`, `earned-in: seed`); seeds include commit-before-done, mutation-test-your-tests, stay-in-literal-scope, avoid-ad-hoc-debug-loops |
+| `bin/lessons/debugging/` | Subdirectory for debugging-related lessons |
+| `bin/lessons/testing/` | Subdirectory for testing-related lessons |
+| `bin/lessons/workflow/` | Subdirectory for workflow-related lessons |
 | `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the free-text `audit/flow.md`/`audit/decision.md` |
 | `bin/caffeinate-guard.sh` | Prevents macOS sleep during session execution via `start`/`stop` commands; session-scoped single guard process with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times); **accepted limitation: host-wide singleton = multiple concurrent sessions on same machine not supported** |
 | `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
@@ -214,7 +219,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
   && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
   && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
-  && bin/dispatch-report.py selfcheck \
+  && bin/dispatch-report.py selfcheck && bin/lesson-lookup.py selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```

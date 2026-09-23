@@ -454,5 +454,10 @@ future task, not part of this one.
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
 | `bin/caffeinate-guard.sh` | macOS sleep prevention during session execution — single session-scoped guard process, PID identity verification, bounded TTL ceiling, idempotent start/stop |
+| `bin/lesson-lookup.py` | retrieves known failure patterns from the lesson store as a retrievable checklist; reads `bin/lessons/**/*.md` with YAML-shaped frontmatter, scores non-E4 lessons by term overlap, always includes E4 (proven-core) lessons, outputs the exact header `## Known failure patterns — DO NOT SKIP` with selected lessons as bullets; falls back to original 4 seed lessons if the store is unavailable |
+| `bin/lessons/` | directory of failure pattern lessons in Markdown with frontmatter (`tags`, `evidence: E4`, `earned-in: seed`) |
+| `bin/lessons/debugging/` | subdirectory for debugging-related lessons |
+| `bin/lessons/testing/` | subdirectory for testing-related lessons |
+| `bin/lessons/workflow/` | subdirectory for workflow-related lessons |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.
