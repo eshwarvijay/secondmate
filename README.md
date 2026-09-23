@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.25-4C8BF5?style=flat-square" alt="version 0.1.25" />
+  <img src="https://img.shields.io/badge/version-0.1.28-4C8BF5?style=flat-square" alt="version 0.1.28" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -215,7 +215,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
   && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
   && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
-  && bin/dispatch-report.py selfcheck \
+  && bin/dispatch-report.py selfcheck && bin/launch-checker.sh --selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```
