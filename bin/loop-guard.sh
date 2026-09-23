@@ -58,35 +58,40 @@ case "$cmd" in
     echo "loop state cleared"; exit 0;;
   selfcheck)
     tmp="$(mktemp -d)"; r=0
-    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
-    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
-    o3="$(SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same 2>&1 || true)"
-    echo "$o3" | grep -q RESTART || { echo "FAIL: no restart message at 3rd repeat"; r=1; }
-    # Test hard abort: ABORT_REPEATS=4 means 4th call (n=4) should exit 3
-    # Use a subshell to avoid set -e from killing us on exit 3
-    if ( SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1; ec=$?; [ "$ec" = 3 ] ) 2>/dev/null; then
-      : # pass
-    else
-      echo "FAIL: should exit 3 at 4th (hard abort)"
-      r=1
-    fi
+    # Full exit-code walk-through for two ABORT_REPEATS values: n<3 exit0 silent,
+    # 3<=n<ABORT_REPEATS exit5 RESTART, n>=ABORT_REPEATS exit3 ABORT.
+    # Each n is checked from exactly ONE call (never re-invoked to "recheck a message" --
+    # loop-guard.sh action is stateful, a second call always advances the counter again).
+    for AR in 5 10; do
+      rm -f "$tmp/action.key" "$tmp/action.count"
+      for n in $(seq 1 $((AR + 1))); do
+        set +e
+        out="$(SM_LOOP_STATE="$tmp" ABORT_REPEATS="$AR" "$0" action --key same 2>&1)"; ec=$?
+        set -e
+        cnt="$(cat "$tmp/action.count" 2>/dev/null || echo '?')"
+        [ "$cnt" = "$n" ] || { echo "FAIL: ABORT=$AR, n=$n count should be $n, got $cnt"; r=1; }
+        if [ "$n" -lt 3 ]; then
+          { [ "$ec" = 0 ] && [ -z "$out" ]; } || { echo "FAIL: ABORT=$AR, n=$n should be exit 0 silent, got ec=$ec out=$out"; r=1; }
+        elif [ "$n" -lt "$AR" ]; then
+          [ "$ec" = 5 ] || { echo "FAIL: ABORT=$AR, n=$n should be exit 5, got $ec"; r=1; }
+          printf '%s' "$out" | grep -q RESTART || { echo "FAIL: ABORT=$AR, n=$n missing RESTART message"; r=1; }
+        else
+          [ "$ec" = 3 ] || { echo "FAIL: ABORT=$AR, n=$n should be exit 3, got $ec"; r=1; }
+          printf '%s' "$out" | grep -q ABORT || { echo "FAIL: ABORT=$AR, n=$n missing ABORT message"; r=1; }
+        fi
+      done
+    done
     # Test new key resets count
     rm -f "$tmp/action.key" "$tmp/action.count"
-    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key other >/dev/null 2>&1 || true
-    [ "$(cat "$tmp/action.count" 2>/dev/null)" = "1" ] || { echo "FAIL: new key should reset count"; r=1; }
+    SM_LOOP_STATE="$tmp" ABORT_REPEATS=10 "$0" action --key different >/dev/null 2>&1 || true
+    [ "$(cat "$tmp/action.count")" = "1" ] || { echo "FAIL: new key should reset count"; r=1; }
+    # Round cap test
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
     if SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1; then echo "FAIL: round cap not enforced"; r=1; fi
     # C-fix: 8 concurrent increments must all land (atomic lock, no lost updates).
     tmp2="$(mktemp -d)"; for _ in 1 2 3 4 5 6 7 8; do SM_LOOP_STATE="$tmp2" ABORT_REPEATS=99 "$0" action --key k >/dev/null 2>&1 & done; wait
     [ "$(cat "$tmp2/action.count" 2>/dev/null || echo 0)" = "8" ] || { echo "FAIL: concurrent count lost updates ($(cat "$tmp2/action.count" 2>/dev/null))"; r=1; }
-    # Verify hard-abort still exits 3 (not 5)
-    tmp3="$(mktemp -d)"
-    for _ in 1 2 3 4 5 6 7 8 9 10; do SM_LOOP_STATE="$tmp3" ABORT_REPEATS=10 "$0" action --key same >/dev/null 2>&1 || true; done
-    set +e
-    SM_LOOP_STATE="$tmp3" ABORT_REPEATS=10 "$0" action --key same >/dev/null 2>&1; ec=$?
-    set -e
-    [ "$ec" = 3 ] || { echo "FAIL: hard abort at ABORT_REPEATS should exit 3, got $ec"; r=1; }
-    rm -rf "$tmp" "$tmp2" "$tmp3"; [ "$r" = 0 ] && echo ok; exit "$r";;
+    rm -rf "$tmp" "$tmp2"; [ "$r" = 0 ] && echo ok; exit "$r";;
   *) echo "usage: loop-guard.sh action --key K | round | reset | selfcheck" >&2; exit 2;;
 esac
