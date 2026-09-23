@@ -386,7 +386,7 @@ This is valid.
         
         # Check all 4 expected seed files exist and parse as E4
         expected_files = [
-            lessons_dir / 'debugging' / 'commit-before-done.md',
+            lessons_dir / 'workflow' / 'commit-before-done.md',
             lessons_dir / 'testing' / 'mutation-test-your-tests.md',
             lessons_dir / 'workflow' / 'stay-in-literal-scope.md',
             lessons_dir / 'debugging' / 'avoid-ad-hoc-debug-loops.md',
