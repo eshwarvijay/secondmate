@@ -34,11 +34,14 @@ case "$cmd" in
     if [ "$h" = "$prev" ]; then n=$((n + 1)); else n=1; printf '%s' "$h" >"$state/action.key"; fi
     echo "$n" >"$state/action.count"
     case "$n" in
-      3|4|5|6|7|8|9)
-        echo "RESTART: identical action ${n}x — kill this maker and restart fresh with the round-state handoff file.";;
-    esac
-    if [ "$n" -ge "$ABORT_REPEATS" ]; then echo "ABORT: no-progress loop (${n}x identical action)"; exit 3; fi
-    exit 5;;
+      1|2) exit 0;;
+      *)
+        if [ "$n" -ge "$ABORT_REPEATS" ]; then
+          echo "ABORT: no-progress loop (${n}x identical action)"; exit 3
+        else
+          echo "RESTART: identical action ${n}x — kill this maker and restart fresh with the round-state handoff file."; exit 5
+        fi;;
+    esac;;
   round)
     mkdir -p "$state"
     _lock || echo "loop-guard: lock busy, counting unlocked" >&2
