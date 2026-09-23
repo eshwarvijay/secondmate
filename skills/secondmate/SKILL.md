@@ -203,7 +203,7 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      model family) but keeps maker ≠ checker and the deterministic verdict. Capture its final message and
      treat it exactly like harness output below.
    - Branch on the verdict deterministically, NOT on the checker's prose:
-     `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused.
+     `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused. When lenses were injected via `--lens`, add `--lenses <comma-separated-list>` to cross-check the envelope's `lens_coverage` field (the checker is told each lens's exact name and should report `{"lens_coverage": {"<name>": true, ...}}`). A missing lens triggers `ambiguous` (exit 2). Also for `fail` verdicts, findings must contain file:line tokens or the explicit escape hatch `[NOLOC]`; invalid findings trigger `ambiguous`.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan>
