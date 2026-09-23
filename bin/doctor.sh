@@ -154,6 +154,7 @@ PYEOF
 
 # Validate model override value is valid (present, numeric, <= threshold)
 # Usage: _bedrock_validate_kimi_k3 <json_path> <model_id> -> 0 if valid
+# Fix: pass values via env vars, not string interpolation, to avoid quote-breaking bugs
 _bedrock_validate_kimi_k3() {
   local json_path="$1"
   local model_id="$2"
@@ -163,13 +164,13 @@ _bedrock_validate_kimi_k3() {
     return 1
   fi
   
-  python3 -c "
-import json
-import sys
+  # Use env vars instead of string interpolation to avoid quote-breaking bugs
+  BEDROCK_JSON_PATH="$json_path" BEDROCK_MODEL_ID="$model_id" BEDROCK_THRESHOLD="$threshold" python3 << 'PYEOF' || return $?
+import json, sys, os
 
-json_path = '''$json_path'''
-model_id = '''$model_id'''
-threshold = $threshold
+json_path = os.environ.get('BEDROCK_JSON_PATH', '')
+model_id = os.environ.get('BEDROCK_MODEL_ID', '')
+threshold = int(os.environ.get('BEDROCK_THRESHOLD', '0'))
 
 try:
     with open(json_path, 'r') as f:
@@ -206,12 +207,13 @@ if not ok:
     sys.exit(1)
 
 sys.exit(0)
-"
+PYEOF
   return $?
 }
 
 # Validate deepseek-r1 model entry (must exist with maxTokens <= 32768)
 # Usage: _bedrock_validate_deepseek_r1 <json_path> <model_id> -> 0 if valid  
+# Fix: pass values via env vars, not string interpolation
 _bedrock_validate_deepseek_r1() {
   local json_path="$1"
   local model_id="$2"
@@ -221,13 +223,12 @@ _bedrock_validate_deepseek_r1() {
     return 1
   fi
   
-  python3 -c "
-import json
-import sys
+  BEDROCK_JSON_PATH="$json_path" BEDROCK_MODEL_ID="$model_id" BEDROCK_THRESHOLD="$threshold" python3 << 'PYEOF' || return $?
+import json, sys, os
 
-json_path = '''$json_path'''
-model_id = '''$model_id'''
-threshold = $threshold
+json_path = os.environ.get('BEDROCK_JSON_PATH', '')
+model_id = os.environ.get('BEDROCK_MODEL_ID', '')
+threshold = int(os.environ.get('BEDROCK_THRESHOLD', '0'))
 
 try:
     with open(json_path, 'r') as f:
@@ -266,7 +267,7 @@ for entry in models:
 
 # Entry not found
 sys.exit(1)
-"
+PYEOF
   return $?
 }
 
@@ -281,15 +282,14 @@ _bedrock_fix_kimi_k3() {
   local safe_target=120000  # Safe concrete target below Bedrock's 128000 ceiling
   local temp_file="${json_path}.tmp.$$"
   
-  python3 -c "
-import json
-import sys
-import os
+  # Pass all values via env vars to avoid quote-breaking bugs
+  BEDROCK_JSON_PATH="$json_path" BEDROCK_MODEL_ID="$model_id" BEDROCK_SAFE_TARGET="$safe_target" BEDROCK_TEMP_FILE="$temp_file" python3 << 'PYEOF' || return $?
+import json, sys, os
 
-json_path = '''$json_path'''
-model_id = '''$model_id'''
-safe_target = $safe_target
-temp_file = '''$temp_file'''
+json_path = os.environ.get('BEDROCK_JSON_PATH', '')
+model_id = os.environ.get('BEDROCK_MODEL_ID', '')
+safe_target = int(os.environ.get('BEDROCK_SAFE_TARGET', '0'))
+temp_file = os.environ.get('BEDROCK_TEMP_FILE', '')
 
 # Read existing file or create empty structure
 if os.path.exists(json_path):
@@ -355,27 +355,27 @@ except Exception as e:
             pass
     print(f'fix failed: {e}', file=sys.stderr)
     sys.exit(1)
-"
+PYEOF
   return $?
 }
 
 # Build safe JSON merge for deepseek-r1 with atomic write
 # Usage: _bedrock_fix_deepseek_r1 <json_path> <model_id> -> 0 on success
+# Fix: pass values via env vars, not string interpolation
 _bedrock_fix_deepseek_r1() {
   local json_path="$1"
   local model_id="$2"
   local safe_target=30000  # Safe concrete target below Bedrock's 32768 ceiling
   local temp_file="${json_path}.tmp.$$"
   
-  python3 -c "
-import json
-import sys
-import os
+  # Pass all values via env vars to avoid quote-breaking bugs
+  BEDROCK_JSON_PATH="$json_path" BEDROCK_MODEL_ID="$model_id" BEDROCK_SAFE_TARGET="$safe_target" BEDROCK_TEMP_FILE="$temp_file" python3 << 'PYEOF' || return $?
+import json, sys, os
 
-json_path = '''$json_path'''
-model_id = '''$model_id'''
-safe_target = $safe_target
-temp_file = '''$temp_file'''
+json_path = os.environ.get('BEDROCK_JSON_PATH', '')
+model_id = os.environ.get('BEDROCK_MODEL_ID', '')
+safe_target = int(os.environ.get('BEDROCK_SAFE_TARGET', '0'))
+temp_file = os.environ.get('BEDROCK_TEMP_FILE', '')
 
 # Read existing file or create empty structure
 if os.path.exists(json_path):
@@ -459,7 +459,7 @@ except Exception as e:
             pass
     print(f'fix failed: {e}', file=sys.stderr)
     sys.exit(1)
-"
+PYEOF
   return $?
 }
 
@@ -3164,14 +3164,12 @@ if not found:
   j="$d/.pi/agent/models.json"
   mkdir -p "$d/.pi/agent"
   
-  # Test each invalid value
+  # Test kimi-k3: each invalid value should report MISSING
   for invalid_val in "true" "false" "0" "-1" "1.5" "NaN" "Infinity" "-Infinity"; do
-    # Build JSON with this invalid value - use Python to construct
     python3 -c "
 import json, sys
 
 def parse_json_value(s):
-    # JSON-compatible parsing: true/false/null/NaN/Infinity/-Infinity/numbers
     s = s.strip()
     if s == 'true':
         return True
@@ -3186,7 +3184,6 @@ def parse_json_value(s):
     elif s.lower() == '-infinity':
         return float('-inf')
     else:
-        # Try as number
         try:
             if '.' in s:
                 return float(s)
@@ -3198,7 +3195,6 @@ def parse_json_value(s):
 val = '''$invalid_val'''
 data_val = parse_json_value(val)
 
-# Find and replace the maxTokens in the base JSON
 base = {
     'providers': {
         'amazon-bedrock': {
@@ -3212,7 +3208,6 @@ with open('$j', 'w') as f:
     json.dump(base, f)
 "
     
-    # Run doctor.sh --json and check status
     status=$(HOME="$d" SM_CHECKER_HARNESS=pi "$script_abs" --json 2>/dev/null | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
@@ -3223,8 +3218,66 @@ for x in data:
 print('NOT_FOUND')
 " 2>/dev/null)
     
-    [ "$status" = "MISSING" ] || { echo "FAIL: Test P10 with maxTokens=$invalid_val expected MISSING, got $status"; rm -rf "$d"; exit 1; }
+    [ "$status" = "MISSING" ] || { echo "FAIL: Test P10 kimi-k3 with maxTokens=$invalid_val expected MISSING, got $status"; rm -rf "$d"; exit 1; }
   done
+  
+  # Test deepseek-r1: each invalid value should report MISSING (Finding 2 fix)
+  for invalid_val in "true" "false" "0" "-1" "1.5" "NaN" "Infinity" "-Infinity"; do
+    python3 -c "
+import json, sys
+
+def parse_json_value(s):
+    s = s.strip()
+    if s == 'true':
+        return True
+    elif s == 'false':
+        return False
+    elif s == 'null':
+        return None
+    elif s.lower() == 'nan':
+        return float('nan')
+    elif s.lower() == 'infinity':
+        return float('inf')
+    elif s.lower() == '-infinity':
+        return float('-inf')
+    else:
+        try:
+            if '.' in s:
+                return float(s)
+            else:
+                return int(s)
+        except ValueError:
+            return s
+
+val = '''$invalid_val'''
+data_val = parse_json_value(val)
+
+base = {
+    'providers': {
+        'amazon-bedrock': {
+            'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000}]
+        }
+    }
+}
+base['providers']['amazon-bedrock']['models'][0]['maxTokens'] = data_val
+
+with open('$j', 'w') as f:
+    json.dump(base, f)
+"
+    
+    status=$(HOME="$d" SM_CHECKER_HARNESS=pi "$script_abs" --json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for x in data:
+    if x['name'] == 'pi Bedrock override: deepseek-r1':
+        print(x['status'])
+        sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+    
+    [ "$status" = "MISSING" ] || { echo "FAIL: Test P10 deepseek-r1 with maxTokens=$invalid_val expected MISSING, got $status"; rm -rf "$d"; exit 1; }
+  done
+  
   rm -rf "$d"
 
   # Test P11: _bedrock_fix_deepseek_r1 preserves custom fields (round 5 finding)
