@@ -93,7 +93,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
     -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
-  herdr agent prompt sm-pi-<task-id> "<plan>
+  herdr agent prompt sm-pi-<task-id> "<plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 600000
@@ -111,7 +111,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan>
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")"`
@@ -204,12 +204,12 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
-     - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan>
+     - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
      - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan>
+     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")"`
