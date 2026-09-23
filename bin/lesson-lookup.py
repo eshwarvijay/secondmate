@@ -415,19 +415,34 @@ earned-in: test
 ---
 {generic_body}
 """
-            (pathlib.Path(tmpdir) / 'with-tags.md').write_text(with_tags)
+            # Two non-E4 lessons with DIFFERENT body text markers (to distinguish in output)
+            # The tagged one has 'testing' in tags, the other doesn't
+            # Both have unique body text so we can track their positions
+            
+            # This lesson has 'testing' in tags - named 'z-tagged' so filename loses tie-break
+            with_tags = '''---
+tags:
+  - testing
+  - specific
+evidence: E0
+earned-in: test
+---
+Z-TAGGED-LESSON: This lesson body has unique marker Z-TAGGED-LESSON for position comparison.
+'''
+            (pathlib.Path(tmpdir) / 'z-tagged.md').write_text(with_tags)  # renamed for filename tie-break test
             
             # This lesson has 'unrelated' in tags (no overlap with task)
-            without_tags = f"""---
+            # Named 'a-untagged' so filename wins tie-break if tags were ignored
+            without_tags = '''---
 tags:
   - unrelated
   - generic
 evidence: E0
 earned-in: test
 ---
-{generic_body}
-"""
-            (pathlib.Path(tmpdir) / 'without-tags.md').write_text(without_tags)
+A-UNTAGGED-LESSON: This lesson body has unique marker A-UNTAGGED-LESSON for position comparison.
+'''
+            (pathlib.Path(tmpdir) / 'a-untagged.md').write_text(without_tags)
             
             # Also add one E4 to ensure it's included
             e4_lesson = """---
@@ -452,11 +467,14 @@ This is an E4 lesson that must always appear.
             output = out.getvalue()
             
             # Both non-E4 lessons should be present (cap not reached)
-            assert 'generic content' in output, f"Lessons should be in output:\n{output}"
+            assert 'Z-TAGGED-LESSON' in output, f"Tagged lesson should be in output:\n{output}"
+            assert 'A-UNTAGGED-LESSON' in output, f"Untagged lesson should be in output:\n{output}"
             # The lesson with 'testing' tag should be ranked higher
-            # Verify the tagged one appears before the untaged one (by position in output)
-            tagged_pos = output.find('specific')
-            untagged_pos = output.find('generic')
+            # Verify the tagged one appears before the untagged one (by position in output)
+            tagged_pos = output.find('Z-TAGGED-LESSON')
+            untagged_pos = output.find('A-UNTAGGED-LESSON')
+            assert tagged_pos >= 0, f"Z-TAGGED-LESSON not found in output:\n{output}"
+            assert untagged_pos >= 0, f"A-UNTAGGED-LESSON not found in output:\n{output}"
             assert tagged_pos < untagged_pos, f"Tagged lesson should rank higher than untagged:\n{output}"
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
