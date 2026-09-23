@@ -96,7 +96,7 @@ flowchart LR
 | `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused |
 | `bin/dispatch-report.py` | Parses a sub-supervisor's final output for the fan-out pattern below — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line so a tag echoed mid-prose (e.g. from the sub-supervisor's own instructions) can't be mistaken for the real signal; last matching line wins → exit `0` done / `1` refused / `2` stuck / `3` no tag found (its own, more-cautious-than-stuck code) |
 | `bin/checker-progress.py` | Filter pi's `--mode json` output: prints one progress line per tool execution to stderr (live activity), extracts final assistant message text from `agent_end` and writes to stdout (exactly as `--mode text` would); handles malformed JSON lines gracefully; preserves exit code propagation via pipefail
-| `bin/loop-guard.sh` | Stuck-loop abort (exit 3) + per-run round/spawn caps + machine-parseable restart signal (exit 5) via `action --key`; `round-state.md` handoff file; `reset` clears only loop state (`action.key`, `action.count`, `rounds`, `spawns`), not task state) |
+| `bin/loop-guard.sh` | Stuck-loop abort (exit 3) + per-run round/spawn caps + machine-parseable restart signal (exit 5) via `action --key`; `round-state.md` handoff file; `reset` clears only loop state (`action.key`, `action.count`, `rounds`, `spawns`), not task state |
 | `bin/run-round.sh` | Wall-clock timeout + idle watchdog + paired audit record (even on kill) |
 | `bin/prune-output.sh` | Model-free head/tail truncation of bulky logs |
 | `bin/new-worktree.sh` | Isolated git worktree per maker (never the primary checkout) |

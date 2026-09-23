@@ -166,7 +166,7 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      `${CLAUDE_PLUGIN_ROOT}/bin/loop-guard.sh round` (per-run round cap + global spawn cap; exhaustion reports `budget-limited`, never success).
      `loop-guard.sh reset` on a new task or human interjection.
    **Exit codes for `loop-guard.sh action`:**
-     - `0` = ok, continue (n < 3 or n >= ABORT_REPEATS with hard-abort message).
+     - `0` = ok, continue (n < 3; silent, no output).
      - `5` = restart recommended (3 <= n < ABORT_REPEATS): the supervisor should kill the maker's herdr agent (e.g., `herdr agent stop sm-<task-id>` or terminate the agent in the pane) and start a fresh one with the same task-scoped name, prompting it with the `round-state.md` handoff content.
      - `3` = hard abort (n >= ABORT_REPEATS): escalate to human intervention.
      - `4` = budget exhausted (from `round` subcommand): unchanged behavior.
