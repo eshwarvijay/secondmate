@@ -81,8 +81,9 @@ This is the spec the maker receives.
   After step 2 Spawn creates `<wt>`, start the Claude maker directly on the root_pane from `herdr worktree create`:
   ```bash
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
-  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
+  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE.  *Before replying DONE, write/update the round-state handoff file* (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 600000
   ```
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
@@ -94,6 +95,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 
     -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
   herdr agent prompt sm-pi-<task-id> "<plan>
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
@@ -111,6 +113,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 
   If `HERDR_ENV` is not 1, fall back to headless:
   `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan>
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
@@ -159,9 +162,16 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 3. **Guard the round** — wrap each maker/checker invocation and track loop health:
    - `${CLAUDE_PLUGIN_ROOT}/bin/run-round.sh --label <id> -- <cmd>` (wall-clock timeout, idle watchdog, audit record even on kill).
-   - `${CLAUDE_PLUGIN_ROOT}/bin/loop-guard.sh action --key "<canonical diff/action>"` (aborts a no-progress repeat loop) and
+   - `${CLAUDE_PLUGIN_ROOT}/bin/loop-guard.sh action --key "<canonical diff/action>"` and
      `${CLAUDE_PLUGIN_ROOT}/bin/loop-guard.sh round` (per-run round cap + global spawn cap; exhaustion reports `budget-limited`, never success).
      `loop-guard.sh reset` on a new task or human interjection.
+   **Exit codes for `loop-guard.sh action`:**
+     - `0` = ok, continue (n < 3 or n >= ABORT_REPEATS with hard-abort message).
+     - `5` = restart recommended (3 <= n < ABORT_REPEATS): the supervisor should kill the maker's herdr agent (e.g., `herdr agent stop sm-<task-id>` or terminate the agent in the pane) and start a fresh one with the same task-scoped name, prompting it with the `round-state.md` handoff content.
+     - `3` = hard abort (n >= ABORT_REPEATS): escalate to human intervention.
+     - `4` = budget exhausted (from `round` subcommand): unchanged behavior.
+     **Note:** `loop-guard.sh` is a pure read-only signal generator; it never kills or restarts anything.
+     The ACTOR is the supervisor, who interprets the exit code and takes action accordingly.
 
 4. **Check** — after the maker commits, trim bulky logs then run the cross-model checker:
    - **Strict rule: when `HERDR_ENV=1`, the checker MUST run in a visible herdr pane — headless is prohibited.** Use the "Checker pane" recipe under "Visible orchestration in herdr" below, not the plain invocation shown in this step. The plain `launch-checker.sh` call below is ONLY for when `HERDR_ENV` is not `1`, or `${CLAUDE_PLUGIN_ROOT}/bin/herdr-pane.sh check` fails.
@@ -196,16 +206,26 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan>
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
      - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
      - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan>
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")"`
      - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan>
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
+     **Restart amplio-style hybrid:** When the supervisor restarts a maker mid-round (due to `loop-guard.sh` exit-5 restart signal,
+     timeout, or idle-watchdog) rather than the maker reaching DONE naturally, the supervisor itself synthesizes the
+     deterministic `Completed` and `Relevant Files` sections from `git log` and `git diff` in the worktree (and
+     `bin/run-round.sh`'s own audit record if one exists for that round) before restarting the fresh maker.
+     The maker owns only the four prose sections it has direct knowledge of: Objective, Active, Blocked, Next Move.
+     This hybrid approach ensures deterministic history while giving the maker room to provide the 'why' when it
+     gets the chance to write it after a restart.
    - **On `error` or `refused`** — do not retry via the maker. Inspect the checker output, fix the checker
      invocation (bad args, missing context) or escalate to the human. `refused` always escalates.
    - **Log the round.** After every checker verdict (pass, fail, error, or refused), append a metrics
@@ -341,8 +361,9 @@ back to the headless path). Every split uses `--no-focus` so the captain's focus
 - **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
-  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
+  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE.  *Before replying DONE, write/update the round-state handoff file* (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 600000
   ```
   If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is

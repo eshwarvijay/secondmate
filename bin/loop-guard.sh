@@ -9,6 +9,8 @@
 set -euo pipefail
 
 state="${SM_LOOP_STATE:-.secondmate}"
+# ABORT_REPEATS controls the no-progress loop_abort threshold.
+# If ABORT_REPEATS <= 3, the exit-5 restart range becomes empty (every repeat goes straight to hard-abort).
 ABORT_REPEATS="${ABORT_REPEATS:-10}"; MAX_ROUNDS="${MAX_ROUNDS:-256}"; MAX_SPAWNS="${MAX_SPAWNS:-1000}"
 
 # C-fix: mkdir is an atomic, cross-platform lock (macOS has no flock). Serializes the counter
@@ -32,11 +34,11 @@ case "$cmd" in
     if [ "$h" = "$prev" ]; then n=$((n + 1)); else n=1; printf '%s' "$h" >"$state/action.key"; fi
     echo "$n" >"$state/action.count"
     case "$n" in
-      3) echo "HYGIENE: identical action 3x — re-read the last output and change approach.";;
-      5|8) echo "HYGIENE: identical action ${n}x, not progressing — do NOT repeat it; pick a different action or stop.";;
+      3|4|5|6|7|8|9)
+        echo "RESTART: identical action ${n}x — kill this maker and restart fresh with the round-state handoff file.";;
     esac
     if [ "$n" -ge "$ABORT_REPEATS" ]; then echo "ABORT: no-progress loop (${n}x identical action)"; exit 3; fi
-    exit 0;;
+    exit 5;;
   round)
     mkdir -p "$state"
     _lock || echo "loop-guard: lock busy, counting unlocked" >&2
@@ -56,8 +58,17 @@ case "$cmd" in
     SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
     SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
     o3="$(SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same 2>&1 || true)"
-    echo "$o3" | grep -q HYGIENE || { echo "FAIL: no reminder at 3rd repeat"; r=1; }
-    if SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1; then echo "FAIL: should abort at 4th"; r=1; fi
+    echo "$o3" | grep -q RESTART || { echo "FAIL: no restart message at 3rd repeat"; r=1; }
+    # Test hard abort: ABORT_REPEATS=4 means 4th call (n=4) should exit 3
+    # Use a subshell to avoid set -e from killing us on exit 3
+    if ( SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1; ec=$?; [ "$ec" = 3 ] ) 2>/dev/null; then
+      : # pass
+    else
+      echo "FAIL: should exit 3 at 4th (hard abort)"
+      r=1
+    fi
+    # Test new key resets count
+    rm -f "$tmp/action.key" "$tmp/action.count"
     SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key other >/dev/null 2>&1 || true
     [ "$(cat "$tmp/action.count" 2>/dev/null)" = "1" ] || { echo "FAIL: new key should reset count"; r=1; }
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
@@ -66,6 +77,13 @@ case "$cmd" in
     # C-fix: 8 concurrent increments must all land (atomic lock, no lost updates).
     tmp2="$(mktemp -d)"; for _ in 1 2 3 4 5 6 7 8; do SM_LOOP_STATE="$tmp2" ABORT_REPEATS=99 "$0" action --key k >/dev/null 2>&1 & done; wait
     [ "$(cat "$tmp2/action.count" 2>/dev/null || echo 0)" = "8" ] || { echo "FAIL: concurrent count lost updates ($(cat "$tmp2/action.count" 2>/dev/null))"; r=1; }
-    rm -rf "$tmp" "$tmp2"; [ "$r" = 0 ] && echo ok; exit "$r";;
+    # Verify hard-abort still exits 3 (not 5)
+    tmp3="$(mktemp -d)"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do SM_LOOP_STATE="$tmp3" ABORT_REPEATS=10 "$0" action --key same >/dev/null 2>&1 || true; done
+    set +e
+    SM_LOOP_STATE="$tmp3" ABORT_REPEATS=10 "$0" action --key same >/dev/null 2>&1; ec=$?
+    set -e
+    [ "$ec" = 3 ] || { echo "FAIL: hard abort at ABORT_REPEATS should exit 3, got $ec"; r=1; }
+    rm -rf "$tmp" "$tmp2" "$tmp3"; [ "$r" = 0 ] && echo ok; exit "$r";;
   *) echo "usage: loop-guard.sh action --key K | round | reset | selfcheck" >&2; exit 2;;
 esac
