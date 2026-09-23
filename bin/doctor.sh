@@ -194,11 +194,15 @@ if not isinstance(override, dict):
     sys.exit(1)
 
 max_tokens = override.get('maxTokens')
-# Finding 1 fix: explicitly exclude bool (Python's bool is subclass of int)
-if not isinstance(max_tokens, (int, float)) or isinstance(max_tokens, bool):
-    sys.exit(1)
-
-if max_tokens > threshold:
+# Consolidated robust numeric validation: positive whole number <= threshold, reject NaN/Infinity, reject bool
+import math as _m
+ok = (isinstance(max_tokens, (int, float))
+      and not isinstance(max_tokens, bool)
+      and _m.isfinite(max_tokens)
+      and max_tokens == int(max_tokens)
+      and max_tokens > 0
+      and max_tokens <= threshold)
+if not ok:
     sys.exit(1)
 
 sys.exit(0)
@@ -248,8 +252,15 @@ for entry in models:
         continue
     if entry.get('id') == model_id:
         max_tokens = entry.get('maxTokens')
-        # Finding 1 fix: explicitly exclude bool (Python's bool is subclass of int)
-        if isinstance(max_tokens, (int, float)) and not isinstance(max_tokens, bool) and max_tokens <= threshold:
+        # Consolidated robust numeric validation (same logic as kimi-k3)
+        import math as _m
+        ok = (isinstance(max_tokens, (int, float))
+              and not isinstance(max_tokens, bool)
+              and _m.isfinite(max_tokens)
+              and max_tokens == int(max_tokens)
+              and max_tokens > 0
+              and max_tokens <= threshold)
+        if ok:
             sys.exit(0)
         sys.exit(1)
 
@@ -1195,8 +1206,18 @@ heal() {
   done <<< "$ROWS"
 
   # Handle Bedrock model override fixes (special case - need to parse the name for model type)
+  # Finding 3 fix: wrap with same lock pattern as secondmate heal to prevent concurrent --heal races
+  _acquire_heal_lock || {
+    echo "Heal not performed."
+    return 1
+  }
+  trap '_release_heal_lock' EXIT
+  
   _heal_bedrock_overrides "$yes"
   heal_result=$?
+  _release_heal_lock
+  trap - EXIT
+  
   [ "$heal_result" -ne 0 ] && heal_failed=1
   
   # Bug 4 fix: return failure if secondmate heal failed
@@ -3130,6 +3151,78 @@ if not found:
 "
   [ $? -eq 0 ] || { echo "FAIL: Test P9 deepseek-r1 not created correctly after heal --yes"; rm -rf "$d"; exit 1; }
   
+  rm -rf "$d"
+
+  # Test P10: consolidated test for all invalid numeric values (round 4 Finding 1+2 fix)
+  # Tests: true, false, 0, -1, 1.5, NaN, Infinity, -Infinity all report MISSING
+  # This consolidates a failing pattern: each round introduced a new edge case
+  # that slipped through because the check was patched case-by-case instead of
+  # being robust from the start. This test verifies the consolidated check works.
+  d=$(mktemp -d)
+  j="$d/.pi/agent/models.json"
+  mkdir -p "$d/.pi/agent"
+  
+  # Test each invalid value
+  for invalid_val in "true" "false" "0" "-1" "1.5" "NaN" "Infinity" "-Infinity"; do
+    # Build JSON with this invalid value - use Python to construct
+    python3 -c "
+import json, sys
+
+def parse_json_value(s):
+    # JSON-compatible parsing: true/false/null/NaN/Infinity/-Infinity/numbers
+    s = s.strip()
+    if s == 'true':
+        return True
+    elif s == 'false':
+        return False
+    elif s == 'null':
+        return None
+    elif s.lower() == 'nan':
+        return float('nan')
+    elif s.lower() == 'infinity':
+        return float('inf')
+    elif s.lower() == '-infinity':
+        return float('-inf')
+    else:
+        # Try as number
+        try:
+            if '.' in s:
+                return float(s)
+            else:
+                return int(s)
+        except ValueError:
+            return s
+
+val = '''$invalid_val'''
+data_val = parse_json_value(val)
+
+# Find and replace the maxTokens in the base JSON
+base = {
+    'providers': {
+        'amazon-bedrock': {
+            'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 120000}}
+        }
+    }
+}
+base['providers']['amazon-bedrock']['modelOverrides']['global.moonshotai.kimi-k3']['maxTokens'] = data_val
+
+with open('$j', 'w') as f:
+    json.dump(base, f)
+"
+    
+    # Run doctor.sh --json and check status
+    status=$(HOME="$d" SM_CHECKER_HARNESS=pi "$script_abs" --json 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for x in data:
+    if x['name'] == 'pi Bedrock override: kimi-k3':
+        print(x['status'])
+        sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+    
+    [ "$status" = "MISSING" ] || { echo "FAIL: Test P10 with maxTokens=$invalid_val expected MISSING, got $status"; rm -rf "$d"; exit 1; }
+  done
   rm -rf "$d"
 
   echo ok; exit 0
