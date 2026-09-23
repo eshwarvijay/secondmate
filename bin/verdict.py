@@ -202,7 +202,7 @@ def check_lens_coverage(requested_lenses, envelope):
     covered = []
     missing = []
     for lens in requested_lenses:
-        if lens_coverage.get(lens):  # truthy value
+        if lens_coverage.get(lens) is True:  # must be the literal boolean True, not merely truthy
             covered.append(lens)
         else:
             missing.append(lens)
@@ -283,6 +283,26 @@ def main(argv):
             text=False
         )
         assert result.returncode == 2  # ambiguous due to missing lens
+        
+        # Test lens coverage with non-boolean truthy value (must NOT count as covered)
+        text_nonbool = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":"not exercised"}}
+```'''
+        verdict_word4, code4, envelope4 = read_verdict_with_envelope(text_nonbool)
+        assert verdict_word4 == "pass" and code4 == 0
+        missing4, covered4 = check_lens_coverage(["qa/coverage"], envelope4)
+        assert missing4 == ["qa/coverage"] and covered4 == []  # string "not exercised" is NOT True
+        
+        # Test with boolean false (must NOT count as covered)
+        text_false = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":false}}
+```'''
+        verdict_word5, code5, envelope5 = read_verdict_with_envelope(text_false)
+        assert verdict_word5 == "pass" and code5 == 0
+        missing5, covered5 = check_lens_coverage(["qa/coverage"], envelope5)
+        assert missing5 == ["qa/coverage"] and covered5 == []  # false is not True
         
         # Test ledger file-write behavior
         import tempfile

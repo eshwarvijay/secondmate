@@ -190,6 +190,7 @@ credentials only you can supply.
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
 | `SM_MERGE_LEDGER` | `<repo>/audit/merge-ledger.jsonl` | append-only per-attempt merge ledger written by `bin/merge-sequencer.sh` (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`); like the lock, anchored to `--repo` by default so every caller targeting the same `--repo` writes to the same ledger |
+| `SM_LENS_COVERAGE_LEDGER` | `./audit/lens-coverage.jsonl` | lens-coverage ledger written by `bin/verdict.py` when `--lenses` flag is used |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 
