@@ -50,7 +50,7 @@ Invoke `/adhd` as a Claude sub-agent; save its winning branch to `.secondmate/pl
 ${CLAUDE_PLUGIN_ROOT}/bin/plan-committee.sh --task "<task description>" [--timeout 300]
 ```
 Spawns 6 headless pi planners in parallel (DeepSeek-R1 → failure modes; Qwen3-Next-80B → architecture;
-Qwen3-Coder-Next → implementation; Kimi-K2-Thinking → holistic risk; Mistral-Large-3 → security;
+Qwen3-Coder-Next → implementation; Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3) → holistic risk; Mistral-Large-3 → security;
 GLM-5 → requirements/product). Outputs: `.secondmate/planning/<label>.md`.
 
 **0c — synthesize (you, the supervisor):**
