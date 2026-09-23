@@ -98,7 +98,9 @@ def _finding_has_location(finding):
         '//' that follows -- verified empirically, every such match starts with '//', which no
         real relative file path ever does).
       - A candidate with no letters at all is a bare number pattern, not a path (e.g. a timestamp
-        '10:30' or a ratio '16:9' -- no real file path is purely numeric).
+        '10:30' or a ratio '16:9' -- no real file path is purely numeric). The letter check is
+        Unicode-aware (str.isalpha(), not an ASCII-only [A-Za-z] regex), so a real relative file
+        with a non-ASCII name (e.g. 'λ.py:12') still correctly counts as a location.
     Accepted, deliberately unclosed gap: a domain/email-shaped string with letters and a port
     (e.g. 'user@example.com:25') still passes this shape-only heuristic. This function checks
     output SHAPE, not semantics, and is a quality heuristic on top of human supervisor review,
@@ -112,7 +114,7 @@ def _finding_has_location(finding):
         path = m.group(0)
         if path.startswith("//"):
             continue  # URL host:port
-        if not re.search(r'[A-Za-z]', path):
+        if not any(c.isalpha() for c in path):
             continue  # purely numeric (timestamp, ratio, etc.), not a path
         return True
     return False
@@ -289,6 +291,11 @@ def main(argv):
         assert rv('x\n```json\n{"verdict":"fail","findings":["aspect ratio 16:9 is wrong"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
         # ...but a finding with a timestamp AND a real file:line reference still passes
         assert rv('x\n```json\n{"verdict":"fail","findings":["at 10:30 see bin/doctor.sh:12"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # A real file whose path contains ONLY non-ASCII letters must still count as a location --
+        # the letter check is Unicode-aware (str.isalpha()), not an ASCII-only [A-Za-z] regex. Using
+        # any ASCII letter (e.g. a ".py" extension) in this fixture would pass even the OLD, buggy
+        # ASCII-only check and silently fail to test the thing this assertion exists to guard.
+        assert rv('x\n```json\n{"verdict":"fail","findings":["λ:12 real bug"],"diagnostic":""}\n```\ny') == ("fail", 1)
         # Empty findings on fail should be ambiguous
         assert rv('finding: `{"verdict":"pass"}` example\n```json\n{"verdict":"fail","findings":[]}\n```') == ("ambiguous", 2)  # empty findings on fail
         # Non-string finding should be ambiguous
