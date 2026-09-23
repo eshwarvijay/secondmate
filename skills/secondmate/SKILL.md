@@ -391,7 +391,7 @@ SCRIPT_EOF
   herdr pane run "$ck" bash /tmp/checker-<task-id>-r<N>.sh
   herdr pane wait-output "$ck" --regex "___SM_R<N>_DONE_[0-9]+" --timeout 600000
   herdr pane read "$ck" --source recent-unwrapped --lines 400 > /tmp/sm-checker.out
-  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py /tmp/sm-checker.out
+  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py --lenses qa/coverage /tmp/sm-checker.out
   ```
 - **Watch + integrate from your pane** — `herdr agent get/read sm-<task-id>`, `herdr pane read "$ck"`; then the
   usual verify-gate + hold. You can't answer another pane's live prompt, so run any gated command yourself

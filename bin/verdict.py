@@ -61,8 +61,10 @@ def _extract_envelope_with_verdict(text, verdict_word):
     """Find and return the envelope dict that contains verdict_word."""
     for pattern in (r"```json\s*\n(.*?)```", r"```\s*\n(.*?)```"):
         blocks = re.findall(pattern, text, re.DOTALL)
-        for block in reversed(blocks):
-            for span in _top_objects(block):
+        for block in reversed(blocks):  # last block first
+            # Find objects in reverse order within block (last-wins)
+            objects = list(_top_objects(block))
+            for span in reversed(objects):  # REVERSE order within block
                 try:
                     o = json.loads(span)
                     if isinstance(o, dict) and o.get("verdict") == verdict_word:
@@ -70,7 +72,8 @@ def _extract_envelope_with_verdict(text, verdict_word):
                 except ValueError:
                     continue
     # Fallback to top-level objects
-    for span in _top_objects(text):
+    objects = list(_top_objects(text))
+    for span in reversed(objects):  # REVERSE order here too
         try:
             o = json.loads(span)
             if isinstance(o, dict) and o.get("verdict") == verdict_word:
@@ -259,6 +262,28 @@ def main(argv):
         missing2, covered2 = check_lens_coverage(["redteam"], envelope2)
         assert missing2 == ["redteam"] and covered2 == []
         
+        # Test last-wins semantics within a single block (Finding 1)
+        text_two_pass = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":true}}
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{}}
+```'''
+        verdict_word3, code3, envelope3 = read_verdict_with_envelope(text_two_pass)
+        assert verdict_word3 == "pass" and code3 == 0
+        # Last object within block should win, which has empty lens_coverage
+        missing3, covered3 = check_lens_coverage(["qa/coverage"], envelope3)
+        assert missing3 == ["qa/coverage"] and covered3 == []
+        
+        # Now test with --lenses flag (should be ambiguous because missing)
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, __file__, "--lenses", "qa/coverage"],
+            input=text_two_pass.encode(),
+            capture_output=True,
+            text=False
+        )
+        assert result.returncode == 2  # ambiguous due to missing lens
+        
         # Test ledger file-write behavior
         import tempfile
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
@@ -331,6 +356,84 @@ def main(argv):
             if os_module.path.exists(lock_path):
                 os_module.remove(lock_path)
         
+        # Test last-wins semantics within a single block
+        text_two_pass = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":true}}
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{}}
+```'''
+        verdict_word3, code3, envelope3 = read_verdict_with_envelope(text_two_pass)
+        assert verdict_word3 == "pass" and code3 == 0
+        # Last object within block should win, which has empty lens_coverage
+        missing3, covered3 = check_lens_coverage(["qa/coverage"], envelope3)
+        assert missing3 == ["qa/coverage"] and covered3 == []
+        
+        # Now test with --lenses flag (should be ambiguous because missing)
+        result = subprocess.run(
+            [sys.executable, __file__, "--lenses", "qa/coverage"],
+            input=text_two_pass.encode(),
+            capture_output=True,
+            text=False
+        )
+        assert result.returncode == 2  # ambiguous due to missing lens
+        
+        
+        # Test --lenses '' (empty string) still records ledger entry
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp_empty:
+            tmp_empty_path = tmp_empty.name
+        
+        os.environ["SM_LENS_COVERAGE_LEDGER"] = tmp_empty_path
+        try:
+            result_empty = subprocess.run(
+                [sys.executable, __file__, "--lenses", ""],
+                input=text_with_lens.encode(),
+                capture_output=True,
+                text=False
+            )
+            assert result_empty.returncode == 0  # should still pass
+            
+            # Ledger should have one record with requested: []
+            with open(tmp_empty_path) as f:
+                lines = f.readlines()
+                assert len(lines) == 1
+                record_empty = json.loads(lines[0])
+                assert record_empty["requested"] == []
+                assert record_empty["covered"] == []
+                assert record_empty["missing"] == []
+                assert record_empty["verdict"] == "pass"
+        finally:
+            os.environ.pop("SM_LENS_COVERAGE_LEDGER", None)
+            if os_module.path.exists(tmp_empty_path):
+                os_module.remove(tmp_empty_path)
+            lock_path = tmp_empty_path + ".lock"
+            if os_module.path.exists(lock_path):
+                os_module.remove(lock_path)
+        
+        
+        # Test ledger-write failure path (warning but verdict unchanged)
+        # Point to an unwritable parent directory
+        import tempfile
+        import os
+        import subprocess
+        
+        # Test 1: Non-existent parent (should trigger warning but verdict unchanged)
+        bad_path = "/nonexistent/parent/dir/ledger.jsonl"
+        os.environ["SM_LENS_COVERAGE_LEDGER"] = bad_path
+        try:
+            result_fail = subprocess.run(
+                [sys.executable, __file__, "--lenses", "redteam"],
+                input=text_for_ledger.encode(),
+                capture_output=True,
+                text=False
+            )
+            # Should still return fail (verdict unchanged)
+            assert result_fail.returncode == 1  # fail verdict
+            # Should have warning in stderr
+            stderr_text = result_fail.stderr.decode() if result_fail.stderr else ""
+            assert "warning: ledger write failed" in stderr_text
+        finally:
+            os.environ.pop("SM_LENS_COVERAGE_LEDGER", None)
+        
         print("ok")
         return
     
@@ -339,10 +442,11 @@ def main(argv):
     verdict_word, exit_code, envelope = read_verdict_with_envelope(text)
     
     requested_lenses = []
-    if args.lenses:
+    if args.lenses is not None:
+        # args.lenses could be empty string if flag passed with empty value
         requested_lenses = [l.strip() for l in args.lenses.split(",") if l.strip()]
     
-    if requested_lenses:
+    if args.lenses is not None:  # Flag was present (even if empty)
         missing, covered = check_lens_coverage(requested_lenses, envelope)
         # Record to ledger regardless of outcome
         _record_lens_coverage(requested_lenses, covered, missing, verdict_word)
