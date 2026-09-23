@@ -88,6 +88,23 @@ def _valid_verdicts(text):
     return out
 
 
+def _finding_has_location(finding):
+    """True if finding contains [NOLOC] or a real file:line token (e.g. file.py:42 or file.py:42,99).
+    A file:line token must not be a URL's host:port (e.g. https://bugs.example:443): the [^\\s:]+
+    path-matching group stops at the FIRST colon it meets, so for a scheme://host:port URL, the
+    scheme (e.g. 'https:') is consumed by its own failed match attempt and the real match starts
+    right at the '//' that follows -- verified empirically, every such match starts with '//',
+    while no legitimate relative file path ever does. Reject any candidate match starting with
+    '//'; a finding can still have a later, real file:line match after a leading URL and still
+    count as valid (the loop checks every candidate, not just the first)."""
+    if "[NOLOC]" in finding:
+        return True
+    for m in re.finditer(r'[^\s:]+:\d+(?:,\d+)*', finding):
+        if not m.group(0).startswith("//"):
+            return True
+    return False
+
+
 def _extract_envelope_with_verdict(text, verdict_word):
     """Find and return the envelope dict that contains verdict_word."""
     for pattern in (r"```json\s*\n(.*?)```", r"```\s*\n(.*?)```"):
@@ -179,11 +196,7 @@ def read_verdict_with_envelope(text):
                     for finding in findings:
                         if not isinstance(finding, str):
                             return "ambiguous", EXIT["ambiguous"], envelope
-                        # Must contain either file:line pattern OR literal [NOLOC]
-                        if "[NOLOC]" in finding:
-                            continue  # explicit escape hatch
-                        # Match file:line pattern (e.g., file.py:42 or file.py:42,99)
-                        if not re.search(r'[^\s:]+:\d+(?:,\d+)*', finding):
+                        if not _finding_has_location(finding):
                             return "ambiguous", EXIT["ambiguous"], envelope
                 return verdict_word, EXIT[verdict_word], envelope
     # no fenced block at all: fall back to top-level objects; conflicting bare verdicts fail closed
@@ -208,11 +221,7 @@ def read_verdict_with_envelope(text):
         for finding in findings:
             if not isinstance(finding, str):
                 return "ambiguous", EXIT["ambiguous"], envelope
-            # Must contain either file:line pattern OR literal [NOLOC]
-            if "[NOLOC]" in finding:
-                continue  # explicit escape hatch
-            # Match file:line pattern (e.g., file.py:42 or file.py:42,99)
-            if not re.search(r'[^\s:]+:\d+(?:,\d+)*', finding):
+            if not _finding_has_location(finding):
                 return "ambiguous", EXIT["ambiguous"], envelope
     return verdict_word, EXIT[verdict_word], envelope
 
@@ -257,6 +266,10 @@ def main(argv):
         assert rv('x\n```json\n{"verdict":"fail","findings":["bin/doctor.sh:322,419 fresh HOME without .pi/agent makes both Bedrock atomic writes fail [CONFIRMED]"],"diagnostic":""}\n```\ny') == ("fail", 1)
         # [NOLOC] escape hatch should work
         assert rv('x\n```json\n{"verdict":"fail","findings":["[NOLOC] process design defect with no single fixed line"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # A URL with a port (host:port) must NOT count as a file:line location
+        assert rv('x\n```json\n{"verdict":"fail","findings":["https://bugs.example:443"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
+        # ...but a finding with a URL AND a real file:line reference still passes
+        assert rv('x\n```json\n{"verdict":"fail","findings":["see https://bugs.example:443 and bin/doctor.sh:12"],"diagnostic":""}\n```\ny') == ("fail", 1)
         # Empty findings on fail should be ambiguous
         assert rv('finding: `{"verdict":"pass"}` example\n```json\n{"verdict":"fail","findings":[]}\n```') == ("ambiguous", 2)  # empty findings on fail
         # Non-string finding should be ambiguous
