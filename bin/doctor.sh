@@ -102,10 +102,10 @@ _reset_detect_state() {
 # Usage: _bedrock_get_model_id "kimi-k3" -> outputs global.moonshotai.kimi-k3 or empty
 # Bug 3 fix: plan-committee.sh path is now overridable via SM_PLANCOMMITTEE_PATH env var
 # for test fixtures (matching the existing convention: SM_SECONDMATE_MARKETPLACE_DIR, etc.)
+# Round 7 fix: use the GLOBAL $script_dir (already symlink-resolved) instead of re-declaring
+# a NEW local script_dir that breaks symlink invocation
 _bedrock_get_model_id() {
   local label="$1"
-  # Bug 3 fix: default to real script_dir/plan-committee.sh but allow override via env var
-  local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   local source_file="${SM_PLANCOMMITTEE_PATH:-$script_dir/plan-committee.sh}"
   
   if [ ! -f "$source_file" ]; then
@@ -3400,6 +3400,61 @@ else:
 "
   [ $? -eq 0 ] || { echo "FAIL: Test P12 deepseek-r1 not correctly fixed"; rm -rf "$d"; exit 1; }
   rm -rf "$d"
+
+  # Test P13: _bedrock_get_model_id must work when doctor.sh invoked via symlink
+  # Round 7 fix: avoid shadowing global $script_dir with local declaration
+  script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  symlink_dir=$(mktemp -d)
+  ln -sf "$script_dir/doctor.sh" "$symlink_dir/doctor"
+  
+  # Create a fixture with correct values
+  d=$(mktemp -d)
+  mkdir -p "$d/.pi/agent"
+  j="$d/.pi/agent/models.json"
+  python3 -c "
+import json
+data = {
+    'providers': {
+        'amazon-bedrock': {
+            'modelOverrides': {'global.moonshotai.kimi-k3': {'maxTokens': 120000}},
+            'models': [{'id': 'us.deepseek.r1-v1:0', 'maxTokens': 30000}]
+        }
+    }
+}
+with open('$j', 'w') as f:
+    json.dump(data, f)
+"
+  
+  home_backup="$HOME"
+  HOME="$d"
+  # Run via symlink
+  out=$("$symlink_dir/doctor" --json 2>&1)
+  HOME="$home_backup"
+  
+  # Both should be OK, not UNKNOWN
+  kimi_status=$(echo "$out" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='pi Bedrock override: kimi-k3':
+        print(x['status'])
+        sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+  [ "$kimi_status" = "OK" ] || { echo "FAIL: Test P13 kimi-k3 via symlink expected OK, got '$kimi_status'"; rm -rf "$d" "$symlink_dir"; exit 1; }
+  
+  deepseek_status=$(echo "$out" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='pi Bedrock override: deepseek-r1':
+        print(x['status'])
+        sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+  [ "$deepseek_status" = "OK" ] || { echo "FAIL: Test P13 deepseek-r1 via symlink expected OK, got '$deepseek_status'"; rm -rf "$d" "$symlink_dir"; exit 1; }
+  
+  rm -rf "$d" "$symlink_dir"
 
   echo ok; exit 0
 fi
