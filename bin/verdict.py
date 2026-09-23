@@ -12,7 +12,7 @@ inside fenced blocks. If there are none, we fall back to scanning TOP-LEVEL {...
 ones, so a stray "verdict" key buried in prose or structured data can't be mistaken for the envelope.
 Conflicting verdicts fail closed (ambiguous). The supervisor branches on the exit code, not the prose.
 """
-import json, re, sys, os, time, argparse, pathlib, contextlib
+import json, re, sys, os, time, argparse, pathlib, contextlib, subprocess
 try:
     import fcntl
 except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
@@ -21,9 +21,40 @@ except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
 VALID = {"pass", "fail", "error", "refused"}
 EXIT = {"pass": 0, "fail": 1, "error": 2, "refused": 2, "malformed": 2, "ambiguous": 2}
 
+def _default_lens_ledger_path():
+    """Resolve the default ledger location when SM_LENS_COVERAGE_LEDGER is unset. Anchoring to plain CWD
+    is fragile: a checker round invoked from a pane/shell whose ambient CWD isn't the intended worktree
+    would resolve this to the wrong repo's audit/ directory (this happened for real this session). Same
+    fix as bin/claim-ledger.py's _default_ledger_path(): anchor via `git rev-parse --git-common-dir`, whose
+    parent is the one physical location every worktree of a repo agrees on -- except for a bare repo or a
+    submodule, where common-dir's own basename isn't literally '.git', so we anchor AT common-dir itself
+    instead of its parent (same one-basename-check rule, no extra --is-bare-repository call)."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            common_dir = pathlib.Path(out.stdout.strip())
+            if not common_dir.is_absolute():
+                common_dir = pathlib.Path.cwd() / common_dir
+            common_dir = common_dir.resolve()
+            anchor = common_dir if common_dir.name != ".git" else common_dir.parent
+            return anchor / "audit" / "lens-coverage.jsonl"
+    except OSError:
+        pass  # git not installed/found -- fall through to the loud-warning CWD-relative fallback below
+    sys.stderr.write(
+        "WARNING: verdict.py could not resolve a git-common-dir (not inside a git repo, or git not found) "
+        "-- falling back to a CWD-relative ./audit/lens-coverage.jsonl, which will NOT be shared across "
+        "other worktrees/CWDs. Set SM_LENS_COVERAGE_LEDGER to a shared path for a durable ledger.\n")
+    return pathlib.Path("audit") / "lens-coverage.jsonl"
+
+
 def get_ledger_path():
-    """Get ledger path, reading SM_LENS_COVERAGE_LEDGER env var."""
-    return pathlib.Path(os.environ.get("SM_LENS_COVERAGE_LEDGER", "audit/lens-coverage.jsonl"))
+    """Get ledger path: SM_LENS_COVERAGE_LEDGER env var if set, else a git-common-dir-anchored default
+    (see _default_lens_ledger_path) so the ledger always resolves to the correct repo root regardless of
+    the caller's ambient cwd."""
+    override = os.environ.get("SM_LENS_COVERAGE_LEDGER")
+    if override:
+        return pathlib.Path(override)
+    return _default_lens_ledger_path()
 
 
 def _top_objects(text):
@@ -274,15 +305,28 @@ def main(argv):
         missing3, covered3 = check_lens_coverage(["qa/coverage"], envelope3)
         assert missing3 == ["qa/coverage"] and covered3 == []
         
-        # Now test with --lenses flag (should be ambiguous because missing)
         import subprocess
+        import tempfile
+        import os
+        
+        # Create temp file for this subprocess
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp_path = tmp.name
+        
         result = subprocess.run(
             [sys.executable, __file__, "--lenses", "qa/coverage"],
             input=text_two_pass.encode(),
             capture_output=True,
-            text=False
+            text=False,
+            env={**os.environ, "SM_LENS_COVERAGE_LEDGER": tmp_path}
         )
         assert result.returncode == 2  # ambiguous due to missing lens
+        
+        # Clean up temp file
+        os.remove(tmp_path)
+        lock_path = tmp_path + ".lock"
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
         
         # Test lens coverage with non-boolean truthy value (must NOT count as covered)
         text_nonbool = '''Some prose.
@@ -376,28 +420,6 @@ def main(argv):
             if os_module.path.exists(lock_path):
                 os_module.remove(lock_path)
         
-        # Test last-wins semantics within a single block
-        text_two_pass = '''Some prose.
-```json
-{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":true}}
-{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{}}
-```'''
-        verdict_word3, code3, envelope3 = read_verdict_with_envelope(text_two_pass)
-        assert verdict_word3 == "pass" and code3 == 0
-        # Last object within block should win, which has empty lens_coverage
-        missing3, covered3 = check_lens_coverage(["qa/coverage"], envelope3)
-        assert missing3 == ["qa/coverage"] and covered3 == []
-        
-        # Now test with --lenses flag (should be ambiguous because missing)
-        result = subprocess.run(
-            [sys.executable, __file__, "--lenses", "qa/coverage"],
-            input=text_two_pass.encode(),
-            capture_output=True,
-            text=False
-        )
-        assert result.returncode == 2  # ambiguous due to missing lens
-        
-        
         # Test --lenses '' (empty string) still records ledger entry
         with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp_empty:
             tmp_empty_path = tmp_empty.name
@@ -453,7 +475,31 @@ def main(argv):
             assert "warning: ledger write failed" in stderr_text
         finally:
             os.environ.pop("SM_LENS_COVERAGE_LEDGER", None)
-        
+
+        # Test cwd-independence: the default ledger path must resolve to the SAME stable,
+        # repo-anchored location whether called from this worktree or from the repo's primary
+        # checkout -- not a bare relative string (this caused a real cross-worktree collision this
+        # session: a checker round invoked from a pane whose actual shell cwd was the primary
+        # checkout, not the intended worktree, wrote real ledger entries into the wrong location).
+        assert str(get_ledger_path()) != "audit/lens-coverage.jsonl", (
+            "ledger path is a bare relative string, not git-anchored")
+        path_from_worktree = _default_lens_ledger_path()
+        common_dir_out = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                                         capture_output=True, text=True)
+        common_dir = pathlib.Path(common_dir_out.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = pathlib.Path.cwd() / common_dir
+        common_dir = common_dir.resolve()
+        primary_checkout = common_dir.parent if common_dir.name == ".git" else common_dir
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(primary_checkout)
+            path_from_primary = _default_lens_ledger_path()
+        finally:
+            os.chdir(prev_cwd)
+        assert path_from_worktree == path_from_primary, (
+            f"ledger path changed with cwd: {path_from_worktree} != {path_from_primary}")
+
         print("ok")
         return
     
