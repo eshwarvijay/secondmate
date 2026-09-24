@@ -1232,6 +1232,84 @@ GITSHIM
   [ "$attempt_count35" = "2" ] || { echo "FAIL: expected exactly 2 push attempts (initial race + 1 retry that hit the unrelated auth failure), got $attempt_count35 -- an unrelated failure must stop the loop immediately, not burn a pointless 3rd attempt"; fails=1; }
   [ "$(_ledger_count sm/auth-fail-midrace PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: race-then-auth-failure was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
 
+  # ---- Test 36: (P1) CRITICAL negative test -- while invocation A is mid-recovery (a real race
+  # on its first push, then a slow recovery fetch), a SECOND, concurrent invocation B targeting the
+  # SAME --repo must wait for A's lock, never merge/push into that same checkout while A's own
+  # recovery is still in progress. An earlier revision released the lock at the top of each retry
+  # attempt, letting B complete entirely mid-A's-recovery -- reproduced directly with two real
+  # concurrent invocations before this fix (B finished successfully, rc=0, while A was still
+  # recovering). The decisive assertion: once both finish, A's own final commit must be an ANCESTOR
+  # of B's resulting main -- proof B's merge only happened after A's ENTIRE recovery (including
+  # the lock's release) was done, not a race that could have landed B's commit onto a stale base. ----
+  IFS='|' read -r origin36 primary36 <<<"$(_setup_repo 36)"
+  git -C "$primary36" worktree add -q "$t/wt36a" -b sm/conc-race-a main
+  echo "feature-36a" >> "$t/wt36a/file.txt"
+  git -C "$t/wt36a" commit -qam "feature 36a"
+  sha36a="$(git -C "$t/wt36a" rev-parse HEAD)"
+  git -C "$primary36" worktree add -q "$t/wt36b" -b sm/conc-race-b main
+  echo "feature-36b" > "$t/wt36b/other-file-36.txt"
+  git -C "$t/wt36b" add other-file-36.txt
+  git -C "$t/wt36b" commit -qam "feature 36b"
+  sha36b="$(git -C "$t/wt36b" rev-parse HEAD)"
+  fake_git_dir36="$t/fake-git-36"
+  mkdir -p "$fake_git_dir36"
+  real_git_path36="$(command -v git)"
+  counter36="$t/push-counter-36"
+  : > "$counter36"
+  cat > "$fake_git_dir36/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path36"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter36" | tr -d ' ')
+  echo "attempt" >> "$counter36"
+  if [ "\$n" = "0" ]; then
+    echo "! [rejected]  main -> main (fetch first)" >&2
+    exit 1
+  fi
+elif [ "\$sub" = "fetch" ]; then
+  sleep 3
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir36/git"
+  (
+    PATH="$fake_git_dir36:$PATH" SM_LOOP_STATE="$SM_LOOP_STATE" SM_MERGE_LEDGER="$SM_MERGE_LEDGER" bash "$MS" \
+      --repo "$primary36" --worktree "$t/wt36a" --branch sm/conc-race-a --base main --checked-sha "$sha36a" \
+      --wait-timeout 20 > "$t/out36a.log" 2>&1
+    echo $? > "$t/rc36a"
+  ) &
+  pid36a=$!
+  sleep 1.2  # let A get past its initial push failure and into the (slow) recovery fetch first
+  # THE DECISIVE ASSERTION IS TIMING, NOT FINAL ANCESTRY: A's own recovery merge pulls in whatever
+  # landed on origin in the meantime, so even a BROKEN (lock-released-too-early) run can still end
+  # up with a plausible-looking, fully-linear final history -- A's recovery logic naturally
+  # subsumes an interleaved change once it happens. What it can NEVER do is make B's own git
+  # commands finish BEFORE A's lock is actually released, if the lock is genuinely held throughout.
+  # Confirmed by direct reproduction: the pre-fix code has B complete in ~0s (races straight in);
+  # the fixed code has B block for ~3s (A's full sleep) before proceeding.
+  start36b=$(date +%s)
+  SM_LOOP_STATE="$SM_LOOP_STATE" SM_MERGE_LEDGER="$SM_MERGE_LEDGER" bash "$MS" \
+    --repo "$primary36" --worktree "$t/wt36b" --branch sm/conc-race-b --base main --checked-sha "$sha36b" \
+    --wait-timeout 20 > "$t/out36b.log" 2>&1
+  rc36b=$?
+  end36b=$(date +%s)
+  elapsed36b=$((end36b - start36b))
+  wait "$pid36a"
+  rc36a="$(cat "$t/rc36a")"
+  [ "$rc36a" = 0 ] && [ "$rc36b" = 0 ] || { echo "FAIL: concurrent race-recovery test did not both succeed (rc_a=$rc36a rc_b=$rc36b)"; echo "out-a: $(cat "$t/out36a.log")"; echo "out-b: $(cat "$t/out36b.log")"; fails=1; }
+  [ "$elapsed36b" -ge 2 ] || { echo "FAIL: B completed in ${elapsed36b}s -- expected B to be BLOCKED on A's lock for close to A's full 3s recovery sleep, not race straight in (serialization violated, the exact bug this test guards)"; fails=1; }
+  [ -f "$primary36/file.txt" ] && grep -q "feature-36a" "$primary36/file.txt" || { echo "FAIL: concurrent race-recovery test lost A's change"; fails=1; }
+  [ -f "$primary36/other-file-36.txt" ] && grep -q "feature-36b" "$primary36/other-file-36.txt" || { echo "FAIL: concurrent race-recovery test lost B's change"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1550,8 +1628,19 @@ if [ "$push_rc" -ne 0 ]; then
     # never a 4th.
     echo "PUSH RACE (attempt 1/3): push failed, attempting race recovery..." >&2
 
+    # The lock stays held through the ENTIRE recovery sequence below (fetch, merge, retry-push,
+    # every attempt) -- same as the normal merge+push path already holds it through both. An
+    # earlier revision released the lock at the top of each retry iteration, on the theory of not
+    # blocking other waiters during network I/O -- but $repo's WORKING TREE/INDEX/HEAD is what the
+    # lock actually protects, and recovery's own 'git merge' mutates exactly that, still inside
+    # $repo, for the full duration of every retry attempt. Releasing it there let a second,
+    # concurrent invocation targeting the SAME --repo acquire the lock and merge/push into that
+    # same checkout WHILE this invocation's recovery was still in progress -- reproduced directly
+    # with two real concurrent invocations: the second completed successfully mid-recovery of the
+    # first, defeating the entire "serialize concurrent merges to the same primary checkout"
+    # purpose this script exists for. Every _release_lock call elsewhere in this file is
+    # immediately followed by exit; this loop's own exits (below) are no different.
     for attempt in 2 3; do
-      _release_lock
       echo "PUSH RACE (attempt $attempt/3): push failed, attempting race recovery..." >&2
 
       # git fetch origin (only touches remote-tracking refs, never working tree)
