@@ -39,16 +39,32 @@ _check_worktree() {
   # "clean" even though the check genuinely could not be performed. The producer's own exit status
   # is now captured and checked before ever inspecting its output -- a nonzero exit reports
   # "unknown", never "clean", matching _herdr_agent_state's own established convention.
+  #
+  # A THIRD, DISTINCT bug (round 6): the round-5 fix's `case "$out" in *"branch refs/heads/sm/$2"*)`
+  # was a bare SUBSTRING match, not an exact-branch match -- porcelain's branch line for an unrelated
+  # branch like sm/foo-bar is literally "branch refs/heads/sm/foo-bar", which CONTAINS
+  # "branch refs/heads/sm/foo" as its own prefix, so task-id "foo" falsely matched an entirely
+  # different worktree ("foo-bar"'s), reported [worktree] present. Reproduced directly with exactly
+  # that fixture. Fixed by requiring a genuinely EXACT match against one whole line of the porcelain
+  # output (each field is its own line) rather than a substring anywhere in the multi-line blob --
+  # `_check_branch`/`_check_claim` were independently re-verified to NOT share this collision class
+  # (`_check_branch` is a real `git rev-parse --verify` ref lookup, not text matching at all;
+  # `_check_claim`'s `[$1]` pattern is bracket-delimited on both sides, so `[foo]` cannot match inside
+  # `[foo-bar]`) -- confirmed by direct reproduction, not just by re-reading the code.
   local out rc=0
   out="$(git -C "$1" worktree list --porcelain 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "unknown: git -C $1 worktree list --porcelain failed (rc=$rc) -- cannot confirm worktree state"
     return
   fi
-  case "$out" in
-    *"branch refs/heads/sm/$2"*) echo "present";;
-    *) echo "clean";;
-  esac
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "branch refs/heads/sm/$2" ]; then
+      echo "present"
+      return
+    fi
+  done <<< "$out"
+  echo "clean"
 }
 
 _check_branch() {
@@ -302,6 +318,23 @@ PYFAILEOF
   echo "$out" | grep -qi "\[claim\].*unknown" || { echo "FAIL: a genuine claim-ledger.py status failure must report [claim] unknown: $out"; fails=1; }
   echo "$out" | grep -qi "\[claim\].*clean" && { echo "FAIL: a genuine claim-ledger.py status failure must NEVER report [claim] clean (false clean): $out"; fails=1; }
   [ "$rc" = 0 ] || { echo "FAIL: an 'unknown' claim check alone (nothing else present) must not force a nonzero exit: $rc: $out"; fails=1; }
+
+  # ---- Test 13: _check_worktree's exact-branch-match fix (round 6) -- an UNRELATED worktree whose
+  # branch name has the target task-id as a proper PREFIX (sm/foo-bar vs task-id foo) must NOT be
+  # mistaken for the target's own worktree. porcelain's branch line for the unrelated branch is
+  # literally "branch refs/heads/sm/foo-bar", which CONTAINS "branch refs/heads/sm/foo" as a
+  # substring -- the round-5 bare `*substring*` match falsely reported [worktree] present for this
+  # exact fixture. Also confirms the exact-match case (the target's OWN worktree, e.g. sm/foo itself)
+  # still correctly reports present -- the fix must not just start under-matching instead. ----
+  git -C "$t/proj" worktree add -q -b sm/prefix-collision-bar "$t/wt-prefix-collision-bar" main
+  rc=0; out="$(SM_CLAIM_LEDGER="$t/claims-empty7.jsonl" HERDR_ENV="" "$0" --task-id prefix-collision --repo "$t/proj" 2>&1)" || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL: an unrelated worktree whose branch has the task-id as a proper prefix must not falsely report present: $rc: $out"; fails=1; }
+  echo "$out" | grep -qi "\[worktree\].*clean" || { echo "FAIL: expected [worktree] clean for the prefix-collision fixture (task-id 'prefix-collision' vs only 'sm/prefix-collision-bar' present): $out"; fails=1; }
+
+  git -C "$t/proj" worktree add -q -b sm/prefix-collision "$t/wt-prefix-collision-exact" main
+  rc=0; out="$(SM_CLAIM_LEDGER="$t/claims-empty8.jsonl" HERDR_ENV="" "$0" --task-id prefix-collision --repo "$t/proj" 2>&1)" || rc=$?
+  [ "$rc" != 0 ] || { echo "FAIL: the task-id's OWN exact-match worktree must still report present (and nonzero) once it also exists: $rc: $out"; fails=1; }
+  echo "$out" | grep -qi "\[worktree\].*present" || { echo "FAIL: expected [worktree] present once the exact-match worktree (sm/prefix-collision) also exists: $out"; fails=1; }
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
