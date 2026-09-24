@@ -3962,6 +3962,45 @@ for x in data:
 
   rm -rf "$d" "$external_toctou3"
 
+  # === Test Q4: the embedded python's generic except handler fails closed when `cp` is unavailable ===
+  # Checker round 5's real, confirmed finding: this exact except-around-makedirs/cp branch is reachable
+  # and already fails closed (verified directly, both by the checker and independently here), but
+  # nothing in --selfcheck ever exercised it -- a future refactor of that error handling could silently
+  # regress its fail-closed behavior with nothing to catch it. Pure test addition, no production change.
+  d=$(mktemp -d)
+  mkdir -p "$d/packages/widget3/.claude/skills/nocp-src"
+  echo "nocp-src real content" > "$d/packages/widget3/.claude/skills/nocp-src/SKILL.md"
+  nocp_lock_dir="$d/.q4-lock"
+
+  nocp_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q4-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q4-no-installed.json" SM_DOCTOR_LOCK_DIR="$nocp_lock_dir" "$script_abs" --json 2>/dev/null)
+  nocp_fix=$(echo "$nocp_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/widget3/nocp-src (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -n "$nocp_fix" ] || { echo "FAIL: Test Q4 expected a non-empty fix to be generated"; rm -rf "$d"; exit 1; }
+
+  # a restricted PATH with every tool the fix genuinely needs EXCEPT cp -- matching the checker's own
+  # repro exactly (bash/sh/python3/mkdir/rm/ls/cat/printf present, cp deliberately absent).
+  nocp_bin="$(mktemp -d)"
+  for _t in bash sh python3 mkdir rm ls cat printf; do
+    _tp="$(command -v "$_t" 2>/dev/null)"
+    [ -n "$_tp" ] && ln -s "$_tp" "$nocp_bin/$_t"
+  done
+
+  nocp_run_out=$(PATH="$nocp_bin" bash -c "$nocp_fix" 2>&1)
+  nocp_run_rc=$?
+  [ "$nocp_run_rc" -ne 0 ] \
+    || { echo "FAIL: Test Q4 expected nonzero exit when cp is unavailable, got rc=0: $nocp_run_out"; rm -rf "$d" "$nocp_bin"; exit 1; }
+  [ ! -e "$d/packages/widget3/.agents/skills/nocp-src" ] \
+    || { echo "FAIL: Test Q4 nocp-src should never have been healed when cp is unavailable"; rm -rf "$d" "$nocp_bin"; exit 1; }
+  echo "$nocp_run_out" | grep -q "refusing/failed" \
+    || { echo "FAIL: Test Q4 expected a clear refusing/failed message, got: $nocp_run_out"; rm -rf "$d" "$nocp_bin"; exit 1; }
+
+  rm -rf "$d" "$nocp_bin"
+
   # === Test R: no project skills anywhere -> no skill discovery rows at all ===
   d=$(mktemp -d)
   # isolate from the REAL installed secondmate plugin state (SM_SECONDMATE_MARKETPLACE_DIR/etc.) so
