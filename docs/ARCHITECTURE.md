@@ -216,7 +216,10 @@ Each stage exists to close a specific failure mode.
    repo; checked before the first push AND monotonically re-checked (never reset once true) before every
    retry, so a hook can't evade detection either by deleting itself afterward or by only appearing
    mid-recovery. The one thing that stays un-closed: the exact instant between any single sample and the push
-   it's immediately followed by. `--preflight-only` runs `git merge-tree --write-tree` against a
+   it's immediately followed by. A separate, broader accepted limitation: every classifier here trusts that
+   `git` in `PATH` is the genuine, unmodified system binary -- a PATH/transport-helper substitute could
+   fabricate any of these structural markers, the same class of threat `bin/caffeinate-guard.sh` already
+   declines to defend against. `--preflight-only` runs `git merge-tree --write-tree` against a
    freshly-fetched `origin/<base>` to detect a conflict before ever acquiring the lock or touching `$repo`'s
    working tree, index, branch refs, or ledger (`--branch` must still resolve to exactly `--checked-sha`) —
    read-only with respect to those five things specifically, not with respect to fetch's/`merge-tree`'s own

@@ -81,6 +81,21 @@
 # write access to $repo/.git/hooks/, timed to a sub-second window, to exploit -- the same class of
 # narrow, artificially-held-open timing risk already accepted elsewhere in this codebase (see
 # bin/caffeinate-guard.sh's own documented PATH/supply-chain limitation).
+#
+# A SEPARATE, BROADER accepted limitation (also deliberately not chased): every classifier in this
+# file (_is_ref_lock_race, _is_race, _is_hook_rejection, _repo_has_pre_push_hook) fundamentally
+# trusts that the 'git' executable actually invoked is the genuine, unmodified system git. A
+# PATH-precedence shim, a custom transport/SSH/credential helper, or any other substitute for the
+# real 'git' binary can fabricate ANY output at all -- including a byte-for-byte copy of git's own
+# "[rejected]"/"[remote rejected]"/"(incorrect old value provided)" structural summary lines this
+# file relies on as unspoofable evidence, since those lines are only unspoofable when they are
+# genuinely git-generated. This is the identical class of threat bin/caffeinate-guard.sh already
+# documents and explicitly declines to defend against ("a PATH/supply-chain threat model outside
+# this feature's scope") -- not a gap in the local-pre-push-hook detection (rounds 7-10 remain
+# complete for that legitimate, ordinary git mechanism), but a categorically different, much
+# broader trust boundary: an adversary who can substitute what 'git' itself prints can defeat every
+# check in this script, not just its race classification, and no text-based check invoked via that
+# same compromised 'git' could ever reliably detect its own compromise from inside this process.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
