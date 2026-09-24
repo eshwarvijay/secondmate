@@ -54,6 +54,18 @@ _HEADER_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}) — (.*)$")
 # per-task files.
 _INDEX_CAP = 15
 
+# Cap on how much of a single entry's TITLE is rendered into its INDEX.md line. An entry-count cap alone
+# does not bound an individual title's length -- an unusually long --title would otherwise blow up
+# INDEX.md regardless of _INDEX_CAP. The full, untruncated title always stays in the per-task file
+# itself; only the generated index line is bounded.
+_INDEX_TITLE_MAX = 120
+
+
+def _truncate(text, max_len=_INDEX_TITLE_MAX):
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "..."
+
 
 def _audit_dir():
     return pathlib.Path(os.environ.get("SM_AUDIT_DIR", "audit"))
@@ -140,11 +152,20 @@ def cmd_show(args):
         sys.exit(f"invalid --type {args.type!r}: must be flow or decision")
     if not _valid_task_id(args.task):
         sys.exit(f"invalid --task {args.task!r}")
-    slug = _slugify(args.task)
-    matches = sorted(_type_dir(args.type).glob(f"*--{slug}.md")) if _type_dir(args.type).exists() else []
+    # Substring match against the filename's slug, not an exact suffix -- migrated legacy entries are
+    # named after their (slugified) TITLE, not a discrete task-id (they never had one), so a short
+    # task-id-shaped query must still find an entry whose real filename slug is the full title. May
+    # legitimately match more than one file; print every match, never silently pick one.
+    needle = _slugify(args.task)
+    d = _type_dir(args.type)
+    matches = sorted(p for p in d.glob("*.md") if needle in p.stem) if d.exists() else []
     if not matches:
-        sys.exit(f"no {args.type} entry found for task {args.task!r}")
-    for path in matches:
+        sys.exit(f"no {args.type} entry found matching task {args.task!r}")
+    for i, path in enumerate(matches):
+        if len(matches) > 1:
+            if i:
+                print()
+            print(f"=== {path} ===")
         print(path.read_text(), end="")
 
 
@@ -198,7 +219,7 @@ def reindex():
         if not recent:
             lines.append("(none yet)")
         for path, date, header_text in recent:
-            lines.append(f"- {date} — {header_text} (`{path}`)")
+            lines.append(f"- {date} — {_truncate(header_text)} (`{path}`)")
         lines.append("")
     _audit_dir().mkdir(parents=True, exist_ok=True)
     (_audit_dir() / "INDEX.md").write_text("\n".join(lines).rstrip() + "\n")
@@ -209,41 +230,80 @@ def cmd_reindex(_args):
     print(f"wrote {_audit_dir() / 'INDEX.md'}")
 
 
+def _split_monolith_entries(text):
+    """Split a monolithic audit/flow.md-style file into (date, title, chunk_text) tuples by finding
+    entry HEADERS (lines matching _HEADER_RE), never by splitting on bare '---' lines -- a markdown
+    horizontal rule is ordinary body text and can legitimately appear inside a real entry, so treating
+    every '---' as a boundary would silently truncate that entry's own content. Each entry's content
+    runs from its own header line up to (but not including) the next header line, or EOF; a single
+    trailing '---'-only separator line (plus any blank lines around it) immediately before the next
+    header is stripped separately, since that belongs to the monolith's own formatting, not the entry.
+    Operates on `text` exactly as read (see cmd_migrate's newline="" open) so line endings inside the
+    body are preserved verbatim in the returned chunk_text."""
+    lines = text.splitlines(keepends=True)
+    header_positions = []
+    for i, line in enumerate(lines):
+        m = _HEADER_RE.match(line.rstrip("\r\n"))
+        if m:
+            header_positions.append((i, m.group(1), m.group(2)))
+    entries = []
+    for idx, (start, date, title) in enumerate(header_positions):
+        end = header_positions[idx + 1][0] if idx + 1 < len(header_positions) else len(lines)
+        chunk_lines = list(lines[start:end])
+        while chunk_lines and chunk_lines[-1].strip() == "":
+            chunk_lines.pop()
+        if chunk_lines and chunk_lines[-1].strip() == "---":
+            chunk_lines.pop()
+            while chunk_lines and chunk_lines[-1].strip() == "":
+                chunk_lines.pop()
+        chunk_text = "".join(chunk_lines)
+        if not chunk_text.endswith("\n"):
+            chunk_text += "\n"
+        entries.append((date, title, chunk_text))
+    return entries
+
+
 def cmd_migrate(args):
     if args.type not in ("flow", "decision"):
         sys.exit(f"invalid --type {args.type!r}: must be flow or decision")
     src = pathlib.Path(args.file)
     if not src.exists():
         sys.exit(f"{src} does not exist")
-    text = src.read_text()
-    chunks = re.split(r"(?m)^---$", text)[1:]  # drop the file's own intro paragraph before the first '---'
+    # newline="" disables Python's universal-newline translation on both read and write, so a CRLF-
+    # encoded source is migrated byte-verbatim rather than silently rewritten with LF-only endings.
+    with open(src, "r", newline="") as f:
+        text = f.read()
+    entries = _split_monolith_entries(text)
+    if not entries:
+        print(f"WARNING: no entries found (no '## YYYY-MM-DD — title' header line) in {src}", file=sys.stderr)
 
     written, skipped, unparsed = 0, 0, 0
     seen_slugs = {}
-    for chunk in chunks:
-        chunk = chunk.strip("\n")
-        if not chunk.strip():
-            continue
-        first_line = chunk.splitlines()[0]
-        m = _HEADER_RE.match(first_line)
-        if not m:
-            unparsed += 1
-            print(f"WARNING: could not parse header, skipping entry: {first_line!r}", file=sys.stderr)
-            continue
-        date, title = m.group(1), m.group(2)
+    for date, title, chunk_text in entries:
         base_slug = _slugify(title)
-        # Guarantee uniqueness even if two same-day entries slugify to the same text after truncation --
-        # migration must never silently drop or overwrite a real historical entry.
         key = (date, base_slug)
         seen_slugs[key] = seen_slugs.get(key, 0) + 1
         slug = base_slug if seen_slugs[key] == 1 else f"{base_slug}-{seen_slugs[key]}"
         path = _entry_path(args.type, date, slug)
-        if path.exists():
-            skipped += 1
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(chunk.strip("\n") + "\n")
-        written += 1
+        # A same-derived-filename collision is only a genuine idempotent re-run if the EXISTING file's
+        # content matches byte-for-byte what we're about to write -- never compare paths alone. If the
+        # content differs, this is a real, different historical entry colliding on the same filename;
+        # keep disambiguating with the same same-day-collision counter already used above, rather than
+        # silently dropping it.
+        while path.exists():
+            with open(path, "r", newline="") as ef:
+                existing = ef.read()
+            if existing == chunk_text:
+                skipped += 1
+                break
+            seen_slugs[key] += 1
+            slug = f"{base_slug}-{seen_slugs[key]}"
+            path = _entry_path(args.type, date, slug)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", newline="") as wf:
+                wf.write(chunk_text)
+            written += 1
     reindex()
     print(f"migrated {written} entries, skipped {skipped} already-present, {unparsed} unparsed")
 
@@ -389,6 +449,115 @@ def selfcheck():
         bodies = {p.read_text() for p in collided}
         assert any("entry A" in b for b in bodies) and any("entry B" in b for b in bodies), (
             "both colliding entries must survive migration verbatim, neither overwriting the other")
+
+        # Checker round 1, bug 1: `show` must find a migrated legacy entry by SUBSTRING match against
+        # its filename slug, not only an exact suffix match -- migrated entries are named after their
+        # (slugified) TITLE, since they never had a discrete task-id.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit4")
+        mono3 = os.path.join(tmpdir, "mono3.md")
+        with open(mono3, "w") as f:
+            f.write(
+                "# flow.md\n\n---\n## 2025-03-01 — harden-checker-invariant: fix the pane recipe quoting bug\n\n"
+                "- did the fix\n"
+            )
+        code, out = _run(["migrate", "--type", "flow", "--file", mono3])
+        assert code == 0 and "migrated 1 entries" in out, out
+        code, out = _run(["show", "--type", "flow", "--task", "harden-checker-invariant"])
+        assert code == 0 and "did the fix" in out, (
+            f"show must find a migrated entry by substring match against its filename slug: {out!r}")
+        # a broad substring matching more than one file must print EVERY match, never silently pick one
+        mono4 = os.path.join(tmpdir, "mono4.md")
+        with open(mono4, "w") as f:
+            f.write(
+                "# flow.md\n\n---\n## 2025-03-02 — harden-checker-invariant: a second unrelated entry\n\n"
+                "- second body marker\n"
+            )
+        code, out = _run(["migrate", "--type", "flow", "--file", mono4])
+        assert code == 0, out
+        code, out = _run(["show", "--type", "flow", "--task", "harden-checker-invariant"])
+        assert code == 0 and "did the fix" in out and "second body marker" in out, (
+            f"show must print EVERY matching entry, not just one: {out!r}")
+
+        # Checker round 1, bug 2: a bare '---' inside an entry's own body (an ordinary markdown
+        # horizontal rule) must not be treated as an entry boundary -- only entry HEADERS split entries.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit5")
+        mono5 = os.path.join(tmpdir, "mono5.md")
+        with open(mono5, "w") as f:
+            f.write(
+                "# flow.md\n\n---\n## 2025-04-01 — midrule-task: has a rule in its own body\n\n"
+                "before-marker\n---\nafter-marker\n\n---\n## 2025-04-02 — next-task: y\n\nz\n"
+            )
+        code, out = _run(["migrate", "--type", "flow", "--file", mono5])
+        assert code == 0 and "migrated 2 entries" in out, out
+        p_mid = _entry_path("flow", "2025-04-01", "midrule-task-has-a-rule-in-its-own-body")
+        assert p_mid.exists(), f"expected {p_mid}"
+        mid_content = p_mid.read_text()
+        assert "before-marker" in mid_content and "after-marker" in mid_content, (
+            f"a bare '---' inside an entry's own body must not truncate the entry: {mid_content!r}")
+
+        # Checker round 1, bug 3: a filename collision with a DIFFERENT existing file (not a genuine
+        # idempotent re-run) must never silently drop the real source entry -- it must be written under
+        # a disambiguating suffix instead, and the unrelated pre-existing file must stay untouched.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit6")
+        # the pre-existing file's path must be the EXACT slug the real entry below will also slugify to
+        # (i.e. slugify("collide-task") == "collide-task") for this to actually exercise a collision.
+        collision_path = _entry_path("flow", "2025-05-01", _slugify("collide-task"))
+        collision_path.parent.mkdir(parents=True, exist_ok=True)
+        collision_path.write_text(
+            "## 2025-05-01 — collide-task: a totally unrelated pre-existing entry\n\nUNRELATED-CONTENT\n")
+        mono6 = os.path.join(tmpdir, "mono6.md")
+        with open(mono6, "w") as f:
+            f.write(
+                "# flow.md\n\n---\n## 2025-05-01 — collide-task\n\n"
+                "MIGRATED-UNIQUE-MARKER\n"
+            )
+        code, out = _run(["migrate", "--type", "flow", "--file", mono6])
+        assert code == 0 and "migrated 1 entries" in out, (
+            f"a real, different colliding entry must be counted as migrated, not silently skipped: {out!r}")
+        assert "UNRELATED-CONTENT" in collision_path.read_text(), (
+            "the unrelated pre-existing file must never be overwritten")
+        all_flow_text = "".join(fp.read_text() for fp in (_audit_dir() / "flow").glob("*.md"))
+        assert "MIGRATED-UNIQUE-MARKER" in all_flow_text, (
+            "a real source entry colliding on filename with different existing content must survive "
+            "under a disambiguating suffix, never be silently dropped")
+
+        # Checker round 1, bug 4: a CRLF-encoded source must migrate byte-verbatim, never silently
+        # rewritten with LF-only line endings.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit7")
+        mono7 = os.path.join(tmpdir, "mono7.md")
+        crlf_text = (
+            "# flow.md\r\n\r\n---\r\n## 2025-06-01 — crlf-task: uses crlf line endings\r\n\r\n"
+            "- detail one\r\n"
+        )
+        with open(mono7, "wb") as f:
+            f.write(crlf_text.encode("utf-8"))
+        code, out = _run(["migrate", "--type", "flow", "--file", mono7])
+        assert code == 0 and "migrated 1 entries" in out, out
+        p_crlf = _entry_path("flow", "2025-06-01", "crlf-task-uses-crlf-line-endings")
+        assert p_crlf.exists(), f"expected {p_crlf}"
+        raw = p_crlf.read_bytes()
+        assert b"\r\n" in raw, (
+            f"a CRLF-encoded source must be migrated byte-verbatim: {raw!r}")
+        assert b"detail one" in raw
+
+        # Checker round 1, bug 5: a single entry with an unusually long --title must not blow up
+        # INDEX.md -- the entry-count cap alone does not bound an individual title's length. The full,
+        # untruncated title must still live in the per-task file itself.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit8")
+        bf2 = os.path.join(tmpdir, "body2.txt")
+        with open(bf2, "w") as f:
+            f.write("- huge title regression\n")
+        huge_title = "x" * 200000
+        code, out = _run(["add", "--type", "flow", "--task", "huge-title-task", "--date", "2026-02-02",
+                           "--title", huge_title, "--body-file", bf2])
+        assert code == 0, out
+        index_text2 = (_audit_dir() / "INDEX.md").read_text()
+        assert len(index_text2) < 20000, (
+            f"a single entry with an unusually long --title must not blow up INDEX.md -- got "
+            f"{len(index_text2)} bytes")
+        p_huge = _entry_path("flow", "2026-02-02", "huge-title-task")
+        assert huge_title in p_huge.read_text(), "the full untruncated title must survive in the per-task file"
+        assert huge_title not in index_text2, "INDEX.md must never render the full untruncated title"
 
         print("ok")
     finally:
