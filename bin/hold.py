@@ -193,10 +193,12 @@ def main(argv):
                          f"{args.sha or '(none)'} -- refusing to attach an answer to a different code state")
             _append({"ev": "answer", "id": args.id, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "a": args.a})
         # advisory echo, printed only on a successful answer -- a self-answered hold (no genuine human
-        # behind the decision) is a real, recorded incident class in audit/decision.md; this can't verify
-        # who is actually at the keyboard, it can only remind whoever ran this command.
+        # behind the decision) is a real, recorded incident class (searchable via
+        # `bin/audit-log.py search "self-answered"`); this can't verify who is actually at the
+        # keyboard, it can only remind whoever ran this command.
         print(f"REMINDER: decision {args.id} is now answered -- this should represent a genuine human "
-              f"decision, not a self-answered hold (see audit/decision.md for past incidents of that).")
+              f"decision, not a self-answered hold (see audit/decision/ via bin/audit-log.py search "
+              f"for past incidents of that).")
     elif args.cmd == "open":
         rows = open_decisions()
         if not rows and _BAD == 0:

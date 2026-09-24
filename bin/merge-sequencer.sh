@@ -1817,7 +1817,8 @@ fi
 # Advisory-only echo, printed right before the real merge (never on --preflight-only, which returns
 # above and never reaches here). Cannot verify plugin.json/README/ARCHITECTURE were actually updated --
 # that would be a much bigger feature -- this only reminds whoever is about to merge, per CLAUDE.md's
-# own standing pre-push requirement (a real, recurring miss logged more than once in audit/decision.md).
+# own standing pre-push requirement (a real, recurring miss logged more than once, searchable via
+# `bin/audit-log.py search` over audit/decision/).
 echo "REMINDER: before this merge lands, confirm .claude-plugin/plugin.json's version was bumped and README.md/docs/ARCHITECTURE.md are synced with this change (CLAUDE.md's pre-push requirement)." >&2
 
 merge_output="$(git -C "$repo" merge --no-ff "$branch" -m "$message" 2>&1)"
