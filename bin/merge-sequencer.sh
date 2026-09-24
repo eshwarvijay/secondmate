@@ -285,6 +285,11 @@ print(n)
   origin_sha1="$(git --git-dir="$origin1" rev-parse main 2>/dev/null || echo "")"
   [ "$origin_sha1" = "$main_after1" ] || { echo "FAIL: origin not pushed to match primary main ($origin_sha1 != $main_after1)"; fails=1; }
   [ "$(_ledger_count sm/clean-success SUCCESS)" = "1" ] || { echo "FAIL: expected exactly one SUCCESS ledger record for sm/clean-success"; fails=1; }
+  echo "$out1" | grep -qi "REMINDER.*plugin.json.*version" || { echo "FAIL: expected a pre-merge version/docs-sync REMINDER on a real merge: $out1"; fails=1; }
+
+  # ---- Test 1b: --preflight-only never prints the pre-merge REMINDER (it's read-only and never merges) ----
+  rc1b=0; out1b="$(_ms --repo "$primary1" --worktree "$t/wt1" --branch sm/clean-success --base main --checked-sha "$sha1" --preflight-only --wait-timeout 5 2>&1)" || rc1b=$?
+  echo "$out1b" | grep -qi "REMINDER" && { echo "FAIL: --preflight-only must never print the pre-merge REMINDER (it never merges): $out1b"; fails=1; }
 
   # ---- Test 2: verify-gate refusal (dirty worktree) leaves main untouched ----
   IFS='|' read -r origin2 primary2 <<<"$(_setup_repo 2)"
@@ -1808,6 +1813,13 @@ if [ -n "$repo_dirty" ]; then
   printf '%s\n' "$repo_dirty" >&2
   exit 2
 fi
+
+# Advisory-only echo, printed right before the real merge (never on --preflight-only, which returns
+# above and never reaches here). Cannot verify plugin.json/README/ARCHITECTURE were actually updated --
+# that would be a much bigger feature -- this only reminds whoever is about to merge, per CLAUDE.md's
+# own standing pre-push requirement (a real, recurring miss logged more than once, searchable via
+# `bin/audit-log.py search` over audit/decision/).
+echo "REMINDER: before this merge lands, confirm .claude-plugin/plugin.json's version was bumped and README.md/docs/ARCHITECTURE.md are synced with this change (CLAUDE.md's pre-push requirement)." >&2
 
 merge_output="$(git -C "$repo" merge --no-ff "$branch" -m "$message" 2>&1)"
 merge_rc=$?

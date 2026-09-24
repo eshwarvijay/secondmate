@@ -64,7 +64,8 @@ flowchart TD
     MS --> INT[integrate]
     INT --> TD[Teardown: close panes, worktree, branch]
     TD --> AU[Audit trail: audit-log.py add -> per-task file + INDEX.md]
-    AU --> Cap
+    AU --> LF[Lesson feedback: tag injected lessons]
+    LF --> Cap
 ```
 
 ## Stage by stage
@@ -149,7 +150,10 @@ Each stage exists to close a specific failure mode.
    commit the human was shown; `answer` then must supply a matching `--sha`, so an approval can't be silently
    reattached to a different, later commit. `hold.py next` hands back exactly one oldest-still-open decision
    at a time, for callers (human or future multi-task dispatcher) that need to process holds one at a time,
-   in order, without racing each other over the full `open` list.
+   in order, without racing each other over the full `open` list. A successful `answer` prints an advisory
+   one-line reminder that the decision should represent a genuine human call — it cannot verify who is
+   actually behind the keyboard, so it can only remind, never enforce; a self-answered hold is a real,
+   recorded incident class (`bin/audit-log.py search "self-answered"` finds it in `audit/decision/`).
    *Guards against:* a pending human decision being lost when a session dies (the human, not the agent,
    closes the gate); an approval given for one code state being silently applied to a different one that
    landed later; multiple concurrently-open holds being answered out of order or by the wrong caller.
@@ -166,7 +170,12 @@ Each stage exists to close a specific failure mode.
    guarantee. It then takes a
    singleton mkdir-based lock **anchored to `--repo` by default** (`<repo>/.secondmate/merge-sequencer.lock`,
    bounded wait, no auto-steal on a stuck lock — a human removes it manually), and **re-invokes
-   `verify-gate.sh` fresh, inside that lock**, immediately before the actual merge. Anchoring the lock (and
+   `verify-gate.sh` fresh, inside that lock**, immediately before the actual merge. Right before that real
+   merge (never on `--preflight-only`, which is read-only by design), it prints an advisory reminder to
+   confirm `.claude-plugin/plugin.json`'s version and README/ARCHITECTURE docs are synced — a static
+   textual echo, not a diff/history check; this repo's own CLAUDE.md already requires that sync before
+   every push, and a missed bump is a real, recurring incident class (searchable in `audit/decision/` via
+   `bin/audit-log.py search`). Anchoring the lock (and
    the ledger) to `--repo` rather than to the calling process's own ambient CWD matters because the realistic
    invocation pattern is a sub-agent-supervisor running with its CWD set to its OWN worktree (as every maker
    launched via herdr already does) — two siblings each invoking `merge-sequencer.sh` from within their own
@@ -249,6 +258,18 @@ Each stage exists to close a specific failure mode.
    git branch -d sm/<task-id>                          # delete the merged branch
    ```
    A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+   `bin/teardown-check.sh --task-id <id> --repo <repo>` runs immediately after as an advisory confirmation:
+   it independently checks whether a git worktree, the `sm/<task-id>` branch, a herdr pane/agent, or a
+   `claim-ledger.py` entry for this task-id is still around — exit 0 clean, nonzero if anything's still
+   present, per its own printed report. It cannot verify HOW anything got left behind, only THAT it did;
+   the supervisor decides what to do with a nonzero report. A headless run with no herdr to check reports
+   that specific check as its own "unknown" condition rather than a false "clean", but that alone never
+   blocks an otherwise-clean headless teardown from reporting success. **Accepted limitation:** its herdr
+   check covers maker agents only (`sm-<task-id>`/`sm-pi-<task-id>`) — a leaked visible checker pane
+   (the "Checker pane" recipe's `herdr-pane.sh split`) has no task-id-derived identity anywhere in this
+   repo's current herdr integration, so it's invisible to this check and would report clean; closing that
+   would need a new pane-naming/discovery convention touching the shared checker-pane recipe every task
+   uses, out of scope here.
 
    **IMPORTANT:** `caffeinate-guard.sh stop` is SESSION-SCOPED, not per-task. Call it ONCE yourself, directly,
    only after you have confirmed EVERY task/worktree in that batch has been torn down. Never call `stop` inside
@@ -265,6 +286,25 @@ Each stage exists to close a specific failure mode.
    `bin/audit-log.py list|search|show`, never loaded in bulk. `audit/metrics.jsonl` (via `log-round.sh`,
    step 4) accumulates alongside them as the structured counterpart — same append-only convention, but one
    JSON line per round instead of one file per task. Commit separately. Skip for trivial one-shot edits.
+
+10. **Lesson feedback.** `lesson-lookup.py` is only half a feedback loop without this step: it injects
+   lessons into every maker prompt (step 0d/step 4's fix rounds, via `--task-id` so the injection itself
+   gets logged to a shared ledger) but, on its own, never learns whether any of them actually helped. In
+   the SAME commit as step 9's `bin/audit-log.py add` update, the supervisor checks that
+   injection ledger for this task-id's entries, and for each lesson it has direct, specific evidence about
+   — the mistake it describes genuinely recurred anyway, or was concretely avoided because of it — tags it
+   `${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py tag --lesson-id <id> --outcome helpful|harmful`. This is the
+   supervisor's own observation of THIS task, never an automated correlation against `audit/metrics.jsonl`,
+   `verdict.py` output, or anything else — no such correlation logic exists, matching the ACE/`tag_skill`
+   evidence-discipline pattern this mechanism is modeled on: leaving a lesson untagged is always fine,
+   tagging on a guess is not. `tag` increments that lesson file's own `helpful_count`/`harmful_count`
+   frontmatter via a surgical, atomic (temp file + rename) text edit, never a full YAML round-trip, so
+   every other line — tags, evidence, earned-in, the body — survives byte-for-byte. Future lookups render
+   each selected lesson's rendered success rate and deprioritize (never exclude) a lesson that's never once
+   been marked helpful, relative to ones that have.
+   *Guards against:* an injected checklist that only ever grows and is never pruned by evidence of what
+   actually works; a proven lesson getting crowded out of the cap by a merely relevant-sounding one that's
+   never actually helped.
 
 ## Scope guard
 
@@ -376,6 +416,10 @@ Each stage exists to close a specific failure mode.
 | Destroying a pre-existing, unrelated conflict on the primary checkout | merge-sequencer.sh refuses before merging if `$repo` already has a `MERGE_HEAD`/is dirty; never calls `merge --abort` on a conflict it didn't start |
 | The script's own lock directory or ledger file tripping its own dirty-repo guard | merge-sequencer.sh's dirty-check excludes the EXACT paths of both self-created artifacts (lock dir + ledger file) via a literal git pathspec — never a basename match, which would wrongly swallow any unrelated same-named path elsewhere in the repo |
 | A ledger-write failure silently reported as full success with no audit record | merge-sequencer.sh prints a loud `WARNING` naming the ledger path; the merge/push outcome is unaffected either way |
+| A hold answered without a genuine human behind it going unnoticed | hold.py's advisory reminder printed on every successful `answer` (cannot verify who is at the keyboard, only reminds) |
+| A merge landing without plugin.json's version bumped / docs synced | merge-sequencer.sh's advisory pre-merge reminder, printed right before every real merge (never on `--preflight-only`) |
+| A worktree/branch/herdr pane/claim believed torn down but actually still present | teardown-check.sh's advisory scan across all four, run right after step 8's teardown commands (maker agents only for the herdr check — a leaked checker pane is not covered, see accepted limitation below) |
+| An injected lesson checklist that only ever grows with no way to tell what's actually helping | lesson-lookup.py's `tag`/success-rate/never-helpful-bucket mechanism, fed by supervisor-observed evidence, not automated correlation |
 
 ## Primitives for parallel sub-agent-supervisors (building blocks, not yet wired into the loop)
 
@@ -480,20 +524,21 @@ future task, not part of this one.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching; with `--lenses` cross-checks lens coverage; enforces findings validation for `fail` verdicts (must have file:line or `[NOLOC]`); writes a `git-common-dir`-anchored `audit/lens-coverage.jsonl` ledger shared across every worktree of the repo (override via `SM_LENS_COVERAGE_LEDGER`) |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never rebases, never reverts a landed local merge on push failure; a genuine push race (origin advanced, or a concurrent server-side ref-transaction race — both distinguished from a real hook/protected-branch rejection by git's own client-generated framing, never by the hook's own message text) is recovered automatically, lock held throughout, bounded at 3 total push attempts (`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`); a LOCAL `pre-push` hook (no `remote: ` framing at all) disables this text-based race detection entirely for that repo, by design — checked before the first push and monotonically re-checked (never reset once true) before every retry, so a self-deleting hook or one installed mid-recovery can't evade it; `--preflight-only` checks for a conflict via `git merge-tree --write-tree` without ever acquiring the lock or touching `$repo`'s working tree/index/branch-refs/ledger; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
-| `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never rebases, never reverts a landed local merge on push failure; a genuine push race (origin advanced, or a concurrent server-side ref-transaction race — both distinguished from a real hook/protected-branch rejection by git's own client-generated framing, never by the hook's own message text) is recovered automatically, lock held throughout, bounded at 3 total push attempts (`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`); a LOCAL `pre-push` hook (no `remote: ` framing at all) disables this text-based race detection entirely for that repo, by design — checked before the first push and monotonically re-checked (never reset once true) before every retry, so a self-deleting hook or one installed mid-recovery can't evade it; `--preflight-only` checks for a conflict via `git merge-tree --write-tree` without ever acquiring the lock or touching `$repo`'s working tree/index/branch-refs/ledger; prints an advisory pre-merge version/docs-sync reminder right before every real merge (never on `--preflight-only`); append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
+| `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval; `answer` prints an advisory genuine-human-decision reminder on success |
 | `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block used by the fan-out pattern (SKILL.md) |
 | `bin/doctor.sh` | pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects and fixes AWS Bedrock model-metadata overrides for pi's local `~/.pi/agent/models.json` (kimi-k3 and deepseek-r1 maxTokens values, verified against real Bedrock enforced ceilings); detects skill discovery asymmetry between pi and Claude Code for the current repo's project skills, scanned at ANY depth via `os.walk` (monorepo-safe, matching `bin/sync-worktree-skills.sh`'s own scan of the identical three conventions, so a nested subproject's skill — exactly the kind already backfilled into a fresh worktree by that script — is never silently missed) — pi reads `.pi/skills/` and `.agents/skills/`, Claude Code reads `.claude/skills/` and `.agents/skills/`, so a skill present under only one non-`.agents` convention is invisible to the other harness; rows are keyed by (subproject-relative-path, name), not name alone, so two different subprojects with a same-named skill each get their own unambiguous row (e.g. `packages/widget/foo`); a Claude-only skill gets an offered fix (`bash -c`-run by the generic heal loop) that copies its resolved real content into that same subproject's `.agents/skills/<name>` — never overwrites an existing entry there, never follows a symlink resolving outside the repo root (mirrors `bin/sync-worktree-skills.sh`'s own guard), and never constructs a shell command from a name or relative-path prefix that fails its safe-pattern check (`bin/claim-ledger.py`'s own `[A-Za-z0-9_-]{1,128}` pattern for names) — a Claude-Code-invisible skill (`.pi/skills/` only) is reported with no auto-fix offered; detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals; idempotent fixes preserve unrelated content |
 | `bin/dispatch-report.py` | parses a sub-supervisor's final output for the fan-out pattern — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line (a tag embedded mid-prose does not match), last matching line wins if several appear; exits `0`/`1`/`2`/`3` (done / refused / stuck / no-tag-found); the dispatcher acts only on this exit code, never on the sub-supervisor's prose |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
-| `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
+| `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, repeatable lesson ids injected that round, optional cost/duration |
 | `bin/audit-log.py` | lookup-only audit trail: `add` writes one task's flow/decision entry verbatim to its own file under `audit/flow/`/`audit/decision/` and regenerates `audit/INDEX.md`, a generated manifest capped at the most recent N entries per type (the only thing `@`-imported into `CLAUDE.md`); `list`/`search`/`show` retrieve full, uncapped history on demand; `migrate` one-time-splits an existing monolithic file into per-task files, verbatim and idempotently; task-id-derived filenames are sanitized against path traversal, matching `claim-ledger.py`'s precedent |
 | `bin/caffeinate-guard.sh` | macOS sleep prevention during session execution — single session-scoped guard process, PID identity verification, bounded TTL ceiling, idempotent start/stop |
-| `bin/lesson-lookup.py` | retrieves known failure patterns from the lesson store as a retrievable checklist; reads `bin/lessons/**/*.md` with YAML-shaped frontmatter, scores non-E4 lessons by term overlap, always includes E4 (proven-core) lessons, outputs the exact header `## Known failure patterns — DO NOT SKIP` with selected lessons as bullets; falls back to original 4 seed lessons if the store is unavailable |
-| `bin/lessons/` | directory of failure pattern lessons in Markdown with frontmatter (`tags`, `evidence: E4`, `earned-in: seed`) |
+| `bin/lesson-lookup.py` | retrieves known failure patterns from the lesson store as a retrievable checklist; reads `bin/lessons/**/*.md` with YAML-shaped frontmatter, scores non-E4 lessons by term overlap, deprioritizes (never excludes) a lesson with `helpful_count == 0` relative to ones with recorded helpful feedback, always includes E4 (proven-core) lessons, outputs the exact header `## Known failure patterns — DO NOT SKIP` with selected lessons as bullets (each carrying a rendered `(helpful X/Y)` success-rate suffix once it has any feedback); falls back to original 4 seed lessons if the store is unavailable. `--task-id` (fail-open) logs selected lesson ids to a `git-common-dir`-anchored injection ledger (`SM_LESSON_LEDGER`, same anchoring rationale as `claim-ledger.py`). `tag --lesson-id <id> --outcome helpful\|harmful` records supervisor-observed feedback via a surgical, atomic frontmatter edit |
+| `bin/lessons/` | directory of failure pattern lessons in Markdown with frontmatter (`tags`, `evidence: E4`, `earned-in: seed`, plus optional `helpful_count`/`harmful_count`, defaulting to 0 when absent) |
 | `bin/lessons/debugging/` | subdirectory for debugging-related lessons |
 | `bin/lessons/testing/` | subdirectory for testing-related lessons |
 | `bin/lessons/workflow/` | subdirectory for workflow-related lessons |
+| `bin/teardown-check.sh` | advisory post-teardown scan: worktree / `sm/<id>` branch / herdr pane-agent / claim-ledger.py entry for a task-id — exit 0 clean, nonzero if anything's still present; degrades an unreachable herdr check to its own "unknown" line rather than a false "clean", without blocking a genuinely clean headless teardown. Accepted limitation: the herdr check covers maker agents only, never a leaked checker pane (no task-id-derived pane identity exists in this repo's current herdr integration) |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.

@@ -117,9 +117,10 @@ def _selfcheck_live():
         # a hold created with --sha X can be validly answered with --sha X.
         code, did, _ = _run(["hold", "--task", "t", "--q", "ready to merge?", "--sha", "deadbeef"])
         assert code == 0, "hold with --sha should succeed"
-        code, _, _ = _run(["answer", did, "--a", "merge", "--sha", "deadbeef"])
+        code, out, _ = _run(["answer", did, "--a", "merge", "--sha", "deadbeef"])
         assert code == 0, "answer with matching --sha should succeed"
         assert did in {r["id"] for r in _recs() if r["ev"] == "answer"}, "matching-sha answer did not close the hold"
+        assert "REMINDER" in out and "human" in out.lower(), "successful answer must print the genuine-human-decision reminder"
 
         # the same hold cannot be answered with a DIFFERENT --sha: must fail, must not append a record.
         code, did2, _ = _run(["hold", "--task", "t", "--q", "ready to merge (again)?", "--sha", "aaaa111"])
@@ -191,6 +192,13 @@ def main(argv):
                 sys.exit(f"decision {args.id} was held at sha {hold_sha}, but answer supplied sha "
                          f"{args.sha or '(none)'} -- refusing to attach an answer to a different code state")
             _append({"ev": "answer", "id": args.id, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "a": args.a})
+        # advisory echo, printed only on a successful answer -- a self-answered hold (no genuine human
+        # behind the decision) is a real, recorded incident class (searchable via
+        # `bin/audit-log.py search "self-answered"`); this can't verify who is actually at the
+        # keyboard, it can only remind whoever ran this command.
+        print(f"REMINDER: decision {args.id} is now answered -- this should represent a genuine human "
+              f"decision, not a self-answered hold (see audit/decision/ via bin/audit-log.py search "
+              f"for past incidents of that).")
     elif args.cmd == "open":
         rows = open_decisions()
         if not rows and _BAD == 0:

@@ -84,7 +84,7 @@ This is the spec the maker receives.
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE.  *Before replying DONE, write/update the round-state handoff file* (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 600000
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>" --task-id "<task-id>")" --wait --timeout 600000
   ```
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
@@ -96,7 +96,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 
   herdr agent prompt sm-pi-<task-id> "<plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 600000
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>" --task-id "<task-id>")" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
   worktree **must have been marked** by calling `${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd <wt>` BEFORE
@@ -114,7 +114,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")" --wait --timeout 
   `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>")"`
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<plan>" --task-id "<task-id>")"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
   A good plan gives:
@@ -207,16 +207,16 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<task-id>")" --wait --timeout 600000`
      - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
      - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")"`
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<task-id>")"`
      - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --timeout 600000`
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<task-id>")" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
      **Restart amplio-style hybrid:** When the supervisor restarts a maker mid-round (due to `loop-guard.sh` exit-5 restart signal,
@@ -229,11 +229,14 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --time
    - **On `error` or `refused`** — do not retry via the maker. Inspect the checker output, fix the checker
      invocation (bad args, missing context) or escalate to the human. `refused` always escalates.
    - **Log the round.** After every checker verdict (pass, fail, error, or refused), append a metrics
-     record: `${CLAUDE_PLUGIN_ROOT}/bin/log-round.sh --task <id> --round <N> --maker claude|pi --verdict <verdict> [--tag <finding-category>]... [--cost <n>] [--duration <n>]`.
+     record: `${CLAUDE_PLUGIN_ROOT}/bin/log-round.sh --task <id> --round <N> --maker claude|pi --verdict <verdict> [--tag <finding-category>]... [--lesson-id <id>]... [--cost <n>] [--duration <n>]`.
      Supply one `--tag` per recurring finding category you'd tag it with in this task's decision entry anyway
      (e.g. `real-bug`, `scope-creep`, `fake-test`, `not-committed`) — this is structured data alongside the
-     prose audit trail, not a replacement for it. `--cost`/`--duration` are optional, only if already at
-     hand (e.g. from a herdr pane's own cost/elapsed display) — never scrape or parse for them.
+     prose audit trail, not a replacement for it. `--lesson-id` is optional and repeatable too, mirroring
+     `--tag` — pass the lesson ids `lesson-lookup.py` actually injected this round if you have them handy,
+     for the same reason step 11 later reads the injection ledger: to know which lessons appeared. `--cost`/
+     `--duration` are optional, only if already at hand (e.g. from a herdr pane's own cost/elapsed display) —
+     never scrape or parse for them.
 
 5. **Gate** — before integrating anything:
    `${CLAUDE_PLUGIN_ROOT}/bin/verify-gate.sh --worktree <wt> --base <branch> --checked-sha <the exact sha the checker reviewed> [--test "<cmd>"]`
@@ -254,6 +257,11 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --time
    ```
    A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
 
+   Then run `${CLAUDE_PLUGIN_ROOT}/bin/teardown-check.sh --task-id <task-id> --repo <repo>` as an advisory
+   confirmation — it reports whether a worktree, branch, herdr pane/agent, or claim-ledger entry for this
+   task-id is still around (exit 0 = clean, nonzero = something is still present, per its own report). It
+   never blocks or fails anything by itself; a nonzero report just means look again before moving on.
+
    **IMPORTANT:** `caffeinate-guard.sh stop` is SESSION-SCOPED, not per-task. Call it ONCE yourself, directly,
    only after you have confirmed EVERY task/worktree in that batch has been torn down. Never call `stop` inside
    a task's per-task teardown — sibling tasks may still be running and need sleep prevention.
@@ -269,6 +277,19 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>")" --wait --time
    cannot stale the checked SHA. Only the generated, size-capped `audit/INDEX.md` is `@`-imported in
    `CLAUDE.md` and auto-loaded into every session — never the per-task files themselves. Skip for trivial
    one-shot edits.
+
+11. **Lesson feedback** — in the SAME commit as step 10's `bin/audit-log.py add` update
+   (directly in the primary checkout, never inside the maker's worktree), tag whichever injected lessons
+   you have real grounds to judge. Check the injection ledger (`$SM_LESSON_LEDGER`, default anchored
+   under `.secondmate/lesson-injections.jsonl`) for this task-id's entries to see which lesson ids were
+   actually shown across the task's rounds, then for each one:
+   `${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py tag --lesson-id <id> --outcome helpful|harmful`.
+   Tag a lesson only when you have direct, specific evidence FROM THIS TASK that the mistake it
+   describes recurred anyway or was concretely avoided because of it — leaving a lesson untagged is
+   always fine, tagging on a hunch is not, since an ungrounded tag corrupts the signal every future
+   task's lesson lookup relies on. This is your own observation of this one task, never an automated
+   correlation against `audit/metrics.jsonl`, `verdict.py` output, or any other history — no such
+   correlation logic exists here, and none should be built.
 
 ## Fan-out to concurrent sub-supervisors (hard-capped at 2)
 
@@ -370,7 +391,7 @@ back to the headless path). Every split uses `--no-focus` so the captain's focus
   herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE.  *Before replying DONE, write/update the round-state handoff file* (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop.
 
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
-$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>")" --wait --timeout 600000
+$(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal>" --task-id "<task-id>")" --wait --timeout 600000
   ```
   If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
