@@ -57,8 +57,10 @@
 # expiry/steal, single machine only.
 #
 # Accepted limitation (documented, not chased further): if $repo has an executable 'pre-push'
-# hook installed (checked via _repo_has_pre_push_hook, respecting core.hooksPath), P1's push-race
-# auto-recovery is disabled ENTIRELY for that repo -- every push failure is reported as PUSH_FAILED,
+# hook installed (checked via _repo_has_pre_push_hook, respecting core.hooksPath, sampled ONCE
+# before the first push attempt so a hook cannot evade detection by deleting/chmod'ing itself as
+# its own last action), P1's push-race auto-recovery is disabled ENTIRELY for that repo -- every
+# push failure is reported as PUSH_FAILED,
 # never retried, even a genuine one. A LOCAL pre-push hook runs client-side, before git ever
 # attempts the network-level push, so its stderr has no "remote: " relay prefix or any other
 # structural marker distinguishing it from git's own client-generated race text -- unlike a
@@ -1372,6 +1374,33 @@ HOOKEOF
   [ "$(_ledger_count sm/local-prepush-keyword PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: local pre-push hook keyword collision was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
   [ "$(_ledger_count sm/local-prepush-keyword PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: local pre-push hook keyword collision was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact sibling spoofing bug this test guards"; fails=1; }
 
+  # ---- Test 39: (P1) CRITICAL negative test -- a TOCTOU variant of Test 37/38: a pre-push hook
+  # that deletes ITSELF (rm -f "$0") as its own last action right before exiting nonzero must still
+  # be PUSH_FAILED, never a race -- proving the hook-presence check is sampled ONCE, BEFORE the
+  # first push attempt, not re-checked afterward (by which point the hook is provably gone from
+  # disk). An earlier revision called _repo_has_pre_push_hook fresh inside each classifier, AFTER
+  # the push had already failed -- exactly the window this hook exploits. ----
+  IFS='|' read -r origin39 primary39 <<<"$(_setup_repo 39)"
+  cat > "$primary39/.git/hooks/pre-push" <<'HOOKEOF'
+#!/bin/sh
+echo "(incorrect old value provided)" >&2
+rm -f "$0"
+exit 1
+HOOKEOF
+  chmod +x "$primary39/.git/hooks/pre-push"
+  git -C "$primary39" worktree add -q "$t/wt39" -b sm/self-removing-hook main
+  echo "feature-p39" >> "$t/wt39/file.txt"
+  git -C "$t/wt39" commit -qam "feature p39"
+  sha39="$(git -C "$t/wt39" rev-parse HEAD)"
+  out39="$(_ms --repo "$primary39" --worktree "$t/wt39" --branch sm/self-removing-hook --base main --checked-sha "$sha39" --wait-timeout 5 2>&1)"
+  rc39=$?
+  [ ! -e "$primary39/.git/hooks/pre-push" ] || { echo "FAIL: test setup invariant broken -- the hook should have deleted itself"; fails=1; }
+  [ "$rc39" -eq 4 ] || { echo "FAIL: self-removing pre-push hook expected rc=4, got $rc39: $out39"; fails=1; }
+  echo "$out39" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out39"; fails=1; }
+  [ "$(_ledger_count sm/self-removing-hook PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (self-removing pre-push hook)"; fails=1; }
+  [ "$(_ledger_count sm/self-removing-hook PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: self-removing pre-push hook was wrongly classified as PUSH_RACE_RECOVERED -- the exact TOCTOU bug this test guards"; fails=1; }
+  [ "$(_ledger_count sm/self-removing-hook PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: self-removing pre-push hook was wrongly classified as PUSH_RACE_EXHAUSTED"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1602,6 +1631,24 @@ fi
 
 merged_sha="$(git -C "$repo" rev-parse HEAD)"
 
+# Captured ONCE, BEFORE the first push attempt -- not re-checked after a push fails. A pre-push
+# hook can delete itself, or chmod itself non-executable, as its OWN last action right before
+# exiting nonzero (verified via a direct, real reproduction: an executable hook that removes
+# itself is genuinely gone from disk by the time anything checks for it afterward) -- a
+# check-after-the-fact would miss exactly the hook whose rejection it exists to catch, a TOCTOU
+# window entirely closed by sampling this fact before the hook has ever had a chance to run.
+had_pre_push_hook=0
+_repo_has_pre_push_hook() {
+  local hooks_dir
+  hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)" || return 1
+  case "$hooks_dir" in
+    /*) : ;;
+    *) hooks_dir="$repo/$hooks_dir" ;;
+  esac
+  [ -x "$hooks_dir/pre-push" ]
+}
+_repo_has_pre_push_hook && had_pre_push_hook=1
+
 # P1: bounded push-race recovery with exact race-signature regex matching
 # Run push with LC_ALL=C to ensure English-language stderr for regex matching
 push_output=$(LC_ALL=C git -C "$repo" push origin "$base" 2>&1)
@@ -1636,18 +1683,12 @@ if [ "$push_rc" -ne 0 ]; then
   # 'pre-push' rejecting means the push never reached the server (the genuine ref-CAS failure this
   # check exists to recognize is architecturally impossible to also have occurred in that same
   # invocation), the correct fix is a filesystem-level check, not another text pattern: if $repo
-  # has an executable pre-push hook installed (respecting core.hooksPath, not just the default
-  # .git/hooks/ location), never trust ANY text match here -- fall through to the hook-rejection/
-  # plain-race checks below instead, which report PUSH_FAILED rather than misclassifying.
-  _repo_has_pre_push_hook() {
-    local hooks_dir
-    hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)" || return 1
-    case "$hooks_dir" in
-      /*) : ;;
-      *) hooks_dir="$repo/$hooks_dir" ;;
-    esac
-    [ -x "$hooks_dir/pre-push" ]
-  }
+  # had an executable pre-push hook installed (respecting core.hooksPath, not just the default
+  # .git/hooks/ location) -- captured in $had_pre_push_hook BEFORE the first push attempt, not
+  # re-checked here, since a hook can delete/chmod itself as its own last action right before
+  # exiting nonzero (verified directly) -- never trust ANY text match here; fall through to the
+  # hook-rejection/plain-race checks below instead, which report PUSH_FAILED rather than
+  # misclassifying.
   _client_lines_only() {
     local out="" line
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1659,7 +1700,7 @@ if [ "$push_rc" -ne 0 ]; then
     printf '%s' "$out"
   }
   _is_ref_lock_race() {
-    _repo_has_pre_push_hook && return 1
+    [ "$had_pre_push_hook" = 1 ] && return 1
     local client_only
     client_only="$(_client_lines_only "$1")"
     case "$client_only" in
@@ -1692,17 +1733,18 @@ if [ "$push_rc" -ne 0 ]; then
     shopt -u nocasematch
     return "$rc"
   }
-  # SAME '_repo_has_pre_push_hook' guard as '_is_ref_lock_race' above, for the SAME reason via a
+  # SAME '$had_pre_push_hook' guard as '_is_ref_lock_race' above, for the SAME reason via a
   # DIFFERENT sibling path: a LOCAL 'pre-push' hook's arbitrary message can ALSO coincidentally
   # contain one of the plain race keywords below (e.g. "your branch appears behind our compliance
   # baseline") -- verified empirically -- and unlike a server-side hook, this message has neither
   # "remote: " framing nor any of _is_hook_rejection's literal keywords for that check to catch
   # first, so it fell straight through to this bare keyword match. A local pre-push hook's stderr
   # is structurally indistinguishable from git's own client-generated race text (no relay prefix,
-  # no boundary marker of any kind), so once a pre-push hook is known to be installed, no text
-  # pattern here can be trusted -- this is the honest, conservative fix, not another point-patch.
+  # no boundary marker of any kind), so once a pre-push hook is known to have been installed
+  # BEFORE the push ran, no text pattern here can be trusted -- this is the honest, conservative
+  # fix, not another point-patch.
   _is_race() {
-    _repo_has_pre_push_hook && return 1
+    [ "$had_pre_push_hook" = 1 ] && return 1
     local re='(behind|fast[- ]?forward|stale info|fetch first|contains work that you do not have)'
     local rc
     shopt -s nocasematch
