@@ -1269,9 +1269,20 @@ _skill_discovery_heal_fix() {
   # recomputing everything fresh from root_p/prefix_path/name (never trusting the already-resolved
   # $resolved/$dst/$dst_parent computed above, which describe a decision made once, earlier, that may no
   # longer hold). Embedded as python3 (matching how this same function already shells out to python3 for
-  # realpath elsewhere) rather than more bash, since a single process can atomically check-then-act with
-  # no gap between the check and the mkdir/cp it gates -- running the identical fix string a second time
-  # after an unsafe filesystem change must refuse, not trust a decision made by an earlier invocation.
+  # realpath elsewhere) rather than more bash, since a single process can check-then-act with no
+  # cross-process gap between the check and the mkdir/cp it gates -- running the identical fix string a
+  # second time after an unsafe filesystem change must refuse, not trust a decision made by an earlier
+  # invocation.
+  #
+  # Accepted residual limitation (checker round 4, not chased further -- documented, not eliminated,
+  # matching this codebase's own precedent for a comparably narrow risk elsewhere, e.g.
+  # bin/scope-guard.py's documented symlink TOCTOU and bin/caffeinate-guard.sh's PATH/supply-chain trust
+  # assumption): the embedded python script's own realpath-check-then-mkdir/cp is still two separate
+  # syscalls within one process, so an adversary with concurrent local filesystem write access could in
+  # theory win a race in the sub-instant window between them -- a real, but far narrower (intra-process,
+  # sub-millisecond, requiring precise concurrent timing by an attacker who already has local write
+  # access to this checkout at that exact instant) risk than the cross-process, arbitrarily-long window
+  # this fix already closes.
   local py_script
   py_script='import os, sys, subprocess
 root_p, prefix_path, name = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -3910,6 +3921,46 @@ for x in data:
     || { echo "FAIL: Test Q2 toctou-src unexpectedly healed at the repo root despite the destination escape"; rm -rf "$d" "$external_toctou"; exit 1; }
 
   rm -rf "$d" "$external_toctou"
+
+  # === Test Q3: TOCTOU -- the SOURCE (not the destination) becomes unsafe after generation ===
+  # Checker round 4's real, confirmed finding: Test Q2 above only ever mutates the DESTINATION after
+  # generation. The embedded execution-time re-check already correctly covers a stale SOURCE too (its
+  # logic mirrors the destination check symmetrically), but that was never actually exercised by a
+  # regression test -- this closes exactly that gap, mechanically, with no production-code change.
+  d=$(mktemp -d)
+  mkdir -p "$d/packages/widget2/.claude/skills/toctou-src2"
+  echo "toctou-src2 SAFE original content" > "$d/packages/widget2/.claude/skills/toctou-src2/SKILL.md"
+  toctou3_lock_dir="$d/.q3-lock"
+
+  # step 1: generate the fix while everything is genuinely safe -- no escape exists yet anywhere.
+  toctou3_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q3-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q3-no-installed.json" SM_DOCTOR_LOCK_DIR="$toctou3_lock_dir" "$script_abs" --json 2>/dev/null)
+  toctou3_fix=$(echo "$toctou3_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/widget2/toctou-src2 (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -n "$toctou3_fix" ] || { echo "FAIL: Test Q3 expected a non-empty fix to be generated while everything was safe"; rm -rf "$d"; exit 1; }
+
+  # step 2: AFTER generation, the SOURCE is replaced by a symlink to an external directory with
+  # DIFFERENT (swapped-in) content -- the stale fix must never copy this substituted content anywhere.
+  external_toctou3="$(mktemp -d)"
+  echo "SWAPPED_IN_CONTENT_MUST_NEVER_APPEAR" > "$external_toctou3/SKILL.md"
+  rm -rf "$d/packages/widget2/.claude/skills/toctou-src2"
+  ln -s "$external_toctou3" "$d/packages/widget2/.claude/skills/toctou-src2"
+
+  # step 3: run the PREVIOUSLY-GENERATED, now-stale fix string as a completely separate step.
+  toctou3_run_out=$(bash -c "$toctou3_fix" 2>&1)
+  toctou3_run_rc=$?
+  [ "$toctou3_run_rc" -ne 0 ] \
+    || { echo "FAIL: Test Q3 the stale fix string should have refused (nonzero exit) once the SOURCE became unsafe, got rc=0: $toctou3_run_out"; rm -rf "$d" "$external_toctou3"; exit 1; }
+  ! grep -rq 'SWAPPED_IN_CONTENT_MUST_NEVER_APPEAR' "$d" 2>/dev/null \
+    || { echo "FAIL: Test Q3 the swapped-in SOURCE content leaked into the repo via a stale fix string"; rm -rf "$d" "$external_toctou3"; exit 1; }
+  [ ! -e "$d/packages/widget2/.agents/skills/toctou-src2" ] \
+    || { echo "FAIL: Test Q3 toctou-src2 unexpectedly healed despite the SOURCE having become unsafe"; rm -rf "$d" "$external_toctou3"; exit 1; }
+
+  rm -rf "$d" "$external_toctou3"
 
   # === Test R: no project skills anywhere -> no skill discovery rows at all ===
   d=$(mktemp -d)
