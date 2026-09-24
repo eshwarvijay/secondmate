@@ -363,6 +363,30 @@ def _log_injection(task_id, lesson_ids):
             f.write(json.dumps(rec) + '\n')
 
 
+# The 4 lesson-ids matching get_original_fallback()'s hardcoded text, in the same order it prints them
+# -- these are the real, shipped seed files' own relative paths (each has evidence: E4, so all 4 are
+# always selected on the normal path too). Used to log a real, honest record of what was actually
+# printed whenever a fallback path fires, instead of leaving --task-id callers with zero record for
+# exactly the case (a degraded/unavailable lesson store) where knowing what was injected matters most.
+_FALLBACK_LESSON_IDS = [
+    'workflow/commit-before-done',
+    'testing/mutation-test-your-tests',
+    'workflow/stay-in-literal-scope',
+    'debugging/avoid-ad-hoc-debug-loops',
+]
+
+
+def _log_injection_safe(task_id, lesson_ids):
+    """Best-effort wrapper around _log_injection -- never raises, so a logging failure can never
+    affect what main() prints or returns. No-op entirely when task_id is falsy."""
+    if not task_id:
+        return
+    try:
+        _log_injection(task_id, lesson_ids)
+    except Exception:
+        pass
+
+
 def _parse_main_args(argv):
     task_text = ""
     task_id = None
@@ -392,6 +416,7 @@ def main(argv=None):
         # If no lessons found, print fallback
         if not lessons:
             print(get_original_fallback(), end='')
+            _log_injection_safe(task_id, list(_FALLBACK_LESSON_IDS))
             return 0
 
         # Select lessons
@@ -402,17 +427,15 @@ def main(argv=None):
         print(output, end='')
 
         # Best-effort injection logging -- must never affect the lookup/injection above in any way.
-        if task_id:
-            try:
-                _log_injection(task_id, [_lesson_id(fp, lessons_dir) for fp, _fm, _body in selected])
-            except Exception:
-                pass
+        _log_injection_safe(task_id, [_lesson_id(fp, lessons_dir) for fp, _fm, _body in selected])
 
         return 0
 
-    except Exception as e:
-        # Any failure -> fallback to original 4 lessons
+    except Exception:
+        # Any failure -> fallback to original 4 lessons. Still logs (best-effort) -- a degraded/
+        # unavailable lesson store is exactly the case where knowing what was shown matters most.
         print(get_original_fallback(), end='')
+        _log_injection_safe(task_id, list(_FALLBACK_LESSON_IDS))
         return 0
 
 
@@ -947,6 +970,82 @@ Fail-open logging test lesson.
                 if k in os.environ:
                     del os.environ[k]
 
+    # Test 8b: the "no lessons found" fallback path (missing/empty lessons dir) must ALSO log an
+    # injection record when --task-id is given -- both main()'s early-return branches (this one, and
+    # the outer except-Exception catch-all tested next) used to return before ever reaching the
+    # logging call, so a caller relying on --task-id got ZERO ledger record for exactly the case (a
+    # degraded/unavailable lesson store) where knowing what was actually shown matters most.
+    # Reproduced directly before this fix: a missing SM_LESSONS_DIR printed the fallback text but
+    # created no ledger file at all.
+    def test_missing_store_fallback_logs():
+        ledger_dir = _tempfile.mkdtemp(prefix='lesson-ledger-missing-')
+        try:
+            os.environ['SM_LESSONS_DIR'] = '/nonexistent/path/that/does/not/exist'
+            ledger_path = pathlib.Path(ledger_dir) / 'lesson-injections.jsonl'
+            os.environ['SM_LESSON_LEDGER'] = str(ledger_path)
+
+            out = io.StringIO()
+            with redirect_stdout(out):
+                sys.argv = ['lesson-lookup.py', '--task', 'demo', '--task-id', 'missing-store-task']
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            output = out.getvalue()
+            assert output.startswith('## Known failure patterns — DO NOT SKIP'), f"should still print the fallback:\n{output}"
+            assert ledger_path.exists(), "a missing lesson store with --task-id must still create the injection ledger"
+            recs = [json.loads(l) for l in ledger_path.read_text().splitlines() if l.strip()]
+            assert len(recs) == 1 and recs[0]['task_id'] == 'missing-store-task', f"expected exactly one logged record: {recs}"
+            assert recs[0]['lesson_ids'] == _FALLBACK_LESSON_IDS, (
+                f"the fallback path must log the 4 canonical fallback lesson-ids (matching the real "
+                f"shipped seed files), got: {recs[0]['lesson_ids']}")
+        finally:
+            shutil.rmtree(ledger_dir, ignore_errors=True)
+            for k in ('SM_LESSONS_DIR', 'SM_LESSON_LEDGER'):
+                if k in os.environ:
+                    del os.environ[k]
+
+    # Test 8c: the outer except-Exception catch-all fallback path (a genuine crash mid-lookup, not
+    # just a missing directory) must ALSO log an injection record when --task-id is given -- same gap
+    # as Test 8b, the other of main()'s two early-return fallback branches. A real, from-scratch
+    # filesystem fixture (a lessons dir that's actually a plain file, permission-denied directories,
+    # etc.) turned out NOT to force a real exception here -- pathlib's rglob() silently no-ops on
+    # both, on this Python/OS combination, rather than raising -- so this instead temporarily
+    # monkeypatches load_lessons() (the one thing main()'s try block calls that can plausibly raise)
+    # to force a deterministic crash, then calls the REAL main() -- the actual function under test --
+    # same precedent this repo's own claim-ledger.py selfcheck already uses (swapping open_claims for
+    # _slow_open_claims to force a specific race window), not a mock of main() itself.
+    def test_exception_fallback_logs():
+        ledger_dir = _tempfile.mkdtemp(prefix='lesson-ledger-exc-')
+        real_load_lessons = load_lessons
+        try:
+            def _raising_load_lessons(_lessons_dir_arg):
+                raise RuntimeError('forced crash for test_exception_fallback_logs')
+            globals()['load_lessons'] = _raising_load_lessons
+
+            ledger_path = pathlib.Path(ledger_dir) / 'lesson-injections.jsonl'
+            os.environ['SM_LESSON_LEDGER'] = str(ledger_path)
+
+            out = io.StringIO()
+            with redirect_stdout(out):
+                sys.argv = ['lesson-lookup.py', '--task', 'demo', '--task-id', 'exception-task']
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            output = out.getvalue()
+            assert output.startswith('## Known failure patterns — DO NOT SKIP'), f"should still print the fallback:\n{output}"
+            assert ledger_path.exists(), "the except-Exception fallback with --task-id must still create the injection ledger"
+            recs = [json.loads(l) for l in ledger_path.read_text().splitlines() if l.strip()]
+            assert len(recs) == 1 and recs[0]['task_id'] == 'exception-task', f"expected exactly one logged record: {recs}"
+            assert recs[0]['lesson_ids'] == _FALLBACK_LESSON_IDS, (
+                f"the except-Exception fallback must log the 4 canonical fallback lesson-ids, got: {recs[0]['lesson_ids']}")
+        finally:
+            globals()['load_lessons'] = real_load_lessons
+            shutil.rmtree(ledger_dir, ignore_errors=True)
+            if 'SM_LESSON_LEDGER' in os.environ:
+                del os.environ['SM_LESSON_LEDGER']
+
     # Test 9: with SM_LESSON_LEDGER and SM_LOOP_STATE both unset, two lesson-lookup.py invocations from
     # DIFFERENT CWDs inside the SAME git repo (the primary checkout + a linked worktree) must resolve to
     # the IDENTICAL default ledger file -- the exact bug class claim-ledger.py's own default path once
@@ -1135,6 +1234,8 @@ race target lesson.
     test_helpful_bucket_beats_relevance()
     test_task_id_logging()
     test_logging_failure_is_fail_open()
+    test_missing_store_fallback_logs()
+    test_exception_fallback_logs()
     test_default_ledger_anchoring()
     test_tag_subcommand()
     test_tag_subcommand_concurrent_race()
