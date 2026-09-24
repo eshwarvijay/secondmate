@@ -102,6 +102,10 @@ Each stage exists to close a specific failure mode.
    - `loop-guard.sh action` hashes each round's canonical action and **aborts a no-progress loop** (same action
      repeated N times, counting failed attempts too); `loop-guard.sh round` enforces a per-run round cap and a
      global spawn cap where exhaustion reports `budget-limited`, never "success".
+     **Machine-parseable restart signal**: for `n >= 3` repeats (before `ABORT_REPEATS`), `loop-guard.sh action`
+     prints `RESTART: identical action nx — kill this maker and restart fresh with the round-state handoff file.`
+     and exits `5` to signal the supervisor to kill and restart the maker with fresh state
+     (`SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md`).
    *Guards against:* hung rounds stalling an unattended run; models spinning on the same broken action forever.
 
 4. **Check.** The diff is trimmed with `prune-output.sh` (model-free head/tail truncation), then

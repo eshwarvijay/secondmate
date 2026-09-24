@@ -9,6 +9,8 @@
 set -euo pipefail
 
 state="${SM_LOOP_STATE:-.secondmate}"
+# ABORT_REPEATS controls the no-progress loop_abort threshold.
+# If ABORT_REPEATS <= 3, the exit-5 restart range becomes empty (every repeat goes straight to hard-abort).
 ABORT_REPEATS="${ABORT_REPEATS:-10}"; MAX_ROUNDS="${MAX_ROUNDS:-256}"; MAX_SPAWNS="${MAX_SPAWNS:-1000}"
 
 # C-fix: mkdir is an atomic, cross-platform lock (macOS has no flock). Serializes the counter
@@ -32,11 +34,14 @@ case "$cmd" in
     if [ "$h" = "$prev" ]; then n=$((n + 1)); else n=1; printf '%s' "$h" >"$state/action.key"; fi
     echo "$n" >"$state/action.count"
     case "$n" in
-      3) echo "HYGIENE: identical action 3x — re-read the last output and change approach.";;
-      5|8) echo "HYGIENE: identical action ${n}x, not progressing — do NOT repeat it; pick a different action or stop.";;
-    esac
-    if [ "$n" -ge "$ABORT_REPEATS" ]; then echo "ABORT: no-progress loop (${n}x identical action)"; exit 3; fi
-    exit 0;;
+      1|2) exit 0;;
+      *)
+        if [ "$n" -ge "$ABORT_REPEATS" ]; then
+          echo "ABORT: no-progress loop (${n}x identical action)"; exit 3
+        else
+          echo "RESTART: identical action ${n}x — kill this maker and restart fresh with the round-state handoff file."; exit 5
+        fi;;
+    esac;;
   round)
     mkdir -p "$state"
     _lock || echo "loop-guard: lock busy, counting unlocked" >&2
@@ -53,13 +58,34 @@ case "$cmd" in
     echo "loop state cleared"; exit 0;;
   selfcheck)
     tmp="$(mktemp -d)"; r=0
-    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
-    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1 || true
-    o3="$(SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same 2>&1 || true)"
-    echo "$o3" | grep -q HYGIENE || { echo "FAIL: no reminder at 3rd repeat"; r=1; }
-    if SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key same >/dev/null 2>&1; then echo "FAIL: should abort at 4th"; r=1; fi
-    SM_LOOP_STATE="$tmp" ABORT_REPEATS=4 "$0" action --key other >/dev/null 2>&1 || true
-    [ "$(cat "$tmp/action.count" 2>/dev/null)" = "1" ] || { echo "FAIL: new key should reset count"; r=1; }
+    # Full exit-code walk-through for two ABORT_REPEATS values: n<3 exit0 silent,
+    # 3<=n<ABORT_REPEATS exit5 RESTART, n>=ABORT_REPEATS exit3 ABORT.
+    # Each n is checked from exactly ONE call (never re-invoked to "recheck a message" --
+    # loop-guard.sh action is stateful, a second call always advances the counter again).
+    for AR in 5 10; do
+      rm -f "$tmp/action.key" "$tmp/action.count"
+      for n in $(seq 1 $((AR + 1))); do
+        set +e
+        out="$(SM_LOOP_STATE="$tmp" ABORT_REPEATS="$AR" "$0" action --key same 2>&1)"; ec=$?
+        set -e
+        cnt="$(cat "$tmp/action.count" 2>/dev/null || echo '?')"
+        [ "$cnt" = "$n" ] || { echo "FAIL: ABORT=$AR, n=$n count should be $n, got $cnt"; r=1; }
+        if [ "$n" -lt 3 ]; then
+          { [ "$ec" = 0 ] && [ -z "$out" ]; } || { echo "FAIL: ABORT=$AR, n=$n should be exit 0 silent, got ec=$ec out=$out"; r=1; }
+        elif [ "$n" -lt "$AR" ]; then
+          [ "$ec" = 5 ] || { echo "FAIL: ABORT=$AR, n=$n should be exit 5, got $ec"; r=1; }
+          printf '%s' "$out" | grep -q RESTART || { echo "FAIL: ABORT=$AR, n=$n missing RESTART message"; r=1; }
+        else
+          [ "$ec" = 3 ] || { echo "FAIL: ABORT=$AR, n=$n should be exit 3, got $ec"; r=1; }
+          printf '%s' "$out" | grep -q ABORT || { echo "FAIL: ABORT=$AR, n=$n missing ABORT message"; r=1; }
+        fi
+      done
+    done
+    # Test new key resets count
+    rm -f "$tmp/action.key" "$tmp/action.count"
+    SM_LOOP_STATE="$tmp" ABORT_REPEATS=10 "$0" action --key different >/dev/null 2>&1 || true
+    [ "$(cat "$tmp/action.count")" = "1" ] || { echo "FAIL: new key should reset count"; r=1; }
+    # Round cap test
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
     SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1
     if SM_LOOP_STATE="$tmp" MAX_ROUNDS=2 "$0" round >/dev/null 2>&1; then echo "FAIL: round cap not enforced"; r=1; fi
