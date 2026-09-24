@@ -681,6 +681,22 @@ while [ $# -gt 0 ]; do case "$1" in
       echo "$_pp" | grep -q "INVALID (do not reason this way)" || { echo "FAIL: _planner_prompt [$_lbl] missing Contrastive CoT INVALID example"; fails=1; }
       echo "$_pp" | grep -q "VALID (reason this way)" || { echo "FAIL: _planner_prompt [$_lbl] missing Contrastive CoT VALID example"; fails=1; }
     done
+    # qwen3-80b's Contrastive CoT example must cite the real documented incident
+    # (audit/flow/2026-09-11--fix-scope-guard-marker-doc...) and must not regress to the
+    # round-1 fabricated jsonschema/schema-utils.py scenario.
+    _qwen80b_pp="$(_planner_prompt qwen3-80b test-task-xyz)"
+    echo "$_qwen80b_pp" | grep -q "bin/utils/" || { echo "FAIL: qwen3-80b Contrastive CoT missing real incident's bin/utils/ reference"; fails=1; }
+    echo "$_qwen80b_pp" | grep -q "verify-worktree.ts" || { echo "FAIL: qwen3-80b Contrastive CoT missing real incident's verify-worktree.ts reference"; fails=1; }
+    echo "$_qwen80b_pp" | grep -q "clean.ts" || { echo "FAIL: qwen3-80b Contrastive CoT missing real incident's clean.ts reference"; fails=1; }
+    echo "$_qwen80b_pp" | grep -q "schema-utils.py" && { echo "FAIL: qwen3-80b Contrastive CoT regressed to fabricated schema-utils.py scenario"; fails=1; }
+    echo "$_qwen80b_pp" | grep -q "jsonschema" && { echo "FAIL: qwen3-80b Contrastive CoT regressed to fabricated jsonschema scenario"; fails=1; }
+    # mistral-large3's Contrastive CoT VALID example must ground its finding in the literal
+    # task text (printing planned file writes) and must not regress to the round-1 fabricated
+    # CLI-arg-derived-path mechanism the task text never stated.
+    _mistral_pp="$(_planner_prompt mistral-large3 test-task-xyz)"
+    echo "$_mistral_pp" | grep -q "Information Disclosure" || { echo "FAIL: mistral-large3 Contrastive CoT missing Information Disclosure grounding"; fails=1; }
+    echo "$_mistral_pp" | grep -q "planned file writes" || { echo "FAIL: mistral-large3 Contrastive CoT missing literal task-text mechanism 'planned file writes'"; fails=1; }
+    echo "$_mistral_pp" | grep -q "derived from a CLI arg" && { echo "FAIL: mistral-large3 Contrastive CoT regressed to fabricated CLI-arg-derived-path mechanism"; fails=1; }
     "$SCRIPT_DIR/committee-output.py" --selfcheck >/dev/null || { echo "FAIL: committee-output real fixture classifier"; fails=1; }
     _qwen_prompt="$(_planner_prompt qwen3-coder test-task-xyz)"
     _kimi_prompt="$(_planner_prompt kimi-k3 test-task-xyz)"
