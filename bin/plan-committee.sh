@@ -112,14 +112,14 @@ Before recommending a new dependency or abstraction layer, name the concrete gap
 Observe these two examples to understand how to and how not to reason about this repo's build conventions.
 
 **INVALID (do not reason this way):**
-Task: "Add JSON schema validation to the six planner output files before synthesis."
-Bad reasoning: "Recommend adding the `jsonschema` pip package for robust validation, and introduce a `SchemaValidator` abstraction layer following the existing pattern in `bin/schema-utils.py`."
-Why invalid: every bin/ script in this repo (hold.py, claim-ledger.py, verdict.py, lesson-lookup.py, audit-log.py) is stdlib-only with no third-party dependencies, and `bin/schema-utils.py` does not exist -- this invents both a dependency and a prior-art file the task text never mentioned.
+Task: "docs/SCOPE-GUARD-PI.md documents a /scope-guard-marker pi extension command that bin/scope-guard-extension.ts never registers -- resolve the doc/registration mismatch."
+Bad reasoning: "Extract a shared `bin/utils/` utility function for marker-path resolution, following the existing prior-art pattern in `verify-worktree.ts` and `clean.ts`."
+Why invalid: this repo has no `bin/utils/` directory and no `verify-worktree.ts` or `clean.ts` file anywhere in it -- the recommendation cites prior art that does not exist instead of checking it against the task text.
 
 **VALID (reason this way):**
 Task: same task.
-Good reasoning: "Option A -- stdlib `json.load` plus manual key/type checks, matching the stdlib-only convention already used by hold.py, claim-ledger.py, verdict.py, lesson-lookup.py, and audit-log.py; no new dependency needed."
-Why valid: the recommendation is grounded in a convention the task's own codebase demonstrably follows, not an assumed or hallucinated pattern.
+Good reasoning: "Option A -- register the missing `/scope-guard-marker` command in `bin/scope-guard-extension.ts`. Option B -- remove the dead doc section instead, since `/scope-guard-status` already prints 'Marker path: <path>' and a dedicated command would be pure duplication. Neither option needs a new shared utility file."
+Why valid: both options are grounded in the specific file and behavior the task text names, with no invented prior art.
 
 ## Generate options
 
@@ -349,8 +349,8 @@ Why invalid: bin/audit-log.py is a Python CLI script with no database connection
 
 **VALID (reason this way):**
 Task: same task.
-Good reasoning: "SQL Injection: N/A -- no such surface (no database or query construction in this task). Path Traversal: MEDIUM -- the --dry-run output lists file paths derived from a CLI arg; an unsanitized `../../etc/passwd`-style argument could be echoed into the planned-writes list, aiding reconnaissance of files outside the audit dir."
-Why valid: the first finding is honestly marked N/A instead of invented, and the second finding names a mechanism (CLI-arg-derived file path) that the task text actually describes.
+Good reasoning: "SQL Injection: N/A -- no such surface (no database or query construction in this task). Information Disclosure: MEDIUM -- printing every planned file write, as the task itself states, reveals this repo's internal file paths and naming conventions to any caller who can run --dry-run, which is reconnaissance value even without a database or network call."
+Why valid: the first finding is honestly marked N/A instead of invented, and the second finding is derived only from the mechanism the task text actually states -- printing planned file writes -- without assuming a CLI argument or other input the task never mentions.
 
 ## Probe each category -- build the concrete payload for each reachable vector.
 
