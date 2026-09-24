@@ -91,6 +91,17 @@ def _slugify(text, max_len=80):
     return slug or "untitled"
 
 
+def _task_component(task_id):
+    """Filename component derived directly from an ALREADY-VALIDATED task-id (see _valid_task_id) --
+    case-normalized (lowercased) but otherwise used AS-IS, never routed through _slugify()'s lossy
+    collapse of '_' and '-' into the same separator. _slugify() exists for arbitrary, unconstrained
+    TITLE text (used by migrate, for legacy entries that never had a discrete task-id); a validated
+    task-id is already a safe, unique-as-typed bare identifier ([A-Za-z0-9_-]{1,128}, no path
+    separators, no NUL, no '..') and needs no further lossy transformation -- two different, equally
+    valid task-ids (e.g. 'a_b' and 'a-b') must never collide on the same derived filename."""
+    return task_id.lower()
+
+
 def _valid_task_id(task_id):
     return isinstance(task_id, str) and bool(_TASK_ID_RE.match(task_id))
 
@@ -138,7 +149,7 @@ def cmd_add(args):
     else:
         sys.exit("no body supplied: pass --body-file PATH or pipe the body on stdin")
 
-    slug = _slugify(args.task)
+    slug = _task_component(args.task)
     path = _entry_path(args.type, args.date, slug)
     if path.exists() and not args.force:
         sys.exit(f"{path} already exists -- refusing to overwrite (pass --force to update it)")
@@ -159,8 +170,10 @@ def cmd_show(args):
     # Substring match against the filename's slug, not an exact suffix -- migrated legacy entries are
     # named after their (slugified) TITLE, not a discrete task-id (they never had one), so a short
     # task-id-shaped query must still find an entry whose real filename slug is the full title. May
-    # legitimately match more than one file; print every match, never silently pick one.
-    needle = _slugify(args.task)
+    # legitimately match more than one file; print every match, never silently pick one. Uses
+    # _task_component (not _slugify) so a query like 'a_b' can't accidentally also match a distinct
+    # 'a-b' entry's filename.
+    needle = _task_component(args.task)
     d = _type_dir(args.type)
     matches = sorted(p for p in d.glob("*.md") if needle in p.stem) if d.exists() else []
     if not matches:
@@ -368,6 +381,35 @@ def selfcheck():
         code, out = _run(["show", "--type", "flow", "--task", "demo-task"])
         assert "updated body" in out and "did the thing" not in out, "force must actually overwrite"
 
+        # Checker round 4, bug 1: two DIFFERENT, both-valid task-ids that only differ in '_' vs '-'
+        # must NOT collide on the same derived filename -- _slugify() collapses both to the same '-',
+        # but a validated task-id must be used non-lossily instead.
+        with open(bf, "w") as f:
+            f.write("- body for task a_b\n")
+        code, out = _run(["add", "--type", "flow", "--task", "a_b", "--date", "2026-03-01",
+                           "--title", "a_b: underscore task", "--body-file", bf])
+        assert code == 0, out
+        with open(bf, "w") as f:
+            f.write("- body for task a-b\n")
+        code, out = _run(["add", "--type", "flow", "--task", "a-b", "--date", "2026-03-01",
+                           "--title", "a-b: hyphen task", "--body-file", bf])
+        assert code == 0, (
+            f"a distinct task-id 'a-b' must not collide with the already-written 'a_b' entry: {out!r}")
+        p_ab_us = _entry_path("flow", "2026-03-01", "a_b")
+        p_ab_hy = _entry_path("flow", "2026-03-01", "a-b")
+        assert p_ab_us.exists() and p_ab_hy.exists() and p_ab_us != p_ab_hy, (
+            "'a_b' and 'a-b' must be written to two distinct files")
+        assert "body for task a_b" in p_ab_us.read_text()
+        assert "body for task a-b" in p_ab_hy.read_text()
+        # each must be independently addressable via show, without the other's content leaking in
+        code, out = _run(["show", "--type", "flow", "--task", "a_b"])
+        assert code == 0 and "body for task a_b" in out and "body for task a-b" not in out, out
+        code, out = _run(["show", "--type", "flow", "--task", "a-b"])
+        assert code == 0 and "body for task a-b" in out and "body for task a_b" not in out, out
+        # and via list
+        code, out = _run(["list", "--type", "flow"])
+        assert "a_b" in out and "a-b" in out, "both distinct task-ids must appear in the full listing"
+
         # task-id validation blocks path-traversal / path-breaking characters, same class of defense
         # claim-ledger.py enforces for its own task-id-derived filenames.
         for bad in ("", "../etc", "a/b", "a\0b", "bad id", "*", "a" * 129, "ok\n"):
@@ -388,8 +430,15 @@ def selfcheck():
         assert code == 0, out
         code, out = _run(["search", "UNIQUEMARKERXYZ"])
         assert code == 0 and "other-task" in out and "decision" in out, out
+        # a --type-scoped search must actually be SCOPED: the needle only exists in a decision-type
+        # entry, so a --type flow search for it must return zero matches, and --type decision must find it.
         code, out = _run(["search", "UNIQUEMARKERXYZ", "--type", "flow"])
-        assert code == 0 and "no matches" not in out.lower() or True  # printed to stderr, not stdout
+        assert code == 0 and out.strip() == "", (
+            f"a --type flow search for a needle that only exists in a decision-type entry must return "
+            f"zero matches: {out!r}")
+        code, out = _run(["search", "UNIQUEMARKERXYZ", "--type", "decision"])
+        assert code == 0 and "other-task" in out, (
+            f"a --type decision search must find the needle in the decision-type entry containing it: {out!r}")
         code, out = _run(["search", "NOSUCHSTRINGATALL"])
         assert code == 0 and out.strip() == "", "a query with zero hits must print nothing to stdout"
 
