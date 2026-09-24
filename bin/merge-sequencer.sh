@@ -1184,6 +1184,54 @@ HOOKEOF
   [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: spoofed ref-lock-race parenthetical was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
   [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: spoofed ref-lock-race parenthetical was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact spoofing bug this test guards"; fails=1; }
 
+  # ---- Test 35: (P1) CRITICAL negative test -- a genuine race on the initial push, followed by
+  # an UNRELATED failure (auth/network, matching neither a race signature nor a recognized hook
+  # rejection) on the FIRST retry, must stop immediately rather than burning a 3rd, pointless
+  # attempt. An earlier revision only escalated on a confirmed hook rejection and silently
+  # continued retrying on anything else it couldn't positively classify. ----
+  IFS='|' read -r origin35 primary35 <<<"$(_setup_repo 35)"
+  git -C "$primary35" worktree add -q "$t/wt35" -b sm/auth-fail-midrace main
+  echo "feature-authfail" >> "$t/wt35/file.txt"
+  git -C "$t/wt35" commit -qam "feature auth fail"
+  sha35="$(git -C "$t/wt35" rev-parse HEAD)"
+  fake_git_dir35="$t/fake-git-35"
+  mkdir -p "$fake_git_dir35"
+  real_git_path35="$(command -v git)"
+  counter35="$t/push-counter-35"
+  : > "$counter35"
+  cat > "$fake_git_dir35/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path35"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter35" | tr -d ' ')
+  echo "attempt" >> "$counter35"
+  if [ "\$n" = "0" ]; then
+    echo "! [rejected]  main -> main (fetch first)" >&2
+    exit 1
+  else
+    echo "fatal: Authentication failed for '\''origin'\''" >&2
+    exit 1
+  fi
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir35/git"
+  out35="$(PATH="$fake_git_dir35:$PATH" _ms --repo "$primary35" --worktree "$t/wt35" --branch sm/auth-fail-midrace --base main --checked-sha "$sha35" --wait-timeout 5 2>&1)"
+  rc35=$?
+  [ "$rc35" -eq 4 ] || { echo "FAIL: race-then-auth-failure expected rc=4, got $rc35: $out35"; fails=1; }
+  attempt_count35="$(wc -l < "$counter35" | tr -d ' ')"
+  [ "$attempt_count35" = "2" ] || { echo "FAIL: expected exactly 2 push attempts (initial race + 1 retry that hit the unrelated auth failure), got $attempt_count35 -- an unrelated failure must stop the loop immediately, not burn a pointless 3rd attempt"; fails=1; }
+  [ "$(_ledger_count sm/auth-fail-midrace PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: race-then-auth-failure was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1542,18 +1590,23 @@ if [ "$push_rc" -ne 0 ]; then
         exit 0
       fi
 
-      # This attempt failed too -- same priority order as the initial classification above: a
-      # ref-lock race (git's own "cannot lock ref" family) is NEVER escalated, since it's the exact
-      # retryable race this loop exists to recover from, even though it also carries "remote: "
-      # framing that would otherwise match the hook check below. A genuine hook rejection
-      # encountered mid-recovery escalates immediately; anything else matching the race signature
-      # just continues to the next loop iteration (or exhausts below).
-      if ! _is_ref_lock_race "$push_output" && _is_hook_rejection "$push_output"; then
-        echo "PUSH RACE EXHAUSTED: hook rejection encountered during recovery attempt $attempt/3" >&2
-        echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
-        _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
-        exit 4
+      # This attempt failed too -- ESCALATE UNLESS the failure is STILL POSITIVELY CONFIRMED to be
+      # the same kind of race, using the exact same classification as the initial push above. An
+      # earlier revision of this check only escalated on a confirmed hook rejection and silently
+      # continued retrying on anything else -- which meant a completely unrelated failure mid-loop
+      # (an expired credential: "fatal: Authentication failed for origin", a transport/network
+      # error, or anything else neither a race nor a recognized hook signature) fell through to
+      # "keep retrying" by default, burning an attempt and ultimately reporting PUSH_RACE_EXHAUSTED
+      # for a failure that was never a race at all. Fail closed instead: only continue the loop
+      # when the failure is affirmatively still race-shaped.
+      if _is_ref_lock_race "$push_output" || { ! _is_hook_rejection "$push_output" && _is_race "$push_output"; }; then
+        continue  # still race-shaped -- proceed to the next attempt (or exhaust below)
       fi
+      echo "PUSH RACE EXHAUSTED: recovery attempt $attempt/3 failed for a reason that is no longer race-shaped (hook/protected-branch rejection, or an unrelated failure such as auth/network)" >&2
+      echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
+      printf '%s\n' "$push_output" >&2
+      _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
+      exit 4
     done
 
     # All 3 attempts (1 initial + 2 retries) exhausted
