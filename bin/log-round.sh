@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # log-round.sh -- append one structured metrics record per checker round to an append-only JSONL ledger,
 # so the supervisor can later query round counts, verdict outcomes, and recurring finding categories
-# across tasks instead of only having free-text prose in audit/flow.md and audit/decision.md.
-# Never rewrites prior lines -- same "append, never rewrite" convention as those files.
+# across tasks instead of only having free-text prose in the per-task audit/flow/ and audit/decision/
+# entries (see bin/audit-log.py). Never rewrites prior lines -- same "append, never rewrite" convention.
 #
 #   log-round.sh --task ID --round N --maker claude|pi --verdict pass|fail|error|refused \
 #     [--tag TAG]... [--lesson-id ID]... [--cost N] [--duration N]

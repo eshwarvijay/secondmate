@@ -230,7 +230,7 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<tas
      invocation (bad args, missing context) or escalate to the human. `refused` always escalates.
    - **Log the round.** After every checker verdict (pass, fail, error, or refused), append a metrics
      record: `${CLAUDE_PLUGIN_ROOT}/bin/log-round.sh --task <id> --round <N> --maker claude|pi --verdict <verdict> [--tag <finding-category>]... [--lesson-id <id>]... [--cost <n>] [--duration <n>]`.
-     Supply one `--tag` per recurring finding category you'd tag it with in `audit/decision.md` anyway
+     Supply one `--tag` per recurring finding category you'd tag it with in this task's decision entry anyway
      (e.g. `real-bug`, `scope-creep`, `fake-test`, `not-committed`) — this is structured data alongside the
      prose audit trail, not a replacement for it. `--lesson-id` is optional and repeatable too, mirroring
      `--tag` — pass the lesson ids `lesson-lookup.py` actually injected this round if you have them handy,
@@ -266,13 +266,19 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<tas
    only after you have confirmed EVERY task/worktree in that batch has been torn down. Never call `stop` inside
    a task's per-task teardown — sibling tasks may still be running and need sleep prevention.
 
-10. **Audit trail** — after teardown, append to `audit/flow.md` and `audit/decision.md` in the **primary checkout**:
-   - `audit/flow.md` — which maker path was chosen and why, planner model list if committee ran, round count, outcome.
-   - `audit/decision.md` — what the maker decided, what the checker found, every gate auto-approved or escalated and why.
-   Append, never rewrite. Commit separately in the primary repo — they do not touch the worktree and cannot stale the checked SHA.
-   Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as context. Skip for trivial one-shot edits.
+10. **Audit trail** — after teardown, in the **primary checkout**, file one entry per task via
+   `${CLAUDE_PLUGIN_ROOT}/bin/audit-log.py add --type flow --task <task-id> --date <YYYY-MM-DD> --title "<title>" --body-file <path>`
+   and the same with `--type decision`:
+   - `flow` — which maker path was chosen and why, planner model list if committee ran, round count, outcome.
+   - `decision` — what the maker decided, what the checker found, every gate auto-approved or escalated and why.
+   This writes the entry verbatim to its own file under `audit/flow/`/`audit/decision/` and regenerates the
+   bounded `audit/INDEX.md` — never hand-edit `audit/INDEX.md`, and there is no `audit/flow.md`/`audit/decision.md`
+   monolith to append to anymore. Commit separately in the primary repo — this does not touch the worktree and
+   cannot stale the checked SHA. Only the generated, size-capped `audit/INDEX.md` is `@`-imported in
+   `CLAUDE.md` and auto-loaded into every session — never the per-task files themselves. Skip for trivial
+   one-shot edits.
 
-11. **Lesson feedback** — in the SAME commit as step 10's `audit/flow.md`/`audit/decision.md` update
+11. **Lesson feedback** — in the SAME commit as step 10's `bin/audit-log.py add` update
    (directly in the primary checkout, never inside the maker's worktree), tag whichever injected lessons
    you have real grounds to judge. Check the injection ledger (`$SM_LESSON_LEDGER`, default anchored
    under `.secondmate/lesson-injections.jsonl`) for this task-id's entries to see which lesson ids were

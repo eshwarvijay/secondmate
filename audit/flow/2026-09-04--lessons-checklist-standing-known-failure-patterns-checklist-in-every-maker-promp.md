@@ -1,0 +1,7 @@
+## 2026-09-04 — lessons-checklist: standing "Known failure patterns" checklist in every maker prompt
+
+- **Trigger:** self-improvement follow-up — feed today's real recurring maker mistakes (not committing, fake tests, scope creep, hanging debug one-liners) back into the maker prompt template itself, so future makers get warned before repeating them
+- **Maker path:** pi (Qwen3-Coder-Next, medium thinking), dedicated worktree workspace `w1B`, run in parallel with `round-metrics-ledger` and `pi-scope-guard`
+- **Rounds:** 2. Round 1 added the 4-bullet checklist to 6 of 7 maker-launch prompt sites in SKILL.md (correctly kept as inline duplication per file, not a referenced block, since each site is a literal string argument) but missed the headless (`HERDR_ENV != 1`) fallback pi-maker invocation. Round 2 added it there too. Round 2's own checker returned `refused` (its file-read tool got blocked reading the 291-line SKILL.md) rather than a real defect — supervisor independently grepped the full file and confirmed exactly 7 maker-invocation sites with 7 matching checklist copies in 1:1 correspondence.
+- **Outcome:** verify-gate PASS at `27074bf` → merged to main (`--no-ff`) → worktree/branch teardown (initially missed, caught and completed after the fact)
+- **Process note:** merge/push executed under the human's explicit advance authorization for this batch of tasks, not a per-task hold answer.
