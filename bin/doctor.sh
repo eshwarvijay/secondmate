@@ -1203,15 +1203,24 @@ PYEOF
 # <prefix>/.agents/skills/<name> (the portable location pi already reads at that same subproject
 # location), so the generic heal() dispatch loop below can run it exactly like any other MISSING row's
 # fix command -- no bespoke _heal_* function needed. Prints nothing (no auto-fix offered) if it is not
-# safe/unambiguous to do so: the name or prefix fails its safe-pattern check (defense in depth --
-# detect() already filtered this), the destination already exists as ANY kind of entry (never offers to
-# clobber), the resolved real SOURCE escapes the repo root the same way bin/sync-worktree-skills.sh
-# already guards against for the identical reason (a symlink pointing outside the checkout must never
-# have its content copied anywhere), or (checker round 2's real finding) an intermediate component of
-# the DESTINATION path escapes the repo root -- e.g. a symlinked <prefix>/.agents pointing outside the
-# checkout, which `mkdir -p`/`cp -R -p` would otherwise silently follow and write real content through,
-# even though dst/dst_parent themselves don't exist yet. Checking only the source side (round 1's fix)
-# left this second, independent escape route wide open.
+# safe/unambiguous to do so AT GENERATION TIME: the name or prefix fails its safe-pattern check
+# (defense in depth -- detect() already filtered this), the destination already exists as ANY kind of
+# entry (never offers to clobber), the resolved real SOURCE escapes the repo root the same way
+# bin/sync-worktree-skills.sh already guards against for the identical reason (a symlink pointing
+# outside the checkout must never have its content copied anywhere), or (checker round 2's real
+# finding) an intermediate component of the DESTINATION path escapes the repo root -- e.g. a symlinked
+# <prefix>/.agents pointing outside the checkout, which `mkdir -p`/`cp -R -p` would otherwise silently
+# follow and write real content through, even though dst/dst_parent themselves don't exist yet.
+# Checking only the source side (round 1's fix) left this second, independent escape route wide open.
+#
+# A generation-time-only check is itself a real, confirmed TOCTOU (checker round 3's finding): the
+# returned string is meant to be inspectable/deferrable, not only auto-executed instantly -- it can be
+# read via --json and run manually by a human at some arbitrary LATER time, after the filesystem has
+# changed. So the SAME containment logic (source AND destination) is embedded as a python3 script
+# INSIDE the returned command string itself, re-run at ACTUAL EXECUTION TIME immediately before any
+# mkdir/cp, recomputing everything fresh from root_p/prefix_path/name rather than trusting this
+# function's own already-resolved values -- running the identical returned string twice, with an unsafe
+# filesystem change in between, must refuse the second time.
 _skill_discovery_heal_fix() {
   local root="$1" prefix="$2" name="$3"
   [[ "$name" =~ $_SKILL_NAME_SAFE_RE ]] || return 0
@@ -1247,8 +1256,50 @@ _skill_discovery_heal_fix() {
     "$root_p"|"$root_p"/*) ;;   # inside the repo -- safe to offer
     *) return 0;;               # an existing destination-path component escapes the repo -- never offer
   esac
-  printf 'if [ -e %q ] || [ -L %q ]; then echo "already exists, skipping" >&2; else mkdir -p %q && cp -R -p %q %q; fi' \
-    "$dst" "$dst" "$dst_parent" "$resolved" "$dst"
+  # The two checks above only prove safety AT THE MOMENT this fix string is generated (--json /
+  # detect()'s time). The returned string is meant to be inspectable and deferrable -- run immediately
+  # by --heal --yes, or read via --json and run manually by a human at some arbitrary LATER time (per
+  # this file's own "SKIP ... provide its source ... set the matching SM_* var" design for every other
+  # fix command) -- so a generation-time-only check is a real, exploitable TOCTOU: if the filesystem
+  # changes between generation and execution (e.g. <prefix>/.agents gets replaced by an outside-pointing
+  # symlink AFTER this string was built), running the already-generated, already-safe-LOOKING string
+  # later leaks content outside the repo exactly like the bug the destination check above was meant to
+  # close. Closing this structurally (not by narrowing the window) means the SAME containment logic must
+  # re-run INSIDE the generated command, at ACTUAL EXECUTION TIME, immediately before any mutation --
+  # recomputing everything fresh from root_p/prefix_path/name (never trusting the already-resolved
+  # $resolved/$dst/$dst_parent computed above, which describe a decision made once, earlier, that may no
+  # longer hold). Embedded as python3 (matching how this same function already shells out to python3 for
+  # realpath elsewhere) rather than more bash, since a single process can atomically check-then-act with
+  # no gap between the check and the mkdir/cp it gates -- running the identical fix string a second time
+  # after an unsafe filesystem change must refuse, not trust a decision made by an earlier invocation.
+  local py_script
+  py_script='import os, sys, subprocess
+root_p, prefix_path, name = sys.argv[1], sys.argv[2], sys.argv[3]
+src = root_p + "/" + prefix_path + ".claude/skills/" + name
+dst_parent = root_p + "/" + prefix_path + ".agents/skills"
+dst = dst_parent + "/" + name
+if os.path.exists(dst) or os.path.islink(dst):
+    print("already exists, skipping", file=sys.stderr)
+    sys.exit(0)
+resolved_src = os.path.realpath(src)
+if not os.path.isdir(resolved_src) or not (resolved_src == root_p or resolved_src.startswith(root_p + os.sep)):
+    print("refusing: source escapes the repo root (checked at execution time)", file=sys.stderr)
+    sys.exit(1)
+anc = dst_parent
+while anc != os.path.dirname(anc) and not (os.path.exists(anc) or os.path.islink(anc)):
+    anc = os.path.dirname(anc)
+resolved_anc = os.path.realpath(anc)
+if not (resolved_anc == root_p or resolved_anc.startswith(root_p + os.sep)):
+    print("refusing: destination escapes the repo root (checked at execution time)", file=sys.stderr)
+    sys.exit(1)
+try:
+    os.makedirs(dst_parent, exist_ok=True)
+    subprocess.run(["cp", "-R", "-p", resolved_src, dst], check=True)
+except Exception as e:
+    print(f"refusing/failed: {e}", file=sys.stderr)
+    sys.exit(1)
+'
+  printf 'python3 -c %q %q %q %q' "$py_script" "$root_p" "$prefix_path" "$name"
 }
 
 detect() {
@@ -3817,6 +3868,48 @@ print('NOT_FOUND')
     || { echo "FAIL: Test Q leaky-dest LEAKED into the external destination on the second heal run"; rm -rf "$d" "$external_dest_q"; exit 1; }
 
   rm -rf "$d" "$external_q" "$external_dest_q"
+
+  # === Test Q2: TOCTOU -- filesystem changes AFTER the fix string was generated, BEFORE it runs ===
+  # Checker round 3's real, confirmed finding, reproduced here exactly: round 2's containment checks
+  # only proved safety at the MOMENT the fix string was generated (--json/detect() time). The returned
+  # string is meant to be inspectable/deferrable -- read via --json and run manually by a human at some
+  # LATER time, not only auto-executed instantly by --heal --yes -- so a generation-time-only check is a
+  # real TOCTOU: if <prefix>/.agents gets replaced by an outside-pointing symlink AFTER the safe fix
+  # string was generated, running that already-generated, already-safe-LOOKING string later must still
+  # refuse, not leak content outside the repo.
+  d=$(mktemp -d)
+  mkdir -p "$d/packages/widget/.claude/skills/toctou-src"
+  echo "toctou-src real content (must NEVER leave the repo)" > "$d/packages/widget/.claude/skills/toctou-src/SKILL.md"
+  toctou_lock_dir="$d/.q2-lock"
+
+  # step 1: generate the fix while everything is genuinely safe -- no escape exists yet anywhere.
+  toctou_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q2-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q2-no-installed.json" SM_DOCTOR_LOCK_DIR="$toctou_lock_dir" "$script_abs" --json 2>/dev/null)
+  toctou_fix=$(echo "$toctou_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/widget/toctou-src (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -n "$toctou_fix" ] || { echo "FAIL: Test Q2 expected a non-empty fix to be generated while everything was safe"; rm -rf "$d"; exit 1; }
+
+  # step 2: AFTER generation, the filesystem changes to introduce an escape -- packages/widget/.agents
+  # is replaced by a symlink resolving to a directory genuinely outside the repo.
+  external_toctou="$(mktemp -d)"
+  ln -s "$external_toctou" "$d/packages/widget/.agents"
+
+  # step 3: run the PREVIOUSLY-GENERATED, now-stale fix string as a completely separate step -- this is
+  # the exact reported scenario, not the already-covered "escape exists before generation" case.
+  toctou_run_out=$(bash -c "$toctou_fix" 2>&1)
+  toctou_run_rc=$?
+  [ "$toctou_run_rc" -ne 0 ] \
+    || { echo "FAIL: Test Q2 the stale fix string should have refused (nonzero exit) once an escape appeared, got rc=0: $toctou_run_out"; rm -rf "$d" "$external_toctou"; exit 1; }
+  [ -z "$(find "$external_toctou" -mindepth 1 2>/dev/null)" ] \
+    || { echo "FAIL: Test Q2 TOCTOU LEAKED real content into the external directory via a stale fix string"; rm -rf "$d" "$external_toctou"; exit 1; }
+  [ ! -e "$d/.agents/skills/toctou-src" ] \
+    || { echo "FAIL: Test Q2 toctou-src unexpectedly healed at the repo root despite the destination escape"; rm -rf "$d" "$external_toctou"; exit 1; }
+
+  rm -rf "$d" "$external_toctou"
 
   # === Test R: no project skills anywhere -> no skill discovery rows at all ===
   d=$(mktemp -d)
