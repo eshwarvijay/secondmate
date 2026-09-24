@@ -33,26 +33,28 @@
 #             landed) | 5 lock timeout | 6 --preflight-only conflict detected | 7 --preflight-only
 #             unsupported/inconclusive (git doesn't support --write-tree, or another error) | 8
 #             --preflight-only clean (no conflict detected).
-#             --preflight-only (6-8) never touches $repo's working tree, index, HEAD/branch refs,
-#             lock, or ledger -- it has exactly two known exceptions, both inherent to doing this
-#             check the reliable way rather than something either side effect should be read as a
-#             bug to chase further: (1) a normal 'git fetch' of --base, which updates
-#             refs/remotes/origin/<base> the same way any "check the remote's current state" call
-#             would; (2) 'git merge-tree --write-tree' itself writes the computed merge-result tree
-#             (and any conflict blobs) into $repo's object database as an unreachable, dangling
-#             object -- no ref ever points to it, so it is ordinary git-gc'able garbage, but it is
-#             a genuine object-database write. This is the git-recommended, exit-code-reliable way
-#             to check for a conflict (the only alternative, the legacy 3-arg 'git merge-tree'
+#             --preflight-only (6-8) is a READ-ONLY CHECK OF $repo's WORKING TREE, INDEX,
+#             HEAD/BRANCH REFS, LOCK, AND LEDGER SPECIFICALLY -- it never touches any of those five
+#             things, on any exit path. It is NOT read-only with respect to $repo's git internals
+#             in general: it runs a normal 'git fetch' of --base (which, like any fetch, writes
+#             .git/FETCH_HEAD, updates refs/remotes/origin/<base>, and downloads any new objects)
+#             and a 'git merge-tree --write-tree' conflict check (which writes the computed
+#             merge-result tree, and any conflict blobs, into the object database as an
+#             unreachable, git-gc'able dangling object -- the git-recommended, exit-code-reliable
+#             way to check for a conflict; the only alternative, the legacy 3-arg 'git merge-tree'
 #             without --write-tree, writes nothing but requires parsing unstructured text output
-#             instead of a clean 0/1 exit code).
+#             instead of a clean 0/1 exit code). Both are the ordinary, unavoidable footprint of
+#             doing this check via git's own supported mechanisms, not a growing exceptions list.
 #             Note: exit codes 6-8 are ONLY for --preflight-only and never occur in normal merge+push flow.
 #             Existing exit codes (0-5) are unchanged and have identical semantics to today.
 #
 # Ledger reason_code is a CLOSED enum: SUCCESS | GATE_REFUSE | BRANCH_MISMATCH | MERGE_CONFLICT |
 #             MERGE_REJECTED | PUSH_FAILED | PUSH_RACE_RECOVERED | PUSH_RACE_EXHAUSTED | LOCK_TIMEOUT -- never freeform.
 #
-# Settled scope (do not re-litigate): no internal auto-retry, no rebase-in-place on refusal, no
-# priority queue / fairness policy, no automatic stale-lock expiry/steal, single machine only.
+# Settled scope (do not re-litigate): no retry of anything OTHER than a confirmed push race (see
+# P1 above -- bounded at 3 total attempts, never on a hook/protected-branch rejection), no
+# rebase-in-place on refusal, no priority queue / fairness policy, no automatic stale-lock
+# expiry/steal, single machine only.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1104,11 +1106,11 @@ HOOKEOF
   [ "$(_ledger_count sm/cab-policy-collision PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: CAB-policy hook message was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
   [ "$(_ledger_count sm/cab-policy-collision PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: CAB-policy hook message was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact free-text-collision bug this test guards"; fails=1; }
 
-  # ---- Test 32: (P2) --preflight-only clean-path object-database exception is EXACTLY the two
-  # documented cases, nothing else -- loose object count may increase (the dangling merge-tree
-  # result), but the lock dir, main ref, ledger, and repo cleanliness stay exactly as Test 22
-  # already asserts. This locks in the fully-scoped contract after round 3 named the second
-  # exception explicitly. ----
+  # ---- Test 32: (P2) --preflight-only's merge-tree --write-tree call may increase the loose
+  # object count (the dangling merge-tree result), but the lock dir, main ref, ledger, and repo
+  # cleanliness stay exactly as Test 22 already asserts -- the READ-ONLY guarantee is scoped to
+  # working tree/index/branch-refs/lock/ledger specifically, not "no git-internal footprint at
+  # all" (see the reframed header comment). ----
   IFS='|' read -r origin32 primary32 <<<"$(_setup_repo 32)"
   git -C "$primary32" worktree add -q "$t/wt32" -b sm/preflight-object-write main
   echo "feature-objwrite" >> "$t/wt32/file.txt"
@@ -1130,6 +1132,57 @@ HOOKEOF
   [ "$objects_after32" -gt "$objects_before32" ] || { echo "FAIL: expected loose object count to increase (the documented merge-tree --write-tree exception) -- got before=$objects_before32 after=$objects_after32; if this now stays equal, the header comment's 2nd exception is stale and should be removed, not left describing behavior that no longer happens"; fails=1; }
   [ -z "$(git -C "$primary32" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight left the working tree dirty despite the object-database exception being documented as write-only (no working-tree/index change)"; fails=1; }
   [ ! -e "$primary32/.git/MERGE_HEAD" ] || { echo "FAIL: preflight left MERGE_HEAD despite never running a real merge"; fails=1; }
+
+  # ---- Test 33: (P2) confirms --preflight-only's fetch has fetch's OWN ordinary footprint
+  # (.git/FETCH_HEAD written, new objects downloaded) -- documented explicitly after round 4 found
+  # this undocumented, using the same independent-clone-advances-origin scenario as the checker's
+  # own repro. This is expected, documented behavior, not a defect to chase further. ----
+  IFS='|' read -r origin33 primary33 <<<"$(_setup_repo 33)"
+  git -C "$primary33" worktree add -q "$t/wt33" -b sm/preflight-fetch-footprint main
+  echo "feature-fetchfoot" >> "$t/wt33/file.txt"
+  git -C "$t/wt33" commit -qam "feature fetch footprint"
+  sha33="$(git -C "$t/wt33" rev-parse HEAD)"
+  git clone -q "$primary33" "$t/other-clone33" >/dev/null 2>&1
+  git -C "$t/other-clone33" remote set-url origin "$origin33"
+  echo "independent-advance-33" > "$t/other-clone33/other-file-33.txt"
+  git -C "$t/other-clone33" add other-file-33.txt
+  git -C "$t/other-clone33" commit -qam "independent origin advance"
+  git -C "$t/other-clone33" push -q origin main
+  [ ! -e "$primary33/.git/FETCH_HEAD" ] || { echo "FAIL: test setup invariant broken -- FETCH_HEAD already present before preflight ran"; fails=1; }
+  objects_before33="$(git -C "$primary33" count-objects | cut -d' ' -f1)"
+  out33="$(_ms --repo "$primary33" --worktree "$t/wt33" --branch sm/preflight-fetch-footprint --base main --checked-sha "$sha33" --preflight-only --wait-timeout 5 2>&1)"
+  rc33=$?
+  [ "$rc33" -eq 8 ] || { echo "FAIL: preflight fetch-footprint test expected rc=8, got $rc33: $out33"; fails=1; }
+  [ -e "$primary33/.git/FETCH_HEAD" ] || { echo "FAIL: expected .git/FETCH_HEAD to exist after preflight's fetch (documented, ordinary fetch footprint)"; fails=1; }
+  objects_after33="$(git -C "$primary33" count-objects | cut -d' ' -f1)"
+  [ "$objects_after33" -gt "$objects_before33" ] || { echo "FAIL: expected new objects to be downloaded from the independent origin advance"; fails=1; }
+  [ -z "$(git -C "$primary33" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight's fetch left the working tree dirty"; fails=1; }
+
+  # ---- Test 34: (P1) CRITICAL negative test -- a hook that tries to LITERALLY SPOOF git's own
+  # ref-lock-race parenthetical, including a fake full "! [remote rejected] ... (incorrect old
+  # value provided)" line, must still be PUSH_FAILED. Verified empirically that git relays even a
+  # spoofed line through the "remote: " prefix, and separately, correctly generates its OWN
+  # unprefixed summary line with the TRUE reason -- _client_lines_only's job is to only ever look
+  # at that second, unspoofable line. ----
+  IFS='|' read -r origin34 primary34 <<<"$(_setup_repo 34)"
+  cat > "$origin34/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "policy denied (incorrect old value provided)" >&2
+echo " ! [remote rejected] main -> main (incorrect old value provided)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin34/hooks/pre-receive"
+  git -C "$primary34" worktree add -q "$t/wt34" -b sm/hook-spoofs-reflock main
+  echo "feature-p34" >> "$t/wt34/file.txt"
+  git -C "$t/wt34" commit -qam "feature p34"
+  sha34="$(git -C "$t/wt34" rev-parse HEAD)"
+  out34="$(_ms --repo "$primary34" --worktree "$t/wt34" --branch sm/hook-spoofs-reflock --base main --checked-sha "$sha34" --wait-timeout 5 2>&1)"
+  rc34=$?
+  [ "$rc34" -eq 4 ] || { echo "FAIL: hook spoofing the ref-lock-race parenthetical expected rc=4, got $rc34: $out34"; fails=1; }
+  echo "$out34" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out34"; fails=1; }
+  [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (hook tried to spoof the ref-lock-race parenthetical)"; fails=1; }
+  [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: spoofed ref-lock-race parenthetical was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: spoofed ref-lock-race parenthetical was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact spoofing bug this test guards"; fails=1; }
 
   rm -rf "$t"
   trap - EXIT
@@ -1208,7 +1261,7 @@ fi
 
 [ -n "$message" ] || message="Merge $branch"
 
-# ============================== preflight-only path (no working-tree/branch-ref/lock/ledger side effects -- see the two documented exceptions in the header comment above) ==============================
+# ============================== preflight-only path (no working-tree/branch-ref/lock/ledger side effects -- fetch/merge-tree's own ordinary git-internal footprint is out of scope of that guarantee, see header comment above) ==============================
 if [ "$preflight_only" = "1" ]; then
   # Same invariant the normal merge path enforces (see the identical check later in this file,
   # around the "Bug A fix" comment) -- --branch is the thing a merge would actually act on, so it
@@ -1224,12 +1277,13 @@ if [ "$preflight_only" = "1" ]; then
   fi
   # Validate git supports --write-tree (git merge-tree requires it)
   git merge-tree --help >/dev/null 2>&1 || { echo "UNSUPPORTED: git merge-tree --write-tree is not supported (requires git >= 2.38)" >&2; exit 7; }
-  # Fetch origin to get current state of --base. NOTE: this updates refs/remotes/origin/$base in
-  # $repo's own git metadata (standard fetch bookkeeping, the normal way anything learns the
-  # remote's current state) -- it is the ONE side effect this path has. It does not touch $repo's
-  # working tree, index, commits, lock, or ledger, and every exit path below (clean, conflict, or
-  # unsupported) is otherwise identical to a real read-only check. A caller that needs a fetch with
-  # literally zero ref writes should use 'git ls-remote' up front themselves and pass its own base.
+  # Fetch origin to get current state of --base. NOTE: like any 'git fetch', this writes
+  # .git/FETCH_HEAD, updates refs/remotes/origin/$base, and downloads any new objects into $repo's
+  # object database -- the ordinary footprint of fetch itself, not something this script adds on
+  # top. It does not touch $repo's working tree, index, HEAD/branch refs, lock, or ledger, and
+  # every exit path below (clean, conflict, or unsupported) is otherwise identical to a real
+  # read-only check of those five things. A caller that needs a fetch with literally zero writes
+  # of any kind should use 'git ls-remote' up front themselves and pass its own base.
   if ! git -C "$repo" fetch origin "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1; then
     echo "ERROR: failed to fetch origin/$base (check network/permissions)" >&2
     exit 7
@@ -1377,21 +1431,33 @@ if [ "$push_rc" -ne 0 ]; then
   # verified empirically with two real concurrent pushes against a bare repo -- so the hook
   # check below cannot be trusted to run first here.
   #
-  # Matches ONLY the "[remote rejected] ... (incorrect old value provided)" PARENTHETICAL
-  # REASON, not the free-text body of the message. An earlier revision of this check matched
-  # the literal words "cannot lock ref" anywhere in the output -- a real, plausible hook message
-  # ("policy denied: cannot lock ref writes until CAB approval") can coincidentally contain that
-  # exact phrase as ordinary English, which is exactly the same class of bug this whole
-  # hook-vs-race distinction exists to prevent. The parenthetical reason after "[remote
-  # rejected]", by contrast, is chosen entirely by git's OWN receive-pack code based on WHY the
-  # ref update actually failed -- a hook's message (whatever it prints to its own stdout/stderr)
-  # is relayed on SEPARATE "remote: <text>" lines and has zero influence over this parenthetical.
-  # Verified empirically: a real pre-receive hook always produces "(pre-receive hook declined)",
-  # a real update hook always produces "(hook declined)" -- NEVER "(incorrect old value
-  # provided)", which only appears when git's own ref-transaction CAS genuinely lost a race,
-  # independent of whether any hook even ran.
+  # Matches ONLY the "(incorrect old value provided)" parenthetical reason, and ONLY when it
+  # appears on a line that is NOT itself a relayed "remote: <text>" line. An earlier revision
+  # matched the literal words "cannot lock ref" anywhere in the raw output (fooled by a hook
+  # message containing that exact phrase as ordinary policy English); the NEXT revision narrowed
+  # to the "(incorrect old value provided)" parenthetical but still searched the whole raw blob,
+  # which a hook can ALSO spoof by printing that exact string itself -- verified empirically: a
+  # hook's own attempt to print "(incorrect old value provided)" (or even a full fake "!
+  # [remote rejected] ... (incorrect old value provided)" line) still gets git's normal "remote: "
+  # relay prefix, and git's REAL client-generated summary line (never "remote: "-prefixed, and
+  # always reflecting the TRUE reason regardless of what the hook printed) appears as a SEPARATE
+  # line alongside it. Filtering out every "remote: "-prefixed line before matching closes this
+  # for good: nothing a hook prints to its own stdout/stderr can ever appear on a non-"remote: "
+  # line, since every byte a hook produces is relayed through that exact prefix mechanism.
+  _client_lines_only() {
+    local out="" line
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "remote: "*) ;;  # hook/server relay -- never trust this line's content structurally
+        *) out+="$line"$'\n';;
+      esac
+    done <<< "$1"
+    printf '%s' "$out"
+  }
   _is_ref_lock_race() {
-    case "$1" in
+    local client_only
+    client_only="$(_client_lines_only "$1")"
+    case "$client_only" in
       *"(incorrect old value provided)"*) return 0;;
     esac
     return 1
