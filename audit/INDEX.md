@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 34 total)
+## Recent flow (orchestration mechanics) entries (15 of 35 total)
 
-- 2026-09-11 — doctor-heal-stale-report: bin/doctor.sh's --heal command shows the pre-heal state in its own trailing table (`audit/flow/2026-09-11--doctor-heal-stale-report-bin-doctor-sh-s-heal-command-shows-the-pre-heal-state-i.md`)
 - 2026-09-11 — fix-doctor-status-line: distinguish reload_pending from stale in doctor.sh's STATUS line (fan-out live validation) (`audit/flow/2026-09-11--fix-doctor-status-line-distinguish-reload-pending-from-stale-in-doctor-sh-s-stat.md`)
 - 2026-09-11 — fix-scope-guard-marker-doc: resolve the /scope-guard-marker doc/registration mismatch (fan-out live validation, sibli... (`audit/flow/2026-09-11--fix-scope-guard-marker-doc-resolve-the-scope-guard-marker-doc-registration-misma.md`)
 - 2026-09-11 — sync-worktree-skills: backfill gitignored project-local .claude/skills/ into fresh worktrees (`audit/flow/2026-09-11--sync-worktree-skills-backfill-gitignored-project-local-claude-skills-into-fresh.md`)
@@ -25,11 +24,11 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-24 — lesson-store: turn hardcoded "Known failure patterns" into a retrievable lesson store (`audit/flow/2026-09-24--lesson-store-turn-hardcoded-known-failure-patterns-into-a-retrievable-lesson-sto.md`)
 - 2026-09-24 — maker-restart-handoff: round-state.md structured handoff file (P1) + loop-guard.sh RESTART/exit-5 signal (P2) (`audit/flow/2026-09-24--maker-restart-handoff-round-state-md-structured-handoff-file-p1-loop-guard-sh-re.md`)
 - 2026-09-24 — pi-skill-discovery-sync: close pi-vs-Claude-Code skill discovery gap + harden doctor.sh heal-fix against symlink esca... (`audit/flow/2026-09-24--pi-skill-discovery-sync.md`)
+- 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/flow/2026-09-24--supervisor-mistake-lessons.md`)
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/flow/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 32 total)
+## Recent decision (choices, findings, escalations) entries (15 of 33 total)
 
-- 2026-09-11 — doctor-heal-stale-report: bin/doctor.sh's --heal command shows the pre-heal state in its own trailing table (`audit/decision/2026-09-11--doctor-heal-stale-report-bin-doctor-sh-s-heal-command-shows-the-pre-heal-state-i.md`)
 - 2026-09-11 — fix-doctor-status-line: distinguish reload_pending from stale in doctor.sh's STATUS line (fan-out live validation) (`audit/decision/2026-09-11--fix-doctor-status-line-distinguish-reload-pending-from-stale-in-doctor-sh-s-stat.md`)
 - 2026-09-11 — fix-scope-guard-marker-doc: resolve the /scope-guard-marker doc/registration mismatch (fan-out live validation, sibli... (`audit/decision/2026-09-11--fix-scope-guard-marker-doc-resolve-the-scope-guard-marker-doc-registration-misma.md`)
 - 2026-09-11 — sync-worktree-skills: backfill gitignored project-local .claude/skills/ into fresh worktrees (`audit/decision/2026-09-11--sync-worktree-skills-backfill-gitignored-project-local-claude-skills-into-fresh.md`)
@@ -43,4 +42,5 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-24 — lesson-store: turn hardcoded "Known failure patterns" into a retrievable lesson store (`audit/decision/2026-09-24--lesson-store-turn-hardcoded-known-failure-patterns-into-a-retrievable-lesson-sto.md`)
 - 2026-09-24 — maker-restart-handoff: round-state.md structured handoff file (P1) + loop-guard.sh RESTART/exit-5 signal (P2) (`audit/decision/2026-09-24--maker-restart-handoff-round-state-md-structured-handoff-file-p1-loop-guard-sh-re.md`)
 - 2026-09-24 — pi-skill-discovery-sync: close pi-vs-Claude-Code skill discovery gap + harden doctor.sh heal-fix against symlink esca... (`audit/decision/2026-09-24--pi-skill-discovery-sync.md`)
+- 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/decision/2026-09-24--supervisor-mistake-lessons.md`)
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/decision/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
