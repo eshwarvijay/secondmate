@@ -33,10 +33,18 @@
 #             landed) | 5 lock timeout | 6 --preflight-only conflict detected | 7 --preflight-only
 #             unsupported/inconclusive (git doesn't support --write-tree, or another error) | 8
 #             --preflight-only clean (no conflict detected).
-#             --preflight-only (6-8) never touches $repo's working tree, index, commits, lock, or
-#             ledger -- the one exception is a normal 'git fetch' of --base, which updates
+#             --preflight-only (6-8) never touches $repo's working tree, index, HEAD/branch refs,
+#             lock, or ledger -- it has exactly two known exceptions, both inherent to doing this
+#             check the reliable way rather than something either side effect should be read as a
+#             bug to chase further: (1) a normal 'git fetch' of --base, which updates
 #             refs/remotes/origin/<base> the same way any "check the remote's current state" call
-#             would (standard fetch bookkeeping, not a merge/lock/ledger side effect).
+#             would; (2) 'git merge-tree --write-tree' itself writes the computed merge-result tree
+#             (and any conflict blobs) into $repo's object database as an unreachable, dangling
+#             object -- no ref ever points to it, so it is ordinary git-gc'able garbage, but it is
+#             a genuine object-database write. This is the git-recommended, exit-code-reliable way
+#             to check for a conflict (the only alternative, the legacy 3-arg 'git merge-tree'
+#             without --write-tree, writes nothing but requires parsing unstructured text output
+#             instead of a clean 0/1 exit code).
 #             Note: exit codes 6-8 are ONLY for --preflight-only and never occur in normal merge+push flow.
 #             Existing exit codes (0-5) are unchanged and have identical semantics to today.
 #
@@ -1071,6 +1079,58 @@ GITSHIM
   [ "$rc30" -eq 7 ] || { echo "FAIL: preflight with a stale --checked-sha (branch has since moved) expected rc=7, got $rc30: $out30"; fails=1; }
   echo "$out30" | grep -qi "does not match --checked-sha\|resolves to" || { echo "FAIL: expected a branch/checked-sha mismatch explanation, got: $out30"; fails=1; }
 
+  # ---- Test 31: (P1) CRITICAL negative test -- a REAL, plausible hook message that happens to
+  # contain the free-text phrase "cannot lock ref" as ordinary policy English (not git's own
+  # ref-CAS parenthetical reason) must still be PUSH_FAILED, never treated as a ref-lock race. An
+  # earlier revision of _is_ref_lock_race matched this phrase anywhere in the output and was fooled
+  # by exactly this kind of message -- fixed by matching ONLY the "(incorrect old value provided)"
+  # parenthetical, which git itself controls and a hook cannot produce. ----
+  IFS='|' read -r origin31 primary31 <<<"$(_setup_repo 31)"
+  cat > "$origin31/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "policy denied: cannot lock ref writes until CAB approval" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin31/hooks/pre-receive"
+  git -C "$primary31" worktree add -q "$t/wt31" -b sm/cab-policy-collision main
+  echo "feature-p31" >> "$t/wt31/file.txt"
+  git -C "$t/wt31" commit -qam "feature p31"
+  sha31="$(git -C "$t/wt31" rev-parse HEAD)"
+  out31="$(_ms --repo "$primary31" --worktree "$t/wt31" --branch sm/cab-policy-collision --base main --checked-sha "$sha31" --wait-timeout 5 2>&1)"
+  rc31=$?
+  [ "$rc31" -eq 4 ] || { echo "FAIL: CAB-policy 'cannot lock ref' collision expected rc=4, got $rc31: $out31"; fails=1; }
+  echo "$out31" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out31"; fails=1; }
+  [ "$(_ledger_count sm/cab-policy-collision PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (hook message coincidentally contained 'cannot lock ref')"; fails=1; }
+  [ "$(_ledger_count sm/cab-policy-collision PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: CAB-policy hook message was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/cab-policy-collision PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: CAB-policy hook message was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact free-text-collision bug this test guards"; fails=1; }
+
+  # ---- Test 32: (P2) --preflight-only clean-path object-database exception is EXACTLY the two
+  # documented cases, nothing else -- loose object count may increase (the dangling merge-tree
+  # result), but the lock dir, main ref, ledger, and repo cleanliness stay exactly as Test 22
+  # already asserts. This locks in the fully-scoped contract after round 3 named the second
+  # exception explicitly. ----
+  IFS='|' read -r origin32 primary32 <<<"$(_setup_repo 32)"
+  git -C "$primary32" worktree add -q "$t/wt32" -b sm/preflight-object-write main
+  echo "feature-objwrite" >> "$t/wt32/file.txt"
+  git -C "$t/wt32" commit -qam "feature object write"
+  sha32="$(git -C "$t/wt32" rev-parse HEAD)"
+  # Genuine divergence on a DIFFERENT file, so the merge-tree result is a real, brand-new tree --
+  # a merge-tree computed against an origin that never diverged just reuses the feature branch's
+  # OWN already-existing tree object, writing nothing new (this is exactly why a naive version of
+  # this test, without this divergent commit, saw no object-count change at all).
+  echo "origin-side-objwrite" > "$primary32/other-file-32.txt"
+  git -C "$primary32" add other-file-32.txt
+  git -C "$primary32" commit -qam "origin-side change, different file"
+  git -C "$primary32" push -q origin main
+  objects_before32="$(git -C "$primary32" count-objects | cut -d' ' -f1)"
+  out32="$(_ms --repo "$primary32" --worktree "$t/wt32" --branch sm/preflight-object-write --base main --checked-sha "$sha32" --preflight-only --wait-timeout 5 2>&1)"
+  rc32=$?
+  [ "$rc32" -eq 8 ] || { echo "FAIL: preflight object-write test expected rc=8, got $rc32: $out32"; fails=1; }
+  objects_after32="$(git -C "$primary32" count-objects | cut -d' ' -f1)"
+  [ "$objects_after32" -gt "$objects_before32" ] || { echo "FAIL: expected loose object count to increase (the documented merge-tree --write-tree exception) -- got before=$objects_before32 after=$objects_after32; if this now stays equal, the header comment's 2nd exception is stale and should be removed, not left describing behavior that no longer happens"; fails=1; }
+  [ -z "$(git -C "$primary32" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight left the working tree dirty despite the object-database exception being documented as write-only (no working-tree/index change)"; fails=1; }
+  [ ! -e "$primary32/.git/MERGE_HEAD" ] || { echo "FAIL: preflight left MERGE_HEAD despite never running a real merge"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1148,7 +1208,7 @@ fi
 
 [ -n "$message" ] || message="Merge $branch"
 
-# ============================== preflight-only path (no working-tree/commit/lock/ledger side effects) ==============================
+# ============================== preflight-only path (no working-tree/branch-ref/lock/ledger side effects -- see the two documented exceptions in the header comment above) ==============================
 if [ "$preflight_only" = "1" ]; then
   # Same invariant the normal merge path enforces (see the identical check later in this file,
   # around the "Bug A fix" comment) -- --branch is the thing a merge would actually act on, so it
@@ -1315,16 +1375,24 @@ if [ "$push_rc" -ne 0 ]; then
   # CONCURRENT server-side ref-transaction race (two pushes landing on the receiving end at
   # nearly the same instant) is ALSO relayed with "remote: "/"[remote rejected]" framing --
   # verified empirically with two real concurrent pushes against a bare repo -- so the hook
-  # check below cannot be trusted to run first here. Unlike a hook's own message (arbitrary,
-  # admin-authored text), "cannot lock ref"/"incorrect old value provided"/"failed to update
-  # ref" are git's OWN internal, non-customizable ref-CAS-failure strings -- a hook script
-  # cannot produce this exact wording, since it's emitted by git's ref-transaction machinery
-  # independently of whether any hook even ran. This IS the retryable race this file exists to
-  # recover from; it just happens to arrive via a different git subsystem than the client-side
-  # "fetch first" check the original race_regex targeted.
+  # check below cannot be trusted to run first here.
+  #
+  # Matches ONLY the "[remote rejected] ... (incorrect old value provided)" PARENTHETICAL
+  # REASON, not the free-text body of the message. An earlier revision of this check matched
+  # the literal words "cannot lock ref" anywhere in the output -- a real, plausible hook message
+  # ("policy denied: cannot lock ref writes until CAB approval") can coincidentally contain that
+  # exact phrase as ordinary English, which is exactly the same class of bug this whole
+  # hook-vs-race distinction exists to prevent. The parenthetical reason after "[remote
+  # rejected]", by contrast, is chosen entirely by git's OWN receive-pack code based on WHY the
+  # ref update actually failed -- a hook's message (whatever it prints to its own stdout/stderr)
+  # is relayed on SEPARATE "remote: <text>" lines and has zero influence over this parenthetical.
+  # Verified empirically: a real pre-receive hook always produces "(pre-receive hook declined)",
+  # a real update hook always produces "(hook declined)" -- NEVER "(incorrect old value
+  # provided)", which only appears when git's own ref-transaction CAS genuinely lost a race,
+  # independent of whether any hook even ran.
   _is_ref_lock_race() {
     case "$1" in
-      *"cannot lock ref"*|*"incorrect old value provided"*|*"failed to update ref"*) return 0;;
+      *"(incorrect old value provided)"*) return 0;;
     esac
     return 1
   }
