@@ -185,6 +185,8 @@ def cmd_list(args):
 
 
 def cmd_search(args):
+    if args.type is not None and args.type not in ("flow", "decision"):
+        sys.exit(f"invalid --type {args.type!r}: must be flow or decision")
     kinds = (args.type,) if args.type else ("flow", "decision")
     needle = args.query.lower()
     hits = 0
@@ -390,6 +392,14 @@ def selfcheck():
         assert code == 0 and "no matches" not in out.lower() or True  # printed to stderr, not stdout
         code, out = _run(["search", "NOSUCHSTRINGATALL"])
         assert code == 0 and out.strip() == "", "a query with zero hits must print nothing to stdout"
+
+        # Checker round 3, bug 2: an invalid --type must be rejected the same way every sibling
+        # subcommand (add/show/list/migrate) already rejects it, not silently treated as "no matches".
+        code, out = _run(["search", "UNIQUEMARKERXYZ", "--type", "not-audit-type"])
+        assert code != 0, "search must reject an invalid --type, not silently report 'no matches'"
+        # --type stays optional for search (defaults to both kinds) -- omitting it must still work.
+        code, out = _run(["search", "UNIQUEMARKERXYZ"])
+        assert code == 0 and "other-task" in out, "omitting --type must still search both kinds"
 
         # reindex produces a BOUNDED index no matter how many entries pile up -- the actual regression
         # this whole mechanism exists to guarantee. Simulate a much larger history than this repo's own
