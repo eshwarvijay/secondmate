@@ -21,19 +21,33 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _check_worktree() {
-  # $1=repo $2=task_id -- is there a linked worktree whose branch is sm/<task_id>? Captures the full
-  # producer output into a variable FIRST, then matches with a pipe-free bash `case` -- never
-  # `producer | grep`. Reproduced directly: with enough worktrees that `grep -qF` finds its match and
-  # exits early, `grep` SIGPIPE-kills the still-writing `git worktree list` under this script's own
-  # `set -o pipefail`, and the pipeline's reported exit status reflects the SIGPIPE-killed producer's
-  # nonzero exit, not grep's own successful match -- a genuinely PRESENT worktree was reported "clean".
-  # Same bug class this repo's own merge-sequencer.sh (task git-coordinator) already hit and fixed the
-  # same way: eliminate the pipe entirely rather than narrow the race window.
-  local out
-  out="$(git -C "$1" worktree list --porcelain 2>/dev/null)" || true
+  # $1=repo $2=task_id -- prints exactly one of: present | clean | unknown: <reason>. Captures the
+  # full producer output AND its own exit status SEPARATELY, then matches with a pipe-free bash
+  # `case` -- never `producer | grep`. Reproduced directly (round 4): with enough worktrees that
+  # `grep -qF` finds its match and exits early, `grep` SIGPIPE-kills the still-writing
+  # `git worktree list` under this script's own `set -o pipefail`, and the pipeline's reported exit
+  # status reflects the SIGPIPE-killed producer's nonzero exit, not grep's own successful match --
+  # a genuinely PRESENT worktree was reported "clean". Same bug class this repo's own
+  # merge-sequencer.sh (task git-coordinator) already hit and fixed the same way: eliminate the pipe
+  # entirely rather than narrow the race window.
+  #
+  # A SECOND, DISTINCT bug (round 5): the round-4 fix's `|| true` on the capture line silently
+  # swallowed a GENUINE producer failure (corrupt repo, permissions, any unrelated nonzero exit from
+  # `git worktree list --porcelain`) and treated it identically to "producer succeeded, no match" --
+  # still a false "clean", the exact same failure class already fixed for _check_herdr this same
+  # round. Reproduced directly: a fake `git` that exits 128 for this exact call made this report
+  # "clean" even though the check genuinely could not be performed. The producer's own exit status
+  # is now captured and checked before ever inspecting its output -- a nonzero exit reports
+  # "unknown", never "clean", matching _herdr_agent_state's own established convention.
+  local out rc=0
+  out="$(git -C "$1" worktree list --porcelain 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "unknown: git -C $1 worktree list --porcelain failed (rc=$rc) -- cannot confirm worktree state"
+    return
+  fi
   case "$out" in
-    *"branch refs/heads/sm/$2"*) return 0;;
-    *) return 1;;
+    *"branch refs/heads/sm/$2"*) echo "present";;
+    *) echo "clean";;
   esac
 }
 
@@ -95,14 +109,21 @@ _check_herdr() {
 }
 
 _check_claim() {
-  # $1=task_id -- delegates ledger-path resolution entirely to claim-ledger.py itself (no path guessing
-  # here). Same pipe-free fix as _check_worktree above -- was previously `producer | grep -qF`, the
-  # identical SIGPIPE-under-pipefail race.
-  local out
-  out="$(python3 "$SCRIPT_DIR/claim-ledger.py" status 2>/dev/null)" || true
+  # $1=task_id -- prints exactly one of: present | clean | unknown: <reason>. Delegates ledger-path
+  # resolution entirely to claim-ledger.py itself (no path guessing here). Same pipe-free fix as
+  # _check_worktree above (was previously `producer | grep -qF`, the identical SIGPIPE-under-pipefail
+  # race) AND the same round-5 fix for a genuine producer failure: a nonzero exit from
+  # `claim-ledger.py status` itself (e.g. python3 missing, the script crashing) must report
+  # "unknown", never be silently treated as "no matching claim" (clean).
+  local out rc=0
+  out="$(python3 "$SCRIPT_DIR/claim-ledger.py" status 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "unknown: claim-ledger.py status failed (rc=$rc) -- cannot confirm claim state"
+    return
+  fi
   case "$out" in
-    *"[$1]"*) return 0;;
-    *) return 1;;
+    *"[$1]"*) echo "present";;
+    *) echo "clean";;
   esac
 }
 
@@ -240,6 +261,48 @@ EOF
   [ "$rc" != 0 ] || { echo "FAIL: a genuinely present claim (large-output SIGPIPE-race fixture) must report nonzero, not a false clean: $out"; fails=1; }
   echo "$out" | grep -qi "claim.*present" || { echo "FAIL: expected claim flagged present despite the large-output SIGPIPE race: $out"; fails=1; }
 
+  # ---- Test 11: git's own call fails for an UNRELATED reason (round 5) -- `git worktree list
+  # --porcelain` exiting 128 (e.g. a corrupt repo, permissions issue) is NOT "no matching worktree" --
+  # must report [worktree] unknown, and must NEVER report [worktree] clean. The round-4 fix's
+  # `|| true` on the output-capture line silently swallowed exactly this case. ----
+  fake_git_dir2="$t/fake-git-fail"; mkdir -p "$fake_git_dir2"
+  real_git_path2="$(command -v git)"
+  cat > "$fake_git_dir2/git" <<GITFAILEOF
+#!/usr/bin/env bash
+real_git="$real_git_path2"
+if [[ "\$*" == *"worktree list --porcelain"* ]]; then
+  echo "fatal: simulated corrupt repository" >&2
+  exit 128
+fi
+exec "\$real_git" "\$@"
+GITFAILEOF
+  chmod +x "$fake_git_dir2/git"
+  rc=0; out="$(PATH="$fake_git_dir2:$PATH" SM_CLAIM_LEDGER="$t/claims-empty5.jsonl" HERDR_ENV="" "$0" --task-id git-fails --repo "$t/proj" 2>&1)" || rc=$?
+  echo "$out" | grep -qi "\[worktree\].*unknown" || { echo "FAIL: a genuine git worktree-list failure must report [worktree] unknown: $out"; fails=1; }
+  echo "$out" | grep -qi "\[worktree\].*clean" && { echo "FAIL: a genuine git worktree-list failure must NEVER report [worktree] clean (false clean): $out"; fails=1; }
+  [ "$rc" = 0 ] || { echo "FAIL: an 'unknown' worktree check alone (nothing else present) must not force a nonzero exit: $rc: $out"; fails=1; }
+
+  # ---- Test 12: claim-ledger.py's own call fails for an UNRELATED reason (round 5) -- python3
+  # crashing/missing is NOT "no matching claim" -- must report [claim] unknown, must NEVER report
+  # [claim] clean. Same false-clean failure class as Test 11, for the other producer|grep-shaped
+  # check this round's fix targets. ----
+  fake_bin5="$t/fakebin-pyfail"; mkdir -p "$fake_bin5"
+  real_python_path="$(command -v python3)"
+  cat > "$fake_bin5/python3" <<PYFAILEOF
+#!/usr/bin/env bash
+real_python="$real_python_path"
+if [[ "\$*" == *"claim-ledger.py status"* ]]; then
+  echo "simulated claim-ledger.py crash" >&2
+  exit 3
+fi
+exec "\$real_python" "\$@"
+PYFAILEOF
+  chmod +x "$fake_bin5/python3"
+  rc=0; out="$(PATH="$fake_bin5:$PATH" SM_CLAIM_LEDGER="$t/claims-empty6.jsonl" HERDR_ENV="" "$0" --task-id claim-py-fails --repo "$t/proj" 2>&1)" || rc=$?
+  echo "$out" | grep -qi "\[claim\].*unknown" || { echo "FAIL: a genuine claim-ledger.py status failure must report [claim] unknown: $out"; fails=1; }
+  echo "$out" | grep -qi "\[claim\].*clean" && { echo "FAIL: a genuine claim-ledger.py status failure must NEVER report [claim] clean (false clean): $out"; fails=1; }
+  [ "$rc" = 0 ] || { echo "FAIL: an 'unknown' claim check alone (nothing else present) must not force a nonzero exit: $rc: $out"; fails=1; }
+
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
@@ -259,12 +322,28 @@ esac
 git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "--repo $repo is not a git working tree" >&2; exit 2; }
 
 dirty=0
+any_unknown=0
 
-if _check_worktree "$repo" "$task_id"; then wt_state="present"; dirty=1; else wt_state="clean"; fi
+# worktree, herdr, and claim can each report a real "unknown" (the check itself couldn't be
+# performed) alongside present/clean; only "present" ever sets dirty, matching _herdr_agent_state's
+# own established convention -- "unknown" is reported honestly but never forces a false "incomplete"
+# on its own (a headless run with no herdr, or a transiently-unreadable producer, must not
+# permanently block an otherwise-clean teardown from reporting success). _check_branch stays a plain
+# boolean -- it's a single unpiped `git rev-parse --verify`, not one of the two producer|grep-shaped
+# checks this round's fix targets.
+wt_state="$(_check_worktree "$repo" "$task_id")"
+[ "$wt_state" = "present" ] && dirty=1
+case "$wt_state" in unknown*) any_unknown=1;; esac
+
 if _check_branch "$repo" "$task_id"; then br_state="present"; dirty=1; else br_state="clean"; fi
+
 herdr_state="$(_check_herdr "$task_id")"
 [ "$herdr_state" = "present" ] && dirty=1
-if _check_claim "$task_id"; then claim_state="present"; dirty=1; else claim_state="clean"; fi
+case "$herdr_state" in unknown*) any_unknown=1;; esac
+
+claim_state="$(_check_claim "$task_id")"
+[ "$claim_state" = "present" ] && dirty=1
+case "$claim_state" in unknown*) any_unknown=1;; esac
 
 echo "[worktree] $wt_state"
 echo "[branch]   $br_state"
@@ -274,8 +353,8 @@ echo "[claim]    $claim_state"
 if [ "$dirty" = 1 ]; then
   echo "TEARDOWN: incomplete (see above) -- advisory only; decide whether to clean up manually"
   exit 1
-elif [ "$herdr_state" != "clean" ]; then
-  echo "TEARDOWN: clean, but herdr state could not be verified (see above) -- advisory only"
+elif [ "$any_unknown" = 1 ]; then
+  echo "TEARDOWN: clean, but some state(s) could not be verified (see above) -- advisory only"
   exit 0
 else
   echo "TEARDOWN: clean"
