@@ -1008,6 +1008,69 @@ HOOKEOF
   [ "$(_ledger_count sm/update-hook-behind PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (update hook, no keyword match, must rely on 'remote:' framing)"; fails=1; }
   [ "$(_ledger_count sm/update-hook-behind PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: update-hook rejection with no keyword match was wrongly retried into PUSH_RACE_EXHAUSTED -- the exact gap the 'remote:' structural check exists to close"; fails=1; }
 
+  # ---- Test 29: (P1) CRITICAL negative test -- a genuine concurrent server-side ref-lock race
+  # ("cannot lock ref .../"incorrect old value provided") ALSO carries "remote: "/"[remote
+  # rejected]" framing (verified empirically against two real concurrent pushes to a bare repo),
+  # so it must NOT be swallowed by the hook check -- it must still be recovered as a race. Uses a
+  # fake shim (deterministic; a real concurrent race is inherently flaky as a regression test) that
+  # returns git's own EXACT real ref-lock-race wording on the first push, then delegates to the
+  # real git (letting it genuinely succeed) on retry. ----
+  IFS='|' read -r origin29 primary29 <<<"$(_setup_repo 29)"
+  git -C "$primary29" worktree add -q "$t/wt29" -b sm/reflock-race main
+  echo "feature-reflock" >> "$t/wt29/file.txt"
+  git -C "$t/wt29" commit -qam "feature reflock"
+  sha29="$(git -C "$t/wt29" rev-parse HEAD)"
+  fake_git_dir29="$t/fake-git-29"
+  mkdir -p "$fake_git_dir29"
+  real_git_path29="$(command -v git)"
+  counter29="$t/reflock-push-counter-29"
+  : > "$counter29"
+  cat > "$fake_git_dir29/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path29"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter29" | tr -d ' ')
+  echo "attempt" >> "$counter29"
+  if [ "\$n" = "0" ]; then
+    echo "remote: error: cannot lock ref 'refs/heads/main': is at aaaa111 but expected bbbb222" >&2
+    echo "! [remote rejected]  main -> main (incorrect old value provided)" >&2
+    exit 1
+  fi
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir29/git"
+  out29="$(PATH="$fake_git_dir29:$PATH" _ms --repo "$primary29" --worktree "$t/wt29" --branch sm/reflock-race --base main --checked-sha "$sha29" --wait-timeout 5 2>&1)"
+  rc29=$?
+  [ "$rc29" -eq 0 ] || { echo "FAIL: ref-lock race expected rc=0 (recovered), got $rc29: $out29"; fails=1; }
+  [ "$(_ledger_count sm/reflock-race PUSH_RACE_RECOVERED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_RECOVERED ledger record for a real ref-lock-race message"; fails=1; }
+  [ "$(_ledger_count sm/reflock-race PUSH_FAILED)" = "0" ] || { echo "FAIL: ref-lock race was wrongly classified as PUSH_FAILED (hook check ran before the ref-lock-race check) -- the exact regression this test guards"; fails=1; }
+
+  # ---- Test 30: (P2) --preflight-only with a STALE --checked-sha (branch has since moved to a
+  # newer, different tip) must refuse (exit 7), never silently check the stale SHA and report
+  # PREFLIGHT OK/CONFLICT about a commit that is no longer --branch's actual current state. ----
+  IFS='|' read -r origin30 primary30 <<<"$(_setup_repo 30)"
+  git -C "$primary30" worktree add -q "$t/wt30" -b sm/preflight-stale main
+  echo "feature-stale-v1" >> "$t/wt30/file.txt"
+  git -C "$t/wt30" commit -qam "feature stale v1"
+  sha30_stale="$(git -C "$t/wt30" rev-parse HEAD)"
+  # Branch moves forward AFTER the SHA above was "reviewed" -- --checked-sha is now stale.
+  echo "feature-stale-v2" >> "$t/wt30/file.txt"
+  git -C "$t/wt30" commit -qam "feature stale v2 (branch moved on)"
+  out30="$(_ms --repo "$primary30" --worktree "$t/wt30" --branch sm/preflight-stale --base main --checked-sha "$sha30_stale" --preflight-only --wait-timeout 5 2>&1)"
+  rc30=$?
+  [ "$rc30" -eq 7 ] || { echo "FAIL: preflight with a stale --checked-sha (branch has since moved) expected rc=7, got $rc30: $out30"; fails=1; }
+  echo "$out30" | grep -qi "does not match --checked-sha\|resolves to" || { echo "FAIL: expected a branch/checked-sha mismatch explanation, got: $out30"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1087,6 +1150,18 @@ fi
 
 # ============================== preflight-only path (no working-tree/commit/lock/ledger side effects) ==============================
 if [ "$preflight_only" = "1" ]; then
+  # Same invariant the normal merge path enforces (see the identical check later in this file,
+  # around the "Bug A fix" comment) -- --branch is the thing a merge would actually act on, so it
+  # must resolve to EXACTLY --checked-sha. Without this, a caller could pass a STALE --checked-sha
+  # (an old review) alongside a --branch that has since moved forward with new, unreviewed commits
+  # -- preflight would check the old, reviewed SHA for conflicts and report "clean" while saying
+  # nothing about the branch's actual current tip. Checked here too (not just relied upon at merge
+  # time) because --preflight-only is read-only-by-design and never reaches that later check at all.
+  branch_sha="$(git -C "$repo" rev-parse --verify "${branch}^{commit}" 2>/dev/null || echo "")"
+  if [ -z "$branch_sha" ] || [ "$branch_sha" != "$checked_sha" ]; then
+    echo "ERROR: --branch '$branch' resolves to '${branch_sha:-<does not resolve>}', which does not match --checked-sha '$checked_sha' -- --preflight-only cannot check a SHA that isn't --branch's own current tip." >&2
+    exit 7
+  fi
   # Validate git supports --write-tree (git merge-tree requires it)
   git merge-tree --help >/dev/null 2>&1 || { echo "UNSUPPORTED: git merge-tree --write-tree is not supported (requires git >= 2.38)" >&2; exit 7; }
   # Fetch origin to get current state of --base. NOTE: this updates refs/remotes/origin/$base in
@@ -1236,19 +1311,37 @@ if [ "$push_rc" -ne 0 ]; then
   # diagnostic text before its actual rejection line -- this would silently misreport a real
   # PUSH_FAILED/hook rejection as an unrelated failure. '=~' has no producer process to kill.
   #
-  # HOOK CHECK RUNS FIRST, WITH ABSOLUTE PRIORITY over the race check -- not merely "excluded from"
-  # the race regex. A hook/protected-branch rejection message is admin-authored, arbitrary text, and
-  # can legitimately contain race-shaped words (e.g. "rejected because branch is behind policy") --
-  # classifying by race-keyword-presence alone would retry a permanent policy rejection forever,
-  # hiding the real failure. Git's own rejection framing is a much more reliable, non-keyword
-  # discriminator: ANY server-side rejection (a real remote hook, or a local bare-repo pre-receive
-  # hook used by this file's own selfcheck fixtures) is relayed to the client with a literal
-  # "remote: " line prefix and shows "[remote rejected]" in the summary line -- wording git itself
-  # controls, not something a hook author can spoof through their own message text. A genuine local,
-  # client-side non-fast-forward rejection (the only thing recovery should ever retry) has neither:
-  # plain "[rejected]" with no "remote" inside the brackets, and no "remote: " lines at all
-  # (verified empirically: a real hook rejection vs. a real fast-forward race produce exactly this
-  # observable difference on this git version).
+  # REF-LOCK RACE CHECK RUNS FIRST, WITH ABSOLUTE PRIORITY over the hook check. A genuine
+  # CONCURRENT server-side ref-transaction race (two pushes landing on the receiving end at
+  # nearly the same instant) is ALSO relayed with "remote: "/"[remote rejected]" framing --
+  # verified empirically with two real concurrent pushes against a bare repo -- so the hook
+  # check below cannot be trusted to run first here. Unlike a hook's own message (arbitrary,
+  # admin-authored text), "cannot lock ref"/"incorrect old value provided"/"failed to update
+  # ref" are git's OWN internal, non-customizable ref-CAS-failure strings -- a hook script
+  # cannot produce this exact wording, since it's emitted by git's ref-transaction machinery
+  # independently of whether any hook even ran. This IS the retryable race this file exists to
+  # recover from; it just happens to arrive via a different git subsystem than the client-side
+  # "fetch first" check the original race_regex targeted.
+  _is_ref_lock_race() {
+    case "$1" in
+      *"cannot lock ref"*|*"incorrect old value provided"*|*"failed to update ref"*) return 0;;
+    esac
+    return 1
+  }
+  # HOOK CHECK RUNS SECOND, WITH PRIORITY over the plain race-keyword check (but never over the
+  # ref-lock race above) -- not merely "excluded from" the race regex. A hook/protected-branch
+  # rejection message is admin-authored, arbitrary text, and can legitimately contain race-shaped
+  # words (e.g. "rejected because branch is behind policy") -- classifying by race-keyword-presence
+  # alone would retry a permanent policy rejection forever, hiding the real failure. Git's own
+  # rejection framing is a much more reliable, non-keyword discriminator: ANY server-side rejection
+  # (a real remote hook, or a local bare-repo pre-receive hook used by this file's own selfcheck
+  # fixtures) is relayed to the client with a literal "remote: " line prefix and shows "[remote
+  # rejected]" in the summary line -- wording git itself controls, not something a hook author can
+  # spoof through their own message text. A genuine local, client-side non-fast-forward rejection
+  # (the only thing recovery should ever retry via THIS check) has neither: plain "[rejected]" with
+  # no "remote" inside the brackets, and no "remote: " lines at all (verified empirically: a real
+  # hook rejection vs. a real fast-forward race produce exactly this observable difference on this
+  # git version).
   _is_hook_rejection() {
     case "$1" in
       *"remote: "*|*"[remote rejected]"*) return 0;;
@@ -1269,7 +1362,7 @@ if [ "$push_rc" -ne 0 ]; then
     return "$rc"
   }
 
-  if ! _is_hook_rejection "$push_output" && _is_race "$push_output"; then
+  if _is_ref_lock_race "$push_output" || { ! _is_hook_rejection "$push_output" && _is_race "$push_output"; }; then
     # Genuine race detected! Attempt bounded recovery. The initial push above already counts as
     # attempt 1 of 3 total -- the loop below performs attempts 2 and 3 (2 more real push calls),
     # never a 4th.
@@ -1315,10 +1408,13 @@ if [ "$push_rc" -ne 0 ]; then
         exit 0
       fi
 
-      # This attempt failed too -- a hook rejection encountered mid-recovery escalates immediately
-      # (same absolute-priority hook check as the initial classification above); anything else
-      # matching the race signature just continues to the next loop iteration (or exhausts below).
-      if _is_hook_rejection "$push_output"; then
+      # This attempt failed too -- same priority order as the initial classification above: a
+      # ref-lock race (git's own "cannot lock ref" family) is NEVER escalated, since it's the exact
+      # retryable race this loop exists to recover from, even though it also carries "remote: "
+      # framing that would otherwise match the hook check below. A genuine hook rejection
+      # encountered mid-recovery escalates immediately; anything else matching the race signature
+      # just continues to the next loop iteration (or exhausts below).
+      if ! _is_ref_lock_race "$push_output" && _is_hook_rejection "$push_output"; then
         echo "PUSH RACE EXHAUSTED: hook rejection encountered during recovery attempt $attempt/3" >&2
         echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
         _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
