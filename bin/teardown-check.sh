@@ -21,8 +21,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 _check_worktree() {
-  # $1=repo $2=task_id -- is there a linked worktree whose branch is sm/<task_id>?
-  git -C "$1" worktree list --porcelain 2>/dev/null | grep -qF "branch refs/heads/sm/$2"
+  # $1=repo $2=task_id -- is there a linked worktree whose branch is sm/<task_id>? Captures the full
+  # producer output into a variable FIRST, then matches with a pipe-free bash `case` -- never
+  # `producer | grep`. Reproduced directly: with enough worktrees that `grep -qF` finds its match and
+  # exits early, `grep` SIGPIPE-kills the still-writing `git worktree list` under this script's own
+  # `set -o pipefail`, and the pipeline's reported exit status reflects the SIGPIPE-killed producer's
+  # nonzero exit, not grep's own successful match -- a genuinely PRESENT worktree was reported "clean".
+  # Same bug class this repo's own merge-sequencer.sh (task git-coordinator) already hit and fixed the
+  # same way: eliminate the pipe entirely rather than narrow the race window.
+  local out
+  out="$(git -C "$1" worktree list --porcelain 2>/dev/null)" || true
+  case "$out" in
+    *"branch refs/heads/sm/$2"*) return 0;;
+    *) return 1;;
+  esac
 }
 
 _check_branch() {
@@ -30,20 +42,68 @@ _check_branch() {
   git -C "$1" rev-parse --verify -q "refs/heads/sm/$2" >/dev/null 2>&1
 }
 
+_herdr_agent_state() {
+  # $1=agent name -- prints exactly one of: present | absent | unknown: <reason>
+  # A nonzero exit alone does NOT mean "genuinely doesn't exist" -- reproduced directly with a fake
+  # herdr that exits nonzero for an unrelated reason ("daemon unavailable") for ANY agent name, which
+  # the earlier version silently reported as "clean" (herdr's own call failing was conflated with the
+  # agent being confirmed absent). The real, confirmed-absent shape (verified directly against a real
+  # herdr 0.8.0 installation): exit 1, and a JSON error object on stderr with code "agent_not_found".
+  # ONLY that exact confirmed shape counts as "absent" -- any other nonzero exit, any other/missing
+  # error code, or unparseable output is ambiguous and must report "unknown", never a false "absent".
+  local out rc=0
+  out="$(herdr agent get "$1" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "present"
+    return
+  fi
+  local code
+  code="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("error", {}).get("code", ""))
+except Exception:
+    print("")
+' 2>/dev/null)"
+  if [ "$code" = "agent_not_found" ]; then
+    echo "absent"
+  else
+    echo "unknown: herdr agent get $1 failed unexpectedly (rc=$rc, not a confirmed agent_not_found): $out"
+  fi
+}
+
 _check_herdr() {
-  # $1=task_id -- prints exactly one of: clean | present | unknown: <reason>
+  # $1=task_id -- prints exactly one of: clean | present | unknown: <reason>. "clean" only when BOTH
+  # possible maker agent names are CONFIRMED absent (never merely "the call didn't return success").
   command -v herdr >/dev/null 2>&1 || { echo "unknown: herdr not found in PATH"; return; }
   [ "${HERDR_ENV:-}" = "1" ] || { echo "unknown: HERDR_ENV is not 1 (headless run -- cannot check)"; return; }
-  if herdr agent get "sm-$1" >/dev/null 2>&1 || herdr agent get "sm-pi-$1" >/dev/null 2>&1; then
+
+  local s1 s2
+  s1="$(_herdr_agent_state "sm-$1")"
+  s2="$(_herdr_agent_state "sm-pi-$1")"
+
+  if [ "$s1" = "present" ] || [ "$s2" = "present" ]; then
     echo "present"
-  else
+  elif [ "$s1" = "absent" ] && [ "$s2" = "absent" ]; then
     echo "clean"
+  elif [ "$s1" != "absent" ]; then
+    echo "$s1"
+  else
+    echo "$s2"
   fi
 }
 
 _check_claim() {
-  # $1=task_id -- delegates ledger-path resolution entirely to claim-ledger.py itself (no path guessing here).
-  python3 "$SCRIPT_DIR/claim-ledger.py" status 2>/dev/null | grep -qF "[$1]"
+  # $1=task_id -- delegates ledger-path resolution entirely to claim-ledger.py itself (no path guessing
+  # here). Same pipe-free fix as _check_worktree above -- was previously `producer | grep -qF`, the
+  # identical SIGPIPE-under-pipefail race.
+  local out
+  out="$(python3 "$SCRIPT_DIR/claim-ledger.py" status 2>/dev/null)" || true
+  case "$out" in
+    *"[$1]"*) return 0;;
+    *) return 1;;
+  esac
 }
 
 if [ "${1:-}" = "--selfcheck" ]; then
@@ -91,12 +151,17 @@ if [ "${1:-}" = "--selfcheck" ]; then
   [ "$rc" = 0 ] || { echo "FAIL: an 'unknown' herdr check alone (nothing else present) must not force a nonzero exit: $rc: $out"; fails=1; }
 
   # ---- Test 6: HERDR_ENV=1, herdr installed and reports the agent still exists -> present, nonzero ----
+  # The fixture's "not this one" branch emits the REAL confirmed-absent shape verified directly against
+  # a real herdr 0.8.0 install: exit 1, a JSON error object on STDERR with code "agent_not_found" -- so
+  # a task-id whose agent names don't match "sm-still-here" resolves to genuinely "absent", not merely
+  # "the call failed" (see Test 9 below for the case where the call fails for an UNRELATED reason).
   fake_bin2="$t/fakebin-herdr"; mkdir -p "$fake_bin2"
   cat > "$fake_bin2/herdr" <<'HERDR_EOF'
 #!/usr/bin/env bash
 if [ "$1" = "agent" ] && [ "$2" = "get" ] && [ "$3" = "sm-still-here" ]; then
   echo '{"name":"sm-still-here"}'; exit 0
 fi
+echo "{\"error\":{\"code\":\"agent_not_found\",\"message\":\"agent target $3 not found\"}}" >&2
 exit 1
 HERDR_EOF
   chmod +x "$fake_bin2/herdr"
@@ -114,6 +179,66 @@ HERDR_EOF
     rc=0; "$0" --task-id "$bad" --repo "$t/proj" >/dev/null 2>&1 || rc=$?
     [ "$rc" = 2 ] || { echo "FAIL: invalid --task-id '$bad' should exit 2, got $rc"; fails=1; }
   done
+
+  # ---- Test 9: herdr's own call fails for an UNRELATED reason (a daemon/connectivity error, not a
+  # confirmed "agent_not_found") -> must report [herdr] unknown, and must NEVER report [herdr] clean.
+  # The earlier version conflated "the call failed" with "confirmed absent" and reported this exact
+  # case as clean. ----
+  fake_bin3="$t/fakebin-herdrfail"; mkdir -p "$fake_bin3"
+  cat > "$fake_bin3/herdr" <<'HERDR_EOF'
+#!/usr/bin/env bash
+echo '{"error":{"code":"daemon_unavailable","message":"daemon unavailable"}}' >&2
+exit 2
+HERDR_EOF
+  chmod +x "$fake_bin3/herdr"
+  rc=0; out="$(PATH="$fake_bin3:$PATH" SM_CLAIM_LEDGER="$t/claims-empty4.jsonl" HERDR_ENV=1 "$0" --task-id herdr-fails --repo "$t/proj" 2>&1)" || rc=$?
+  echo "$out" | grep -qi "\[herdr\].*unknown" || { echo "FAIL: an unrelated herdr call failure must report [herdr] unknown: $out"; fails=1; }
+  echo "$out" | grep -qi "\[herdr\].*clean" && { echo "FAIL: an unrelated herdr call failure must NEVER report [herdr] clean (false clean): $out"; fails=1; }
+
+  # ---- Test 10: real SIGPIPE-under-pipefail race in _check_worktree (and _check_claim, identical
+  # shape) -- a `producer | grep -qF` pipe where grep finds an early match and exits, SIGPIPE-killing
+  # the still-writing producer, made the pipeline's reported exit status reflect the SIGPIPE-killed
+  # producer's nonzero exit under this script's own `set -o pipefail`, not grep's own successful match
+  # -- silently reporting a genuinely PRESENT worktree/claim as "clean". A fake `git` (worktree case)
+  # emits the real matching line early, then a large (~5MB) payload after it, so the still-writing
+  # producer is reliably still mid-write when grep's early exit closes the pipe; a synthetic
+  # claim-ledger with the real matching entry sorted first (by task-id) followed by 5000 filler
+  # entries does the same for the claim case. Must actually fail before the pipe-free fix and pass
+  # after -- not just asserting the happy path. ----
+  fake_git_dir="$t/fake-git-bin"; mkdir -p "$fake_git_dir"
+  real_git_path="$(command -v git)"
+  cat > "$fake_git_dir/git" <<GITEOF
+#!/usr/bin/env bash
+real_git="$real_git_path"
+if [[ "\$*" == *"worktree list --porcelain"* ]]; then
+  echo "worktree /race/target"
+  echo "HEAD 1111111111111111111111111111111111111111"
+  echo "branch refs/heads/sm/race-target"
+  echo
+  python3 -c "print('x' * 5000000)"
+  exit \$?
+fi
+exec "\$real_git" "\$@"
+GITEOF
+  chmod +x "$fake_git_dir/git"
+  rc=0; out="$(PATH="$fake_git_dir:$PATH" SM_CLAIM_LEDGER="$t/claims-race-wt.jsonl" HERDR_ENV="" "$0" --task-id race-target --repo "$t/proj" 2>&1)" || rc=$?
+  [ "$rc" != 0 ] || { echo "FAIL: a genuinely present worktree (large-output SIGPIPE-race fixture) must report nonzero, not a false clean: $out"; fails=1; }
+  echo "$out" | grep -qi "worktree.*present" || { echo "FAIL: expected worktree flagged present despite the large-output SIGPIPE race: $out"; fails=1; }
+
+  claim_race_ledger="$t/claims-race-big.jsonl"
+  python3 - "$claim_race_ledger" <<'EOF'
+import json, secrets, time, sys
+path = sys.argv[1]
+with open(path, 'w') as f:
+    f.write(json.dumps({"ev": "claimed", "task_id": "aaa-race-target", "owner": "tester",
+                         "token": secrets.token_hex(16), "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}) + "\n")
+    for i in range(5000):
+        f.write(json.dumps({"ev": "claimed", "task_id": "zzz-filler-%05d" % i, "owner": "tester",
+                             "token": secrets.token_hex(16), "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}) + "\n")
+EOF
+  rc=0; out="$(SM_CLAIM_LEDGER="$claim_race_ledger" HERDR_ENV="" "$0" --task-id aaa-race-target --repo "$t/proj" 2>&1)" || rc=$?
+  [ "$rc" != 0 ] || { echo "FAIL: a genuinely present claim (large-output SIGPIPE-race fixture) must report nonzero, not a false clean: $out"; fails=1; }
+  echo "$out" | grep -qi "claim.*present" || { echo "FAIL: expected claim flagged present despite the large-output SIGPIPE race: $out"; fails=1; }
 
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
