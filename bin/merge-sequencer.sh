@@ -1544,6 +1544,49 @@ GITSHIM
   rc43b=$?
   [ "$rc43b" -eq 2 ] || { echo "FAIL: --preflight-only --test '' expected rc=2, got $rc43b: $out43b"; fails=1; }
 
+  # ---- Test 44: (P1) CRITICAL negative test -- fabricated LOCAL text (not from any hook, not
+  # from git itself -- simulating a transport helper/proxy/credential-helper writing to stderr)
+  # containing a bare race keyword ("behind") but NOT git's own "[rejected]" structural summary
+  # line must still be PUSH_FAILED, never a race. _is_race's bare keyword match was vulnerable to
+  # ANY source of local stderr text, not just pre-push hooks (which at least have an installable
+  # file _repo_has_pre_push_hook can check for) -- this has no such file at all. Fixed the same
+  # structural way _is_ref_lock_race already was: require git's own "[rejected]" (bare, non-
+  # "[remote rejected]") marker alongside the keyword, since arbitrary external text has no reason
+  # to replicate that exact structural line. ----
+  IFS='|' read -r origin44 primary44 <<<"$(_setup_repo 44)"
+  git -C "$primary44" worktree add -q "$t/wt44" -b sm/fabricated-transport-text main
+  echo "feature-p44" >> "$t/wt44/file.txt"
+  git -C "$t/wt44" commit -qam "feature p44"
+  sha44="$(git -C "$t/wt44" rev-parse HEAD)"
+  fake_git_dir44="$t/fake-git-44"
+  mkdir -p "$fake_git_dir44"
+  real_git_path44="$(command -v git)"
+  cat > "$fake_git_dir44/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path44"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "fatal: transport backend is behind on maintenance" >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir44/git"
+  out44="$(PATH="$fake_git_dir44:$PATH" _ms --repo "$primary44" --worktree "$t/wt44" --branch sm/fabricated-transport-text --base main --checked-sha "$sha44" --wait-timeout 5 2>&1)"
+  rc44=$?
+  [ "$rc44" -eq 4 ] || { echo "FAIL: fabricated transport-text collision expected rc=4, got $rc44: $out44"; fails=1; }
+  echo "$out44" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out44"; fails=1; }
+  [ "$(_ledger_count sm/fabricated-transport-text PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (fabricated non-git transport text, no '[rejected]' structural marker)"; fails=1; }
+  [ "$(_ledger_count sm/fabricated-transport-text PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: fabricated transport text was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact bug this test guards"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1887,15 +1930,24 @@ if [ "$push_rc" -ne 0 ]; then
   # SAME '$had_pre_push_hook' guard as '_is_ref_lock_race' above, for the SAME reason via a
   # DIFFERENT sibling path: a LOCAL 'pre-push' hook's arbitrary message can ALSO coincidentally
   # contain one of the plain race keywords below (e.g. "your branch appears behind our compliance
-  # baseline") -- verified empirically -- and unlike a server-side hook, this message has neither
-  # "remote: " framing nor any of _is_hook_rejection's literal keywords for that check to catch
-  # first, so it fell straight through to this bare keyword match. A local pre-push hook's stderr
-  # is structurally indistinguishable from git's own client-generated race text (no relay prefix,
-  # no boundary marker of any kind), so once a pre-push hook is known to have been installed
-  # BEFORE the push ran, no text pattern here can be trusted -- this is the honest, conservative
-  # fix, not another point-patch.
+  # baseline") -- verified empirically. But a pre-push hook is not the only source of arbitrary
+  # LOCAL text a push can produce: a transport helper, proxy wrapper, or credential helper can ALSO
+  # write to stderr, and a bare keyword match anywhere in the blob (e.g. a fabricated "fatal:
+  # transport backend is behind on maintenance") was misclassified as a race the exact same way,
+  # with no installable hook file to check for at all. The fix generalizes the same way
+  # _is_ref_lock_race's own fix did: git's REAL client-side non-fast-forward rejection is always
+  # framed as a "! [rejected] <src> -> <dst> (<reason>)" structural summary line -- verified
+  # empirically for "fetch first" (and, by the same client code path, for every other reason in the
+  # keyword list below) -- which arbitrary external text has no reason to replicate. Requiring
+  # "[rejected]" (the bare, non-"remote"-prefixed form -- "[remote rejected]" is a DIFFERENT,
+  # server-side marker already handled by _is_hook_rejection/_is_ref_lock_race above) alongside the
+  # keyword closes this the same structural way, not with another enumerated exclusion.
   _is_race() {
     [ "$had_pre_push_hook" = 1 ] && return 1
+    case "$1" in
+      *"[rejected]"*) : ;;
+      *) return 1 ;;
+    esac
     local re='(behind|fast[- ]?forward|stale info|fetch first|contains work that you do not have)'
     local rc
     shopt -s nocasematch

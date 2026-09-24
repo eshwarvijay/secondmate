@@ -198,7 +198,9 @@ Each stage exists to close a specific failure mode.
    as the local merge, closing an out-of-order-push race between siblings. A push that fails for any OTHER
    reason (e.g. a hook/protected-branch rejection) never reverts an already-landed local merge — only the push
    needs a manual retry. A push that fails specifically because origin genuinely advanced between merge and
-   push (an exact race-signature check on stderr, distinguished from a hook/protected-branch rejection even
+   push (requiring BOTH a race-shaped keyword AND git's own bare `[rejected]` structural summary line, never a
+   keyword alone -- arbitrary local text, whether from a hook, a transport helper, or a proxy, has no reason
+   to replicate that exact git-generated line; distinguished from a hook/protected-branch rejection even
    when its own message happens to contain a race-shaped word, and from a genuine concurrent server-side
    ref-transaction race via git's own client-generated rejection reason rather than any hook-influenced text)
    is recovered automatically: the singleton lock stays held through the ENTIRE recovery sequence (never
