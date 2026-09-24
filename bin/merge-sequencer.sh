@@ -56,30 +56,30 @@
 # rebase-in-place on refusal, no priority queue / fairness policy, no automatic stale-lock
 # expiry/steal, single machine only.
 #
-# Accepted limitation (documented, not chased further): if $repo has an executable 'pre-push'
-# hook installed (checked via _repo_has_pre_push_hook, respecting core.hooksPath, sampled ONCE
-# before the first push attempt so a hook cannot evade detection by deleting/chmod'ing itself as
-# its own last action), P1's push-race auto-recovery is disabled ENTIRELY for that repo -- every
-# push failure is reported as PUSH_FAILED,
-# never retried, even a genuine one. A LOCAL pre-push hook runs client-side, before git ever
-# attempts the network-level push, so its stderr has no "remote: " relay prefix or any other
-# structural marker distinguishing it from git's own client-generated race text -- unlike a
-# server-side hook (pre-receive/update), which is always relayed through that exact, un-spoofable
-# prefix. There is no text pattern that can safely tell "genuine race" from "pre-push hook's own
-# arbitrary message" apart in that case, so this trades away auto-recovery specifically for repos
-# with a local pre-push hook installed, in exchange for never retrying (and thereby hiding) a
-# permanent policy rejection. A human can always retry the push manually in that case.
+# Accepted limitation (documented, not chased further): if $repo has (or at any point during this
+# invocation acquires) an executable 'pre-push' hook (checked via _repo_has_pre_push_hook,
+# respecting core.hooksPath, sampled before the first push attempt AND monotonically re-sampled --
+# OR'd, never reset -- before every retry, so a hook seen at ANY sample point stays remembered even
+# after it deletes/chmod's itself as its own last action), P1's push-race auto-recovery is disabled
+# ENTIRELY for that repo -- every push failure is reported as PUSH_FAILED, never retried, even a
+# genuine one. A LOCAL pre-push hook runs client-side, before git ever attempts the network-level
+# push, so its stderr has no "remote: " relay prefix or any other structural marker distinguishing
+# it from git's own client-generated race text -- unlike a server-side hook (pre-receive/update),
+# which is always relayed through that exact, un-spoofable prefix. There is no text pattern that
+# can safely tell "genuine race" from "pre-push hook's own arbitrary message" apart in that case,
+# so this trades away auto-recovery specifically for repos with a local pre-push hook installed, in
+# exchange for never retrying (and thereby hiding) a permanent policy rejection. A human can always
+# retry the push manually in that case.
 #
-# A NARROWER residual of the same limitation, deliberately not chased further: the one-time
-# sample happens immediately before the first push, closing the "hook deletes itself after
-# rejecting" direction -- but a hook installed in the instant BETWEEN that sample and the push
-# it's meant to guard is still invisible to this check (sampling closer to the push shrinks the
-# window, it can never eliminate it; re-sampling before every retry would instead REOPEN the
-# original self-deleting-hook gap for attempts 2 and 3). Closing this fully would require
-# detecting hook execution itself, not just presence -- a materially bigger change (e.g. GIT_TRACE
-# instrumentation) for a scenario that requires an adversarial actor with filesystem write access
-# to $repo/.git/hooks/, timed to a sub-second window, to exploit -- the same class of narrow,
-# artificially-held-open timing risk already accepted elsewhere in this codebase (see
+# A NARROWER residual of the same limitation, deliberately not chased further: monotonic
+# re-sampling closes "a hook is installed sometime during the (potentially long) recovery
+# fetch/merge, before the NEXT push" -- but the exact INSTANT between any one sample and the push
+# it's immediately followed by is still, unavoidably, a real check-then-act gap (sampling closer to
+# the push shrinks this window, it can never eliminate it structurally). Closing this fully would
+# require detecting hook execution itself, not just presence -- a materially bigger change (e.g.
+# GIT_TRACE instrumentation) for a scenario that requires an adversarial actor with filesystem
+# write access to $repo/.git/hooks/, timed to a sub-second window, to exploit -- the same class of
+# narrow, artificially-held-open timing risk already accepted elsewhere in this codebase (see
 # bin/caffeinate-guard.sh's own documented PATH/supply-chain limitation).
 set -uo pipefail
 
@@ -1413,6 +1413,59 @@ HOOKEOF
   [ "$(_ledger_count sm/self-removing-hook PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: self-removing pre-push hook was wrongly classified as PUSH_RACE_RECOVERED -- the exact TOCTOU bug this test guards"; fails=1; }
   [ "$(_ledger_count sm/self-removing-hook PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: self-removing pre-push hook was wrongly classified as PUSH_RACE_EXHAUSTED"; fails=1; }
 
+  # ---- Test 40: (P1) CRITICAL negative test -- ANOTHER TOCTOU variant: no pre-push hook exists
+  # when the initial sample runs (attempt 1 races normally), but one is INSTALLED during the
+  # recovery fetch, before attempt 2's own push, then deletes itself. Must still stop at exactly 2
+  # push attempts with PUSH_RACE_EXHAUSTED/PUSH_FAILED-equivalent, never a 3rd, unauthorized push
+  # after the hook's rejection. Proves the monotonic re-sample (OR'd before every retry, never
+  # reset) catches a hook that only appears MID-recovery, not just one present from the start. ----
+  IFS='|' read -r origin40 primary40 <<<"$(_setup_repo 40)"
+  git -C "$primary40" worktree add -q "$t/wt40" -b sm/mid-recovery-hook main
+  echo "feature-p40" >> "$t/wt40/file.txt"
+  git -C "$t/wt40" commit -qam "feature p40"
+  sha40="$(git -C "$t/wt40" rev-parse HEAD)"
+  fake_git_dir40="$t/fake-git-40"
+  mkdir -p "$fake_git_dir40"
+  real_git_path40="$(command -v git)"
+  counter40="$t/push-counter-40"
+  : > "$counter40"
+  hook_path40="$primary40/.git/hooks/pre-push"
+  cat > "$fake_git_dir40/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path40"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter40" | tr -d ' ')
+  echo "attempt" >> "$counter40"
+  if [ "\$n" = "0" ]; then
+    echo "! [rejected]  main -> main (fetch first)" >&2
+    exit 1
+  fi
+elif [ "\$sub" = "fetch" ]; then
+  n=\$(wc -l < "$counter40" | tr -d ' ')
+  if [ "\$n" = "1" ] && [ ! -e "$hook_path40" ]; then
+    printf '#!/bin/sh\necho "(incorrect old value provided)" >&2\nrm -f "\$0"\nexit 1\n' > "$hook_path40"
+    chmod +x "$hook_path40"
+  fi
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir40/git"
+  out40="$(PATH="$fake_git_dir40:$PATH" _ms --repo "$primary40" --worktree "$t/wt40" --branch sm/mid-recovery-hook --base main --checked-sha "$sha40" --wait-timeout 5 2>&1)"
+  rc40=$?
+  [ "$rc40" -eq 4 ] || { echo "FAIL: hook installed mid-recovery expected rc=4, got $rc40: $out40"; fails=1; }
+  attempt_count40="$(wc -l < "$counter40" | tr -d ' ')"
+  [ "$attempt_count40" = "2" ] || { echo "FAIL: expected exactly 2 push attempts (a hook installed mid-recovery must stop the loop, not burn an unauthorized 3rd push), got $attempt_count40"; fails=1; }
+  [ "$(_ledger_count sm/mid-recovery-hook PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: hook installed mid-recovery was wrongly classified as PUSH_RACE_RECOVERED -- the exact TOCTOU bug this test guards"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1643,12 +1696,16 @@ fi
 
 merged_sha="$(git -C "$repo" rev-parse HEAD)"
 
-# Captured ONCE, BEFORE the first push attempt -- not re-checked after a push fails. A pre-push
-# hook can delete itself, or chmod itself non-executable, as its OWN last action right before
-# exiting nonzero (verified via a direct, real reproduction: an executable hook that removes
-# itself is genuinely gone from disk by the time anything checks for it afterward) -- a
-# check-after-the-fact would miss exactly the hook whose rejection it exists to catch, a TOCTOU
-# window entirely closed by sampling this fact before the hook has ever had a chance to run.
+# Sampled BEFORE the first push attempt, and monotonically re-sampled (OR'd, never reset back to
+# 0) before every retry -- see the retry loop below. A pre-push hook can delete itself, or chmod
+# itself non-executable, as its OWN last action right before exiting nonzero (verified via a
+# direct, real reproduction: an executable hook that removes itself is genuinely gone from disk by
+# the time anything checks for it afterward), and can ALSO be installed only partway through a
+# (potentially long) recovery fetch/merge, before a LATER retry's own push (also verified directly)
+# -- sampling once at the very top misses the second case; re-checking fresh on every retry (naive
+# overwrite, not OR) would have reopened the first. Monotonic accumulation closes both: once any
+# sample sees a hook, the flag stays 1 for the rest of this invocation regardless of what a later
+# sample (after the hook may have already run and cleaned up) would see on its own.
 had_pre_push_hook=0
 _repo_has_pre_push_hook() {
   local hooks_dir
@@ -1695,11 +1752,11 @@ if [ "$push_rc" -ne 0 ]; then
   # 'pre-push' rejecting means the push never reached the server (the genuine ref-CAS failure this
   # check exists to recognize is architecturally impossible to also have occurred in that same
   # invocation), the correct fix is a filesystem-level check, not another text pattern: if $repo
-  # had an executable pre-push hook installed (respecting core.hooksPath, not just the default
-  # .git/hooks/ location) -- captured in $had_pre_push_hook BEFORE the first push attempt, not
-  # re-checked here, since a hook can delete/chmod itself as its own last action right before
-  # exiting nonzero (verified directly) -- never trust ANY text match here; fall through to the
-  # hook-rejection/plain-race checks below instead, which report PUSH_FAILED rather than
+  # had (or ever has) an executable pre-push hook installed (respecting core.hooksPath) -- sampled
+  # into $had_pre_push_hook before the first push AND monotonically re-sampled (OR'd, never reset)
+  # before every retry, so a hook that existed at ANY sample point stays remembered even after it
+  # deletes/chmod's itself as its own last action -- never trust ANY text match here; fall through
+  # to the hook-rejection/plain-race checks below instead, which report PUSH_FAILED rather than
   # misclassifying.
   _client_lines_only() {
     local out="" line
@@ -1811,6 +1868,17 @@ if [ "$push_rc" -ne 0 ]; then
         exit 4
       fi
 
+      # Re-sample immediately before EACH retry push, OR'd into the flag (never reset back to 0).
+      # Round 8 closed "a hook exists at the start, then deletes itself" by sampling once before
+      # attempt 1 and never re-checking. Round 9/10 found the OTHER direction this single sample
+      # misses: a hook installed DURING the (potentially long, real-world) recovery fetch/merge
+      # window, before attempt 2 or 3's own push, was invisible to a check that only ever ran once
+      # at the very top. Monotonic OR closes both without reopening either: once a hook is SEEN at
+      # any sample point, the flag stays 1 for the rest of this invocation regardless of whether a
+      # LATER sample (after the hook has done its own damage and possibly deleted itself) would
+      # have missed it. A naive re-sample that overwrote the flag each time would have reintroduced
+      # round 8's exact gap for attempts 2/3; this doesn't, because it only ever adds evidence.
+      _repo_has_pre_push_hook && had_pre_push_hook=1
       # Retry push (this IS attempt $attempt -- the loop variable already counts it)
       push_output=$(LC_ALL=C git -C "$repo" push origin "$base" 2>&1)
       push_rc=$?

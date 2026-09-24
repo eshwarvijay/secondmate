@@ -210,10 +210,11 @@ Each stage exists to close a specific failure mode.
    mid-recovery (a hook rejection, an auth/network error) escalates immediately instead of burning a
    pointless further attempt. **Accepted limitation:** a LOCAL `pre-push` hook (client-side, carries none of
    the "remote: " framing this classification relies on) can defeat this text-based detection entirely — if
-   `$repo` has one installed (checked once, before the first push attempt, so a hook can't evade detection by
-   deleting itself afterward), race auto-recovery is disabled for that repo; a hook installed in the instant
-   between that check and the push it guards is a further, narrower, un-closed residual of the same
-   limitation. `--preflight-only` runs `git merge-tree --write-tree` against a
+   `$repo` has (or at any point during the invocation acquires) one, race auto-recovery is disabled for that
+   repo; checked before the first push AND monotonically re-checked (never reset once true) before every
+   retry, so a hook can't evade detection either by deleting itself afterward or by only appearing
+   mid-recovery. The one thing that stays un-closed: the exact instant between any single sample and the push
+   it's immediately followed by. `--preflight-only` runs `git merge-tree --write-tree` against a
    freshly-fetched `origin/<base>` to detect a conflict before ever acquiring the lock or touching `$repo`'s
    working tree, index, branch refs, or ledger (`--branch` must still resolve to exactly `--checked-sha`) —
    read-only with respect to those five things specifically, not with respect to fetch's/`merge-tree`'s own
