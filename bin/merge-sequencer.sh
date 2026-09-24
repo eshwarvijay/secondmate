@@ -69,6 +69,18 @@
 # arbitrary message" apart in that case, so this trades away auto-recovery specifically for repos
 # with a local pre-push hook installed, in exchange for never retrying (and thereby hiding) a
 # permanent policy rejection. A human can always retry the push manually in that case.
+#
+# A NARROWER residual of the same limitation, deliberately not chased further: the one-time
+# sample happens immediately before the first push, closing the "hook deletes itself after
+# rejecting" direction -- but a hook installed in the instant BETWEEN that sample and the push
+# it's meant to guard is still invisible to this check (sampling closer to the push shrinks the
+# window, it can never eliminate it; re-sampling before every retry would instead REOPEN the
+# original self-deleting-hook gap for attempts 2 and 3). Closing this fully would require
+# detecting hook execution itself, not just presence -- a materially bigger change (e.g. GIT_TRACE
+# instrumentation) for a scenario that requires an adversarial actor with filesystem write access
+# to $repo/.git/hooks/, timed to a sub-second window, to exploit -- the same class of narrow,
+# artificially-held-open timing risk already accepted elsewhere in this codebase (see
+# bin/caffeinate-guard.sh's own documented PATH/supply-chain limitation).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
