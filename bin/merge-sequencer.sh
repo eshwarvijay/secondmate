@@ -1527,6 +1527,23 @@ GITSHIM
   [ "$main_after42" != "$main_before42" ] || { echo "FAIL: local merge commit was not retained despite the recovery fetch failing"; fails=1; }
   [ "$(_ledger_count sm/recovery-fetch-fail PUSH_RACE_EXHAUSTED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record for a recovery fetch failure"; fails=1; }
 
+  # ---- Test 43: (P2) '--preflight-only --message ""' and '--preflight-only --test ""' must
+  # still refuse (exit 2) -- an earlier revision checked "[ -n "$test_cmd" ]", which treats an
+  # EXPLICITLY-passed empty value the same as the flag never being given at all, silently letting
+  # a generic wrapper that always forwards "--message \"${MESSAGE:-}\"" bypass the documented
+  # "cannot be combined with --test or --message" contract. ----
+  IFS='|' read -r origin43 primary43 <<<"$(_setup_repo 43)"
+  git -C "$primary43" worktree add -q "$t/wt43" -b sm/preflight-empty-flag main
+  echo "feature-p43" >> "$t/wt43/file.txt"
+  git -C "$t/wt43" commit -qam "feature p43"
+  sha43="$(git -C "$t/wt43" rev-parse HEAD)"
+  out43a="$(_ms --repo "$primary43" --worktree "$t/wt43" --branch sm/preflight-empty-flag --base main --checked-sha "$sha43" --preflight-only --message "" --wait-timeout 5 2>&1)"
+  rc43a=$?
+  [ "$rc43a" -eq 2 ] || { echo "FAIL: --preflight-only --message '' expected rc=2, got $rc43a: $out43a"; fails=1; }
+  out43b="$(_ms --repo "$primary43" --worktree "$t/wt43" --branch sm/preflight-empty-flag --base main --checked-sha "$sha43" --preflight-only --test "" --wait-timeout 5 2>&1)"
+  rc43b=$?
+  [ "$rc43b" -eq 2 ] || { echo "FAIL: --preflight-only --test '' expected rc=2, got $rc43b: $out43b"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1534,7 +1551,7 @@ GITSHIM
 fi
 
 # ============================== argument parsing ==============================
-repo="" worktree="" branch="" base="main" checked_sha="" test_cmd="" message="" wait_timeout=300 preflight_only=""
+repo="" worktree="" branch="" base="main" checked_sha="" test_cmd="" message="" wait_timeout=300 preflight_only="" test_cmd_given="" message_given=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; repo="$2"; shift 2;;
@@ -1542,8 +1559,8 @@ while [ $# -gt 0 ]; do
     --branch) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; branch="$2"; shift 2;;
     --base) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; base="$2"; shift 2;;
     --checked-sha) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; checked_sha="$2"; shift 2;;
-    --test) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; test_cmd="$2"; shift 2;;
-    --message) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; message="$2"; shift 2;;
+    --test) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; test_cmd="$2"; test_cmd_given=1; shift 2;;
+    --message) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; message="$2"; message_given=1; shift 2;;
     --wait-timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; wait_timeout="$2"; shift 2;;
     --preflight-only) preflight_only=1; shift;;
     --selfcheck) shift;; # already handled above when it's $1; keep parser tolerant if it appears later
@@ -1558,9 +1575,13 @@ done
 [ -n "$checked_sha" ] || { echo "need --checked-sha SHA" >&2; _usage; exit 2; }
 case "$wait_timeout" in ''|*[!0-9]*) echo "invalid --wait-timeout: $wait_timeout (want a non-negative integer)" >&2; exit 2;; esac
 
-# --preflight-only has its own dedicated execution path and cannot be combined with other options
+# --preflight-only has its own dedicated execution path and cannot be combined with other options.
+# Checked via *_given (whether the flag was explicitly passed), not by testing the value for
+# emptiness -- an earlier revision used "[ -n "$test_cmd" ]", which silently let
+# "--preflight-only --message ''" (or --test '') through: the flag WAS combined, just with an
+# empty value, which is still combining it per the stated contract.
 if [ "$preflight_only" = "1" ]; then
-  if [ -n "$test_cmd" ] || [ -n "$message" ]; then
+  if [ "$test_cmd_given" = "1" ] || [ "$message_given" = "1" ]; then
     echo "--preflight-only is read-only and cannot be combined with --test or --message" >&2
     _usage
     exit 2
