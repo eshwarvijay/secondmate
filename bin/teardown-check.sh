@@ -16,6 +16,17 @@
 # --task-id charset/length discipline mirrors claim-ledger.py's _TASK_ID_RE ([A-Za-z0-9_-], 1-128 chars)
 # -- bash can't import that Python regex, so it's re-derived here as a `case` pattern, same pattern
 # merge-sequencer.sh already uses for its own --branch charset check (different charset: no '/').
+#
+# ACCEPTED LIMITATION (round 7, documented not fixed): the herdr check covers maker AGENTS only
+# (sm-<task-id> / sm-pi-<task-id>, which already have a task-id-derived name via mark-maker.sh/
+# `agent start`) -- it never queries a checker PANE. A leaked visible checker pane (created via
+# `herdr-pane.sh split` in SKILL.md's "Checker pane" recipe) is invisible here and would report
+# clean. Closing this for real would mean inventing and wiring a brand-new pane-naming/task-id-
+# tracking convention across herdr-pane.sh's split call, the shared "Checker pane" recipe every task
+# in this repo uses, and this script's own query logic -- materially bigger in scope and blast radius
+# than this task, and risks regressing every other task's loop by touching that shared recipe. Out of
+# scope here; matches this repo's own precedent for other accepted, documented-not-chased gaps (e.g.
+# pi-scope-guard's /scope-guard-marker gap, sync-worktree-skills' ancestor-dangling-symlink gap).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

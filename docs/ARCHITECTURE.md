@@ -263,7 +263,12 @@ Each stage exists to close a specific failure mode.
    present, per its own printed report. It cannot verify HOW anything got left behind, only THAT it did;
    the supervisor decides what to do with a nonzero report. A headless run with no herdr to check reports
    that specific check as its own "unknown" condition rather than a false "clean", but that alone never
-   blocks an otherwise-clean headless teardown from reporting success.
+   blocks an otherwise-clean headless teardown from reporting success. **Accepted limitation:** its herdr
+   check covers maker agents only (`sm-<task-id>`/`sm-pi-<task-id>`) — a leaked visible checker pane
+   (the "Checker pane" recipe's `herdr-pane.sh split`) has no task-id-derived identity anywhere in this
+   repo's current herdr integration, so it's invisible to this check and would report clean; closing that
+   would need a new pane-naming/discovery convention touching the shared checker-pane recipe every task
+   uses, out of scope here.
 
    **IMPORTANT:** `caffeinate-guard.sh stop` is SESSION-SCOPED, not per-task. Call it ONCE yourself, directly,
    only after you have confirmed EVERY task/worktree in that batch has been torn down. Never call `stop` inside
@@ -409,7 +414,7 @@ Each stage exists to close a specific failure mode.
 | A ledger-write failure silently reported as full success with no audit record | merge-sequencer.sh prints a loud `WARNING` naming the ledger path; the merge/push outcome is unaffected either way |
 | A hold answered without a genuine human behind it going unnoticed | hold.py's advisory reminder printed on every successful `answer` (cannot verify who is at the keyboard, only reminds) |
 | A merge landing without plugin.json's version bumped / docs synced | merge-sequencer.sh's advisory pre-merge reminder, printed right before every real merge (never on `--preflight-only`) |
-| A worktree/branch/herdr pane/claim believed torn down but actually still present | teardown-check.sh's advisory scan across all four, run right after step 8's teardown commands |
+| A worktree/branch/herdr pane/claim believed torn down but actually still present | teardown-check.sh's advisory scan across all four, run right after step 8's teardown commands (maker agents only for the herdr check — a leaked checker pane is not covered, see accepted limitation below) |
 | An injected lesson checklist that only ever grows with no way to tell what's actually helping | lesson-lookup.py's `tag`/success-rate/never-helpful-bucket mechanism, fed by supervisor-observed evidence, not automated correlation |
 
 ## Primitives for parallel sub-agent-supervisors (building blocks, not yet wired into the loop)
@@ -529,6 +534,6 @@ future task, not part of this one.
 | `bin/lessons/debugging/` | subdirectory for debugging-related lessons |
 | `bin/lessons/testing/` | subdirectory for testing-related lessons |
 | `bin/lessons/workflow/` | subdirectory for workflow-related lessons |
-| `bin/teardown-check.sh` | advisory post-teardown scan: worktree / `sm/<id>` branch / herdr pane-agent / claim-ledger.py entry for a task-id — exit 0 clean, nonzero if anything's still present; degrades an unreachable herdr check to its own "unknown" line rather than a false "clean", without blocking a genuinely clean headless teardown |
+| `bin/teardown-check.sh` | advisory post-teardown scan: worktree / `sm/<id>` branch / herdr pane-agent / claim-ledger.py entry for a task-id — exit 0 clean, nonzero if anything's still present; degrades an unreachable herdr check to its own "unknown" line rather than a false "clean", without blocking a genuinely clean headless teardown. Accepted limitation: the herdr check covers maker agents only, never a leaked checker pane (no task-id-derived pane identity exists in this repo's current herdr integration) |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.
