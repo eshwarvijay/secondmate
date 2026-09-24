@@ -1092,6 +1092,227 @@ print('',end='')
   return 0
 }
 
+# --- Skill discovery asymmetry detection (pi vs Claude Code) ---
+# Encodes the REAL, verified discovery rules for project-local skills (confirmed against pi's compiled
+# source, see bin/sync-worktree-skills.sh's header for the full writeup):
+#   Claude Code reads: .claude/skills/<name>  and  .agents/skills/<name>
+#   pi               reads: .pi/skills/<name>    and  .agents/skills/<name>
+# .agents/skills/ is the one convention both harnesses read directly -- the portable intersection.
+# A skill present ONLY under .claude/skills is invisible to a pi maker; ONLY under .pi/skills is
+# invisible to a Claude Code maker. Scanned at ANY depth under the repo root (monorepo-safe -- e.g.
+# packages/widget/.claude/skills/<name>), matching bin/sync-worktree-skills.sh's own any-depth scan of
+# the identical three conventions: a skill only reachable in a nested subproject is exactly the kind of
+# thing that DOES get synced into a fresh worktree by that script, so this diagnostic must see it too,
+# or it would silently miss a real, already-synced, possibly pi-invisible skill.
+#
+# Two different subprojects can each have their own skill named the same thing, so rows are keyed by
+# (subproject-relative-path, name), not name alone -- a nested skill's row label is
+# "<relative-parent>/<name>" (e.g. "packages/widget/nested-only"); a top-level skill's label is just
+# "<name>", unchanged from before this repo's own nested-monorepo support was added.
+#
+# Skill names AND the relative-parent path are both validated before EVER being interpolated into a
+# constructed heal command. Names use the exact bare-identifier pattern bin/claim-ledger.py already
+# uses for task-id validation ([A-Za-z0-9_-]{1,128}); the relative-parent path is additionally
+# constrained to a plain forward-slash-joined sequence of such segments with no ".." component (though
+# it is already structurally impossible for it to contain one -- it comes from Python's os.walk, which
+# only ever descends from root, never ascends outside it). A directory with a crafted name/path is
+# silently excluded from every row rather than risking it reaching a shell string. This is a passive
+# filesystem scan of names already sitting on disk, not caller-supplied input, so silent exclusion
+# (rather than a hard error) is the right failure mode: it must never abort the rest of the report over
+# one odd name.
+_SKILL_NAME_SAFE_RE='^[A-Za-z0-9_-]{1,128}$'
+_SKILL_PREFIX_SAFE_RE='^[A-Za-z0-9_./-]*$'
+
+_detect_skill_discovery_sync() {
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || root="$PWD"
+
+  # Written to a standalone temp file, then run and captured as a SEPARATE step -- deliberately NOT a
+  # heredoc nested directly inside a `$(...)` command substitution. That combination is a real, proven
+  # bash parsing landmine: bash's `$(...)` matcher does its own quote-tracking pass over the heredoc
+  # body regardless of the delimiter being quoted, so a single stray apostrophe anywhere in the body
+  # (even inside a `#` comment, e.g. an English contraction) breaks the surrounding script's syntax
+  # entirely -- confirmed by direct repro before writing this comment. Every OTHER heredoc in this file
+  # is a plain statement (`python3 << 'PYEOF' ... PYEOF`, output going straight to the caller, never
+  # wrapped in `$(...)`) and is safe; this is the first one that also needed to CAPTURE python's output,
+  # which is why it needs the extra temp-file step to stay safe against a future comment edit.
+  local tmp_py
+  tmp_py="$(mktemp)" || return 0
+  cat > "$tmp_py" << 'PYEOF'
+import os, re
+
+root = os.environ['SM_SKILL_ROOT']
+NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+CONVENTIONS = {'.claude': 'claude', '.pi': 'pi', '.agents': 'agents'}
+
+# (relative-parent-prefix, skill-name) -> set of conventions found under that exact location.
+locs = {}
+
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d != '.git']  # never scan git internals
+    if os.path.basename(dirpath) != 'skills':
+        continue
+    conv = CONVENTIONS.get(os.path.basename(os.path.dirname(dirpath)))
+    if conv is None:
+        continue
+    grandparent = os.path.dirname(os.path.dirname(dirpath))
+    prefix = os.path.relpath(grandparent, root)
+    if prefix == '.':
+        prefix = ''
+    try:
+        entries = os.listdir(dirpath)
+    except OSError:
+        continue
+    for entry in entries:
+        if NAME_RE.match(entry) and os.path.isdir(os.path.join(dirpath, entry)):  # isdir follows symlinks
+            locs.setdefault((prefix, entry), set()).add(conv)
+
+claude_visible = {k for k, c in locs.items() if 'claude' in c or 'agents' in c}
+pi_visible = {k for k, c in locs.items() if 'pi' in c or 'agents' in c}
+
+for prefix, name in sorted(locs.keys()):
+    print(f"{prefix}|{name}|{int((prefix, name) in claude_visible)}|{int((prefix, name) in pi_visible)}")
+PYEOF
+
+  local report
+  report="$(SM_SKILL_ROOT="$root" python3 "$tmp_py" 2>/dev/null)"
+  rm -f "$tmp_py"
+  [ -n "$report" ] || return 0
+
+  local prefix name in_claude in_pi label
+  # '|' (not tab) is deliberate: bash's `read` treats runs of IFS *whitespace* characters (space, tab,
+  # newline -- hardcoded, regardless of what IFS is actually set to) as a single delimiter and strips a
+  # LEADING one entirely, silently eating the empty first field a top-level (no-prefix) skill's line
+  # starts with and shifting every subsequent field left by one -- confirmed by direct repro. '|' is not
+  # an IFS-whitespace character, so a leading empty field is preserved correctly.
+  while IFS='|' read -r prefix name in_claude in_pi; do
+    [ -n "$name" ] || continue
+    if [ -n "$prefix" ]; then label="$prefix/$name"; else label="$name"; fi
+    if [ "$in_claude" = 1 ] && [ "$in_pi" = 1 ]; then
+      add OK "skill discovery: $label (pi+claude)" companion ""
+    elif [ "$in_claude" = 1 ]; then
+      add MISSING "skill discovery: $label (not visible to pi)" companion "$(_skill_discovery_heal_fix "$root" "$prefix" "$name")"
+    else
+      add MISSING "skill discovery: $label (not visible to claude)" companion ""
+    fi
+  done <<< "$report"
+}
+
+# Usage: _skill_discovery_heal_fix <repo-root> <relative-parent-prefix> <name>
+# Prints a safe, idempotent shell command that copies a Claude-only skill's real content into
+# <prefix>/.agents/skills/<name> (the portable location pi already reads at that same subproject
+# location), so the generic heal() dispatch loop below can run it exactly like any other MISSING row's
+# fix command -- no bespoke _heal_* function needed. Prints nothing (no auto-fix offered) if it is not
+# safe/unambiguous to do so AT GENERATION TIME: the name or prefix fails its safe-pattern check
+# (defense in depth -- detect() already filtered this), the destination already exists as ANY kind of
+# entry (never offers to clobber), the resolved real SOURCE escapes the repo root the same way
+# bin/sync-worktree-skills.sh already guards against for the identical reason (a symlink pointing
+# outside the checkout must never have its content copied anywhere), or (checker round 2's real
+# finding) an intermediate component of the DESTINATION path escapes the repo root -- e.g. a symlinked
+# <prefix>/.agents pointing outside the checkout, which `mkdir -p`/`cp -R -p` would otherwise silently
+# follow and write real content through, even though dst/dst_parent themselves don't exist yet.
+# Checking only the source side (round 1's fix) left this second, independent escape route wide open.
+#
+# A generation-time-only check is itself a real, confirmed TOCTOU (checker round 3's finding): the
+# returned string is meant to be inspectable/deferrable, not only auto-executed instantly -- it can be
+# read via --json and run manually by a human at some arbitrary LATER time, after the filesystem has
+# changed. So the SAME containment logic (source AND destination) is embedded as a python3 script
+# INSIDE the returned command string itself, re-run at ACTUAL EXECUTION TIME immediately before any
+# mkdir/cp, recomputing everything fresh from root_p/prefix_path/name rather than trusting this
+# function's own already-resolved values -- running the identical returned string twice, with an unsafe
+# filesystem change in between, must refuse the second time.
+_skill_discovery_heal_fix() {
+  local root="$1" prefix="$2" name="$3"
+  [[ "$name" =~ $_SKILL_NAME_SAFE_RE ]] || return 0
+  [[ "$prefix" =~ $_SKILL_PREFIX_SAFE_RE ]] || return 0
+  case "$prefix" in *..*) return 0;; esac
+  local root_p src dst dst_parent resolved prefix_path
+  root_p="$(cd "$root" && pwd -P)" || return 0
+  if [ -n "$prefix" ]; then prefix_path="$prefix/"; else prefix_path=""; fi
+  src="$root_p/${prefix_path}.claude/skills/$name"
+  dst_parent="$root_p/${prefix_path}.agents/skills"
+  dst="$dst_parent/$name"
+  { [ -e "$dst" ] || [ -L "$dst" ]; } && return 0   # already something there -- never offer to clobber
+  resolved="$(python3 -c 'import os,sys; p=os.path.realpath(sys.argv[1]); print(p if os.path.isdir(p) else "")' "$src" 2>/dev/null)"
+  [ -n "$resolved" ] || return 0
+  case "$resolved" in
+    "$root_p"|"$root_p"/*) ;;   # inside the repo -- safe to offer
+    *) return 0;;               # resolves outside the repo -- never offer (mirrors sync-worktree-skills.sh)
+  esac
+  # Destination containment check: an escape requires an ALREADY-EXISTING symlink somewhere along
+  # dst_parent's path (you cannot escape through a component that hasn't been created yet), so walk up
+  # from dst_parent to the nearest EXISTING ancestor (any entry type -- `-e` alone follows symlinks and
+  # would misreport a dangling one as absent, matching the `-e || -L` idiom used throughout this file)
+  # and resolve THAT via realpath -- it must stay inside root_p just like the source already must.
+  local dst_ancestor resolved_dst_ancestor
+  dst_ancestor="$dst_parent"
+  while [ "$dst_ancestor" != "/" ] && [ -n "$dst_ancestor" ] \
+        && ! { [ -e "$dst_ancestor" ] || [ -L "$dst_ancestor" ]; }; do
+    dst_ancestor="$(dirname "$dst_ancestor")"
+  done
+  resolved_dst_ancestor="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$dst_ancestor" 2>/dev/null)"
+  [ -n "$resolved_dst_ancestor" ] || return 0
+  case "$resolved_dst_ancestor" in
+    "$root_p"|"$root_p"/*) ;;   # inside the repo -- safe to offer
+    *) return 0;;               # an existing destination-path component escapes the repo -- never offer
+  esac
+  # The two checks above only prove safety AT THE MOMENT this fix string is generated (--json /
+  # detect()'s time). The returned string is meant to be inspectable and deferrable -- run immediately
+  # by --heal --yes, or read via --json and run manually by a human at some arbitrary LATER time (per
+  # this file's own "SKIP ... provide its source ... set the matching SM_* var" design for every other
+  # fix command) -- so a generation-time-only check is a real, exploitable TOCTOU: if the filesystem
+  # changes between generation and execution (e.g. <prefix>/.agents gets replaced by an outside-pointing
+  # symlink AFTER this string was built), running the already-generated, already-safe-LOOKING string
+  # later leaks content outside the repo exactly like the bug the destination check above was meant to
+  # close. Closing this structurally (not by narrowing the window) means the SAME containment logic must
+  # re-run INSIDE the generated command, at ACTUAL EXECUTION TIME, immediately before any mutation --
+  # recomputing everything fresh from root_p/prefix_path/name (never trusting the already-resolved
+  # $resolved/$dst/$dst_parent computed above, which describe a decision made once, earlier, that may no
+  # longer hold). Embedded as python3 (matching how this same function already shells out to python3 for
+  # realpath elsewhere) rather than more bash, since a single process can check-then-act with no
+  # cross-process gap between the check and the mkdir/cp it gates -- running the identical fix string a
+  # second time after an unsafe filesystem change must refuse, not trust a decision made by an earlier
+  # invocation.
+  #
+  # Accepted residual limitation (checker round 4, not chased further -- documented, not eliminated,
+  # matching this codebase's own precedent for a comparably narrow risk elsewhere, e.g.
+  # bin/scope-guard.py's documented symlink TOCTOU and bin/caffeinate-guard.sh's PATH/supply-chain trust
+  # assumption): the embedded python script's own realpath-check-then-mkdir/cp is still two separate
+  # syscalls within one process, so an adversary with concurrent local filesystem write access could in
+  # theory win a race in the sub-instant window between them -- a real, but far narrower (intra-process,
+  # sub-millisecond, requiring precise concurrent timing by an attacker who already has local write
+  # access to this checkout at that exact instant) risk than the cross-process, arbitrarily-long window
+  # this fix already closes.
+  local py_script
+  py_script='import os, sys, subprocess
+root_p, prefix_path, name = sys.argv[1], sys.argv[2], sys.argv[3]
+src = root_p + "/" + prefix_path + ".claude/skills/" + name
+dst_parent = root_p + "/" + prefix_path + ".agents/skills"
+dst = dst_parent + "/" + name
+if os.path.exists(dst) or os.path.islink(dst):
+    print("already exists, skipping", file=sys.stderr)
+    sys.exit(0)
+resolved_src = os.path.realpath(src)
+if not os.path.isdir(resolved_src) or not (resolved_src == root_p or resolved_src.startswith(root_p + os.sep)):
+    print("refusing: source escapes the repo root (checked at execution time)", file=sys.stderr)
+    sys.exit(1)
+anc = dst_parent
+while anc != os.path.dirname(anc) and not (os.path.exists(anc) or os.path.islink(anc)):
+    anc = os.path.dirname(anc)
+resolved_anc = os.path.realpath(anc)
+if not (resolved_anc == root_p or resolved_anc.startswith(root_p + os.sep)):
+    print("refusing: destination escapes the repo root (checked at execution time)", file=sys.stderr)
+    sys.exit(1)
+try:
+    os.makedirs(dst_parent, exist_ok=True)
+    subprocess.run(["cp", "-R", "-p", resolved_src, dst], check=True)
+except Exception as e:
+    print(f"refusing/failed: {e}", file=sys.stderr)
+    sys.exit(1)
+'
+  printf 'python3 -c %q %q %q %q' "$py_script" "$root_p" "$prefix_path" "$name"
+}
+
 detect() {
   local h="${SM_CHECKER_HARNESS:-pi}"
   h="$(printf '%s' "$h" | tr '\n\r|' '   ')"   # finding #9: no newline/pipe can inject/forge rows before JSON encoding
@@ -1113,6 +1334,10 @@ detect() {
   # - The fix is idempotent: running heal multiple times on already-correct values does nothing
   # - If pi is absent, these checks are skipped entirely (no rows added)
   _detect_bedrock_overrides
+
+  # SKILL DISCOVERY ASYMMETRY — a project skill present under .claude/skills/ (or .pi/skills/) only
+  # may be invisible to the OTHER maker harness; see _detect_skill_discovery_sync's own comment.
+  _detect_skill_discovery_sync
 
   # SECONDMATE PLUGIN STALENESS — check if the running copy is stale compared to marketplace checkout
   _detect_secondmate_staleness
@@ -3455,6 +3680,338 @@ print('NOT_FOUND')
   [ "$deepseek_status" = "OK" ] || { echo "FAIL: Test P13 deepseek-r1 via symlink expected OK, got '$deepseek_status'"; rm -rf "$d" "$symlink_dir"; exit 1; }
   
   rm -rf "$d" "$symlink_dir"
+
+  # === Test Q: skill discovery asymmetry detection + heal ===
+  d=$(mktemp -d)
+  # alpha: present in BOTH .claude/skills and .agents/skills -> OK, visible to both harnesses.
+  mkdir -p "$d/.claude/skills/alpha" "$d/.agents/skills/alpha"
+  echo "alpha claude copy" > "$d/.claude/skills/alpha/SKILL.md"
+  echo "alpha agents copy" > "$d/.agents/skills/alpha/SKILL.md"
+  # bravo: present ONLY under .claude/skills -> invisible to pi. .agents/skills/bravo does not exist
+  # yet, so a safe, unambiguous heal-fix command should be offered.
+  mkdir -p "$d/.claude/skills/bravo"
+  echo "bravo real content" > "$d/.claude/skills/bravo/SKILL.md"
+  # charlie: present ONLY under .pi/skills -> invisible to Claude Code. No heal offered for this
+  # direction by design (this task's explicit scope: only build heal for the pi-invisible case).
+  mkdir -p "$d/.pi/skills/charlie"
+  echo "charlie real content" > "$d/.pi/skills/charlie/SKILL.md"
+  # leaky: a .claude/skills entry that is a symlink resolving OUTSIDE the repo root entirely -- must be
+  # reported as invisible-to-pi, but must NEVER be offered as a heal target (mirrors
+  # bin/sync-worktree-skills.sh's own leaky-symlink guard for the identical underlying risk). The
+  # external target lives under a SEPARATE mktemp dir, genuinely outside $d, not merely a sibling path
+  # string that happens to still resolve inside it.
+  external_q="$(mktemp -d)"
+  echo "SENSITIVE_Q" > "$external_q/leaked.txt"
+  ln -s "$external_q" "$d/.claude/skills/leaky"
+  # a directory name that fails the safe-identifier check -- must be silently excluded from every row,
+  # never crash the scan, never reach a constructed shell command.
+  mkdir -p "$d/.claude/skills/bad;name"
+  echo "unsafe name content" > "$d/.claude/skills/bad;name/SKILL.md"
+  # nested-only: present ONLY under a NESTED subproject's .claude/skills -- invisible to pi. Verifies
+  # the any-depth monorepo scan (matching bin/sync-worktree-skills.sh's own scan of the identical three
+  # conventions) and that the row label is qualified with the subproject's relative path, not just the
+  # bare skill name -- checker round 1's real, confirmed finding: this scan used to be top-level only,
+  # silently missing every nested-monorepo skill (and its heal-fix) entirely.
+  mkdir -p "$d/packages/widget/.claude/skills/nested-only"
+  echo "nested real content" > "$d/packages/widget/.claude/skills/nested-only/SKILL.md"
+  # dupe: the SAME skill name in TWO DIFFERENT subprojects, both .claude-only -- must produce two
+  # DISTINCT, unambiguous rows (never collapsed into one by name alone), each healing independently
+  # into its own subproject's .agents/skills/, never cross-contaminating the other's content.
+  mkdir -p "$d/packages/a/.claude/skills/dupe" "$d/packages/b/.claude/skills/dupe"
+  echo "dupe in package a" > "$d/packages/a/.claude/skills/dupe/SKILL.md"
+  echo "dupe in package b" > "$d/packages/b/.claude/skills/dupe/SKILL.md"
+  # leaky-dest: checker round 2's real, confirmed finding -- a genuinely safe, real, inside-repo SOURCE
+  # (packages/leakproj/.claude/skills/leaky-dest), but the DESTINATION's own intermediate path component
+  # (packages/leakproj/.agents) is itself a symlink resolving OUTSIDE the repo entirely. Round 1's fix
+  # only ever containment-checked the source; `mkdir -p`/`cp -R -p` both follow a symlinked intermediate
+  # destination component even though dst/dst_parent themselves don't exist yet, so this must be caught
+  # independently on the destination side or real content gets written outside the checkout.
+  mkdir -p "$d/packages/leakproj/.claude/skills/leaky-dest"
+  echo "leaky-dest real content (must NEVER leave the repo)" > "$d/packages/leakproj/.claude/skills/leaky-dest/SKILL.md"
+  external_dest_q="$(mktemp -d)"
+  ln -s "$external_dest_q" "$d/packages/leakproj/.agents"
+
+  # isolate from the REAL installed secondmate plugin state (SM_SECONDMATE_MARKETPLACE_DIR/etc.) so
+  # this test's --heal --yes never touches the real marketplace checkout or attempts a real network
+  # fetch -- matching every other JSON/heal invocation earlier in this selfcheck. A nonexistent
+  # marketplace dir makes _detect_secondmate_status report "missing" instantly, no I/O.
+  q_lock_dir="$d/.q-lock"
+  out_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --json 2>/dev/null)
+  q_check() {  # q_check <name> <expected_status>
+    local got
+    got=$(echo "$out_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='$1':
+        print(x['status']); sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+    [ "$got" = "$2" ] || { echo "FAIL: Test Q expected '$1' status '$2', got '$got'"; rm -rf "$d"; exit 1; }
+  }
+  q_check "skill discovery: alpha (pi+claude)" OK
+  q_check "skill discovery: bravo (not visible to pi)" MISSING
+  q_check "skill discovery: charlie (not visible to claude)" MISSING
+  q_check "skill discovery: leaky (not visible to pi)" MISSING
+  q_check "skill discovery: packages/widget/nested-only (not visible to pi)" MISSING
+  q_check "skill discovery: packages/a/dupe (not visible to pi)" MISSING
+  q_check "skill discovery: packages/b/dupe (not visible to pi)" MISSING
+  echo "$out_json" | grep -q '"name":"skill discovery: bad;name' && { echo "FAIL: Test Q unsafe name 'bad;name' leaked into a row"; rm -rf "$d"; exit 1; }
+
+  # a nested skill's row must carry a non-empty, real heal-fix command too (parity with the top-level
+  # bravo case) -- and each of the two duplicate-named skills must get its OWN, independent fix.
+  q_fix_nonempty() {  # q_fix_nonempty <name>
+    local got
+    got=$(echo "$out_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='$1':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+    [ -n "$got" ] || { echo "FAIL: Test Q expected '$1' to have a non-empty heal-fix, got empty"; rm -rf "$d"; exit 1; }
+  }
+  q_fix_nonempty "skill discovery: packages/widget/nested-only (not visible to pi)"
+  q_fix_nonempty "skill discovery: packages/a/dupe (not visible to pi)"
+  q_fix_nonempty "skill discovery: packages/b/dupe (not visible to pi)"
+
+  # charlie's row must carry no auto-fix (empty fix field) -- no heal offered in this direction.
+  charlie_fix=$(echo "$out_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: charlie (not visible to claude)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -z "$charlie_fix" ] || { echo "FAIL: Test Q charlie should have no auto-fix, got '$charlie_fix'"; rm -rf "$d"; exit 1; }
+
+  # leaky's row must ALSO carry no auto-fix -- the whole point of the outside-repo-root guard.
+  leaky_fix=$(echo "$out_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: leaky (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -z "$leaky_fix" ] || { echo "FAIL: Test Q leaky should have no auto-fix (outside-repo symlink), got '$leaky_fix'"; rm -rf "$d"; exit 1; }
+
+  # leaky-dest: a genuinely SAFE, real, inside-repo source, but the DESTINATION's own intermediate
+  # component escapes the repo -- must still be reported as MISSING (not silently OK, not a crash), and
+  # must carry no auto-fix, exactly like the source-side leaky case above (checker round 2's own
+  # accepted equivalent-outcome standard: never silently claim success while doing nothing).
+  q_check "skill discovery: packages/leakproj/leaky-dest (not visible to pi)" MISSING
+  leaky_dest_fix=$(echo "$out_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/leakproj/leaky-dest (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -z "$leaky_dest_fix" ] || { echo "FAIL: Test Q leaky-dest should have no auto-fix (outside-repo DESTINATION symlink), got '$leaky_dest_fix'"; rm -rf "$d"; exit 1; }
+
+  # run --heal --yes: bravo should get healed (real copy at .agents/skills/bravo), charlie/leaky left
+  # untouched (no fix offered), and no sensitive content from the leaky symlink must ever appear anywhere.
+  heal_out=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --heal --yes 2>&1)
+  [ -f "$d/.agents/skills/bravo/SKILL.md" ] || { echo "FAIL: Test Q heal did not create .agents/skills/bravo"; echo "$heal_out" >&2; rm -rf "$d"; exit 1; }
+  diff -q "$d/.claude/skills/bravo/SKILL.md" "$d/.agents/skills/bravo/SKILL.md" >/dev/null \
+    || { echo "FAIL: Test Q healed bravo content differs from its real source"; rm -rf "$d"; exit 1; }
+  [ ! -e "$d/.agents/skills/charlie" ] || { echo "FAIL: Test Q charlie should never get a .agents/skills entry (no heal offered)"; rm -rf "$d"; exit 1; }
+  [ ! -e "$d/.agents/skills/leaky" ] || { echo "FAIL: Test Q leaky should never get a .agents/skills entry (outside-repo symlink)"; rm -rf "$d"; exit 1; }
+  ! grep -rq 'SENSITIVE_Q' "$d/.agents" 2>/dev/null \
+    || { echo "FAIL: Test Q SENSITIVE_Q (from outside the repo) leaked into .agents/skills"; rm -rf "$d"; exit 1; }
+
+  # leaky-dest: the whole point of checker round 2's finding -- the heal-fix (correctly not offered
+  # above) must never have run, so NOTHING was ever written into the externally-symlinked destination.
+  [ -z "$(find "$external_dest_q" -mindepth 1 2>/dev/null)" ] \
+    || { echo "FAIL: Test Q leaky-dest LEAKED real content into the external destination symlink target"; rm -rf "$d" "$external_dest_q"; exit 1; }
+
+  # nested-only healed at its OWN subproject-relative path -- not at the repo root's .agents/skills/.
+  [ -f "$d/packages/widget/.agents/skills/nested-only/SKILL.md" ] \
+    || { echo "FAIL: Test Q heal did not create packages/widget/.agents/skills/nested-only"; echo "$heal_out" >&2; rm -rf "$d"; exit 1; }
+  diff -q "$d/packages/widget/.claude/skills/nested-only/SKILL.md" "$d/packages/widget/.agents/skills/nested-only/SKILL.md" >/dev/null \
+    || { echo "FAIL: Test Q healed nested-only content differs from its real source"; rm -rf "$d"; exit 1; }
+  [ ! -e "$d/.agents/skills/nested-only" ] \
+    || { echo "FAIL: Test Q nested-only incorrectly healed at the repo root instead of its own subproject path"; rm -rf "$d"; exit 1; }
+
+  # both dupes healed independently, each at its OWN subproject path, with no cross-contamination.
+  [ -f "$d/packages/a/.agents/skills/dupe/SKILL.md" ] || { echo "FAIL: Test Q heal did not create packages/a/.agents/skills/dupe"; rm -rf "$d"; exit 1; }
+  [ -f "$d/packages/b/.agents/skills/dupe/SKILL.md" ] || { echo "FAIL: Test Q heal did not create packages/b/.agents/skills/dupe"; rm -rf "$d"; exit 1; }
+  [ "$(cat "$d/packages/a/.agents/skills/dupe/SKILL.md")" = "dupe in package a" ] \
+    || { echo "FAIL: Test Q packages/a/dupe healed with wrong content (cross-contamination?)"; rm -rf "$d"; exit 1; }
+  [ "$(cat "$d/packages/b/.agents/skills/dupe/SKILL.md")" = "dupe in package b" ] \
+    || { echo "FAIL: Test Q packages/b/dupe healed with wrong content (cross-contamination?)"; rm -rf "$d"; exit 1; }
+
+  # re-detect after heal: bravo must now report OK (pi+claude visible), proving the fresh detect() call
+  # heal() already performs picks up the just-created .agents/skills/bravo with no special-casing.
+  out_json2=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --json 2>/dev/null)
+  bravo_status2=$(echo "$out_json2" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: bravo (pi+claude)':
+        print(x['status']); sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+  [ "$bravo_status2" = "OK" ] || { echo "FAIL: Test Q post-heal bravo expected OK row, got '$bravo_status2'"; rm -rf "$d"; exit 1; }
+
+  q_check2() {  # q_check2 <name> <expected_status>
+    local got
+    got=$(echo "$out_json2" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='$1':
+        print(x['status']); sys.exit(0)
+print('NOT_FOUND')
+" 2>/dev/null)
+    [ "$got" = "$2" ] || { echo "FAIL: Test Q expected post-heal '$1' status '$2', got '$got'"; rm -rf "$d"; exit 1; }
+  }
+  q_check2 "skill discovery: packages/widget/nested-only (pi+claude)" OK
+  q_check2 "skill discovery: packages/a/dupe (pi+claude)" OK
+  q_check2 "skill discovery: packages/b/dupe (pi+claude)" OK
+  # leaky-dest must STILL be MISSING post-heal -- it was never (and must never be) actually healed.
+  q_check2 "skill discovery: packages/leakproj/leaky-dest (not visible to pi)" MISSING
+
+  # mutation check: re-running the heal fix a second time (idempotent) must not error or duplicate.
+  heal_out2=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --heal --yes 2>&1)
+  [ -f "$d/.agents/skills/bravo/SKILL.md" ] || { echo "FAIL: Test Q second heal run broke bravo"; rm -rf "$d"; exit 1; }
+  [ -z "$(find "$external_dest_q" -mindepth 1 2>/dev/null)" ] \
+    || { echo "FAIL: Test Q leaky-dest LEAKED into the external destination on the second heal run"; rm -rf "$d" "$external_dest_q"; exit 1; }
+
+  rm -rf "$d" "$external_q" "$external_dest_q"
+
+  # === Test Q2: TOCTOU -- filesystem changes AFTER the fix string was generated, BEFORE it runs ===
+  # Checker round 3's real, confirmed finding, reproduced here exactly: round 2's containment checks
+  # only proved safety at the MOMENT the fix string was generated (--json/detect() time). The returned
+  # string is meant to be inspectable/deferrable -- read via --json and run manually by a human at some
+  # LATER time, not only auto-executed instantly by --heal --yes -- so a generation-time-only check is a
+  # real TOCTOU: if <prefix>/.agents gets replaced by an outside-pointing symlink AFTER the safe fix
+  # string was generated, running that already-generated, already-safe-LOOKING string later must still
+  # refuse, not leak content outside the repo.
+  d=$(mktemp -d)
+  mkdir -p "$d/packages/widget/.claude/skills/toctou-src"
+  echo "toctou-src real content (must NEVER leave the repo)" > "$d/packages/widget/.claude/skills/toctou-src/SKILL.md"
+  toctou_lock_dir="$d/.q2-lock"
+
+  # step 1: generate the fix while everything is genuinely safe -- no escape exists yet anywhere.
+  toctou_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q2-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q2-no-installed.json" SM_DOCTOR_LOCK_DIR="$toctou_lock_dir" "$script_abs" --json 2>/dev/null)
+  toctou_fix=$(echo "$toctou_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/widget/toctou-src (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -n "$toctou_fix" ] || { echo "FAIL: Test Q2 expected a non-empty fix to be generated while everything was safe"; rm -rf "$d"; exit 1; }
+
+  # step 2: AFTER generation, the filesystem changes to introduce an escape -- packages/widget/.agents
+  # is replaced by a symlink resolving to a directory genuinely outside the repo.
+  external_toctou="$(mktemp -d)"
+  ln -s "$external_toctou" "$d/packages/widget/.agents"
+
+  # step 3: run the PREVIOUSLY-GENERATED, now-stale fix string as a completely separate step -- this is
+  # the exact reported scenario, not the already-covered "escape exists before generation" case.
+  toctou_run_out=$(bash -c "$toctou_fix" 2>&1)
+  toctou_run_rc=$?
+  [ "$toctou_run_rc" -ne 0 ] \
+    || { echo "FAIL: Test Q2 the stale fix string should have refused (nonzero exit) once an escape appeared, got rc=0: $toctou_run_out"; rm -rf "$d" "$external_toctou"; exit 1; }
+  [ -z "$(find "$external_toctou" -mindepth 1 2>/dev/null)" ] \
+    || { echo "FAIL: Test Q2 TOCTOU LEAKED real content into the external directory via a stale fix string"; rm -rf "$d" "$external_toctou"; exit 1; }
+  [ ! -e "$d/.agents/skills/toctou-src" ] \
+    || { echo "FAIL: Test Q2 toctou-src unexpectedly healed at the repo root despite the destination escape"; rm -rf "$d" "$external_toctou"; exit 1; }
+
+  rm -rf "$d" "$external_toctou"
+
+  # === Test Q3: TOCTOU -- the SOURCE (not the destination) becomes unsafe after generation ===
+  # Checker round 4's real, confirmed finding: Test Q2 above only ever mutates the DESTINATION after
+  # generation. The embedded execution-time re-check already correctly covers a stale SOURCE too (its
+  # logic mirrors the destination check symmetrically), but that was never actually exercised by a
+  # regression test -- this closes exactly that gap, mechanically, with no production-code change.
+  d=$(mktemp -d)
+  mkdir -p "$d/packages/widget2/.claude/skills/toctou-src2"
+  echo "toctou-src2 SAFE original content" > "$d/packages/widget2/.claude/skills/toctou-src2/SKILL.md"
+  toctou3_lock_dir="$d/.q3-lock"
+
+  # step 1: generate the fix while everything is genuinely safe -- no escape exists yet anywhere.
+  toctou3_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q3-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q3-no-installed.json" SM_DOCTOR_LOCK_DIR="$toctou3_lock_dir" "$script_abs" --json 2>/dev/null)
+  toctou3_fix=$(echo "$toctou3_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/widget2/toctou-src2 (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -n "$toctou3_fix" ] || { echo "FAIL: Test Q3 expected a non-empty fix to be generated while everything was safe"; rm -rf "$d"; exit 1; }
+
+  # step 2: AFTER generation, the SOURCE is replaced by a symlink to an external directory with
+  # DIFFERENT (swapped-in) content -- the stale fix must never copy this substituted content anywhere.
+  external_toctou3="$(mktemp -d)"
+  echo "SWAPPED_IN_CONTENT_MUST_NEVER_APPEAR" > "$external_toctou3/SKILL.md"
+  rm -rf "$d/packages/widget2/.claude/skills/toctou-src2"
+  ln -s "$external_toctou3" "$d/packages/widget2/.claude/skills/toctou-src2"
+
+  # step 3: run the PREVIOUSLY-GENERATED, now-stale fix string as a completely separate step.
+  toctou3_run_out=$(bash -c "$toctou3_fix" 2>&1)
+  toctou3_run_rc=$?
+  [ "$toctou3_run_rc" -ne 0 ] \
+    || { echo "FAIL: Test Q3 the stale fix string should have refused (nonzero exit) once the SOURCE became unsafe, got rc=0: $toctou3_run_out"; rm -rf "$d" "$external_toctou3"; exit 1; }
+  ! grep -rq 'SWAPPED_IN_CONTENT_MUST_NEVER_APPEAR' "$d" 2>/dev/null \
+    || { echo "FAIL: Test Q3 the swapped-in SOURCE content leaked into the repo via a stale fix string"; rm -rf "$d" "$external_toctou3"; exit 1; }
+  [ ! -e "$d/packages/widget2/.agents/skills/toctou-src2" ] \
+    || { echo "FAIL: Test Q3 toctou-src2 unexpectedly healed despite the SOURCE having become unsafe"; rm -rf "$d" "$external_toctou3"; exit 1; }
+
+  rm -rf "$d" "$external_toctou3"
+
+  # === Test Q4: the embedded python's generic except handler fails closed when `cp` is unavailable ===
+  # Checker round 5's real, confirmed finding: this exact except-around-makedirs/cp branch is reachable
+  # and already fails closed (verified directly, both by the checker and independently here), but
+  # nothing in --selfcheck ever exercised it -- a future refactor of that error handling could silently
+  # regress its fail-closed behavior with nothing to catch it. Pure test addition, no production change.
+  d=$(mktemp -d)
+  mkdir -p "$d/packages/widget3/.claude/skills/nocp-src"
+  echo "nocp-src real content" > "$d/packages/widget3/.claude/skills/nocp-src/SKILL.md"
+  nocp_lock_dir="$d/.q4-lock"
+
+  nocp_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q4-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q4-no-installed.json" SM_DOCTOR_LOCK_DIR="$nocp_lock_dir" "$script_abs" --json 2>/dev/null)
+  nocp_fix=$(echo "$nocp_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/widget3/nocp-src (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -n "$nocp_fix" ] || { echo "FAIL: Test Q4 expected a non-empty fix to be generated"; rm -rf "$d"; exit 1; }
+
+  # a restricted PATH with every tool the fix genuinely needs EXCEPT cp -- matching the checker's own
+  # repro exactly (bash/sh/python3/mkdir/rm/ls/cat/printf present, cp deliberately absent).
+  nocp_bin="$(mktemp -d)"
+  for _t in bash sh python3 mkdir rm ls cat printf; do
+    _tp="$(command -v "$_t" 2>/dev/null)"
+    [ -n "$_tp" ] && ln -s "$_tp" "$nocp_bin/$_t"
+  done
+
+  nocp_run_out=$(PATH="$nocp_bin" bash -c "$nocp_fix" 2>&1)
+  nocp_run_rc=$?
+  [ "$nocp_run_rc" -ne 0 ] \
+    || { echo "FAIL: Test Q4 expected nonzero exit when cp is unavailable, got rc=0: $nocp_run_out"; rm -rf "$d" "$nocp_bin"; exit 1; }
+  [ ! -e "$d/packages/widget3/.agents/skills/nocp-src" ] \
+    || { echo "FAIL: Test Q4 nocp-src should never have been healed when cp is unavailable"; rm -rf "$d" "$nocp_bin"; exit 1; }
+  echo "$nocp_run_out" | grep -q "refusing/failed" \
+    || { echo "FAIL: Test Q4 expected a clear refusing/failed message, got: $nocp_run_out"; rm -rf "$d" "$nocp_bin"; exit 1; }
+
+  rm -rf "$d" "$nocp_bin"
+
+  # === Test R: no project skills anywhere -> no skill discovery rows at all ===
+  d=$(mktemp -d)
+  # isolate from the REAL installed secondmate plugin state (SM_SECONDMATE_MARKETPLACE_DIR/etc.) so
+  # this test's --heal --yes never touches the real marketplace checkout or attempts a real network
+  # fetch -- matching every other JSON/heal invocation earlier in this selfcheck. A nonexistent
+  # marketplace dir makes _detect_secondmate_status report "missing" instantly, no I/O.
+  q_lock_dir="$d/.q-lock"
+  out_json=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --json 2>/dev/null)
+  echo "$out_json" | grep -q '"name":"skill discovery:' \
+    && { echo "FAIL: Test R expected zero skill discovery rows with no skill dirs present"; rm -rf "$d"; exit 1; }
+  rm -rf "$d"
 
   echo ok; exit 0
 fi

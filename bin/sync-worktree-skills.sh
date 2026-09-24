@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# sync-worktree-skills.sh -- backfills gitignored project-local .claude/skills/ directories into a
-# freshly created git worktree.
+# sync-worktree-skills.sh -- backfills gitignored project-local skill directories into a freshly
+# created git worktree, for EVERY skill-discovery convention a maker harness actually reads:
+# .claude/skills/ (Claude Code), .pi/skills/ (pi, project-local), and .agents/skills/ (the neutral
+# "Agent Skills" standard -- the one location BOTH Claude Code and pi read directly).
 #
-# The bug this fixes: project-local Claude Code skills live in .claude/skills/<name>/ directories -- a
-# convention distinct from secondmate's own marketplace-based plugin skills. In real repos,
-# .claude/skills/ is commonly gitignored (confirmed: a real user repo has `**/.claude/skills/` in its
+# The bug this fixes: project-local skills live in <convention>/skills/<name>/ directories -- a
+# convention distinct from secondmate's own marketplace-based plugin skills. In real repos, these
+# directories are commonly gitignored (confirmed: a real user repo has `**/.claude/skills/` in its
 # .gitignore), possibly at ANY depth in a monorepo. `git worktree add` -- used both by
 # new-worktree.sh's headless path AND by the external `herdr worktree create` tool secondmate doesn't
 # own -- only ever populates a new worktree from committed, tracked content; gitignored files never
@@ -12,12 +14,29 @@
 # "Unknown skill: ..." for a project-local skill that exists fine in the primary checkout, simply
 # because the directory is genuinely absent from the worktree.
 #
+# A SEPARATE gap this script does NOT and cannot fix: pi's own skill loader has no knowledge of
+# .claude/skills/ at all (confirmed against pi's compiled source) -- only .pi/skills/, .agents/skills/,
+# and an explicit `skills: [...]` array in .pi/settings.json. Backfilling .claude/skills/ alone (this
+# script's original scope) makes a skill visible to a Claude Code maker in a fresh worktree but leaves
+# it INVISIBLE to a pi maker, even after backfilling, if that skill's only real content lives under
+# .claude/skills/. Syncing .pi/skills/ and .agents/skills/ too (this script's current scope) closes
+# that gap the same way: by making sure whatever real content already exists under those conventions in
+# the primary checkout is also genuinely present in the worktree. It does NOT create new content under
+# a convention that never had it in the primary in the first place -- see bin/doctor.sh's skill
+# discovery check for that (a separate, project-content-mutating decision, deliberately not made here).
+# It also does NOT and must not bypass pi's own trust-gating: pi treats .agents/skills/ found in the
+# cwd (or any ancestor) as a trust-requiring PROJECT resource, so a skill that is present, discoverable,
+# AND synced into a brand-new worktree with no prior trust record may still need a one-time human/agent
+# trust grant before pi will actually load it -- present, discoverable, and trusted are three separate
+# conditions, and this script only ever gets the first two right by design.
+#
 #   sync-worktree-skills.sh --primary <path> --worktree <path>
 #   sync-worktree-skills.sh --selfcheck
 #
-# Scope is deliberately narrow: .claude/skills/ ONLY, at any depth under --primary (monorepo-safe --
-# e.g. <repo>/some-subproject/.claude/skills/<name>/). This does NOT sync any other gitignored
-# .claude/* path (settings.json, settings.local.json, session-state files like
+# Scope is deliberately narrow: .claude/skills/, .pi/skills/, and .agents/skills/ ONLY, each at any
+# depth under --primary (monorepo-safe -- e.g. <repo>/some-subproject/.claude/skills/<name>/). This
+# does NOT sync any other gitignored .claude/*, .pi/*, or .agents/* path (settings.json,
+# settings.local.json, session-state files like
 # compaction_log.txt/task_state.md/session_handoff.md/loop_*_state.md) -- an explicit human decision
 # after reviewing a real repo's .gitignore: those other files are either sensitive local config or
 # session-specific state that would be actively wrong to duplicate into a fresh worktree.
@@ -39,12 +58,14 @@
 # never leaves a half-written directory visible at the real target path.
 #
 # A DIFFERENT case from the internal-symlink one above: the skill's own top-level entry directly under
-# .claude/skills/ can itself be a symlink, not a plain directory -- a real, confirmed monorepo pattern
-# (e.g. .claude/skills/<name> -> ../../.agents/skills/<name>, splitting a project-local skill's real
-# content into a separate, often ALSO-gitignored directory elsewhere in the same checkout). Such an
+# one of the skill directories above can itself be a symlink, not a plain directory -- a real, confirmed
+# monorepo pattern (e.g. .claude/skills/<name> -> ../../.agents/skills/<name>, splitting a project-local
+# skill's real content into a separate, often ALSO-gitignored directory elsewhere in the same checkout --
+# and, since .agents/skills/ is now ALSO scanned directly, that same real content gets synced a second
+# time at its own .agents/skills/<name> path too, which is exactly what makes it visible to pi). Such an
 # entry is resolved (following the whole chain, wherever it actually leads within the checkout) to its
 # real target directory, and THAT real directory's real content is what gets copied and materialized as
-# a genuine directory at .claude/skills/<name>/ in the worktree -- never left as a symlink there, since
+# a genuine directory at the entry's own target path in the worktree -- never left as a symlink there, since
 # a symlink pointing at a target that is itself gitignored (and therefore also absent from the fresh
 # worktree) would just be a dangling link. A top-level entry that is a symlink NOT resolving to a real
 # directory (broken/dangling, or pointing at a plain file) is skipped with a clear stderr warning --
@@ -150,9 +171,25 @@ EOF
   # proceeded to `mv` a real directory onto that path, failing with "Not a directory".
   ln -s "../../nonexistent-target-for-epsilon" "$t/primary/.claude/skills/epsilon"
 
+  # a project-local PI skill, "zeta" -- present under .pi/skills/, the convention pi's own loader reads
+  # directly (confirmed against pi's compiled source) but Claude Code never does. This is the core
+  # pi-visibility gap this task exists to close: before this task, this script only ever looked at
+  # .claude/skills/, so zeta would never have been synced at all.
+  mkdir -p "$t/primary/.pi/skills/zeta"
+  cat > "$t/primary/.pi/skills/zeta/SKILL.md" <<'EOF'
+---
+name: zeta
+description: fixture skill under .pi/skills/ -- pi's own project-local skill convention, never read
+  by Claude Code, and (before this task) never synced by this script at all.
+---
+# Zeta skill (pi-only, project-local)
+Real content, several lines, so a truncated or corrupted copy is detectable by a plain diff.
+EOF
+
   cat > "$t/primary/.gitignore" <<'EOF'
 **/.claude/skills/
 **/.agents/skills/
+**/.pi/skills/
 EOF
   git -C "$t/primary" add -A
   # force-add beta despite the broad ignore pattern above -- mirrors how a real repo can have one
@@ -190,6 +227,10 @@ EOF
     || { echo "FAIL: fixture broken -- epsilon's symlink target unexpectedly resolves to something"; fails=1; }
   [ -f "$t/wt/.claude/skills/beta/SKILL.md" ] \
     || { echo "FAIL: fixture broken -- tracked beta missing from the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.pi/skills/zeta" ] \
+    || { echo "FAIL: fixture broken -- zeta (.pi/skills) unexpectedly already present in the fresh worktree"; fails=1; }
+  [ ! -e "$t/wt/.agents/skills/gamma" ] \
+    || { echo "FAIL: fixture broken -- .agents/skills/gamma unexpectedly already present in the fresh worktree"; fails=1; }
 
   # --- run the real fix ---
   if ! "$0" --primary "$t/primary" --worktree "$t/wt" >/dev/null 2>"$t/err1"; then
@@ -213,6 +254,20 @@ EOF
   [ -d "$t/wt/.claude/skills/gamma" ] || { echo "FAIL: gamma is not a real directory after sync"; fails=1; }
   diff -q "$t/primary/.agents/skills/gamma/SKILL.md" "$t/wt/.claude/skills/gamma/SKILL.md" >/dev/null \
     || { echo "FAIL: gamma SKILL.md content differs from its real (resolved) source after sync"; fails=1; }
+
+  # .agents/skills/gamma (the plain, non-symlink real directory gamma's own .claude/skills entry
+  # resolves to) is now ALSO synced directly at its own path -- this is the actual pi-visibility fix:
+  # pi never follows the .claude/skills/gamma symlink (it doesn't read .claude/skills/ at all), but it
+  # DOES read .agents/skills/ directly, so this second, independent sync target is what makes gamma
+  # genuinely discoverable by a pi maker.
+  [ -d "$t/wt/.agents/skills/gamma" ] || { echo "FAIL: .agents/skills/gamma (pi-visible path) not synced"; fails=1; }
+  diff -q "$t/primary/.agents/skills/gamma/SKILL.md" "$t/wt/.agents/skills/gamma/SKILL.md" >/dev/null \
+    || { echo "FAIL: .agents/skills/gamma content differs after sync"; fails=1; }
+
+  # zeta (.pi/skills/zeta) is synced -- the pi-only project skill convention this task adds coverage for.
+  [ -f "$t/wt/.pi/skills/zeta/SKILL.md" ] || { echo "FAIL: zeta (.pi/skills) not synced"; fails=1; }
+  diff -q "$t/primary/.pi/skills/zeta/SKILL.md" "$t/wt/.pi/skills/zeta/SKILL.md" >/dev/null \
+    || { echo "FAIL: zeta SKILL.md content differs after sync"; fails=1; }
 
   # delta (a dangling-symlink skill entry) is skipped gracefully -- absent from the worktree, warned
   # about clearly on stderr, and must NOT have aborted the rest of the run (alpha/gamma above still
@@ -343,10 +398,17 @@ _resolve_skill_symlink() {
   printf '%s\n' "$resolved"
 }
 
+# The set of skill-directory conventions this script backfills, each scanned at ANY depth under
+# $primary (monorepo-safe) via the identical resolution/security/idempotency logic below -- see the
+# header comment for why all three are needed (Claude Code only reads .claude/skills/; pi only reads
+# .pi/skills/ and .agents/skills/; .agents/skills/ is the one convention both read directly).
+_SKILL_DIR_PATTERNS=('*/.claude/skills' '*/.pi/skills' '*/.agents/skills')
+
 fails=0
+for _skill_dir_pattern in "${_SKILL_DIR_PATTERNS[@]}"; do
 while IFS= read -r -d '' skills_dir; do
-  # relparent is the path of this .claude/skills directory relative to $primary (e.g. ".claude/skills"
-  # or "some-subproject/.claude/skills") -- computed by substring, not shell pattern-matching, so any
+  # relparent is the path of this skills directory relative to $primary (e.g. ".claude/skills" or
+  # "some-subproject/.pi/skills") -- computed by substring, not shell pattern-matching, so any
   # glob-special characters that happen to appear in $primary itself can't corrupt the result.
   relparent="${skills_dir:$((${#primary} + 1))}"
   while IFS= read -r -d '' skill_dir; do
@@ -383,6 +445,7 @@ while IFS= read -r -d '' skills_dir; do
       fails=1
     fi
   done < <(find "$skills_dir" -mindepth 1 -maxdepth 1 \( -type d -o -type l \) -print0)
-done < <(find "$primary" -type d -path '*/.claude/skills' -print0)
+done < <(find "$primary" -type d -path "$_skill_dir_pattern" -print0)
+done
 
 exit "$fails"
