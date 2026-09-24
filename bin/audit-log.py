@@ -62,9 +62,13 @@ _INDEX_TITLE_MAX = 120
 
 
 def _truncate(text, max_len=_INDEX_TITLE_MAX):
+    """Truncate to AT MOST max_len characters total, ellipsis included -- reserve room for the "..."
+    within the cap rather than appending it on top, and floor at max_len itself for a very small cap
+    where there's no room left for an ellipsis at all."""
     if len(text) <= max_len:
         return text
-    return text[:max_len].rstrip() + "..."
+    keep = max(0, max_len - 3)
+    return (text[:keep].rstrip() + "...")[:max_len]
 
 
 def _audit_dir():
@@ -235,11 +239,14 @@ def _split_monolith_entries(text):
     entry HEADERS (lines matching _HEADER_RE), never by splitting on bare '---' lines -- a markdown
     horizontal rule is ordinary body text and can legitimately appear inside a real entry, so treating
     every '---' as a boundary would silently truncate that entry's own content. Each entry's content
-    runs from its own header line up to (but not including) the next header line, or EOF; a single
-    trailing '---'-only separator line (plus any blank lines around it) immediately before the next
-    header is stripped separately, since that belongs to the monolith's own formatting, not the entry.
-    Operates on `text` exactly as read (see cmd_migrate's newline="" open) so line endings inside the
-    body are preserved verbatim in the returned chunk_text."""
+    runs from its own header line up to (but not including) the next header line, or EOF. Only when
+    there IS a next entry is a trailing '---'-only separator line (plus surrounding blank lines)
+    immediately before that next header stripped, since THAT belongs to the monolith's own formatting,
+    not the entry -- for the LAST entry (no next header), everything from its own header to EOF is kept
+    exactly as sliced, since any trailing '---' or lack of a final newline there is the entry's own real
+    content/byte-shape, not a separator. Operates on `text` exactly as read (see cmd_migrate's
+    newline="" open) so line endings, and the presence or absence of a final newline, are preserved
+    verbatim in the returned chunk_text."""
     lines = text.splitlines(keepends=True)
     header_positions = []
     for i, line in enumerate(lines):
@@ -248,17 +255,17 @@ def _split_monolith_entries(text):
             header_positions.append((i, m.group(1), m.group(2)))
     entries = []
     for idx, (start, date, title) in enumerate(header_positions):
-        end = header_positions[idx + 1][0] if idx + 1 < len(header_positions) else len(lines)
+        has_next = idx + 1 < len(header_positions)
+        end = header_positions[idx + 1][0] if has_next else len(lines)
         chunk_lines = list(lines[start:end])
-        while chunk_lines and chunk_lines[-1].strip() == "":
-            chunk_lines.pop()
-        if chunk_lines and chunk_lines[-1].strip() == "---":
-            chunk_lines.pop()
+        if has_next:
             while chunk_lines and chunk_lines[-1].strip() == "":
                 chunk_lines.pop()
+            if chunk_lines and chunk_lines[-1].strip() == "---":
+                chunk_lines.pop()
+                while chunk_lines and chunk_lines[-1].strip() == "":
+                    chunk_lines.pop()
         chunk_text = "".join(chunk_lines)
-        if not chunk_text.endswith("\n"):
-            chunk_text += "\n"
         entries.append((date, title, chunk_text))
     return entries
 
@@ -558,6 +565,44 @@ def selfcheck():
         p_huge = _entry_path("flow", "2026-02-02", "huge-title-task")
         assert huge_title in p_huge.read_text(), "the full untruncated title must survive in the per-task file"
         assert huge_title not in index_text2, "INDEX.md must never render the full untruncated title"
+
+        # Checker round 2, bug 1: a trailing '---' on the LAST entry (no next header follows it) is
+        # that entry's own real body content, not a boundary separator, and must be preserved verbatim.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit9")
+        mono8 = os.path.join(tmpdir, "mono8.md")
+        with open(mono8, "w") as f:
+            f.write("# flow.md\n\n---\n## 2026-01-01 — final-rule\n\nmust-remain\n---\n")
+        code, out = _run(["migrate", "--type", "flow", "--file", mono8])
+        assert code == 0 and "migrated 1 entries" in out, out
+        p_final = _entry_path("flow", "2026-01-01", "final-rule")
+        assert p_final.exists(), f"expected {p_final}"
+        final_content = p_final.read_text()
+        assert final_content == "## 2026-01-01 — final-rule\n\nmust-remain\n---\n", (
+            f"a trailing '---' on the LAST entry must be preserved verbatim, not stripped as if it were "
+            f"a boundary separator: {final_content!r}")
+
+        # Checker round 2, bug 2: migrate must never add a trailing newline the source didn't have --
+        # that would grow the migrated file by one byte and break the byte-verbatim guarantee.
+        os.environ["SM_AUDIT_DIR"] = os.path.join(tmpdir, "audit10")
+        mono9 = os.path.join(tmpdir, "mono9.md")
+        no_final_nl_entry = "## 2026-01-02 — no-final-newline\n\nbody-without-final-newline"
+        with open(mono9, "w") as f:
+            f.write("# flow.md\n\n---\n" + no_final_nl_entry)
+        code, out = _run(["migrate", "--type", "flow", "--file", mono9])
+        assert code == 0 and "migrated 1 entries" in out, out
+        p_nonl = _entry_path("flow", "2026-01-02", "no-final-newline")
+        assert p_nonl.exists(), f"expected {p_nonl}"
+        raw_nonl = p_nonl.read_bytes()
+        assert raw_nonl == no_final_nl_entry.encode("utf-8"), (
+            f"migrate must never append a trailing newline the source's last entry didn't have: {raw_nonl!r}")
+
+        # Checker round 2, bug 3: _truncate must never return MORE than max_len characters total,
+        # ellipsis included -- it must reserve room for "..." within the cap, not append it on top.
+        for n in (2, 3, 5, 50, _INDEX_TITLE_MAX):
+            t = _truncate("x" * (n + 500), max_len=n)
+            assert len(t) <= n, f"_truncate(max_len={n}) must return at most {n} chars, got {len(t)}: {t!r}"
+        assert len(_truncate("x" * 121, max_len=120)) <= 120, (
+            "_truncate(max_len=120) must never return more than 120 characters")
 
         print("ok")
     finally:
