@@ -1205,9 +1205,13 @@ PYEOF
 # fix command -- no bespoke _heal_* function needed. Prints nothing (no auto-fix offered) if it is not
 # safe/unambiguous to do so: the name or prefix fails its safe-pattern check (defense in depth --
 # detect() already filtered this), the destination already exists as ANY kind of entry (never offers to
-# clobber), or the resolved real source escapes the repo root the same way bin/sync-worktree-skills.sh
+# clobber), the resolved real SOURCE escapes the repo root the same way bin/sync-worktree-skills.sh
 # already guards against for the identical reason (a symlink pointing outside the checkout must never
-# have its content copied anywhere).
+# have its content copied anywhere), or (checker round 2's real finding) an intermediate component of
+# the DESTINATION path escapes the repo root -- e.g. a symlinked <prefix>/.agents pointing outside the
+# checkout, which `mkdir -p`/`cp -R -p` would otherwise silently follow and write real content through,
+# even though dst/dst_parent themselves don't exist yet. Checking only the source side (round 1's fix)
+# left this second, independent escape route wide open.
 _skill_discovery_heal_fix() {
   local root="$1" prefix="$2" name="$3"
   [[ "$name" =~ $_SKILL_NAME_SAFE_RE ]] || return 0
@@ -1225,6 +1229,23 @@ _skill_discovery_heal_fix() {
   case "$resolved" in
     "$root_p"|"$root_p"/*) ;;   # inside the repo -- safe to offer
     *) return 0;;               # resolves outside the repo -- never offer (mirrors sync-worktree-skills.sh)
+  esac
+  # Destination containment check: an escape requires an ALREADY-EXISTING symlink somewhere along
+  # dst_parent's path (you cannot escape through a component that hasn't been created yet), so walk up
+  # from dst_parent to the nearest EXISTING ancestor (any entry type -- `-e` alone follows symlinks and
+  # would misreport a dangling one as absent, matching the `-e || -L` idiom used throughout this file)
+  # and resolve THAT via realpath -- it must stay inside root_p just like the source already must.
+  local dst_ancestor resolved_dst_ancestor
+  dst_ancestor="$dst_parent"
+  while [ "$dst_ancestor" != "/" ] && [ -n "$dst_ancestor" ] \
+        && ! { [ -e "$dst_ancestor" ] || [ -L "$dst_ancestor" ]; }; do
+    dst_ancestor="$(dirname "$dst_ancestor")"
+  done
+  resolved_dst_ancestor="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$dst_ancestor" 2>/dev/null)"
+  [ -n "$resolved_dst_ancestor" ] || return 0
+  case "$resolved_dst_ancestor" in
+    "$root_p"|"$root_p"/*) ;;   # inside the repo -- safe to offer
+    *) return 0;;               # an existing destination-path component escapes the repo -- never offer
   esac
   printf 'if [ -e %q ] || [ -L %q ]; then echo "already exists, skipping" >&2; else mkdir -p %q && cp -R -p %q %q; fi' \
     "$dst" "$dst" "$dst_parent" "$resolved" "$dst"
@@ -3637,6 +3658,16 @@ print('NOT_FOUND')
   mkdir -p "$d/packages/a/.claude/skills/dupe" "$d/packages/b/.claude/skills/dupe"
   echo "dupe in package a" > "$d/packages/a/.claude/skills/dupe/SKILL.md"
   echo "dupe in package b" > "$d/packages/b/.claude/skills/dupe/SKILL.md"
+  # leaky-dest: checker round 2's real, confirmed finding -- a genuinely safe, real, inside-repo SOURCE
+  # (packages/leakproj/.claude/skills/leaky-dest), but the DESTINATION's own intermediate path component
+  # (packages/leakproj/.agents) is itself a symlink resolving OUTSIDE the repo entirely. Round 1's fix
+  # only ever containment-checked the source; `mkdir -p`/`cp -R -p` both follow a symlinked intermediate
+  # destination component even though dst/dst_parent themselves don't exist yet, so this must be caught
+  # independently on the destination side or real content gets written outside the checkout.
+  mkdir -p "$d/packages/leakproj/.claude/skills/leaky-dest"
+  echo "leaky-dest real content (must NEVER leave the repo)" > "$d/packages/leakproj/.claude/skills/leaky-dest/SKILL.md"
+  external_dest_q="$(mktemp -d)"
+  ln -s "$external_dest_q" "$d/packages/leakproj/.agents"
 
   # isolate from the REAL installed secondmate plugin state (SM_SECONDMATE_MARKETPLACE_DIR/etc.) so
   # this test's --heal --yes never touches the real marketplace checkout or attempts a real network
@@ -3702,6 +3733,20 @@ for x in data:
 " 2>/dev/null)
   [ -z "$leaky_fix" ] || { echo "FAIL: Test Q leaky should have no auto-fix (outside-repo symlink), got '$leaky_fix'"; rm -rf "$d"; exit 1; }
 
+  # leaky-dest: a genuinely SAFE, real, inside-repo source, but the DESTINATION's own intermediate
+  # component escapes the repo -- must still be reported as MISSING (not silently OK, not a crash), and
+  # must carry no auto-fix, exactly like the source-side leaky case above (checker round 2's own
+  # accepted equivalent-outcome standard: never silently claim success while doing nothing).
+  q_check "skill discovery: packages/leakproj/leaky-dest (not visible to pi)" MISSING
+  leaky_dest_fix=$(echo "$out_json" | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+for x in data:
+    if x['name']=='skill discovery: packages/leakproj/leaky-dest (not visible to pi)':
+        print(x['fix']); sys.exit(0)
+" 2>/dev/null)
+  [ -z "$leaky_dest_fix" ] || { echo "FAIL: Test Q leaky-dest should have no auto-fix (outside-repo DESTINATION symlink), got '$leaky_dest_fix'"; rm -rf "$d"; exit 1; }
+
   # run --heal --yes: bravo should get healed (real copy at .agents/skills/bravo), charlie/leaky left
   # untouched (no fix offered), and no sensitive content from the leaky symlink must ever appear anywhere.
   heal_out=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --heal --yes 2>&1)
@@ -3712,6 +3757,11 @@ for x in data:
   [ ! -e "$d/.agents/skills/leaky" ] || { echo "FAIL: Test Q leaky should never get a .agents/skills entry (outside-repo symlink)"; rm -rf "$d"; exit 1; }
   ! grep -rq 'SENSITIVE_Q' "$d/.agents" 2>/dev/null \
     || { echo "FAIL: Test Q SENSITIVE_Q (from outside the repo) leaked into .agents/skills"; rm -rf "$d"; exit 1; }
+
+  # leaky-dest: the whole point of checker round 2's finding -- the heal-fix (correctly not offered
+  # above) must never have run, so NOTHING was ever written into the externally-symlinked destination.
+  [ -z "$(find "$external_dest_q" -mindepth 1 2>/dev/null)" ] \
+    || { echo "FAIL: Test Q leaky-dest LEAKED real content into the external destination symlink target"; rm -rf "$d" "$external_dest_q"; exit 1; }
 
   # nested-only healed at its OWN subproject-relative path -- not at the repo root's .agents/skills/.
   [ -f "$d/packages/widget/.agents/skills/nested-only/SKILL.md" ] \
@@ -3757,12 +3807,16 @@ print('NOT_FOUND')
   q_check2 "skill discovery: packages/widget/nested-only (pi+claude)" OK
   q_check2 "skill discovery: packages/a/dupe (pi+claude)" OK
   q_check2 "skill discovery: packages/b/dupe (pi+claude)" OK
+  # leaky-dest must STILL be MISSING post-heal -- it was never (and must never be) actually healed.
+  q_check2 "skill discovery: packages/leakproj/leaky-dest (not visible to pi)" MISSING
 
   # mutation check: re-running the heal fix a second time (idempotent) must not error or duplicate.
   heal_out2=$(cd "$d" && GIT_CEILING_DIRECTORIES="$d" SM_SECONDMATE_MARKETPLACE_DIR="$d/.q-no-marketplace" SM_INSTALLED_PLUGINS_JSON="$d/.q-no-installed.json" SM_DOCTOR_LOCK_DIR="$q_lock_dir" "$script_abs" --heal --yes 2>&1)
   [ -f "$d/.agents/skills/bravo/SKILL.md" ] || { echo "FAIL: Test Q second heal run broke bravo"; rm -rf "$d"; exit 1; }
+  [ -z "$(find "$external_dest_q" -mindepth 1 2>/dev/null)" ] \
+    || { echo "FAIL: Test Q leaky-dest LEAKED into the external destination on the second heal run"; rm -rf "$d" "$external_dest_q"; exit 1; }
 
-  rm -rf "$d" "$external_q"
+  rm -rf "$d" "$external_q" "$external_dest_q"
 
   # === Test R: no project skills anywhere -> no skill discovery rows at all ===
   d=$(mktemp -d)
