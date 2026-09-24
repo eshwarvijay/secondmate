@@ -55,6 +55,18 @@
 # P1 above -- bounded at 3 total attempts, never on a hook/protected-branch rejection), no
 # rebase-in-place on refusal, no priority queue / fairness policy, no automatic stale-lock
 # expiry/steal, single machine only.
+#
+# Accepted limitation (documented, not chased further): if $repo has an executable 'pre-push'
+# hook installed (checked via _repo_has_pre_push_hook, respecting core.hooksPath), P1's push-race
+# auto-recovery is disabled ENTIRELY for that repo -- every push failure is reported as PUSH_FAILED,
+# never retried, even a genuine one. A LOCAL pre-push hook runs client-side, before git ever
+# attempts the network-level push, so its stderr has no "remote: " relay prefix or any other
+# structural marker distinguishing it from git's own client-generated race text -- unlike a
+# server-side hook (pre-receive/update), which is always relayed through that exact, un-spoofable
+# prefix. There is no text pattern that can safely tell "genuine race" from "pre-push hook's own
+# arbitrary message" apart in that case, so this trades away auto-recovery specifically for repos
+# with a local pre-push hook installed, in exchange for never retrying (and thereby hiding) a
+# permanent policy rejection. A human can always retry the push manually in that case.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1310,6 +1322,56 @@ GITSHIM
   [ -f "$primary36/file.txt" ] && grep -q "feature-36a" "$primary36/file.txt" || { echo "FAIL: concurrent race-recovery test lost A's change"; fails=1; }
   [ -f "$primary36/other-file-36.txt" ] && grep -q "feature-36b" "$primary36/other-file-36.txt" || { echo "FAIL: concurrent race-recovery test lost B's change"; fails=1; }
 
+  # ---- Test 37: (P1) CRITICAL negative test -- a LOCAL 'pre-push' hook (client-side, runs BEFORE
+  # git ever attempts the network-level push at all) whose message happens to say
+  # "(incorrect old value provided)" verbatim must still be PUSH_FAILED, never a ref-lock race.
+  # Unlike a server-side hook, pre-push's stderr has NO "remote: " relay prefix (or any other
+  # marker) at all -- verified empirically -- so _client_lines_only's filter can't help here; the
+  # fix is a filesystem-level check (_repo_has_pre_push_hook), not another text pattern. ----
+  IFS='|' read -r origin37 primary37 <<<"$(_setup_repo 37)"
+  cat > "$primary37/.git/hooks/pre-push" <<'HOOKEOF'
+#!/bin/sh
+echo "(incorrect old value provided)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$primary37/.git/hooks/pre-push"
+  git -C "$primary37" worktree add -q "$t/wt37" -b sm/local-prepush-reflock main
+  echo "feature-p37" >> "$t/wt37/file.txt"
+  git -C "$t/wt37" commit -qam "feature p37"
+  sha37="$(git -C "$t/wt37" rev-parse HEAD)"
+  out37="$(_ms --repo "$primary37" --worktree "$t/wt37" --branch sm/local-prepush-reflock --base main --checked-sha "$sha37" --wait-timeout 5 2>&1)"
+  rc37=$?
+  [ "$rc37" -eq 4 ] || { echo "FAIL: local pre-push hook spoofing the ref-lock-race parenthetical expected rc=4, got $rc37: $out37"; fails=1; }
+  echo "$out37" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out37"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-reflock PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (local pre-push hook, no server contact at all)"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-reflock PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: local pre-push hook rejection was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-reflock PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: local pre-push hook rejection was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact local-hook spoofing bug this test guards"; fails=1; }
+
+  # ---- Test 38: (P1) CRITICAL negative test -- the SAME local 'pre-push' hook gap, but for the
+  # PLAIN keyword race check (_is_race), not the ref-lock parenthetical -- a hook message
+  # containing an ordinary race-shaped word ("behind") with none of _is_hook_rejection's own
+  # keywords, and no "remote: " framing, must also stay PUSH_FAILED. This is a distinct sibling
+  # bug from Test 37 (different classifier function), independently confirmed real before fixing:
+  # a bare "_repo_has_pre_push_hook" guard on _is_ref_lock_race alone did NOT close this one. ----
+  IFS='|' read -r origin38 primary38 <<<"$(_setup_repo 38)"
+  cat > "$primary38/.git/hooks/pre-push" <<'HOOKEOF'
+#!/bin/sh
+echo "your branch appears behind our compliance baseline, contact IT" >&2
+exit 1
+HOOKEOF
+  chmod +x "$primary38/.git/hooks/pre-push"
+  git -C "$primary38" worktree add -q "$t/wt38" -b sm/local-prepush-keyword main
+  echo "feature-p38" >> "$t/wt38/file.txt"
+  git -C "$t/wt38" commit -qam "feature p38"
+  sha38="$(git -C "$t/wt38" rev-parse HEAD)"
+  out38="$(_ms --repo "$primary38" --worktree "$t/wt38" --branch sm/local-prepush-keyword --base main --checked-sha "$sha38" --wait-timeout 5 2>&1)"
+  rc38=$?
+  [ "$rc38" -eq 4 ] || { echo "FAIL: local pre-push hook keyword collision expected rc=4, got $rc38: $out38"; fails=1; }
+  echo "$out38" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out38"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-keyword PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (local pre-push hook, plain-keyword collision)"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-keyword PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: local pre-push hook keyword collision was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-keyword PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: local pre-push hook keyword collision was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact sibling spoofing bug this test guards"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -1562,14 +1624,30 @@ if [ "$push_rc" -ne 0 ]; then
   # matched the literal words "cannot lock ref" anywhere in the raw output (fooled by a hook
   # message containing that exact phrase as ordinary policy English); the NEXT revision narrowed
   # to the "(incorrect old value provided)" parenthetical but still searched the whole raw blob,
-  # which a hook can ALSO spoof by printing that exact string itself -- verified empirically: a
-  # hook's own attempt to print "(incorrect old value provided)" (or even a full fake "!
-  # [remote rejected] ... (incorrect old value provided)" line) still gets git's normal "remote: "
-  # relay prefix, and git's REAL client-generated summary line (never "remote: "-prefixed, and
-  # always reflecting the TRUE reason regardless of what the hook printed) appears as a SEPARATE
-  # line alongside it. Filtering out every "remote: "-prefixed line before matching closes this
-  # for good: nothing a hook prints to its own stdout/stderr can ever appear on a non-"remote: "
-  # line, since every byte a hook produces is relayed through that exact prefix mechanism.
+  # which a SERVER-SIDE hook can ALSO spoof by printing that exact string itself -- verified
+  # empirically: a server-side hook's own attempt to print "(incorrect old value provided)" (or
+  # even a full fake "! [remote rejected] ... (incorrect old value provided)" line) still gets
+  # git's normal "remote: " relay prefix, and git's REAL client-generated summary line (never
+  # "remote: "-prefixed) appears as a SEPARATE line alongside it. Filtering out every
+  # "remote: "-prefixed line closes THAT class -- but a LOCAL 'pre-push' hook runs entirely
+  # client-side, BEFORE git ever attempts the network-level push at all, so its stderr has no
+  # "remote: " relay prefix (or ANY other distinguishing marker) whatsoever: verified empirically
+  # that its output is indistinguishable in shape from git's own client-generated text. Since
+  # 'pre-push' rejecting means the push never reached the server (the genuine ref-CAS failure this
+  # check exists to recognize is architecturally impossible to also have occurred in that same
+  # invocation), the correct fix is a filesystem-level check, not another text pattern: if $repo
+  # has an executable pre-push hook installed (respecting core.hooksPath, not just the default
+  # .git/hooks/ location), never trust ANY text match here -- fall through to the hook-rejection/
+  # plain-race checks below instead, which report PUSH_FAILED rather than misclassifying.
+  _repo_has_pre_push_hook() {
+    local hooks_dir
+    hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)" || return 1
+    case "$hooks_dir" in
+      /*) : ;;
+      *) hooks_dir="$repo/$hooks_dir" ;;
+    esac
+    [ -x "$hooks_dir/pre-push" ]
+  }
   _client_lines_only() {
     local out="" line
     while IFS= read -r line || [ -n "$line" ]; do
@@ -1581,6 +1659,7 @@ if [ "$push_rc" -ne 0 ]; then
     printf '%s' "$out"
   }
   _is_ref_lock_race() {
+    _repo_has_pre_push_hook && return 1
     local client_only
     client_only="$(_client_lines_only "$1")"
     case "$client_only" in
@@ -1613,7 +1692,17 @@ if [ "$push_rc" -ne 0 ]; then
     shopt -u nocasematch
     return "$rc"
   }
+  # SAME '_repo_has_pre_push_hook' guard as '_is_ref_lock_race' above, for the SAME reason via a
+  # DIFFERENT sibling path: a LOCAL 'pre-push' hook's arbitrary message can ALSO coincidentally
+  # contain one of the plain race keywords below (e.g. "your branch appears behind our compliance
+  # baseline") -- verified empirically -- and unlike a server-side hook, this message has neither
+  # "remote: " framing nor any of _is_hook_rejection's literal keywords for that check to catch
+  # first, so it fell straight through to this bare keyword match. A local pre-push hook's stderr
+  # is structurally indistinguishable from git's own client-generated race text (no relay prefix,
+  # no boundary marker of any kind), so once a pre-push hook is known to be installed, no text
+  # pattern here can be trusted -- this is the honest, conservative fix, not another point-patch.
   _is_race() {
+    _repo_has_pre_push_hook && return 1
     local re='(behind|fast[- ]?forward|stale info|fetch first|contains work that you do not have)'
     local rc
     shopt -s nocasematch
