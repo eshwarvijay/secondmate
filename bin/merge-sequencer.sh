@@ -1466,6 +1466,67 @@ GITSHIM
   [ "$attempt_count40" = "2" ] || { echo "FAIL: expected exactly 2 push attempts (a hook installed mid-recovery must stop the loop, not burn an unauthorized 3rd push), got $attempt_count40"; fails=1; }
   [ "$(_ledger_count sm/mid-recovery-hook PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: hook installed mid-recovery was wrongly classified as PUSH_RACE_RECOVERED -- the exact TOCTOU bug this test guards"; fails=1; }
 
+  # ---- Test 41: (P2) --preflight-only's own 'git fetch origin' failing (network/permissions)
+  # must exit 7, read-only, no side effects -- an existing, correct code path with zero prior
+  # selfcheck coverage. ----
+  IFS='|' read -r origin41 primary41 <<<"$(_setup_repo 41)"
+  git -C "$primary41" worktree add -q "$t/wt41" -b sm/preflight-fetch-fail main
+  echo "feature-p41" >> "$t/wt41/file.txt"
+  git -C "$t/wt41" commit -qam "feature p41"
+  sha41="$(git -C "$t/wt41" rev-parse HEAD)"
+  git -C "$primary41" remote set-url origin "$t/nonexistent-origin-41"
+  main_before41="$(git -C "$primary41" rev-parse main)"
+  out41="$(_ms --repo "$primary41" --worktree "$t/wt41" --branch sm/preflight-fetch-fail --base main --checked-sha "$sha41" --preflight-only --wait-timeout 5 2>&1)"
+  rc41=$?
+  [ "$rc41" -eq 7 ] || { echo "FAIL: preflight fetch failure expected rc=7, got $rc41: $out41"; fails=1; }
+  echo "$out41" | grep -qi "failed to fetch" || { echo "FAIL: expected a 'failed to fetch' message, got: $out41"; fails=1; }
+  main_after41="$(git -C "$primary41" rev-parse main)"
+  [ "$main_after41" = "$main_before41" ] || { echo "FAIL: preflight fetch failure advanced main when it should be read-only"; fails=1; }
+  [ -z "$(git -C "$primary41" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight fetch failure left the working tree dirty"; fails=1; }
+  [ ! -d "$primary41/.secondmate/merge-sequencer.lock" ] || { echo "FAIL: preflight fetch failure created a lock directory"; fails=1; }
+
+  # ---- Test 42: (P1) the recovery loop's OWN 'git fetch origin' call (inside the retry loop,
+  # before the recovery merge) failing must exit 4 with PUSH_RACE_EXHAUSTED, retaining the local
+  # merge commit -- an existing, correct code path with zero prior selfcheck coverage. ----
+  IFS='|' read -r origin42 primary42 <<<"$(_setup_repo 42)"
+  git -C "$primary42" worktree add -q "$t/wt42" -b sm/recovery-fetch-fail main
+  echo "feature-p42" >> "$t/wt42/file.txt"
+  git -C "$t/wt42" commit -qam "feature p42"
+  sha42="$(git -C "$t/wt42" rev-parse HEAD)"
+  main_before42="$(git -C "$primary42" rev-parse main)"
+  fake_git_dir42="$t/fake-git-42"
+  mkdir -p "$fake_git_dir42"
+  real_git_path42="$(command -v git)"
+  cat > "$fake_git_dir42/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path42"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "! [rejected]  main -> main (fetch first)" >&2
+  exit 1
+elif [ "\$sub" = "fetch" ]; then
+  echo "fatal: unable to access origin: simulated network failure" >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir42/git"
+  out42="$(PATH="$fake_git_dir42:$PATH" _ms --repo "$primary42" --worktree "$t/wt42" --branch sm/recovery-fetch-fail --base main --checked-sha "$sha42" --wait-timeout 5 2>&1)"
+  rc42=$?
+  [ "$rc42" -eq 4 ] || { echo "FAIL: recovery fetch failure expected rc=4, got $rc42: $out42"; fails=1; }
+  echo "$out42" | grep -qi "failed to fetch origin before attempt" || { echo "FAIL: expected a 'failed to fetch origin before attempt' message, got: $out42"; fails=1; }
+  main_after42="$(git -C "$primary42" rev-parse main)"
+  [ "$main_after42" != "$main_before42" ] || { echo "FAIL: local merge commit was not retained despite the recovery fetch failing"; fails=1; }
+  [ "$(_ledger_count sm/recovery-fetch-fail PUSH_RACE_EXHAUSTED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record for a recovery fetch failure"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
