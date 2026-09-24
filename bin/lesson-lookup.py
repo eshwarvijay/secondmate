@@ -55,10 +55,14 @@ _SCRIPT_PATH = os.path.abspath(__file__)
 _TASK_ID_RE = re.compile(r'\A[A-Za-z0-9_-]{1,128}\Z')
 
 # lesson-id is a '/'-joined relative path (no extension) under lessons_dir, e.g. "workflow/commit-before-done".
-# Each '/'-separated segment is restricted to the same charset as a task-id, and no segment may be
-# empty/'.'/'..' -- this is used to resolve a real file path (the `tag` subcommand), so it gets the
-# same path-traversal-safe validation discipline as claim-ledger.py's task-id, generalized for '/'.
-_LESSON_ID_RE = re.compile(r'\A[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*\Z')
+# Each '/'-separated segment is restricted to the same charset AND length as a task-id ({1,128}), and no
+# segment may be empty/'.'/'..' -- this is used to resolve a real file path (the `tag` subcommand), so it
+# gets the same path-traversal-safe validation discipline as claim-ledger.py's task-id, generalized for
+# '/'. Bounded PER SEGMENT (not total length): a lesson-id's segments are each semantically the same kind
+# of identifier a bare task-id is (this repo's real lesson-ids are short, e.g. 2 segments), so the natural
+# bound is claim-ledger.py's existing 1-128-char precedent applied to each component, not a separate,
+# unprecedented total-path-length limit.
+_LESSON_ID_RE = re.compile(r'\A[A-Za-z0-9_-]{1,128}(?:/[A-Za-z0-9_-]{1,128})*\Z')
 
 
 def _split_frontmatter(content):
@@ -474,20 +478,29 @@ def cmd_tag(argv):
     if path is None:
         sys.stderr.write(f"tag: invalid or out-of-bounds --lesson-id {lesson_id_arg!r}\n")
         return 2
-    if not path.is_file():
-        sys.stderr.write(f"tag: no lesson file found for --lesson-id {lesson_id_arg!r} ({path})\n")
-        return 1
 
-    content = path.read_text(encoding='utf-8')
-    fm_text, body = _split_frontmatter(content)
-    if fm_text is None:
-        sys.stderr.write(f"tag: {path} has no parseable frontmatter\n")
-        return 1
+    # The read-increment-write cycle below is a real lost-update race without a lock: two concurrent
+    # `tag` calls against the SAME lesson file (plausible now that a few sub-supervisors can run
+    # concurrently and reach their own task-close tagging step around the same time) can both read the
+    # same pre-increment count, both compute the same +1, and one overwrite silently clobbers the
+    # other's -- reproduced directly (20 concurrent calls landing well under 20 on a shared counter).
+    # Locked on the lesson file's own path, same fcntl idiom as hold.py/claim-ledger.py/this file's own
+    # _ledger_lock() -- reused as-is rather than inventing a second locking mechanism.
+    with _ledger_lock(path):
+        if not path.is_file():
+            sys.stderr.write(f"tag: no lesson file found for --lesson-id {lesson_id_arg!r} ({path})\n")
+            return 1
 
-    field = 'helpful_count' if outcome == 'helpful' else 'harmful_count'
-    new_fm_text, new_val = _increment_frontmatter_count(fm_text, field)
-    new_content = '---\n' + new_fm_text + '\n---\n' + body
-    _atomic_write(path, new_content)
+        content = path.read_text(encoding='utf-8')
+        fm_text, body = _split_frontmatter(content)
+        if fm_text is None:
+            sys.stderr.write(f"tag: {path} has no parseable frontmatter\n")
+            return 1
+
+        field = 'helpful_count' if outcome == 'helpful' else 'harmful_count'
+        new_fm_text, new_val = _increment_frontmatter_count(fm_text, field)
+        new_content = '---\n' + new_fm_text + '\n---\n' + body
+        _atomic_write(path, new_content)
 
     print(f"tagged {lesson_id_arg} as {outcome} ({field}={new_val})")
     return 0
@@ -998,10 +1011,15 @@ A body paragraph that must survive byte-for-byte across a tag edit.
             no_counts_fm = {'evidence': 'E4'}
             assert _counts(no_counts_fm) == (0, 0), "missing counts must default to (0, 0)"
 
-            # path-traversal / out-of-bounds lesson-ids are rejected, never touching any file.
-            for bad_id in ('../etc/passwd', '/etc/passwd', 'sub/../../../etc/passwd', '', 'bad id', 'a//b'):
+            # path-traversal / out-of-bounds lesson-ids are rejected, never touching any file. Includes
+            # a per-segment length bound matching claim-ledger.py's own task-id precedent (1-128 chars):
+            # a 129-char segment must be rejected, a 128-char segment is the accepted boundary.
+            for bad_id in ('../etc/passwd', '/etc/passwd', 'sub/../../../etc/passwd', '', 'bad id', 'a//b',
+                            'a' * 129, 'sub/' + 'b' * 129):
                 rc = cmd_tag(['--lesson-id', bad_id, '--outcome', 'helpful'])
                 assert rc != 0, f"bad lesson-id {bad_id!r} should be rejected"
+            assert _resolve_lesson_path(tmpdir, 'a' * 129) is None, "a 129-char segment must be rejected"
+            assert _resolve_lesson_path(tmpdir, 'a' * 128) is not None, "a 128-char segment is the accepted boundary"
 
             # unknown lesson-id (valid shape, no such file) -> nonzero, no crash.
             rc = cmd_tag(['--lesson-id', 'sub/does-not-exist', '--outcome', 'helpful'])
@@ -1014,6 +1032,51 @@ A body paragraph that must survive byte-for-byte across a tag edit.
             shutil.rmtree(tmpdir, ignore_errors=True)
             if 'SM_LESSONS_DIR' in os.environ:
                 del os.environ['SM_LESSONS_DIR']
+
+    # Test 11: `tag` against the SAME lesson file from many REAL, genuinely concurrent processes must
+    # not lose updates. In-process serial calls to cmd_tag() can never exercise this -- they can't race
+    # with themselves -- so this spawns real subprocesses via subprocess.Popen (started without waiting,
+    # so their launches actually overlap) against the real CLI entrypoint, the same way
+    # test_default_ledger_anchoring() above exercises the real CLI rather than calling functions directly.
+    def test_tag_subcommand_concurrent_race():
+        tmpdir = _tempfile.mkdtemp(prefix='lesson-selfcheck-')
+        try:
+            (pathlib.Path(tmpdir) / 'sub').mkdir()
+            original = """---
+tags:
+  - maker
+evidence: E4
+earned-in: seed
+---
+
+race target lesson.
+"""
+            fpath = pathlib.Path(tmpdir) / 'sub' / 'race.md'
+            fpath.write_text(original)
+
+            env = {k: v for k, v in os.environ.items()}
+            env['SM_LESSONS_DIR'] = tmpdir
+
+            n = 20
+            procs = [
+                subprocess.Popen(
+                    [sys.executable, _SCRIPT_PATH, 'tag', '--lesson-id', 'sub/race', '--outcome', 'helpful'],
+                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                for _ in range(n)
+            ]
+            for p in procs:
+                rc = p.wait(timeout=30)
+                _, err = p.communicate()
+                assert rc == 0, f"a concurrent tag call failed with rc={rc}: {err}"
+
+            content = fpath.read_text()
+            fm, _body = parse_frontmatter(content)
+            assert fm.get('helpful_count') == str(n), (
+                f"expected helpful_count == {n} after {n} genuinely concurrent tag calls with no lost "
+                f"updates, got {fm.get('helpful_count')!r} -- this is exactly the read-increment-write "
+                f"lost-update race the per-lesson-file lock exists to close")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     # Run all tests
     import os, io
@@ -1029,6 +1092,7 @@ A body paragraph that must survive byte-for-byte across a tag edit.
     test_logging_failure_is_fail_open()
     test_default_ledger_anchoring()
     test_tag_subcommand()
+    test_tag_subcommand_concurrent_race()
 
     # Test 10: All 4 real shipped seed files parse correctly and are evidence:E4
     def test_real_seed_files():
