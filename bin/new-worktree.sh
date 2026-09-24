@@ -19,7 +19,11 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # no-op ':' still printed 'ok' here, because nothing asserted the synced skill's presence).
   mkdir -p "$t/proj/.claude/skills/wiring-check"
   echo "wiring-check content" > "$t/proj/.claude/skills/wiring-check/SKILL.md"
-  echo '**/.claude/skills/' > "$t/proj/.gitignore"
+  # a pi-only project skill fixture too, so this selfcheck also exercises sync-worktree-skills.sh's
+  # pi-visibility sync (.pi/skills/), not just its original .claude/skills/ scope.
+  mkdir -p "$t/proj/.pi/skills/pi-wiring-check"
+  echo "pi wiring-check content" > "$t/proj/.pi/skills/pi-wiring-check/SKILL.md"
+  printf '**/.claude/skills/\n**/.pi/skills/\n' > "$t/proj/.gitignore"
   git -C "$t/proj" add -A; git -C "$t/proj" commit -qm init
   fails=0
   rc=0; "$0" --repo "$t/proj" --task 'x/../../escape' >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: traversal task not rejected ($rc)"; fails=1; }
@@ -30,6 +34,8 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # above -- not a mock, not a separate reimplementation of the sync logic.
   [ -f "$t/wts/proj-good/.claude/skills/wiring-check/SKILL.md" ] \
     || { echo "FAIL: sync-worktree-skills.sh wiring broken -- gitignored .claude/skills/wiring-check not present in the new worktree"; fails=1; }
+  [ -f "$t/wts/proj-good/.pi/skills/pi-wiring-check/SKILL.md" ] \
+    || { echo "FAIL: sync-worktree-skills.sh wiring broken -- gitignored .pi/skills/pi-wiring-check not present in the new worktree"; fails=1; }
   rm -rf "$t"; [ "$fails" = 0 ] && echo ok; exit "$fails"
 fi
 
