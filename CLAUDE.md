@@ -2,8 +2,11 @@
 
 ## Audit trail (auto-loaded each session)
 
-@audit/flow.md
-@audit/decision.md
+@audit/INDEX.md
+
+That index is generated and bounded (most recent entries only) — never hand-edit it. Full history is
+one file per task under `audit/flow/` and `audit/decision/`; look it up on demand with
+`bin/audit-log.py list|search|show`, never by loading it in bulk.
 
 ## Docs must stay in sync with code
 

@@ -63,7 +63,7 @@ flowchart TD
     HD -->|hold or abandon| STOP([stop])
     MS --> INT[integrate]
     INT --> TD[Teardown: close panes, worktree, branch]
-    TD --> AU[Audit trail: flow.md, decision.md]
+    TD --> AU[Audit trail: audit-log.py add -> per-task file + INDEX.md]
     AU --> Cap
 ```
 
@@ -255,13 +255,16 @@ Each stage exists to close a specific failure mode.
    a task's per-task teardown — sibling tasks may still be running and need sleep prevention.
    *See the Roles section above for the session guard lifecycle.*
 
-9. **Audit trail.** After teardown, append to `audit/flow.md` (orchestration: maker path, models, rounds,
-   outcome) and `audit/decision.md` (what the maker decided, checker findings, gates auto-approved or
-   escalated) in the **primary checkout** — not the worktree, so no commit advances the checked SHA.
-   Both files are `@`-imported in `CLAUDE.md` and auto-loaded into every session as living context.
-   `audit/metrics.jsonl` (via `log-round.sh`, step 4) accumulates alongside them as the structured
-   counterpart — same append-only convention, but one JSON line per round instead of prose per task.
-   Commit separately. Skip for trivial one-shot edits.
+9. **Audit trail.** After teardown, in the **primary checkout** — not the worktree, so no commit advances
+   the checked SHA — file one entry per task via `bin/audit-log.py add --type flow ...` (orchestration:
+   maker path, models, rounds, outcome) and `bin/audit-log.py add --type decision ...` (what the maker
+   decided, checker findings, gates auto-approved or escalated). Each entry is written verbatim to its own
+   file under `audit/flow/<task>.md`/`audit/decision/<task>.md` — a lookup-only structure, never appended
+   to a monolith. Only the generated, size-capped `audit/INDEX.md` (last N entries per type) is `@`-imported
+   in `CLAUDE.md` and auto-loaded into every session; full history is retrieved on demand with
+   `bin/audit-log.py list|search|show`, never loaded in bulk. `audit/metrics.jsonl` (via `log-round.sh`,
+   step 4) accumulates alongside them as the structured counterpart — same append-only convention, but one
+   JSON line per round instead of one file per task. Commit separately. Skip for trivial one-shot edits.
 
 ## Scope guard
 
@@ -485,6 +488,7 @@ future task, not part of this one.
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, optional cost/duration |
+| `bin/audit-log.py` | lookup-only audit trail: `add` writes one task's flow/decision entry verbatim to its own file under `audit/flow/`/`audit/decision/` and regenerates `audit/INDEX.md`, a generated manifest capped at the most recent N entries per type (the only thing `@`-imported into `CLAUDE.md`); `list`/`search`/`show` retrieve full, uncapped history on demand; `migrate` one-time-splits an existing monolithic file into per-task files, verbatim and idempotently; task-id-derived filenames are sanitized against path traversal, matching `claim-ledger.py`'s precedent |
 | `bin/caffeinate-guard.sh` | macOS sleep prevention during session execution — single session-scoped guard process, PID identity verification, bounded TTL ceiling, idempotent start/stop |
 | `bin/lesson-lookup.py` | retrieves known failure patterns from the lesson store as a retrievable checklist; reads `bin/lessons/**/*.md` with YAML-shaped frontmatter, scores non-E4 lessons by term overlap, always includes E4 (proven-core) lessons, outputs the exact header `## Known failure patterns — DO NOT SKIP` with selected lessons as bullets; falls back to original 4 seed lessons if the store is unavailable |
 | `bin/lessons/` | directory of failure pattern lessons in Markdown with frontmatter (`tags`, `evidence: E4`, `earned-in: seed`) |
