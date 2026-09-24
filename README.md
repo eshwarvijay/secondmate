@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.30-4C8BF5?style=flat-square" alt="version 0.1.30" />
+  <img src="https://img.shields.io/badge/version-0.1.31-4C8BF5?style=flat-square" alt="version 0.1.31" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -107,7 +107,8 @@ flowchart LR
 | `bin/lessons/debugging/` | Subdirectory for debugging-related lessons |
 | `bin/lessons/testing/` | Subdirectory for testing-related lessons |
 | `bin/lessons/workflow/` | Subdirectory for workflow-related lessons |
-| `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the free-text `audit/flow.md`/`audit/decision.md` |
+| `bin/log-round.sh` | Appends one structured JSONL record per checker round to `audit/metrics.jsonl` (task, round, maker, verdict, finding-category tags, optional cost/duration) — queryable alongside the per-task audit entries below |
+| `bin/audit-log.py` | Lookup-only audit trail so the flow/decision history never auto-loads unboundedly: `add` writes one task's entry verbatim to its own file under `audit/flow/`/`audit/decision/`, then regenerates a size-capped `audit/INDEX.md` (last N entries per type — the only thing `@`-imported into `CLAUDE.md`); `list`/`search`/`show` retrieve full history on demand, never in bulk; `migrate` one-time-splits an existing monolithic file into per-task files, verbatim and idempotently; sanitizes task-id-derived filenames against path traversal (same precedent as `bin/claim-ledger.py`) |
 | `bin/caffeinate-guard.sh` | Prevents macOS sleep during session execution via `start`/`stop` commands; session-scoped single guard process with PID verification and bounded -t TTL ceiling; idempotent (safe to call multiple times); **accepted limitation: host-wide singleton = multiple concurrent sessions on same machine not supported** |
 | `bin/herdr-pane.sh` | When in [herdr](https://herdr.dev/): `spawn` starts any maker (Claude or pi) as a lifecycle-tracked agent and returns `<name> <pane_id>` for cleanup, marking its worktree for `scope-guard.py`; checker runs via `herdr pane run` + `pane wait-output` with a per-round unique marker |
 | `bin/doctor.sh` | Pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects AWS Bedrock model-metadata overrides (kimi-k3, deepseek-r1 maxTokens values) for pi's local models.json and fixes them; detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals. |
@@ -194,6 +195,7 @@ credentials only you can supply.
 | `SM_CAFFEINATE_ROOT` | `~/.secondmate-caffeinate` | where `caffeinate-guard.sh` stores the session-scoped guard PID file (PID + fingerprint) |
 | `SM_MAKER_ALLOW_CREDS` | unset | set to `1` inside a maker session to opt in to credential-store commands (Keychain `security`, `gh auth`) that `scope-guard.py` otherwise denies |
 | `SM_METRICS_LEDGER` | `./audit/metrics.jsonl` | append-only per-round metrics ledger written by `bin/log-round.sh` |
+| `SM_AUDIT_DIR` | `./audit` | root directory for `bin/audit-log.py`'s per-task entries (`audit/flow/`, `audit/decision/`) and the generated `audit/INDEX.md` — always run from the primary checkout per the skill's own instruction, so a CWD-relative default is correct |
 | `SM_MERGE_LEDGER` | `<repo>/audit/merge-ledger.jsonl` | append-only per-attempt merge ledger written by `bin/merge-sequencer.sh` (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`/`LOCK_TIMEOUT`); like the lock, anchored to `--repo` by default so every caller targeting the same `--repo` writes to the same ledger |
 | `SM_LENS_COVERAGE_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `audit/lens-coverage.jsonl` -- the common-dir's parent when its own basename is `.git` (a normal repo/worktree), else the common-dir itself (a bare repo or a submodule) | lens-coverage ledger written by `bin/verdict.py` when `--lenses` is used, shared across every worktree of the same repo |
 
@@ -222,6 +224,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
   && bin/dispatch-report.py selfcheck && bin/launch-checker.sh --selfcheck \
   && bin/lesson-lookup.py selfcheck \
+  && bin/audit-log.py selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```
