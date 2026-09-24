@@ -58,11 +58,27 @@ _TASK_ID_RE = re.compile(r'\A[A-Za-z0-9_-]{1,128}\Z')
 # Each '/'-separated segment is restricted to the same charset AND length as a task-id ({1,128}), and no
 # segment may be empty/'.'/'..' -- this is used to resolve a real file path (the `tag` subcommand), so it
 # gets the same path-traversal-safe validation discipline as claim-ledger.py's task-id, generalized for
-# '/'. Bounded PER SEGMENT (not total length): a lesson-id's segments are each semantically the same kind
-# of identifier a bare task-id is (this repo's real lesson-ids are short, e.g. 2 segments), so the natural
-# bound is claim-ledger.py's existing 1-128-char precedent applied to each component, not a separate,
-# unprecedented total-path-length limit.
+# '/'. Bounded PER SEGMENT at 1-128 chars: a lesson-id's segments are each semantically the same kind of
+# identifier a bare task-id is (this repo's real lesson-ids are short, e.g. 2 segments), so claim-ledger.py's
+# existing 1-128-char precedent applies directly per component.
+#
+# The per-segment bound alone is NOT sufficient, though: many segments, each individually valid and
+# within the 128-char limit, still join (via '/') into an arbitrarily long overall string -- reproduced
+# directly, 40 segments of 128 chars each (every one individually legal) resolves to a filesystem path
+# long enough that the OS itself raises an unhandled OSError ("File name too long") from pathlib's own
+# .resolve() call in _resolve_lesson_path, before this regex or that function's own confinement check
+# ever gets a say. _resolve_lesson_path additionally caps the TOTAL lesson-id length (see
+# _LESSON_ID_MAX_LEN below) before ever touching the filesystem, closing that gap directly rather than
+# only reacting to whatever error the OS happens to raise for a given overlong construction.
 _LESSON_ID_RE = re.compile(r'\A[A-Za-z0-9_-]{1,128}(?:/[A-Za-z0-9_-]{1,128})*\Z')
+
+# Total lesson-id length cap, checked before the regex and before any filesystem operation. Real
+# lesson-ids are short (this repo's shipped ones are 2 segments, e.g. "workflow/commit-before-done", well
+# under 50 chars) -- 255 is generous headroom for legitimate growth while sitting far below any OS's own
+# path-length ceiling (macOS PATH_MAX=1024, Linux PATH_MAX=4096) even after joining onto lessons_dir's own
+# path and appending ".md". Matches the well-known NAME_MAX convention (max bytes in one path component
+# on most filesystems) as a familiar, safe constant, rather than inventing an arbitrary number.
+_LESSON_ID_MAX_LEN = 255
 
 
 def _split_frontmatter(content):
@@ -402,16 +418,22 @@ def main(argv=None):
 
 def _resolve_lesson_path(lessons_dir, lesson_id):
     """Resolve a --lesson-id to a real file path, strictly confined to lessons_dir. Rejects anything
-    not matching _LESSON_ID_RE (no '..' segments, no empty segments, no leading/trailing '/') AND
+    not matching _LESSON_ID_RE (no '..' segments, no empty segments, no leading/trailing '/'), anything
+    over _LESSON_ID_MAX_LEN total chars (checked FIRST, before the regex or any filesystem call --
+    otherwise-valid segments can still join into a path long enough for the OS itself to raise), AND
     double-checks the resolved path is actually still under lessons_dir (defense in depth against a
     symlink escape), the same layered posture scope-guard.py already uses for path confinement."""
-    if not lesson_id or not _LESSON_ID_RE.match(lesson_id):
+    if not lesson_id or len(lesson_id) > _LESSON_ID_MAX_LEN or not _LESSON_ID_RE.match(lesson_id):
         return None
     lessons_path = pathlib.Path(lessons_dir).resolve()
-    candidate = (lessons_path / (lesson_id + '.md')).resolve()
     try:
+        candidate = (lessons_path / (lesson_id + '.md')).resolve()
         candidate.relative_to(lessons_path)
-    except ValueError:
+    except (ValueError, OSError):
+        # ValueError: resolved outside lessons_path (symlink escape). OSError: defense-in-depth
+        # backstop for any OS-level path failure (e.g. a still-too-long resolved path on some other
+        # filesystem/platform combination the length cap above didn't anticipate) -- fails closed to
+        # the same clean "invalid lesson-id" rejection as every other bad case, never an unhandled crash.
         return None
     return candidate
 
@@ -486,21 +508,35 @@ def cmd_tag(argv):
     # other's -- reproduced directly (20 concurrent calls landing well under 20 on a shared counter).
     # Locked on the lesson file's own path, same fcntl idiom as hold.py/claim-ledger.py/this file's own
     # _ledger_lock() -- reused as-is rather than inventing a second locking mechanism.
-    with _ledger_lock(path):
-        if not path.is_file():
-            sys.stderr.write(f"tag: no lesson file found for --lesson-id {lesson_id_arg!r} ({path})\n")
-            return 1
+    #
+    # Outer OSError backstop: _resolve_lesson_path's own length cap is the primary defense against an
+    # overlong lesson-id, but it's not the only place an OS-level path error could still surface --
+    # reproduced directly, with the length cap removed, that the SAME overlong-path failure the cap
+    # exists to prevent doesn't necessarily raise inside _resolve_lesson_path's own .resolve() call at
+    # all (macOS's realpath() didn't error there); it instead surfaced one layer deeper, from
+    # _ledger_lock's own mkdir/stat on that same too-long path. Wrapping the whole tag operation in one
+    # OSError catch means ANY such failure -- from this exact cause or a different OS/filesystem
+    # combination the length cap didn't anticipate -- degrades to the same clean, controlled rejection
+    # every other invalid lesson-id already gets, never an unhandled traceback.
+    try:
+        with _ledger_lock(path):
+            if not path.is_file():
+                sys.stderr.write(f"tag: no lesson file found for --lesson-id {lesson_id_arg!r} ({path})\n")
+                return 1
 
-        content = path.read_text(encoding='utf-8')
-        fm_text, body = _split_frontmatter(content)
-        if fm_text is None:
-            sys.stderr.write(f"tag: {path} has no parseable frontmatter\n")
-            return 1
+            content = path.read_text(encoding='utf-8')
+            fm_text, body = _split_frontmatter(content)
+            if fm_text is None:
+                sys.stderr.write(f"tag: {path} has no parseable frontmatter\n")
+                return 1
 
-        field = 'helpful_count' if outcome == 'helpful' else 'harmful_count'
-        new_fm_text, new_val = _increment_frontmatter_count(fm_text, field)
-        new_content = '---\n' + new_fm_text + '\n---\n' + body
-        _atomic_write(path, new_content)
+            field = 'helpful_count' if outcome == 'helpful' else 'harmful_count'
+            new_fm_text, new_val = _increment_frontmatter_count(fm_text, field)
+            new_content = '---\n' + new_fm_text + '\n---\n' + body
+            _atomic_write(path, new_content)
+    except OSError as e:
+        sys.stderr.write(f"tag: OS error operating on --lesson-id {lesson_id_arg!r} ({e})\n")
+        return 1
 
     print(f"tagged {lesson_id_arg} as {outcome} ({field}={new_val})")
     return 0
@@ -1013,13 +1049,22 @@ A body paragraph that must survive byte-for-byte across a tag edit.
 
             # path-traversal / out-of-bounds lesson-ids are rejected, never touching any file. Includes
             # a per-segment length bound matching claim-ledger.py's own task-id precedent (1-128 chars):
-            # a 129-char segment must be rejected, a 128-char segment is the accepted boundary.
+            # a 129-char segment must be rejected, a 128-char segment is the accepted boundary. Also
+            # includes the exact real-world reproduction that crashed cmd_tag with an unhandled OSError
+            # before this fix: 40 segments, EACH individually valid and within the per-segment 128-char
+            # bound, joined with '/' -- a per-segment-only check lets this through, but the resulting
+            # resolved filesystem path is long enough for the OS itself to raise. Must now be a clean,
+            # controlled rejection (nonzero exit, no traceback) exactly like every other invalid case.
+            many_valid_segments = '/'.join(['a' * 128] * 40)
             for bad_id in ('../etc/passwd', '/etc/passwd', 'sub/../../../etc/passwd', '', 'bad id', 'a//b',
-                            'a' * 129, 'sub/' + 'b' * 129):
+                            'a' * 129, 'sub/' + 'b' * 129, many_valid_segments):
                 rc = cmd_tag(['--lesson-id', bad_id, '--outcome', 'helpful'])
                 assert rc != 0, f"bad lesson-id {bad_id!r} should be rejected"
             assert _resolve_lesson_path(tmpdir, 'a' * 129) is None, "a 129-char segment must be rejected"
             assert _resolve_lesson_path(tmpdir, 'a' * 128) is not None, "a 128-char segment is the accepted boundary"
+            assert _resolve_lesson_path(tmpdir, many_valid_segments) is None, (
+                "many individually-valid segments joined into an overlong overall lesson-id must be "
+                "rejected cleanly (via the total-length cap), never left to crash on an OS path error")
 
             # unknown lesson-id (valid shape, no such file) -> nonzero, no crash.
             rc = cmd_tag(['--lesson-id', 'sub/does-not-exist', '--outcome', 'helpful'])
