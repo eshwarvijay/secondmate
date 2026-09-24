@@ -43,8 +43,14 @@ import sys, os, re, argparse, pathlib, io, contextlib, tempfile, shutil
 _SCRIPT_PATH = os.path.abspath(__file__)
 
 # Same defensive posture as claim-ledger.py's _TASK_ID_RE: a task-id is a safe bare identifier, no path
-# separators, no null bytes, no empty string, bounded length.
-_TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+# separators, no null bytes, no empty string, bounded length. Lowercase-only (unlike claim-ledger.py's
+# task-id, which is never used to derive a filename) -- this repo's own real task-id convention is
+# already lowercase-kebab-case, and the filesystem underneath audit/<type>/ is case-INSENSITIVE (a
+# plain macOS default): two differently-cased task-ids would alias to the same physical file at the OS
+# level regardless of any case-normalization this script does, so the only real fix is closing the
+# collision at the validation gate, not trying to preserve an illusion of case-distinctness the
+# filesystem doesn't support.
+_TASK_ID_RE = re.compile(r"\A[a-z0-9_-]{1,128}\Z")
 _DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 _HEADER_RE = re.compile(r"^## (\d{4}-\d{2}-\d{2}) — (.*)$")
 
@@ -93,13 +99,16 @@ def _slugify(text, max_len=80):
 
 def _task_component(task_id):
     """Filename component derived directly from an ALREADY-VALIDATED task-id (see _valid_task_id) --
-    case-normalized (lowercased) but otherwise used AS-IS, never routed through _slugify()'s lossy
-    collapse of '_' and '-' into the same separator. _slugify() exists for arbitrary, unconstrained
-    TITLE text (used by migrate, for legacy entries that never had a discrete task-id); a validated
-    task-id is already a safe, unique-as-typed bare identifier ([A-Za-z0-9_-]{1,128}, no path
-    separators, no NUL, no '..') and needs no further lossy transformation -- two different, equally
-    valid task-ids (e.g. 'a_b' and 'a-b') must never collide on the same derived filename."""
-    return task_id.lower()
+    used AS-IS, never routed through _slugify()'s lossy collapse of '_' and '-' into the same
+    separator. _slugify() exists for arbitrary, unconstrained TITLE text (used by migrate, for legacy
+    entries that never had a discrete task-id); a validated task-id is already a safe, unique-as-typed,
+    lowercase-only bare identifier ([a-z0-9_-]{1,128}, no path separators, no NUL, no '..') and needs no
+    further transformation -- two different, equally valid task-ids (e.g. 'a_b' and 'a-b') must never
+    collide on the same derived filename. _TASK_ID_RE itself is lowercase-only specifically so this
+    function never has to case-normalize anything: the underlying filesystem is case-INSENSITIVE, so a
+    normalizing .lower() here could only ever paper over a real collision the OS would still hit, not
+    prevent one -- the fix belongs at the validation gate, not here."""
+    return task_id
 
 
 def _valid_task_id(task_id):
@@ -135,8 +144,8 @@ def cmd_add(args):
     if args.type not in ("flow", "decision"):
         sys.exit(f"invalid --type {args.type!r}: must be flow or decision")
     if not _valid_task_id(args.task):
-        sys.exit(f"invalid --task {args.task!r}: must match [A-Za-z0-9_-] and be 1-128 chars "
-                  f"(no path separators, no null bytes, no empty string)")
+        sys.exit(f"invalid --task {args.task!r}: must match [a-z0-9_-] (lowercase only) and be 1-128 "
+                  f"chars (no path separators, no null bytes, no empty string, no uppercase letters)")
     if not _valid_date(args.date):
         sys.exit(f"invalid --date {args.date!r}: must be YYYY-MM-DD")
     if not args.title.strip():
@@ -411,11 +420,16 @@ def selfcheck():
         assert "a_b" in out and "a-b" in out, "both distinct task-ids must appear in the full listing"
 
         # task-id validation blocks path-traversal / path-breaking characters, same class of defense
-        # claim-ledger.py enforces for its own task-id-derived filenames.
-        for bad in ("", "../etc", "a/b", "a\0b", "bad id", "*", "a" * 129, "ok\n"):
+        # claim-ledger.py enforces for its own task-id-derived filenames. Also blocks uppercase letters
+        # (checker round 5): the underlying filesystem is case-INSENSITIVE, so 'Task-A' and 'task-a'
+        # would alias to the same physical file regardless of any in-process case handling -- the
+        # collision must be closed at the validation gate, by rejecting uppercase outright.
+        for bad in ("", "../etc", "a/b", "a\0b", "bad id", "*", "a" * 129, "ok\n", "Task-A", "TASK-A"):
             code, out = _run(["add", "--type", "flow", "--task", bad, "--date", "2026-01-01",
                                "--title", "x", "--body-file", bf])
             assert code != 0, f"invalid task-id {bad!r} must be rejected"
+        code, out = _run(["show", "--type", "flow", "--task", "Task-A"])
+        assert code != 0, "show must also reject an uppercase-containing task-id, not silently accept it"
         # and even if it somehow slipped through, nothing should ever land outside the audit dir
         audit_root = pathlib.Path(os.environ["SM_AUDIT_DIR"]).resolve()
         for path in audit_root.rglob("*.md"):
