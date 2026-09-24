@@ -4,6 +4,7 @@
 
   verdict.py [FILE]   # FILE or stdin = checker output; prints the verdict word
                       # exit: 0=pass  1=fail  2=error/refused/ambiguous/malformed
+  verdict.py --lenses <comma-separated-list> [FILE]  # additionally cross-check lens_coverage
   verdict.py selfcheck
 
 The checker is instructed to END with a fenced ```json {"verdict":...} block, so we prefer verdicts found
@@ -11,10 +12,49 @@ inside fenced blocks. If there are none, we fall back to scanning TOP-LEVEL {...
 ones, so a stray "verdict" key buried in prose or structured data can't be mistaken for the envelope.
 Conflicting verdicts fail closed (ambiguous). The supervisor branches on the exit code, not the prose.
 """
-import json, re, sys
+import json, re, sys, os, time, argparse, pathlib, contextlib, subprocess
+try:
+    import fcntl
+except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
+    fcntl = None
 
 VALID = {"pass", "fail", "error", "refused"}
 EXIT = {"pass": 0, "fail": 1, "error": 2, "refused": 2, "malformed": 2, "ambiguous": 2}
+
+def _default_lens_ledger_path():
+    """Resolve the default ledger location when SM_LENS_COVERAGE_LEDGER is unset. Anchoring to plain CWD
+    is fragile: a checker round invoked from a pane/shell whose ambient CWD isn't the intended worktree
+    would resolve this to the wrong repo's audit/ directory (this happened for real this session). Same
+    fix as bin/claim-ledger.py's _default_ledger_path(): anchor via `git rev-parse --git-common-dir`, whose
+    parent is the one physical location every worktree of a repo agrees on -- except for a bare repo or a
+    submodule, where common-dir's own basename isn't literally '.git', so we anchor AT common-dir itself
+    instead of its parent (same one-basename-check rule, no extra --is-bare-repository call)."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-common-dir"], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            common_dir = pathlib.Path(out.stdout.strip())
+            if not common_dir.is_absolute():
+                common_dir = pathlib.Path.cwd() / common_dir
+            common_dir = common_dir.resolve()
+            anchor = common_dir if common_dir.name != ".git" else common_dir.parent
+            return anchor / "audit" / "lens-coverage.jsonl"
+    except OSError:
+        pass  # git not installed/found -- fall through to the loud-warning CWD-relative fallback below
+    sys.stderr.write(
+        "WARNING: verdict.py could not resolve a git-common-dir (not inside a git repo, or git not found) "
+        "-- falling back to a CWD-relative ./audit/lens-coverage.jsonl, which will NOT be shared across "
+        "other worktrees/CWDs. Set SM_LENS_COVERAGE_LEDGER to a shared path for a durable ledger.\n")
+    return pathlib.Path("audit") / "lens-coverage.jsonl"
+
+
+def get_ledger_path():
+    """Get ledger path: SM_LENS_COVERAGE_LEDGER env var if set, else a git-common-dir-anchored default
+    (see _default_lens_ledger_path) so the ledger always resolves to the correct repo root regardless of
+    the caller's ambient cwd."""
+    override = os.environ.get("SM_LENS_COVERAGE_LEDGER")
+    if override:
+        return pathlib.Path(override)
+    return _default_lens_ledger_path()
 
 
 def _top_objects(text):
@@ -48,7 +88,103 @@ def _valid_verdicts(text):
     return out
 
 
-def read_verdict(text):
+def _finding_has_location(finding):
+    """True if finding contains [NOLOC] or a real file:line token (e.g. file.py:42 or file.py:42,99).
+    Two structural exclusions rule out colon-number patterns that aren't real code locations,
+    without enumerating specific non-file strings (this repo's own 'generalize, don't enumerate'
+    lesson from the fix-plan-committee-tool-call task):
+      - A candidate starting with '//' is a URL's host:port, not a path (e.g. https://x:443 --
+        the [^\\s:]+ group stops at the scheme's own colon, so the actual match starts at the
+        '//' that follows -- verified empirically, every such match starts with '//', which no
+        real relative file path ever does).
+      - A candidate with no letters at all is a bare number pattern, not a path (e.g. a timestamp
+        '10:30' or a ratio '16:9' -- no real file path is purely numeric). The letter check is
+        Unicode-aware (str.isalpha(), not an ASCII-only [A-Za-z] regex), so a real relative file
+        with a non-ASCII name (e.g. 'λ.py:12') still correctly counts as a location.
+    Accepted, deliberately unclosed gap: a domain/email-shaped string with letters and a port
+    (e.g. 'user@example.com:25') still passes this shape-only heuristic. This function checks
+    output SHAPE, not semantics, and is a quality heuristic on top of human supervisor review,
+    not a security boundary -- closing every conceivable non-file colon-number string requires
+    real semantic understanding this stdlib regex heuristic cannot have. A finding can still have
+    a later, real file:line match after an excluded candidate and count as valid (the loop checks
+    every candidate, not just the first)."""
+    if "[NOLOC]" in finding:
+        return True
+    for m in re.finditer(r'[^\s:]+:\d+(?:,\d+)*', finding):
+        path = m.group(0)
+        if path.startswith("//"):
+            continue  # URL host:port
+        if not any(c.isalpha() for c in path):
+            continue  # purely numeric (timestamp, ratio, etc.), not a path
+        return True
+    return False
+
+
+def _extract_envelope_with_verdict(text, verdict_word):
+    """Find and return the envelope dict that contains verdict_word."""
+    for pattern in (r"```json\s*\n(.*?)```", r"```\s*\n(.*?)```"):
+        blocks = re.findall(pattern, text, re.DOTALL)
+        for block in reversed(blocks):  # last block first
+            # Find objects in reverse order within block (last-wins)
+            objects = list(_top_objects(block))
+            for span in reversed(objects):  # REVERSE order within block
+                try:
+                    o = json.loads(span)
+                    if isinstance(o, dict) and o.get("verdict") == verdict_word:
+                        return o
+                except ValueError:
+                    continue
+    # Fallback to top-level objects
+    objects = list(_top_objects(text))
+    for span in reversed(objects):  # REVERSE order here too
+        try:
+            o = json.loads(span)
+            if isinstance(o, dict) and o.get("verdict") == verdict_word:
+                return o
+        except ValueError:
+            continue
+    return None
+
+
+@contextlib.contextmanager
+def _ledger_lock():
+    """Same fcntl idiom as hold.py's _ledger_lock(): serialize concurrent mutations."""
+    if fcntl is None:
+        yield; return
+    ledger_path = get_ledger_path()
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(ledger_path) + ".lock", "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _record_lens_coverage(requested, covered, missing, verdict):
+    """Append one JSON line to audit/lens-coverage.jsonl."""
+    try:
+        with _ledger_lock():
+            ledger_path = get_ledger_path()
+            ledger_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(ledger_path, "a") as f:
+                json.dump({
+                    "timestamp": time.time(),
+                    "requested": requested,
+                    "covered": covered,
+                    "missing": missing,
+                    "verdict": verdict
+                }, f)
+                f.write("\n")
+    except Exception as e:
+        sys.stderr.write(f"warning: ledger write failed: {e}\n")
+        # A ledger-write failure itself is a loud stderr WARNING, never a silent loss
+        # Matching merge-ledger.jsonl's own documented precedent exactly
+
+
+def read_verdict_with_envelope(text):
+    """Read verdict from text, validating findings for fail verdicts.
+    Returns (verdict_word, exit_code, envelope_or_none)."""
     # The checker is instructed to END with a fenced ```json envelope as its FINAL output, so the real
     # verdict is the LAST json-fenced block; example envelopes quoted earlier in the findings are ignored
     # (finding #3: a `{"verdict":"pass"}` example inside a finding must not be mistaken for the verdict).
@@ -58,34 +194,374 @@ def read_verdict(text):
             vs = _valid_verdicts(block)
             if vs:
                 if len(set(vs)) > 1:                    # one block, conflicting verdicts -> fail closed
-                    return "ambiguous", EXIT["ambiguous"]
-                return vs[-1], EXIT[vs[-1]]
+                    return "ambiguous", EXIT["ambiguous"], None
+                # Extract envelope to validate findings for "fail" verdicts
+                verdict_word = vs[-1]
+                envelope = _extract_envelope_with_verdict(text, verdict_word)
+                if verdict_word == "fail":
+                    if not envelope:
+                        return "ambiguous", EXIT["ambiguous"], envelope
+                    # Validate findings for fail verdict
+                    findings = envelope.get("findings", [])
+                    if not isinstance(findings, list):
+                        return "ambiguous", EXIT["ambiguous"], envelope
+                    if not findings:  # empty findings array on fail verdict is invalid
+                        return "ambiguous", EXIT["ambiguous"], envelope
+                    # Validate each finding
+                    for finding in findings:
+                        if not isinstance(finding, str):
+                            return "ambiguous", EXIT["ambiguous"], envelope
+                        if not _finding_has_location(finding):
+                            return "ambiguous", EXIT["ambiguous"], envelope
+                return verdict_word, EXIT[verdict_word], envelope
     # no fenced block at all: fall back to top-level objects; conflicting bare verdicts fail closed
     vs = _valid_verdicts(text)
     if not vs:
-        return "malformed", EXIT["malformed"]
+        return "malformed", EXIT["malformed"], None
     if len(set(vs)) > 1:
-        return "ambiguous", EXIT["ambiguous"]
-    return vs[-1], EXIT[vs[-1]]
+        return "ambiguous", EXIT["ambiguous"], None
+    # Validate findings for fail verdicts from top-level objects too
+    verdict_word = vs[-1]
+    envelope = _extract_envelope_with_verdict(text, verdict_word)
+    if verdict_word == "fail":
+        if not envelope:
+            return "ambiguous", EXIT["ambiguous"], envelope
+        # Validate findings for fail verdict
+        findings = envelope.get("findings", [])
+        if not isinstance(findings, list):
+            return "ambiguous", EXIT["ambiguous"], envelope
+        if not findings:  # empty findings array on fail verdict is invalid
+            return "ambiguous", EXIT["ambiguous"], envelope
+        # Validate each finding
+        for finding in findings:
+            if not isinstance(finding, str):
+                return "ambiguous", EXIT["ambiguous"], envelope
+            if not _finding_has_location(finding):
+                return "ambiguous", EXIT["ambiguous"], envelope
+    return verdict_word, EXIT[verdict_word], envelope
+
+
+def read_verdict(text):
+    """Read verdict from text, validating findings for fail verdicts."""
+    return read_verdict_with_envelope(text)[0]
+
+
+def check_lens_coverage(requested_lenses, envelope):
+    """Check that every requested lens appears in envelope's lens_coverage.
+    Returns (missing_lenses, covered_lenses)."""
+    if not envelope:
+        return requested_lenses, []  # all missing
+    lens_coverage = envelope.get("lens_coverage", {})
+    if not isinstance(lens_coverage, dict):
+        return requested_lenses, []  # invalid format, treat as all missing
+    covered = []
+    missing = []
+    for lens in requested_lenses:
+        if lens_coverage.get(lens) is True:  # must be the literal boolean True, not merely truthy
+            covered.append(lens)
+        else:
+            missing.append(lens)
+    return missing, covered
 
 
 def main(argv):
+    parser = argparse.ArgumentParser(description="Extract verdict from checker output")
+    parser.add_argument("file", nargs="?", help="checker output file (default: stdin)")
+    parser.add_argument("--lenses", help="comma-separated list of lens names to require coverage for")
+    args = parser.parse_args(argv)
+    
     if argv and argv[0] == "selfcheck":
-        rv = read_verdict
-        assert rv('x\n```json\n{"verdict":"fail","findings":["a"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # Run selfcheck tests
+        def rv(text):
+            return read_verdict_with_envelope(text)[:2]  # just (word, code)
+        
+        # First test: failing verdict with invalid finding "a" should be ambiguous
+        assert rv('x\n```json\n{"verdict":"fail","findings":["a"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)  # invalid finding
+        # Valid finding with file:line should pass
+        assert rv('x\n```json\n{"verdict":"fail","findings":["bin/doctor.sh:322,419 fresh HOME without .pi/agent makes both Bedrock atomic writes fail [CONFIRMED]"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # [NOLOC] escape hatch should work
+        assert rv('x\n```json\n{"verdict":"fail","findings":["[NOLOC] process design defect with no single fixed line"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # A URL with a port (host:port) must NOT count as a file:line location
+        assert rv('x\n```json\n{"verdict":"fail","findings":["https://bugs.example:443"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
+        # ...but a finding with a URL AND a real file:line reference still passes
+        assert rv('x\n```json\n{"verdict":"fail","findings":["see https://bugs.example:443 and bin/doctor.sh:12"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # A bare timestamp (purely numeric colon-pattern) must NOT count as a file:line location
+        assert rv('x\n```json\n{"verdict":"fail","findings":["observed at 10:30 UTC"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
+        # A bare ratio (purely numeric colon-pattern) must NOT count as a file:line location
+        assert rv('x\n```json\n{"verdict":"fail","findings":["aspect ratio 16:9 is wrong"],"diagnostic":""}\n```\ny') == ("ambiguous", 2)
+        # ...but a finding with a timestamp AND a real file:line reference still passes
+        assert rv('x\n```json\n{"verdict":"fail","findings":["at 10:30 see bin/doctor.sh:12"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # A real file whose path contains ONLY non-ASCII letters must still count as a location --
+        # the letter check is Unicode-aware (str.isalpha()), not an ASCII-only [A-Za-z] regex. Using
+        # any ASCII letter (e.g. a ".py" extension) in this fixture would pass even the OLD, buggy
+        # ASCII-only check and silently fail to test the thing this assertion exists to guard.
+        assert rv('x\n```json\n{"verdict":"fail","findings":["λ:12 real bug"],"diagnostic":""}\n```\ny') == ("fail", 1)
+        # Empty findings on fail should be ambiguous
+        assert rv('finding: `{"verdict":"pass"}` example\n```json\n{"verdict":"fail","findings":[]}\n```') == ("ambiguous", 2)  # empty findings on fail
+        # Non-string finding should be ambiguous
+        assert rv('x\n```json\n{"verdict":"fail","findings":[123],"diagnostic":""}\n```\ny') == ("ambiguous", 2)  # non-string finding
         assert rv('```json\n{"verdict":"pass"}\n```') == ("pass", 0)
         assert rv('no json at all') == ("malformed", 2)
         assert rv('{"verdict":"bogus"}') == ("malformed", 2)
         assert rv('{"report":{"verdict":"pass"}}')[1] == 2                        # #8 nested, not an envelope
-        assert rv('finding: `{"verdict":"pass"}` example\n```json\n{"verdict":"fail","findings":[]}\n```') == ("fail", 1)  # #3 example ignored
-        assert rv('```json\n{"verdict":"pass"}\n```\n```json\n{"verdict":"fail"}\n```') == ("fail", 1)  # last json block wins
+        # last json block wins test updated: fail without findings is invalid -> ambiguous
+        assert rv('```json\n{"verdict":"pass"}\n```\n```json\n{"verdict":"fail"}\n```') == ("ambiguous", 2)  # fail invalid, ambiguous
         assert rv('{"verdict":"fail"} bare {"verdict":"pass"}') == ("ambiguous", 2)  # no fence + conflict -> fail closed
         assert rv('prose "{not json}" then\n```json\n{"verdict":"pass"}\n```') == ("pass", 0)  # braces in strings
-        print("ok"); return
-    text = open(argv[0]).read() if argv else sys.stdin.read()
-    v, code = read_verdict(text)
-    print(v)
-    sys.exit(code)
+        
+        # Test lens coverage
+        text_with_lens = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"redteam":true,"qa":true}}
+```'''
+        verdict_word, code, envelope = read_verdict_with_envelope(text_with_lens)
+        assert verdict_word == "pass" and code == 0
+        assert envelope is not None
+        # Check lens coverage function
+        missing, covered = check_lens_coverage(["redteam", "qa"], envelope)
+        assert missing == [] and set(covered) == {"redteam", "qa"}
+        missing, covered = check_lens_coverage(["redteam", "qa", "missing"], envelope)
+        assert missing == ["missing"] and set(covered) == {"redteam", "qa"}
+        
+        # Test missing lens coverage
+        text_missing = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":""}
+```'''
+        verdict_word2, code2, envelope2 = read_verdict_with_envelope(text_missing)
+        missing2, covered2 = check_lens_coverage(["redteam"], envelope2)
+        assert missing2 == ["redteam"] and covered2 == []
+        
+        # Test last-wins semantics within a single block (Finding 1)
+        text_two_pass = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":true}}
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{}}
+```'''
+        verdict_word3, code3, envelope3 = read_verdict_with_envelope(text_two_pass)
+        assert verdict_word3 == "pass" and code3 == 0
+        # Last object within block should win, which has empty lens_coverage
+        missing3, covered3 = check_lens_coverage(["qa/coverage"], envelope3)
+        assert missing3 == ["qa/coverage"] and covered3 == []
+        
+        import subprocess
+        import tempfile
+        import os
+        
+        # Create temp file for this subprocess
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        result = subprocess.run(
+            [sys.executable, __file__, "--lenses", "qa/coverage"],
+            input=text_two_pass.encode(),
+            capture_output=True,
+            text=False,
+            env={**os.environ, "SM_LENS_COVERAGE_LEDGER": tmp_path}
+        )
+        assert result.returncode == 2  # ambiguous due to missing lens
+        
+        # Clean up temp file
+        os.remove(tmp_path)
+        lock_path = tmp_path + ".lock"
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+        
+        # Test lens coverage with non-boolean truthy value (must NOT count as covered)
+        text_nonbool = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":"not exercised"}}
+```'''
+        verdict_word4, code4, envelope4 = read_verdict_with_envelope(text_nonbool)
+        assert verdict_word4 == "pass" and code4 == 0
+        missing4, covered4 = check_lens_coverage(["qa/coverage"], envelope4)
+        assert missing4 == ["qa/coverage"] and covered4 == []  # string "not exercised" is NOT True
+        
+        # Test with boolean false (must NOT count as covered)
+        text_false = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"qa/coverage":false}}
+```'''
+        verdict_word5, code5, envelope5 = read_verdict_with_envelope(text_false)
+        assert verdict_word5 == "pass" and code5 == 0
+        missing5, covered5 = check_lens_coverage(["qa/coverage"], envelope5)
+        assert missing5 == ["qa/coverage"] and covered5 == []  # false is not True
+        
+        # Test ledger file-write behavior
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp:
+            tmp_path = tmp.name
+        
+        # Override ledger path via environment variable (matching hold.py/claim-ledger.py convention)
+        import os
+        saved_env = os.environ.get("SM_LENS_COVERAGE_LEDGER")
+        os.environ["SM_LENS_COVERAGE_LEDGER"] = tmp_path
+        try:
+            # Call main with --lenses to trigger ledger write
+            # We'll simulate a subprocess call to test real code path
+            import subprocess
+            text_for_ledger = '''Some prose.
+```json
+{"verdict":"fail","findings":["bin/doctor.sh:322,419 something"],"diagnostic":"","lens_coverage":{"redteam":true}}
+```'''
+            result = subprocess.run(
+                [sys.executable, __file__, "--lenses", "redteam"],
+                input=text_for_ledger.encode(),
+                capture_output=True,
+                text=False
+            )
+            assert result.returncode == 1  # fail verdict
+            
+            # Read back the ledger file
+            with open(tmp_path) as f:
+                lines = f.readlines()
+                assert len(lines) == 1
+                import json
+                record = json.loads(lines[0])
+                assert record["requested"] == ["redteam"]
+                assert record["covered"] == ["redteam"]
+                assert record["missing"] == []
+                assert record["verdict"] == "fail"
+                assert "timestamp" in record
+                
+            # Test with missing lens
+            text_missing_lens = '''Some prose.
+```json
+{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{"redteam":true}}
+```'''
+            result2 = subprocess.run(
+                [sys.executable, __file__, "--lenses", "redteam,qa"],
+                input=text_missing_lens.encode(),
+                capture_output=True,
+                text=False
+            )
+            assert result2.returncode == 2  # ambiguous due to missing lens
+            
+            with open(tmp_path) as f:
+                lines = f.readlines()
+                assert len(lines) == 2
+                record2 = json.loads(lines[1])
+                assert record2["requested"] == ["redteam", "qa"]
+                assert record2["covered"] == ["redteam"]
+                assert record2["missing"] == ["qa"]
+                assert record2["verdict"] == "pass"
+                
+        finally:
+            # Clean up
+            if saved_env is None:
+                os.environ.pop("SM_LENS_COVERAGE_LEDGER", None)
+            else:
+                os.environ["SM_LENS_COVERAGE_LEDGER"] = saved_env
+            import os as os_module
+            if os_module.path.exists(tmp_path):
+                os_module.remove(tmp_path)
+            lock_path = tmp_path + ".lock"
+            if os_module.path.exists(lock_path):
+                os_module.remove(lock_path)
+        
+        # Test --lenses '' (empty string) still records ledger entry
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as tmp_empty:
+            tmp_empty_path = tmp_empty.name
+        
+        os.environ["SM_LENS_COVERAGE_LEDGER"] = tmp_empty_path
+        try:
+            result_empty = subprocess.run(
+                [sys.executable, __file__, "--lenses", ""],
+                input=text_with_lens.encode(),
+                capture_output=True,
+                text=False
+            )
+            assert result_empty.returncode == 0  # should still pass
+            
+            # Ledger should have one record with requested: []
+            with open(tmp_empty_path) as f:
+                lines = f.readlines()
+                assert len(lines) == 1
+                record_empty = json.loads(lines[0])
+                assert record_empty["requested"] == []
+                assert record_empty["covered"] == []
+                assert record_empty["missing"] == []
+                assert record_empty["verdict"] == "pass"
+        finally:
+            os.environ.pop("SM_LENS_COVERAGE_LEDGER", None)
+            if os_module.path.exists(tmp_empty_path):
+                os_module.remove(tmp_empty_path)
+            lock_path = tmp_empty_path + ".lock"
+            if os_module.path.exists(lock_path):
+                os_module.remove(lock_path)
+        
+        
+        # Test ledger-write failure path (warning but verdict unchanged)
+        # Point to an unwritable parent directory
+        import tempfile
+        import os
+        import subprocess
+        
+        # Test 1: Non-existent parent (should trigger warning but verdict unchanged)
+        bad_path = "/nonexistent/parent/dir/ledger.jsonl"
+        os.environ["SM_LENS_COVERAGE_LEDGER"] = bad_path
+        try:
+            result_fail = subprocess.run(
+                [sys.executable, __file__, "--lenses", "redteam"],
+                input=text_for_ledger.encode(),
+                capture_output=True,
+                text=False
+            )
+            # Should still return fail (verdict unchanged)
+            assert result_fail.returncode == 1  # fail verdict
+            # Should have warning in stderr
+            stderr_text = result_fail.stderr.decode() if result_fail.stderr else ""
+            assert "warning: ledger write failed" in stderr_text
+        finally:
+            os.environ.pop("SM_LENS_COVERAGE_LEDGER", None)
+
+        # Test cwd-independence: the default ledger path must resolve to the SAME stable,
+        # repo-anchored location whether called from this worktree or from the repo's primary
+        # checkout -- not a bare relative string (this caused a real cross-worktree collision this
+        # session: a checker round invoked from a pane whose actual shell cwd was the primary
+        # checkout, not the intended worktree, wrote real ledger entries into the wrong location).
+        assert str(get_ledger_path()) != "audit/lens-coverage.jsonl", (
+            "ledger path is a bare relative string, not git-anchored")
+        path_from_worktree = _default_lens_ledger_path()
+        common_dir_out = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                                         capture_output=True, text=True)
+        common_dir = pathlib.Path(common_dir_out.stdout.strip())
+        if not common_dir.is_absolute():
+            common_dir = pathlib.Path.cwd() / common_dir
+        common_dir = common_dir.resolve()
+        primary_checkout = common_dir.parent if common_dir.name == ".git" else common_dir
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(primary_checkout)
+            path_from_primary = _default_lens_ledger_path()
+        finally:
+            os.chdir(prev_cwd)
+        assert path_from_worktree == path_from_primary, (
+            f"ledger path changed with cwd: {path_from_worktree} != {path_from_primary}")
+
+        print("ok")
+        return
+    
+    # Normal operation
+    text = open(args.file).read() if args.file else sys.stdin.read()
+    verdict_word, exit_code, envelope = read_verdict_with_envelope(text)
+    
+    requested_lenses = []
+    if args.lenses is not None:
+        # args.lenses could be empty string if flag passed with empty value
+        requested_lenses = [l.strip() for l in args.lenses.split(",") if l.strip()]
+    
+    if args.lenses is not None:  # Flag was present (even if empty)
+        missing, covered = check_lens_coverage(requested_lenses, envelope)
+        # Record to ledger regardless of outcome
+        _record_lens_coverage(requested_lenses, covered, missing, verdict_word)
+        # If any lens missing, result must be ambiguous (exit 2)
+        if missing:
+            verdict_word = "ambiguous"
+            exit_code = EXIT["ambiguous"]
+    
+    print(verdict_word)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

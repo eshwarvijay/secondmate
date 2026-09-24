@@ -97,7 +97,10 @@ for _l in "${lenses[@]:-}"; do
   for _n in "${_names[@]}"; do
     _lf="$SCRIPT_DIR/lenses/$_n.md"
     [ -f "$_lf" ] || { echo "unknown lens: $_n (looked for $_lf). Available: $( (cd "$SCRIPT_DIR/lenses" 2>/dev/null && find . -name '*.md' ! -name 'ROUTER.md' | sed 's|^\./||;s|\.md$||') | tr '\n' ' ')" >&2; exit 2; }
-    lens_args+=(--append-system-prompt "$(cat "$_lf")")
+    # Inject lens content with explicit name so checker can report lens_coverage
+    lens_content="$(cat "$_lf")"
+    lens_args+=(--append-system-prompt "You are being evaluated against the named lens '$_n'. If your envelope includes a lens_coverage field, report this lens by this exact string.")
+    lens_args+=(--append-system-prompt "$lens_content")
   done
 done
 

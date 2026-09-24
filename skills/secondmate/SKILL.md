@@ -201,7 +201,7 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
      model family) but keeps maker ≠ checker and the deterministic verdict. Capture its final message and
      treat it exactly like harness output below.
    - Branch on the verdict deterministically, NOT on the checker's prose:
-     `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused.
+     `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused. When lenses were injected via `--lens`, add `--lenses <comma-separated-list>` to cross-check the envelope's `lens_coverage` field (the checker is told each lens's exact name and should report `{"lens_coverage": {"<name>": true, ...}}`). A missing lens triggers `ambiguous` (exit 2). Also for `fail` verdicts, findings must contain file:line tokens or the explicit escape hatch `[NOLOC]`; invalid findings trigger `ambiguous`.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
@@ -384,7 +384,7 @@ SCRIPT_EOF
   herdr pane run "$ck" bash /tmp/checker-<task-id>-r<N>.sh
   herdr pane wait-output "$ck" --regex "___SM_R<N>_DONE_[0-9]+" --timeout 600000
   herdr pane read "$ck" --source recent-unwrapped --lines 400 > /tmp/sm-checker.out
-  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py /tmp/sm-checker.out
+  ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py --lenses qa/coverage /tmp/sm-checker.out
   ```
 - **Watch + integrate from your pane** — `herdr agent get/read sm-<task-id>`, `herdr pane read "$ck"`; then the
   usual verify-gate + hold. You can't answer another pane's live prompt, so run any gated command yourself
