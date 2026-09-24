@@ -30,9 +30,13 @@
 #             real content conflict (MERGE_CONFLICT, 'git ls-files -u' non-empty) or a rejection with no
 #             actual conflict, e.g. a pre-merge-commit policy hook (MERGE_REJECTED, 'git ls-files -u'
 #             empty) -- both abort cleanly and leave $repo unchanged | 4 push failed (local merge already
-#             landed) | 5 lock timeout | 6 --preflight-only conflict detected (read-only, no side effects) | 7
-#             --preflight-only unsupported/inconclusive (git doesn't support --write-tree, or another error) | 8
-#             --preflight-only clean (no conflict detected, read-only).
+#             landed) | 5 lock timeout | 6 --preflight-only conflict detected | 7 --preflight-only
+#             unsupported/inconclusive (git doesn't support --write-tree, or another error) | 8
+#             --preflight-only clean (no conflict detected).
+#             --preflight-only (6-8) never touches $repo's working tree, index, commits, lock, or
+#             ledger -- the one exception is a normal 'git fetch' of --base, which updates
+#             refs/remotes/origin/<base> the same way any "check the remote's current state" call
+#             would (standard fetch bookkeeping, not a merge/lock/ledger side effect).
 #             Note: exit codes 6-8 are ONLY for --preflight-only and never occur in normal merge+push flow.
 #             Existing exit codes (0-5) are unchanged and have identical semantics to today.
 #
@@ -749,14 +753,16 @@ GITSHIM
     echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record" >&2
     fails=1
   fi
-  # Captured to a variable before grepping -- a live 'git log | grep -q' pipe lets grep
-  # exit the instant it finds a match (always the newest/first commit here), which can
-  # SIGPIPE-kill git before it finishes writing under 'set -o pipefail' (line 44), making
-  # the pipeline report failure despite a real match. Same bug class this repo already
-  # fixed once in bin/plan-committee.sh's collision guard -- eliminate the pipe, don't
-  # narrow the race.
+  # Captured to a variable, then matched with bash's own '[[ == *pattern* ]]' -- no subprocess, no
+  # pipe. A live 'git log | grep -q' pipe lets grep exit the instant it finds a match (always the
+  # newest/first commit here), which can SIGPIPE-kill git before it finishes writing under 'set -o
+  # pipefail' (line 44), making the pipeline report failure despite a real match. A 'printf | grep
+  # -q' on the captured variable is NOT a full fix either -- a large enough string reproduces the
+  # exact same SIGPIPE for the exact same reason (verified directly: ~200KB reliably triggers it).
+  # Same bug class this repo already fixed once in bin/plan-committee.sh's collision guard --
+  # eliminate the pipe entirely, don't narrow the race or shrink the payload.
   log19="$(git -C "$primary19" log --oneline)"
-  if ! printf '%s\n' "$log19" | grep -q "merge-sequencer: race recovery"; then
+  if [[ "$log19" != *"merge-sequencer: race recovery"* ]]; then
     echo "FAIL: expected at least one recovery-merge commit message in git log" >&2
     fails=1
   fi
@@ -789,10 +795,10 @@ HOOKEOF
   [ "$(_ledger_count sm/push-fail-20 PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: hook rejection was wrongly classified as PUSH_RACE_EXHAUSTED"; fails=1; }
   [ "$(_ledger_count sm/push-fail-20 PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record for hook rejection"; fails=1; }
   # Verify NO recovery-merge commit exists (hook rejection should not trigger any retry).
-  # Captured to a variable before grepping -- see Test 19's identical comment for why a
-  # live pipe here is unsafe under 'set -o pipefail' if a match is ever unexpectedly found.
+  # Captured + matched with '[[ == * ]]', no pipe -- see Test 19's identical comment for why
+  # even a captured-variable pipe to grep -q is unsafe (SIGPIPE under pipefail) for large input.
   log20="$(git -C "$primary20" log --oneline)"
-  printf '%s\n' "$log20" | grep -q "merge-sequencer: race recovery" && { echo "FAIL: hook rejection wrongly triggered a recovery-merge commit (retry should NOT have happened)"; fails=1; } || true
+  [[ "$log20" == *"merge-sequencer: race recovery"* ]] && { echo "FAIL: hook rejection wrongly triggered a recovery-merge commit (retry should NOT have happened)"; fails=1; } || true
 
   # ---- Test 21: (P1) recovery merge itself conflicts -> escalate, main left at state after FIRST merge ----
   IFS='|' read -r origin21 primary21 <<<"$(_setup_repo 21)"
@@ -818,12 +824,12 @@ HOOKEOF
   # The FIRST (original) merge should still be present on main
   [ "$main_after21" != "$main_before21" ] || { echo "FAIL: main not advanced despite first merge landing"; fails=1; }
   # Verify the conflict resolution marker is the FIRST merge (not corrupted by failed recovery).
-  # Captured to a variable before grepping in both checks below -- see Test 19's identical
-  # comment for why a live 'log | grep -q' pipe is unsafe under 'set -o pipefail' (line 44).
+  # Captured + matched with '[[ == * ]]' in both checks below, no pipe at all -- see Test 19's
+  # identical comment for why even a captured-variable pipe to grep -q is unsafe for large input.
   log21="$(git -C "$primary21" log --oneline)"
-  printf '%s\n' "$log21" | grep -q "feature conflict" || { echo "FAIL: first merge's feature conflict commit missing from main"; fails=1; }
+  [[ "$log21" == *"feature conflict"* ]] || { echo "FAIL: first merge's feature conflict commit missing from main"; fails=1; }
   # Verify no recovery merge commit for conflict case (failed on first attempt, no retries)
-  printf '%s\n' "$log21" | grep -q "merge-sequencer: race recovery" && { echo "FAIL: conflict case should not have recovery commits"; fails=1; } || true
+  [[ "$log21" == *"merge-sequencer: race recovery"* ]] && { echo "FAIL: conflict case should not have recovery commits"; fails=1; } || true
   [ "$(_ledger_count sm/push-race-conflict PUSH_RACE_EXHAUSTED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record for recovery conflict"; fails=1; }
 
   # ---- Test 22: (P2) --preflight-only with clean merge (no conflict) -> exit 6, zero side effects ----
@@ -883,6 +889,124 @@ HOOKEOF
   rc24=$?
   [ "$rc24" -eq 8 ] || { echo "FAIL: preflight normal clean expected rc=8, got $rc24: $out24"; fails=1; }
   echo "$out24" | grep -qi "preflight.*clean\|no conflict" || { echo "FAIL: expected a clean/no-conflict message for preflight normal, got: $out24"; fails=1; }
+
+  # ---- Test 25: (P1) CRITICAL negative test -- a hook rejection whose OWN message happens to
+  # contain a race keyword ("behind") must still be PUSH_FAILED, never retried as a race. A real
+  # hook's message is admin-authored, arbitrary text; classifying by keyword presence alone would
+  # retry a permanent policy rejection forever. Reuses the real-hook fixture pattern from Test
+  # 17/20 (not the fake shim -- this needs git's OWN real "remote: "/"[remote rejected]" framing).
+  IFS='|' read -r origin25 primary25 <<<"$(_setup_repo 25)"
+  cat > "$origin25/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "rejected because branch is behind policy" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin25/hooks/pre-receive"
+  git -C "$primary25" worktree add -q "$t/wt25" -b sm/hook-behind-collision main
+  echo "feature-p25" >> "$t/wt25/file.txt"
+  git -C "$t/wt25" commit -qam "feature p25"
+  sha25="$(git -C "$t/wt25" rev-parse HEAD)"
+  main_before25="$(git -C "$primary25" rev-parse main)"
+  out25="$(_ms --repo "$primary25" --worktree "$t/wt25" --branch sm/hook-behind-collision --base main --checked-sha "$sha25" --wait-timeout 5 2>&1)"
+  rc25=$?
+  [ "$rc25" -eq 4 ] || { echo "FAIL: hook rejection containing 'behind' expected rc=4, got $rc25: $out25"; fails=1; }
+  main_after25="$(git -C "$primary25" rev-parse main)"
+  [ "$main_after25" != "$main_before25" ] || { echo "FAIL: local merge commit was not retained despite the push being rejected"; fails=1; }
+  echo "$out25" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out25"; fails=1; }
+  # The whole point of this test: must be PUSH_FAILED, NOT retried into PUSH_RACE_EXHAUSTED,
+  # despite the hook's own message containing the word "behind" (in the race regex).
+  [ "$(_ledger_count sm/hook-behind-collision PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (hook message collided with a race keyword)"; fails=1; }
+  [ "$(_ledger_count sm/hook-behind-collision PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: hook rejection containing 'behind' was wrongly retried and classified as PUSH_RACE_EXHAUSTED -- the exact keyword-collision bug this test guards"; fails=1; }
+  [ "$(_ledger_count sm/hook-behind-collision PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: hook rejection containing 'behind' was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  log25="$(git -C "$primary25" log --oneline)"
+  [[ "$log25" != *"merge-sequencer: race recovery"* ]] || { echo "FAIL: hook rejection containing 'behind' wrongly triggered a recovery-merge commit"; fails=1; }
+
+  # ---- Test 26: (P1) exhaustion performs EXACTLY 3 total push attempts (1 initial + 2 retries),
+  # never a 4th. The fake shim below counts every real 'push' invocation it intercepts by
+  # appending one line per call to a counter file. ----
+  IFS='|' read -r origin26 primary26 <<<"$(_setup_repo 26)"
+  git -C "$primary26" worktree add -q "$t/wt26" -b sm/push-race-count main
+  echo "feature-count" >> "$t/wt26/file.txt"
+  git -C "$t/wt26" commit -qam "feature count"
+  sha26="$(git -C "$t/wt26" rev-parse HEAD)"
+  counter26="$t/push-attempt-counter-26"
+  : > "$counter26"
+  fake_git_dir26="$t/fake-git-26"
+  mkdir -p "$fake_git_dir26"
+  real_git_path26="$(command -v git)"
+  cat > "$fake_git_dir26/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path26"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "attempt" >> "$counter26"
+  echo "! [rejected]  main -> main (fetch first)" >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir26/git"
+  out26="$(PATH="$fake_git_dir26:$PATH" _ms --repo "$primary26" --worktree "$t/wt26" --branch sm/push-race-count --base main --checked-sha "$sha26" --wait-timeout 5 2>&1)"
+  rc26=$?
+  [ "$rc26" -eq 4 ] || { echo "FAIL: push-race count test expected rc=4, got $rc26: $out26"; fails=1; }
+  attempt_count26="$(wc -l < "$counter26" | tr -d ' ')"
+  [ "$attempt_count26" = "3" ] || { echo "FAIL: expected exactly 3 total push attempts (1 initial + 2 retries), got $attempt_count26"; fails=1; }
+
+  # ---- Test 27: (P1) a hook rejection with a LARGE message (well over a pipe buffer) must still
+  # be correctly classified as PUSH_FAILED, never PUSH_RACE_EXHAUSTED -- proves the classifier's
+  # own bash-native '[[ =~ ]]'/'[[ == * ]]' matching (no subprocess, no pipe) is genuinely immune
+  # to the SIGPIPE-under-pipefail class this diff fixes, regardless of payload size. ----
+  IFS='|' read -r origin27 primary27 <<<"$(_setup_repo 27)"
+  python3 -c "
+print('#!/bin/sh')
+print('echo \'' + ('x' * 200000) + '\' >&2')
+print('echo \"remote: rejected because branch is behind policy\" >&2')
+print('exit 1')
+" > "$origin27/hooks/pre-receive"
+  chmod +x "$origin27/hooks/pre-receive"
+  git -C "$primary27" worktree add -q "$t/wt27" -b sm/hook-large-message main
+  echo "feature-p27" >> "$t/wt27/file.txt"
+  git -C "$t/wt27" commit -qam "feature p27"
+  sha27="$(git -C "$t/wt27" rev-parse HEAD)"
+  out27="$(_ms --repo "$primary27" --worktree "$t/wt27" --branch sm/hook-large-message --base main --checked-sha "$sha27" --wait-timeout 5 2>&1)"
+  rc27=$?
+  [ "$rc27" -eq 4 ] || { echo "FAIL: large hook rejection expected rc=4, got $rc27"; fails=1; }
+  [ "$(_ledger_count sm/hook-large-message PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record for a large hook rejection message"; fails=1; }
+  [ "$(_ledger_count sm/hook-large-message PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: a large hook rejection message was wrongly retried into PUSH_RACE_EXHAUSTED"; fails=1; }
+
+  # ---- Test 28: (P1) an 'update' hook (not 'pre-receive') whose message contains a race keyword
+  # ("behind") but NONE of hook_rejection_regex's literal keywords, and whose git-generated summary
+  # says only "(hook declined)" -- NOT "(pre-receive hook declined)" -- must still be classified as
+  # PUSH_FAILED via the "remote: "/"[remote rejected]" structural check alone, since no keyword
+  # match exists anywhere. Verified empirically: a real local 'update' hook produces exactly this
+  # wording on this git version. This is the one real case that isolates the "remote:" check as
+  # the sole discriminator -- unlike Test 25/27, whose 'pre-receive' hooks are ALSO caught by
+  # hook_rejection_regex's literal "pre-receive" keyword via git's own separate boilerplate. ----
+  IFS='|' read -r origin28 primary28 <<<"$(_setup_repo 28)"
+  cat > "$origin28/hooks/update" <<'HOOKEOF'
+#!/bin/sh
+echo "access denied: your changes are behind the required baseline" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin28/hooks/update"
+  git -C "$primary28" worktree add -q "$t/wt28" -b sm/update-hook-behind main
+  echo "feature-p28" >> "$t/wt28/file.txt"
+  git -C "$t/wt28" commit -qam "feature p28"
+  sha28="$(git -C "$t/wt28" rev-parse HEAD)"
+  out28="$(_ms --repo "$primary28" --worktree "$t/wt28" --branch sm/update-hook-behind --base main --checked-sha "$sha28" --wait-timeout 5 2>&1)"
+  rc28=$?
+  [ "$rc28" -eq 4 ] || { echo "FAIL: update-hook 'behind' collision expected rc=4, got $rc28: $out28"; fails=1; }
+  echo "$out28" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out28"; fails=1; }
+  [ "$(_ledger_count sm/update-hook-behind PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (update hook, no keyword match, must rely on 'remote:' framing)"; fails=1; }
+  [ "$(_ledger_count sm/update-hook-behind PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: update-hook rejection with no keyword match was wrongly retried into PUSH_RACE_EXHAUSTED -- the exact gap the 'remote:' structural check exists to close"; fails=1; }
 
   rm -rf "$t"
   trap - EXIT
@@ -961,11 +1085,16 @@ fi
 
 [ -n "$message" ] || message="Merge $branch"
 
-# ============================== preflight-only path (read-only, no side effects) ==============================
+# ============================== preflight-only path (no working-tree/commit/lock/ledger side effects) ==============================
 if [ "$preflight_only" = "1" ]; then
   # Validate git supports --write-tree (git merge-tree requires it)
   git merge-tree --help >/dev/null 2>&1 || { echo "UNSUPPORTED: git merge-tree --write-tree is not supported (requires git >= 2.38)" >&2; exit 7; }
-  # Fetch origin to get current state of --base (remote-tracking refs only, no working tree changes)
+  # Fetch origin to get current state of --base. NOTE: this updates refs/remotes/origin/$base in
+  # $repo's own git metadata (standard fetch bookkeeping, the normal way anything learns the
+  # remote's current state) -- it is the ONE side effect this path has. It does not touch $repo's
+  # working tree, index, commits, lock, or ledger, and every exit path below (clean, conflict, or
+  # unsupported) is otherwise identical to a real read-only check. A caller that needs a fetch with
+  # literally zero ref writes should use 'git ls-remote' up front themselves and pass its own base.
   if ! git -C "$repo" fetch origin "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1; then
     echo "ERROR: failed to fetch origin/$base (check network/permissions)" >&2
     exit 7
@@ -1101,29 +1230,58 @@ merged_sha="$(git -C "$repo" rev-parse HEAD)"
 push_output=$(LC_ALL=C git -C "$repo" push origin "$base" 2>&1)
 push_rc=$?
 if [ "$push_rc" -ne 0 ]; then
-  # Check if this is a genuine race by matching stderr against a narrow race-signature regex
-  # Allow hyphen/no-hyphen/space variants: "fast forward" vs "fast-forward"
-  # Include "stale info", "fetch first", and "contains work that you do not have"
-  # CRITICAL: EXPLICITLY exclude anything indicating a hook/protected-branch rejection
-  # - A bare '[rejected]' alone is NOT sufficient evidence of a race
-  # - A pre-receive hook or protected branch also produces rejected push, permanently
-  # - Retrying that would burn budget forever and hide the real failure
-  race_regex='(behind|fast[- ]?forward|stale info|fetch first|contains work that you do not have)'
-  hook_rejection_regex='(pre-receive|pre-update|updatehook|hook rejection|protected branch)'
-  
-  if echo "$push_output" | grep -qiE "$race_regex"; then
-    # Race detected! Hook rejections during recovery are treated as part of the race loop.
-    # Only the first push with hook rejection (not matching the race regex) results in PUSH_FAILED.
+  # Classify the failure using bash's own '=~' (no subprocess, no pipe -- 'echo ... | grep -q'
+  # lets grep exit the instant it matches, which can SIGPIPE-kill the left-hand producer under
+  # 'set -o pipefail' (line 44) for a large enough push_output, e.g. a verbose hook dumping lots of
+  # diagnostic text before its actual rejection line -- this would silently misreport a real
+  # PUSH_FAILED/hook rejection as an unrelated failure. '=~' has no producer process to kill.
+  #
+  # HOOK CHECK RUNS FIRST, WITH ABSOLUTE PRIORITY over the race check -- not merely "excluded from"
+  # the race regex. A hook/protected-branch rejection message is admin-authored, arbitrary text, and
+  # can legitimately contain race-shaped words (e.g. "rejected because branch is behind policy") --
+  # classifying by race-keyword-presence alone would retry a permanent policy rejection forever,
+  # hiding the real failure. Git's own rejection framing is a much more reliable, non-keyword
+  # discriminator: ANY server-side rejection (a real remote hook, or a local bare-repo pre-receive
+  # hook used by this file's own selfcheck fixtures) is relayed to the client with a literal
+  # "remote: " line prefix and shows "[remote rejected]" in the summary line -- wording git itself
+  # controls, not something a hook author can spoof through their own message text. A genuine local,
+  # client-side non-fast-forward rejection (the only thing recovery should ever retry) has neither:
+  # plain "[rejected]" with no "remote" inside the brackets, and no "remote: " lines at all
+  # (verified empirically: a real hook rejection vs. a real fast-forward race produce exactly this
+  # observable difference on this git version).
+  _is_hook_rejection() {
+    case "$1" in
+      *"remote: "*|*"[remote rejected]"*) return 0;;
+    esac
+    local re='(pre-receive|pre-update|updatehook|hook rejection|protected branch)'
+    local rc
+    shopt -s nocasematch
+    [[ "$1" =~ $re ]]; rc=$?
+    shopt -u nocasematch
+    return "$rc"
+  }
+  _is_race() {
+    local re='(behind|fast[- ]?forward|stale info|fetch first|contains work that you do not have)'
+    local rc
+    shopt -s nocasematch
+    [[ "$1" =~ $re ]]; rc=$?
+    shopt -u nocasematch
+    return "$rc"
+  }
+
+  if ! _is_hook_rejection "$push_output" && _is_race "$push_output"; then
+    # Genuine race detected! Attempt bounded recovery. The initial push above already counts as
+    # attempt 1 of 3 total -- the loop below performs attempts 2 and 3 (2 more real push calls),
+    # never a 4th.
     echo "PUSH RACE (attempt 1/3): push failed, attempting race recovery..." >&2
-    
-    # Genuine race detected! Attempt bounded recovery (max 3 total attempts)
-    for attempt in 1 2 3; do
+
+    for attempt in 2 3; do
       _release_lock
       echo "PUSH RACE (attempt $attempt/3): push failed, attempting race recovery..." >&2
-      
+
       # git fetch origin (only touches remote-tracking refs, never working tree)
       if ! git -C "$repo" fetch origin >/dev/null 2>&1; then
-        echo "PUSH RACE EXHAUSTED: failed to fetch origin after $attempt attempt(s)" >&2
+        echo "PUSH RACE EXHAUSTED: failed to fetch origin before attempt $attempt" >&2
         _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
         exit 4
       fi
@@ -1140,13 +1298,13 @@ if [ "$push_rc" -ne 0 ]; then
       if [ "$merge_recovery_rc" -ne 0 ]; then
         # Recovery merge itself conflicted!
         git -C "$repo" merge --abort >/dev/null 2>&1 || true
-        echo "PUSH RACE EXHAUSTED: recovery merge conflicted after $attempt attempt(s)" >&2
+        echo "PUSH RACE EXHAUSTED: recovery merge conflicted on attempt $attempt" >&2
         echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
         _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
         exit 4
       fi
-      
-      # Retry push
+
+      # Retry push (this IS attempt $attempt -- the loop variable already counts it)
       push_output=$(LC_ALL=C git -C "$repo" push origin "$base" 2>&1)
       push_rc=$?
       if [ "$push_rc" -eq 0 ]; then
@@ -1156,25 +1314,26 @@ if [ "$push_rc" -ne 0 ]; then
         echo "merged $branch -> $base as $final_merged_sha (pushed to origin after race recovery)" >&2
         exit 0
       fi
-      
-      # This attempt failed, check if it's still a race or something else
-      if echo "$push_output" | grep -qiE "$hook_rejection_regex"; then
-        # Now we hit a hook rejection during recovery -> escalate
+
+      # This attempt failed too -- a hook rejection encountered mid-recovery escalates immediately
+      # (same absolute-priority hook check as the initial classification above); anything else
+      # matching the race signature just continues to the next loop iteration (or exhausts below).
+      if _is_hook_rejection "$push_output"; then
         echo "PUSH RACE EXHAUSTED: hook rejection encountered during recovery attempt $attempt/3" >&2
         echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
         _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
         exit 4
       fi
     done
-    
-    # All 3 attempts exhausted
+
+    # All 3 attempts (1 initial + 2 retries) exhausted
     _release_lock
-    echo "PUSH RACE EXHAUSTED: all 3 recovery attempts failed" >&2
+    echo "PUSH RACE EXHAUSTED: all 3 attempts failed" >&2
     echo "NOTE: the local merge commit $merged_sha for '$branch' already landed on '$base' in $repo -- it was NOT reverted" >&2
     _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
     exit 4
   else
-    # Not a race -> treat as PUSH_FAILED (no retry)
+    # Not a race (or a hook/protected-branch rejection, which always takes priority) -> PUSH_FAILED, no retry
     _release_lock
     echo "PUSH FAILED pushing '$base' to origin from $repo:" >&2
     printf '%s\n' "$push_output" >&2
