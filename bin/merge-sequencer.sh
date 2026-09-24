@@ -30,13 +30,72 @@
 #             real content conflict (MERGE_CONFLICT, 'git ls-files -u' non-empty) or a rejection with no
 #             actual conflict, e.g. a pre-merge-commit policy hook (MERGE_REJECTED, 'git ls-files -u'
 #             empty) -- both abort cleanly and leave $repo unchanged | 4 push failed (local merge already
-#             landed) | 5 lock timeout.
+#             landed) | 5 lock timeout | 6 --preflight-only conflict detected | 7 --preflight-only
+#             unsupported/inconclusive (git doesn't support --write-tree, or another error) | 8
+#             --preflight-only clean (no conflict detected).
+#             --preflight-only (6-8) is a READ-ONLY CHECK OF $repo's WORKING TREE, INDEX,
+#             HEAD/BRANCH REFS, LOCK, AND LEDGER SPECIFICALLY -- it never touches any of those five
+#             things, on any exit path. It is NOT read-only with respect to $repo's git internals
+#             in general: it runs a normal 'git fetch' of --base (which, like any fetch, writes
+#             .git/FETCH_HEAD, updates refs/remotes/origin/<base>, and downloads any new objects)
+#             and a 'git merge-tree --write-tree' conflict check (which writes the computed
+#             merge-result tree, and any conflict blobs, into the object database as an
+#             unreachable, git-gc'able dangling object -- the git-recommended, exit-code-reliable
+#             way to check for a conflict; the only alternative, the legacy 3-arg 'git merge-tree'
+#             without --write-tree, writes nothing but requires parsing unstructured text output
+#             instead of a clean 0/1 exit code). Both are the ordinary, unavoidable footprint of
+#             doing this check via git's own supported mechanisms, not a growing exceptions list.
+#             Note: exit codes 6-8 are ONLY for --preflight-only and never occur in normal merge+push flow.
+#             Existing exit codes (0-5) are unchanged and have identical semantics to today.
 #
 # Ledger reason_code is a CLOSED enum: SUCCESS | GATE_REFUSE | BRANCH_MISMATCH | MERGE_CONFLICT |
-#             MERGE_REJECTED | PUSH_FAILED | LOCK_TIMEOUT -- never freeform.
+#             MERGE_REJECTED | PUSH_FAILED | PUSH_RACE_RECOVERED | PUSH_RACE_EXHAUSTED | LOCK_TIMEOUT -- never freeform.
 #
-# Settled scope (do not re-litigate): no internal auto-retry, no rebase-in-place on refusal, no
-# priority queue / fairness policy, no automatic stale-lock expiry/steal, single machine only.
+# Settled scope (do not re-litigate): no retry of anything OTHER than a confirmed push race (see
+# P1 above -- bounded at 3 total attempts, never on a hook/protected-branch rejection), no
+# rebase-in-place on refusal, no priority queue / fairness policy, no automatic stale-lock
+# expiry/steal, single machine only.
+#
+# Accepted limitation (documented, not chased further): if $repo has (or at any point during this
+# invocation acquires) an executable 'pre-push' hook (checked via _repo_has_pre_push_hook,
+# respecting core.hooksPath, sampled before the first push attempt AND monotonically re-sampled --
+# OR'd, never reset -- before every retry, so a hook seen at ANY sample point stays remembered even
+# after it deletes/chmod's itself as its own last action), P1's push-race auto-recovery is disabled
+# ENTIRELY for that repo -- every push failure is reported as PUSH_FAILED, never retried, even a
+# genuine one. A LOCAL pre-push hook runs client-side, before git ever attempts the network-level
+# push, so its stderr has no "remote: " relay prefix or any other structural marker distinguishing
+# it from git's own client-generated race text -- unlike a server-side hook (pre-receive/update),
+# which is always relayed through that exact, un-spoofable prefix. There is no text pattern that
+# can safely tell "genuine race" from "pre-push hook's own arbitrary message" apart in that case,
+# so this trades away auto-recovery specifically for repos with a local pre-push hook installed, in
+# exchange for never retrying (and thereby hiding) a permanent policy rejection. A human can always
+# retry the push manually in that case.
+#
+# A NARROWER residual of the same limitation, deliberately not chased further: monotonic
+# re-sampling closes "a hook is installed sometime during the (potentially long) recovery
+# fetch/merge, before the NEXT push" -- but the exact INSTANT between any one sample and the push
+# it's immediately followed by is still, unavoidably, a real check-then-act gap (sampling closer to
+# the push shrinks this window, it can never eliminate it structurally). Closing this fully would
+# require detecting hook execution itself, not just presence -- a materially bigger change (e.g.
+# GIT_TRACE instrumentation) for a scenario that requires an adversarial actor with filesystem
+# write access to $repo/.git/hooks/, timed to a sub-second window, to exploit -- the same class of
+# narrow, artificially-held-open timing risk already accepted elsewhere in this codebase (see
+# bin/caffeinate-guard.sh's own documented PATH/supply-chain limitation).
+#
+# A SEPARATE, BROADER accepted limitation (also deliberately not chased): every classifier in this
+# file (_is_ref_lock_race, _is_race, _is_hook_rejection, _repo_has_pre_push_hook) fundamentally
+# trusts that the 'git' executable actually invoked is the genuine, unmodified system git. A
+# PATH-precedence shim, a custom transport/SSH/credential helper, or any other substitute for the
+# real 'git' binary can fabricate ANY output at all -- including a byte-for-byte copy of git's own
+# "[rejected]"/"[remote rejected]"/"(incorrect old value provided)" structural summary lines this
+# file relies on as unspoofable evidence, since those lines are only unspoofable when they are
+# genuinely git-generated. This is the identical class of threat bin/caffeinate-guard.sh already
+# documents and explicitly declines to defend against ("a PATH/supply-chain threat model outside
+# this feature's scope") -- not a gap in the local-pre-push-hook detection (rounds 7-10 remain
+# complete for that legitimate, ordinary git mechanism), but a categorically different, much
+# broader trust boundary: an adversary who can substitute what 'git' itself prints can defeat every
+# check in this script, not just its race classification, and no text-based check invoked via that
+# same compromised 'git' could ever reliably detect its own compromise from inside this process.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -158,6 +217,8 @@ _usage() {
 usage: merge-sequencer.sh --repo PATH --worktree PATH --branch NAME --base REF --checked-sha SHA
                            [--test CMD] [--message MSG] [--wait-timeout SECONDS]
        merge-sequencer.sh --selfcheck
+       merge-sequencer.sh --repo PATH --worktree PATH --branch NAME --base REF --checked-sha SHA
+                           --preflight-only
 EOF
 }
 
@@ -634,6 +695,913 @@ HOOKEOF
   [ "$(_ledger_count sm/hook-reject MERGE_REJECTED)" = "1" ] || { echo "FAIL: expected exactly one MERGE_REJECTED ledger record"; fails=1; }
   [ "$(_ledger_count sm/hook-reject MERGE_CONFLICT)" = "0" ] || { echo "FAIL: a hook rejection must NOT be logged as MERGE_CONFLICT -- the whole point of the closed-enum distinction"; fails=1; }
 
+  # ---- Test 18: (P1) genuine push race recovers successfully within budget, leaving both changes on main ----
+  IFS='|' read -r origin18 primary18 <<<"$(_setup_repo 18)"
+  git -C "$primary18" worktree add -q "$t/wt18" -b sm/push-race-recover main
+  echo "feature-race" >> "$t/wt18/file.txt"
+  git -C "$t/wt18" commit -qam "feature race"
+  sha18="$(git -C "$t/wt18" rev-parse HEAD)"
+  main_before18="$(git -C "$primary18" rev-parse main)"
+  # Prime origin with a concurrent push to create a real fast-forward race
+  git -C "$primary18" fetch origin >/dev/null 2>&1
+  # Create another commit on origin that will race with our push
+  # CRITICAL: use a different file so there's no content conflict during recovery merge
+  git -C "$primary18" checkout -q -b temp-race main
+  echo "temp-race-commit" > "$primary18/race-file.txt"
+  git -C "$primary18" add race-file.txt
+  git -C "$primary18" commit -qam "temp race commit"
+  git -C "$primary18" push -q origin temp-race:main
+  # Switch back to main before calling merge-sequencer.sh
+  git -C "$primary18" checkout -q main
+  # Now our invocation fetches, then we do a second push that will be a race
+  out18="$(_ms --repo "$primary18" --worktree "$t/wt18" --branch sm/push-race-recover --base main --checked-sha "$sha18" --wait-timeout 5 2>&1)"
+  rc18=$?
+  [ "$rc18" -eq 0 ] || { echo "FAIL: push-race recovery expected rc=0, got $rc18: $out18"; fails=1; }
+  main_after18="$(git -C "$primary18" rev-parse main)"
+  # Both changes must be present on main - verify by checking the commit messages
+  [ "$(git -C "$primary18" log --oneline -n 5 | grep -c 'temp race commit')" = "1" ] || { echo "FAIL: origin's temp race commit missing from main"; fails=1; }
+  [ "$(git -C "$primary18" log --oneline -n 5 | grep -c 'feature race')" = "1" ] || { echo "FAIL: our feature race commit missing from main"; fails=1; }
+  # Verify PUSH_RACE_RECOVERED ledger record
+  [ "$(_ledger_count sm/push-race-recover PUSH_RACE_RECOVERED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_RECOVERED ledger record"; fails=1; }
+  # Verify recovery commit message appears in git log
+  recovery_line=$(git -C "$primary18" log --oneline | grep "merge-sequencer: race recovery")
+  if [ -z "$recovery_line" ]; then
+    echo "FAIL: expected a recovery-merge commit message in git log (not found)" >&2
+    echo "DEBUG: git log -n 10:" >&2
+    git -C "$primary18" log --oneline -n 10 >&2
+    fails=1
+  fi
+  origin18_main="$(git --git-dir="$origin18" rev-parse main 2>/dev/null || echo "")"
+  [ "$origin18_main" = "$main_after18" ] || { echo "FAIL: origin main diverged from primary main after race recovery"; fails=1; }
+
+  # ---- Test 19: (P1) push-race exhausts all 3 attempts (persistent, genuine race signature on
+  # every attempt) -> PUSH_RACE_EXHAUSTED, exit 4. Uses a fake 'git' shim (not a pre-receive hook --
+  # a hook rejection must NEVER be classified as a race, see Test 20) prepended to PATH so every
+  # 'git push origin main' call deterministically fails with a real race-shaped message, regardless
+  # of attempt number -- this exercises the implementation's own bounded-3-attempts loop exhausting,
+  # not any fixture timing. The shim must correctly skip a leading '-C <dir>' (this file always calls
+  # git as 'git -C "$repo" push origin "$base"') and match on the ACTUAL pushed ref ($base, i.e.
+  # 'main'), not the branch name -- an earlier revision of this test matched on the branch name and
+  # never intercepted anything, since the branch name is never what gets pushed.
+  IFS='|' read -r origin19 primary19 <<<"$(_setup_repo 19)"
+  git -C "$primary19" worktree add -q "$t/wt19" -b sm/push-race-exhaust main
+  echo "feature-exhaust" >> "$t/wt19/file.txt"
+  git -C "$t/wt19" commit -qam "feature exhaust"
+  sha19="$(git -C "$t/wt19" rev-parse HEAD)"
+  main_before19="$(git -C "$primary19" rev-parse main)"
+  # Give origin ONE genuine, real advance the primary repo doesn't have yet (via a separate clone,
+  # never through $primary19), so the recovery loop's fetch+merge has real content to merge on its
+  # first attempt (producing an actual, distinctive recovery commit) rather than finding origin
+  # identical to what it already has -- a merge with truly nothing to merge is always a no-op
+  # ("Already up to date"), even with --no-ff, and would never produce a commit at all.
+  # Clone the PRIMARY checkout (has 'main' actually checked out), not the bare origin -- a bare
+  # repo's HEAD symref can be stale/nonexistent after its first push (it doesn't auto-follow
+  # whatever branch was pushed), which silently produces an empty, branch-less clone. Then
+  # explicitly repoint the clone's 'origin' remote at the REAL shared bare origin19 -- cloning
+  # from primary19 makes the clone's own 'origin' default to primary19 itself, which would refuse
+  # a push to its currently-checked-out branch.
+  # A separate, non-overlapping file -- touching file.txt (which the feature branch also modifies)
+  # would create a genuine content conflict, not the clean divergence this test needs.
+  git clone -q "$primary19" "$t/other-clone19" >/dev/null 2>&1
+  git -C "$t/other-clone19" remote set-url origin "$origin19"
+  echo "someone-else-raced-ahead" > "$t/other-clone19/other-file-19.txt"
+  git -C "$t/other-clone19" add other-file-19.txt
+  git -C "$t/other-clone19" commit -qam "a genuinely unrelated concurrent advance"
+  git -C "$t/other-clone19" push -q origin main
+  origin19_before="$(git --git-dir="$origin19" rev-parse main 2>/dev/null || echo "")"
+  fake_git_dir19="$t/fake-git-19"
+  mkdir -p "$fake_git_dir19"
+  real_git_path19="$(command -v git)"
+  cat > "$fake_git_dir19/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path19"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "! [rejected]  main -> main (fetch first)" >&2
+  echo "hint: Updates were rejected because the tip of your current branch is behind" >&2
+  echo "hint: its remote counterpart. Integrate the remote changes before pushing again." >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir19/git"
+  out19="$(PATH="$fake_git_dir19:$PATH" _ms --repo "$primary19" --worktree "$t/wt19" --branch sm/push-race-exhaust --base main --checked-sha "$sha19" --wait-timeout 5 2>&1)"
+  rc19=$?
+  [ "$rc19" -eq 4 ] || { echo "FAIL: push-race exhausted expected rc=4, got $rc19: $out19"; fails=1; }
+  main_after19="$(git -C "$primary19" rev-parse main)"
+  [ "$main_after19" != "$main_before19" ] || { echo "FAIL: local merge commit not retained on push exhaustion"; fails=1; }
+  origin19_after="$(git --git-dir="$origin19" rev-parse main 2>/dev/null || echo "")"
+  [ "$origin19_after" = "$origin19_before" ] || { echo "FAIL: origin main moved despite push being rejected on every attempt"; fails=1; }
+  if [ "$(_ledger_count sm/push-race-exhaust PUSH_RACE_EXHAUSTED)" != "1" ]; then
+    echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record" >&2
+    fails=1
+  fi
+  # Captured to a variable, then matched with bash's own '[[ == *pattern* ]]' -- no subprocess, no
+  # pipe. A live 'git log | grep -q' pipe lets grep exit the instant it finds a match (always the
+  # newest/first commit here), which can SIGPIPE-kill git before it finishes writing under 'set -o
+  # pipefail' (line 44), making the pipeline report failure despite a real match. A 'printf | grep
+  # -q' on the captured variable is NOT a full fix either -- a large enough string reproduces the
+  # exact same SIGPIPE for the exact same reason (verified directly: ~200KB reliably triggers it).
+  # Same bug class this repo already fixed once in bin/plan-committee.sh's collision guard --
+  # eliminate the pipe entirely, don't narrow the race or shrink the payload.
+  log19="$(git -C "$primary19" log --oneline)"
+  if [[ "$log19" != *"merge-sequencer: race recovery"* ]]; then
+    echo "FAIL: expected at least one recovery-merge commit message in git log" >&2
+    fails=1
+  fi
+
+  # ---- Test 20: (P1) CRITICAL negative test - pre-receive hook rejection must NOT be classified as race ----
+  # Reuse test 15's fixture: a bare origin with a rejecting pre-receive hook
+  IFS='|' read -r origin20 primary20 <<<"$(_setup_repo 20)"
+  cat > "$origin20/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "rejected by pre-receive hook (test)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin20/hooks/pre-receive"
+  git -C "$primary20" worktree add -q "$t/wt20" -b sm/push-fail-20 main
+  echo "feature-p20" >> "$t/wt20/file.txt"
+  git -C "$t/wt20" commit -qam "feature p20"
+  sha20="$(git -C "$t/wt20" rev-parse HEAD)"
+  main_before20="$(git -C "$primary20" rev-parse main)"
+  origin20_before="$(git --git-dir="$origin20" rev-parse main 2>/dev/null || echo "")"
+  out20="$(_ms --repo "$primary20" --worktree "$t/wt20" --branch sm/push-fail-20 --base main --checked-sha "$sha20" --wait-timeout 5 2>&1)"
+  rc20=$?
+  [ "$rc20" -eq 4 ] || { echo "FAIL: rejected push (hook) expected rc=4, got $rc20: $out20"; fails=1; }
+  main_after20="$(git -C "$primary20" rev-parse main)"
+  [ "$main_after20" != "$main_before20" ] || { echo "FAIL: local merge commit was not retained despite the push being rejected"; fails=1; }
+  origin20_after="$(git --git-dir="$origin20" rev-parse main 2>/dev/null || echo "")"
+  [ "$origin20_after" = "$origin20_before" ] || { echo "FAIL: origin main changed despite the push being rejected"; fails=1; }
+  echo "$out20" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message in output, got: $out20"; fails=1; }
+  # CRITICAL: must NOT be PUSH_RACE_* -- must be exactly PUSH_FAILED
+  [ "$(_ledger_count sm/push-fail-20 PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: hook rejection was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/push-fail-20 PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: hook rejection was wrongly classified as PUSH_RACE_EXHAUSTED"; fails=1; }
+  [ "$(_ledger_count sm/push-fail-20 PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record for hook rejection"; fails=1; }
+  # Verify NO recovery-merge commit exists (hook rejection should not trigger any retry).
+  # Captured + matched with '[[ == * ]]', no pipe -- see Test 19's identical comment for why
+  # even a captured-variable pipe to grep -q is unsafe (SIGPIPE under pipefail) for large input.
+  log20="$(git -C "$primary20" log --oneline)"
+  [[ "$log20" == *"merge-sequencer: race recovery"* ]] && { echo "FAIL: hook rejection wrongly triggered a recovery-merge commit (retry should NOT have happened)"; fails=1; } || true
+
+  # ---- Test 21: (P1) recovery merge itself conflicts -> escalate, main left at state after FIRST merge ----
+  IFS='|' read -r origin21 primary21 <<<"$(_setup_repo 21)"
+  git -C "$primary21" worktree add -q "$t/wt21" -b sm/push-race-conflict main
+  echo "feature-conflict" >> "$t/wt21/file.txt"
+  git -C "$t/wt21" commit -qam "feature conflict"
+  sha21="$(git -C "$t/wt21" rev-parse HEAD)"
+  main_before21="$(git -C "$primary21" rev-parse main)"
+  # Make origin advance with conflicting changes to force recovery merge conflict
+  git -C "$primary21" fetch origin >/dev/null 2>&1
+  # Create conflicting changes on origin - use SAME file to ensure conflict
+  git -C "$primary21" checkout -q -b conflict-race main
+  echo "conflict-on-origin" >> "$primary21/file.txt"
+  git -C "$primary21" commit -qam "origin conflict commit"
+  git -C "$primary21" push -q origin conflict-race:main
+  # Switch back to main before calling merge-sequencer.sh
+  git -C "$primary21" checkout -q main
+  out21="$(_ms --repo "$primary21" --worktree "$t/wt21" --branch sm/push-race-conflict --base main --checked-sha "$sha21" --wait-timeout 5 2>&1)"
+  rc21=$?
+  # After 3 exhausted attempts, should escalate with exit 4 (PUSH_RACE_EXHAUSTED logic)
+  [ "$rc21" -eq 4 ] || { echo "FAIL: recovery merge conflict exhaustion expected rc=4, got $rc21: $out21"; fails=1; }
+  main_after21="$(git -C "$primary21" rev-parse main)"
+  # The FIRST (original) merge should still be present on main
+  [ "$main_after21" != "$main_before21" ] || { echo "FAIL: main not advanced despite first merge landing"; fails=1; }
+  # Verify the conflict resolution marker is the FIRST merge (not corrupted by failed recovery).
+  # Captured + matched with '[[ == * ]]' in both checks below, no pipe at all -- see Test 19's
+  # identical comment for why even a captured-variable pipe to grep -q is unsafe for large input.
+  log21="$(git -C "$primary21" log --oneline)"
+  [[ "$log21" == *"feature conflict"* ]] || { echo "FAIL: first merge's feature conflict commit missing from main"; fails=1; }
+  # Verify no recovery merge commit for conflict case (failed on first attempt, no retries)
+  [[ "$log21" == *"merge-sequencer: race recovery"* ]] && { echo "FAIL: conflict case should not have recovery commits"; fails=1; } || true
+  [ "$(_ledger_count sm/push-race-conflict PUSH_RACE_EXHAUSTED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record for recovery conflict"; fails=1; }
+
+  # ---- Test 22: (P2) --preflight-only with clean merge (no conflict) -> exit 6, zero side effects ----
+  IFS='|' read -r origin22 primary22 <<<"$(_setup_repo 22)"
+  git -C "$primary22" worktree add -q "$t/wt22" -b sm/preflight-clean main
+  echo "feature-preflight" >> "$t/wt22/file.txt"
+  git -C "$t/wt22" commit -qam "feature preflight clean"
+  sha22="$(git -C "$t/wt22" rev-parse HEAD)"
+  main_before22="$(git -C "$primary22" rev-parse main)"
+  lock_dir22="$primary22/.secondmate/merge-sequencer.lock"
+  # Count ledger entries before preflight
+  ledger_lines_before=$(wc -l < "$ledger_default" 2>/dev/null || echo 0)
+  out22="$(_ms --repo "$primary22" --worktree "$t/wt22" --branch sm/preflight-clean --base main --checked-sha "$sha22" --preflight-only --wait-timeout 5 2>&1)"
+  rc22=$?
+  [ "$rc22" -eq 8 ] || { echo "FAIL: preflight clean expected rc=8, got $rc22: $out22"; fails=1; }
+  echo "$out22" | grep -qi "preflight.*clean\|no conflict\|clean" || { echo "FAIL: expected a clean/no-conflict message, got: $out22"; fails=1; }
+  # Zero side effects: no lock dir, no merge commit, no ledger entry
+  [ ! -d "$lock_dir22" ] || { echo "FAIL: preflight clean created lock directory (should be read-only)"; fails=1; }
+  main_after22="$(git -C "$primary22" rev-parse main)"
+  [ "$main_after22" = "$main_before22" ] || { echo "FAIL: preflight clean advanced main when it should be read-only"; fails=1; }
+  # Check ledger wasn't modified during preflight
+  ledger_lines_after=$(wc -l < "$ledger_default" 2>/dev/null || echo 0)
+  [ "$ledger_lines_after" = "$ledger_lines_before" ] || { echo "FAIL: preflight clean wrote to ledger (should be read-only, lines before=$ledger_lines_before after=$ledger_lines_after)"; fails=1; }
+  [ ! -e "$primary22/.git/MERGE_HEAD" ] || { echo "FAIL: preflight clean left MERGE_HEAD (should be read-only)"; fails=1; }
+  [ -z "$(git -C "$primary22" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight clean left repo dirty (should be read-only)"; fails=1; }
+
+  # ---- Test 23: (P2) --preflight-only with conflict -> exit 6 (conflict), no side effects ----
+  # git merge-tree --write-tree exits 1 on conflict -> we map to exit 6 for --preflight-only conflict
+  IFS='|' read -r origin23 primary23 <<<"$(_setup_repo 23)"
+  git -C "$primary23" worktree add -q "$t/wt23" -b sm/preflight-conflict main
+  echo "conflict-A" > "$t/wt23/file.txt"
+  git -C "$t/wt23" commit -qam "A (branch conflict)"
+  sha23="$(git -C "$t/wt23" rev-parse HEAD)"
+  echo "conflict-B" > "$primary23/file.txt"
+  git -C "$primary23" commit -qam "B (main conflict)"
+  git -C "$primary23" push -q origin main
+  main_before23="$(git -C "$primary23" rev-parse main)"
+  out23="$(_ms --repo "$primary23" --worktree "$t/wt23" --branch sm/preflight-conflict --base main --checked-sha "$sha23" --preflight-only --wait-timeout 5 2>&1)"
+  rc23=$?
+  [ "$rc23" -eq 6 ] || { echo "FAIL: preflight conflict expected rc=6, got $rc23: $out23"; fails=1; }
+  echo "$out23" | grep -qi "conflict\|stale\|merge origin.*base.*branch" || { echo "FAIL: expected a conflict message with actionable advice, got: $out23"; fails=1; }
+  # Zero side effects even for conflict
+  lock_dir23="$primary23/.secondmate/merge-sequencer.lock"
+  [ ! -d "$lock_dir23" ] || { echo "FAIL: preflight conflict created lock directory (should be read-only)"; fails=1; }
+  main_after23="$(git -C "$primary23" rev-parse main)"
+  [ "$main_after23" = "$main_before23" ] || { echo "FAIL: preflight conflict advanced main when it should be read-only"; fails=1; }
+  [ ! -e "$primary23/.git/MERGE_HEAD" ] || { echo "FAIL: preflight conflict left MERGE_HEAD (should be read-only, never merges)"; fails=1; }
+
+  # ---- Test 24: (P2) --preflight-only normal happy path validation ----
+  IFS='|' read -r origin24 primary24 <<<"$(_setup_repo 24)"
+  git -C "$primary24" worktree add -q "$t/wt24" -b sm/preflight-normal main
+  echo "feature-normal" >> "$t/wt24/file.txt"
+  git -C "$t/wt24" commit -qam "feature normal"
+  sha24="$(git -C "$t/wt24" rev-parse HEAD)"
+  # Verify normal success path
+  out24="$(_ms --repo "$primary24" --worktree "$t/wt24" --branch sm/preflight-normal --base main --checked-sha "$sha24" --preflight-only --wait-timeout 5 2>&1)"
+  rc24=$?
+  [ "$rc24" -eq 8 ] || { echo "FAIL: preflight normal clean expected rc=8, got $rc24: $out24"; fails=1; }
+  echo "$out24" | grep -qi "preflight.*clean\|no conflict" || { echo "FAIL: expected a clean/no-conflict message for preflight normal, got: $out24"; fails=1; }
+
+  # ---- Test 25: (P1) CRITICAL negative test -- a hook rejection whose OWN message happens to
+  # contain a race keyword ("behind") must still be PUSH_FAILED, never retried as a race. A real
+  # hook's message is admin-authored, arbitrary text; classifying by keyword presence alone would
+  # retry a permanent policy rejection forever. Reuses the real-hook fixture pattern from Test
+  # 17/20 (not the fake shim -- this needs git's OWN real "remote: "/"[remote rejected]" framing).
+  IFS='|' read -r origin25 primary25 <<<"$(_setup_repo 25)"
+  cat > "$origin25/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "rejected because branch is behind policy" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin25/hooks/pre-receive"
+  git -C "$primary25" worktree add -q "$t/wt25" -b sm/hook-behind-collision main
+  echo "feature-p25" >> "$t/wt25/file.txt"
+  git -C "$t/wt25" commit -qam "feature p25"
+  sha25="$(git -C "$t/wt25" rev-parse HEAD)"
+  main_before25="$(git -C "$primary25" rev-parse main)"
+  out25="$(_ms --repo "$primary25" --worktree "$t/wt25" --branch sm/hook-behind-collision --base main --checked-sha "$sha25" --wait-timeout 5 2>&1)"
+  rc25=$?
+  [ "$rc25" -eq 4 ] || { echo "FAIL: hook rejection containing 'behind' expected rc=4, got $rc25: $out25"; fails=1; }
+  main_after25="$(git -C "$primary25" rev-parse main)"
+  [ "$main_after25" != "$main_before25" ] || { echo "FAIL: local merge commit was not retained despite the push being rejected"; fails=1; }
+  echo "$out25" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out25"; fails=1; }
+  # The whole point of this test: must be PUSH_FAILED, NOT retried into PUSH_RACE_EXHAUSTED,
+  # despite the hook's own message containing the word "behind" (in the race regex).
+  [ "$(_ledger_count sm/hook-behind-collision PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (hook message collided with a race keyword)"; fails=1; }
+  [ "$(_ledger_count sm/hook-behind-collision PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: hook rejection containing 'behind' was wrongly retried and classified as PUSH_RACE_EXHAUSTED -- the exact keyword-collision bug this test guards"; fails=1; }
+  [ "$(_ledger_count sm/hook-behind-collision PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: hook rejection containing 'behind' was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  log25="$(git -C "$primary25" log --oneline)"
+  [[ "$log25" != *"merge-sequencer: race recovery"* ]] || { echo "FAIL: hook rejection containing 'behind' wrongly triggered a recovery-merge commit"; fails=1; }
+
+  # ---- Test 26: (P1) exhaustion performs EXACTLY 3 total push attempts (1 initial + 2 retries),
+  # never a 4th. The fake shim below counts every real 'push' invocation it intercepts by
+  # appending one line per call to a counter file. ----
+  IFS='|' read -r origin26 primary26 <<<"$(_setup_repo 26)"
+  git -C "$primary26" worktree add -q "$t/wt26" -b sm/push-race-count main
+  echo "feature-count" >> "$t/wt26/file.txt"
+  git -C "$t/wt26" commit -qam "feature count"
+  sha26="$(git -C "$t/wt26" rev-parse HEAD)"
+  counter26="$t/push-attempt-counter-26"
+  : > "$counter26"
+  fake_git_dir26="$t/fake-git-26"
+  mkdir -p "$fake_git_dir26"
+  real_git_path26="$(command -v git)"
+  cat > "$fake_git_dir26/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path26"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "attempt" >> "$counter26"
+  echo "! [rejected]  main -> main (fetch first)" >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir26/git"
+  out26="$(PATH="$fake_git_dir26:$PATH" _ms --repo "$primary26" --worktree "$t/wt26" --branch sm/push-race-count --base main --checked-sha "$sha26" --wait-timeout 5 2>&1)"
+  rc26=$?
+  [ "$rc26" -eq 4 ] || { echo "FAIL: push-race count test expected rc=4, got $rc26: $out26"; fails=1; }
+  attempt_count26="$(wc -l < "$counter26" | tr -d ' ')"
+  [ "$attempt_count26" = "3" ] || { echo "FAIL: expected exactly 3 total push attempts (1 initial + 2 retries), got $attempt_count26"; fails=1; }
+
+  # ---- Test 27: (P1) a hook rejection with a LARGE message (well over a pipe buffer) must still
+  # be correctly classified as PUSH_FAILED, never PUSH_RACE_EXHAUSTED -- proves the classifier's
+  # own bash-native '[[ =~ ]]'/'[[ == * ]]' matching (no subprocess, no pipe) is genuinely immune
+  # to the SIGPIPE-under-pipefail class this diff fixes, regardless of payload size. ----
+  IFS='|' read -r origin27 primary27 <<<"$(_setup_repo 27)"
+  python3 -c "
+print('#!/bin/sh')
+print('echo \'' + ('x' * 200000) + '\' >&2')
+print('echo \"remote: rejected because branch is behind policy\" >&2')
+print('exit 1')
+" > "$origin27/hooks/pre-receive"
+  chmod +x "$origin27/hooks/pre-receive"
+  git -C "$primary27" worktree add -q "$t/wt27" -b sm/hook-large-message main
+  echo "feature-p27" >> "$t/wt27/file.txt"
+  git -C "$t/wt27" commit -qam "feature p27"
+  sha27="$(git -C "$t/wt27" rev-parse HEAD)"
+  out27="$(_ms --repo "$primary27" --worktree "$t/wt27" --branch sm/hook-large-message --base main --checked-sha "$sha27" --wait-timeout 5 2>&1)"
+  rc27=$?
+  [ "$rc27" -eq 4 ] || { echo "FAIL: large hook rejection expected rc=4, got $rc27"; fails=1; }
+  [ "$(_ledger_count sm/hook-large-message PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record for a large hook rejection message"; fails=1; }
+  [ "$(_ledger_count sm/hook-large-message PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: a large hook rejection message was wrongly retried into PUSH_RACE_EXHAUSTED"; fails=1; }
+
+  # ---- Test 28: (P1) an 'update' hook (not 'pre-receive') whose message contains a race keyword
+  # ("behind") but NONE of hook_rejection_regex's literal keywords, and whose git-generated summary
+  # says only "(hook declined)" -- NOT "(pre-receive hook declined)" -- must still be classified as
+  # PUSH_FAILED via the "remote: "/"[remote rejected]" structural check alone, since no keyword
+  # match exists anywhere. Verified empirically: a real local 'update' hook produces exactly this
+  # wording on this git version. This is the one real case that isolates the "remote:" check as
+  # the sole discriminator -- unlike Test 25/27, whose 'pre-receive' hooks are ALSO caught by
+  # hook_rejection_regex's literal "pre-receive" keyword via git's own separate boilerplate. ----
+  IFS='|' read -r origin28 primary28 <<<"$(_setup_repo 28)"
+  cat > "$origin28/hooks/update" <<'HOOKEOF'
+#!/bin/sh
+echo "access denied: your changes are behind the required baseline" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin28/hooks/update"
+  git -C "$primary28" worktree add -q "$t/wt28" -b sm/update-hook-behind main
+  echo "feature-p28" >> "$t/wt28/file.txt"
+  git -C "$t/wt28" commit -qam "feature p28"
+  sha28="$(git -C "$t/wt28" rev-parse HEAD)"
+  out28="$(_ms --repo "$primary28" --worktree "$t/wt28" --branch sm/update-hook-behind --base main --checked-sha "$sha28" --wait-timeout 5 2>&1)"
+  rc28=$?
+  [ "$rc28" -eq 4 ] || { echo "FAIL: update-hook 'behind' collision expected rc=4, got $rc28: $out28"; fails=1; }
+  echo "$out28" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out28"; fails=1; }
+  [ "$(_ledger_count sm/update-hook-behind PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (update hook, no keyword match, must rely on 'remote:' framing)"; fails=1; }
+  [ "$(_ledger_count sm/update-hook-behind PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: update-hook rejection with no keyword match was wrongly retried into PUSH_RACE_EXHAUSTED -- the exact gap the 'remote:' structural check exists to close"; fails=1; }
+
+  # ---- Test 29: (P1) CRITICAL negative test -- a genuine concurrent server-side ref-lock race
+  # ("cannot lock ref .../"incorrect old value provided") ALSO carries "remote: "/"[remote
+  # rejected]" framing (verified empirically against two real concurrent pushes to a bare repo),
+  # so it must NOT be swallowed by the hook check -- it must still be recovered as a race. Uses a
+  # fake shim (deterministic; a real concurrent race is inherently flaky as a regression test) that
+  # returns git's own EXACT real ref-lock-race wording on the first push, then delegates to the
+  # real git (letting it genuinely succeed) on retry. ----
+  IFS='|' read -r origin29 primary29 <<<"$(_setup_repo 29)"
+  git -C "$primary29" worktree add -q "$t/wt29" -b sm/reflock-race main
+  echo "feature-reflock" >> "$t/wt29/file.txt"
+  git -C "$t/wt29" commit -qam "feature reflock"
+  sha29="$(git -C "$t/wt29" rev-parse HEAD)"
+  fake_git_dir29="$t/fake-git-29"
+  mkdir -p "$fake_git_dir29"
+  real_git_path29="$(command -v git)"
+  counter29="$t/reflock-push-counter-29"
+  : > "$counter29"
+  cat > "$fake_git_dir29/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path29"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter29" | tr -d ' ')
+  echo "attempt" >> "$counter29"
+  if [ "\$n" = "0" ]; then
+    echo "remote: error: cannot lock ref 'refs/heads/main': is at aaaa111 but expected bbbb222" >&2
+    echo "! [remote rejected]  main -> main (incorrect old value provided)" >&2
+    exit 1
+  fi
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir29/git"
+  out29="$(PATH="$fake_git_dir29:$PATH" _ms --repo "$primary29" --worktree "$t/wt29" --branch sm/reflock-race --base main --checked-sha "$sha29" --wait-timeout 5 2>&1)"
+  rc29=$?
+  [ "$rc29" -eq 0 ] || { echo "FAIL: ref-lock race expected rc=0 (recovered), got $rc29: $out29"; fails=1; }
+  [ "$(_ledger_count sm/reflock-race PUSH_RACE_RECOVERED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_RECOVERED ledger record for a real ref-lock-race message"; fails=1; }
+  [ "$(_ledger_count sm/reflock-race PUSH_FAILED)" = "0" ] || { echo "FAIL: ref-lock race was wrongly classified as PUSH_FAILED (hook check ran before the ref-lock-race check) -- the exact regression this test guards"; fails=1; }
+
+  # ---- Test 30: (P2) --preflight-only with a STALE --checked-sha (branch has since moved to a
+  # newer, different tip) must refuse (exit 7), never silently check the stale SHA and report
+  # PREFLIGHT OK/CONFLICT about a commit that is no longer --branch's actual current state. ----
+  IFS='|' read -r origin30 primary30 <<<"$(_setup_repo 30)"
+  git -C "$primary30" worktree add -q "$t/wt30" -b sm/preflight-stale main
+  echo "feature-stale-v1" >> "$t/wt30/file.txt"
+  git -C "$t/wt30" commit -qam "feature stale v1"
+  sha30_stale="$(git -C "$t/wt30" rev-parse HEAD)"
+  # Branch moves forward AFTER the SHA above was "reviewed" -- --checked-sha is now stale.
+  echo "feature-stale-v2" >> "$t/wt30/file.txt"
+  git -C "$t/wt30" commit -qam "feature stale v2 (branch moved on)"
+  out30="$(_ms --repo "$primary30" --worktree "$t/wt30" --branch sm/preflight-stale --base main --checked-sha "$sha30_stale" --preflight-only --wait-timeout 5 2>&1)"
+  rc30=$?
+  [ "$rc30" -eq 7 ] || { echo "FAIL: preflight with a stale --checked-sha (branch has since moved) expected rc=7, got $rc30: $out30"; fails=1; }
+  echo "$out30" | grep -qi "does not match --checked-sha\|resolves to" || { echo "FAIL: expected a branch/checked-sha mismatch explanation, got: $out30"; fails=1; }
+
+  # ---- Test 31: (P1) CRITICAL negative test -- a REAL, plausible hook message that happens to
+  # contain the free-text phrase "cannot lock ref" as ordinary policy English (not git's own
+  # ref-CAS parenthetical reason) must still be PUSH_FAILED, never treated as a ref-lock race. An
+  # earlier revision of _is_ref_lock_race matched this phrase anywhere in the output and was fooled
+  # by exactly this kind of message -- fixed by matching ONLY the "(incorrect old value provided)"
+  # parenthetical, which git itself controls and a hook cannot produce. ----
+  IFS='|' read -r origin31 primary31 <<<"$(_setup_repo 31)"
+  cat > "$origin31/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "policy denied: cannot lock ref writes until CAB approval" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin31/hooks/pre-receive"
+  git -C "$primary31" worktree add -q "$t/wt31" -b sm/cab-policy-collision main
+  echo "feature-p31" >> "$t/wt31/file.txt"
+  git -C "$t/wt31" commit -qam "feature p31"
+  sha31="$(git -C "$t/wt31" rev-parse HEAD)"
+  out31="$(_ms --repo "$primary31" --worktree "$t/wt31" --branch sm/cab-policy-collision --base main --checked-sha "$sha31" --wait-timeout 5 2>&1)"
+  rc31=$?
+  [ "$rc31" -eq 4 ] || { echo "FAIL: CAB-policy 'cannot lock ref' collision expected rc=4, got $rc31: $out31"; fails=1; }
+  echo "$out31" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out31"; fails=1; }
+  [ "$(_ledger_count sm/cab-policy-collision PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (hook message coincidentally contained 'cannot lock ref')"; fails=1; }
+  [ "$(_ledger_count sm/cab-policy-collision PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: CAB-policy hook message was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/cab-policy-collision PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: CAB-policy hook message was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact free-text-collision bug this test guards"; fails=1; }
+
+  # ---- Test 32: (P2) --preflight-only's merge-tree --write-tree call may increase the loose
+  # object count (the dangling merge-tree result), but the lock dir, main ref, ledger, and repo
+  # cleanliness stay exactly as Test 22 already asserts -- the READ-ONLY guarantee is scoped to
+  # working tree/index/branch-refs/lock/ledger specifically, not "no git-internal footprint at
+  # all" (see the reframed header comment). ----
+  IFS='|' read -r origin32 primary32 <<<"$(_setup_repo 32)"
+  git -C "$primary32" worktree add -q "$t/wt32" -b sm/preflight-object-write main
+  echo "feature-objwrite" >> "$t/wt32/file.txt"
+  git -C "$t/wt32" commit -qam "feature object write"
+  sha32="$(git -C "$t/wt32" rev-parse HEAD)"
+  # Genuine divergence on a DIFFERENT file, so the merge-tree result is a real, brand-new tree --
+  # a merge-tree computed against an origin that never diverged just reuses the feature branch's
+  # OWN already-existing tree object, writing nothing new (this is exactly why a naive version of
+  # this test, without this divergent commit, saw no object-count change at all).
+  echo "origin-side-objwrite" > "$primary32/other-file-32.txt"
+  git -C "$primary32" add other-file-32.txt
+  git -C "$primary32" commit -qam "origin-side change, different file"
+  git -C "$primary32" push -q origin main
+  objects_before32="$(git -C "$primary32" count-objects | cut -d' ' -f1)"
+  out32="$(_ms --repo "$primary32" --worktree "$t/wt32" --branch sm/preflight-object-write --base main --checked-sha "$sha32" --preflight-only --wait-timeout 5 2>&1)"
+  rc32=$?
+  [ "$rc32" -eq 8 ] || { echo "FAIL: preflight object-write test expected rc=8, got $rc32: $out32"; fails=1; }
+  objects_after32="$(git -C "$primary32" count-objects | cut -d' ' -f1)"
+  [ "$objects_after32" -gt "$objects_before32" ] || { echo "FAIL: expected loose object count to increase (the documented merge-tree --write-tree exception) -- got before=$objects_before32 after=$objects_after32; if this now stays equal, the header comment's 2nd exception is stale and should be removed, not left describing behavior that no longer happens"; fails=1; }
+  [ -z "$(git -C "$primary32" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight left the working tree dirty despite the object-database exception being documented as write-only (no working-tree/index change)"; fails=1; }
+  [ ! -e "$primary32/.git/MERGE_HEAD" ] || { echo "FAIL: preflight left MERGE_HEAD despite never running a real merge"; fails=1; }
+
+  # ---- Test 33: (P2) confirms --preflight-only's fetch has fetch's OWN ordinary footprint
+  # (.git/FETCH_HEAD written, new objects downloaded) -- documented explicitly after round 4 found
+  # this undocumented, using the same independent-clone-advances-origin scenario as the checker's
+  # own repro. This is expected, documented behavior, not a defect to chase further. ----
+  IFS='|' read -r origin33 primary33 <<<"$(_setup_repo 33)"
+  git -C "$primary33" worktree add -q "$t/wt33" -b sm/preflight-fetch-footprint main
+  echo "feature-fetchfoot" >> "$t/wt33/file.txt"
+  git -C "$t/wt33" commit -qam "feature fetch footprint"
+  sha33="$(git -C "$t/wt33" rev-parse HEAD)"
+  git clone -q "$primary33" "$t/other-clone33" >/dev/null 2>&1
+  git -C "$t/other-clone33" remote set-url origin "$origin33"
+  echo "independent-advance-33" > "$t/other-clone33/other-file-33.txt"
+  git -C "$t/other-clone33" add other-file-33.txt
+  git -C "$t/other-clone33" commit -qam "independent origin advance"
+  git -C "$t/other-clone33" push -q origin main
+  [ ! -e "$primary33/.git/FETCH_HEAD" ] || { echo "FAIL: test setup invariant broken -- FETCH_HEAD already present before preflight ran"; fails=1; }
+  objects_before33="$(git -C "$primary33" count-objects | cut -d' ' -f1)"
+  out33="$(_ms --repo "$primary33" --worktree "$t/wt33" --branch sm/preflight-fetch-footprint --base main --checked-sha "$sha33" --preflight-only --wait-timeout 5 2>&1)"
+  rc33=$?
+  [ "$rc33" -eq 8 ] || { echo "FAIL: preflight fetch-footprint test expected rc=8, got $rc33: $out33"; fails=1; }
+  [ -e "$primary33/.git/FETCH_HEAD" ] || { echo "FAIL: expected .git/FETCH_HEAD to exist after preflight's fetch (documented, ordinary fetch footprint)"; fails=1; }
+  objects_after33="$(git -C "$primary33" count-objects | cut -d' ' -f1)"
+  [ "$objects_after33" -gt "$objects_before33" ] || { echo "FAIL: expected new objects to be downloaded from the independent origin advance"; fails=1; }
+  [ -z "$(git -C "$primary33" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight's fetch left the working tree dirty"; fails=1; }
+
+  # ---- Test 34: (P1) CRITICAL negative test -- a hook that tries to LITERALLY SPOOF git's own
+  # ref-lock-race parenthetical, including a fake full "! [remote rejected] ... (incorrect old
+  # value provided)" line, must still be PUSH_FAILED. Verified empirically that git relays even a
+  # spoofed line through the "remote: " prefix, and separately, correctly generates its OWN
+  # unprefixed summary line with the TRUE reason -- _client_lines_only's job is to only ever look
+  # at that second, unspoofable line. ----
+  IFS='|' read -r origin34 primary34 <<<"$(_setup_repo 34)"
+  cat > "$origin34/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "policy denied (incorrect old value provided)" >&2
+echo " ! [remote rejected] main -> main (incorrect old value provided)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$origin34/hooks/pre-receive"
+  git -C "$primary34" worktree add -q "$t/wt34" -b sm/hook-spoofs-reflock main
+  echo "feature-p34" >> "$t/wt34/file.txt"
+  git -C "$t/wt34" commit -qam "feature p34"
+  sha34="$(git -C "$t/wt34" rev-parse HEAD)"
+  out34="$(_ms --repo "$primary34" --worktree "$t/wt34" --branch sm/hook-spoofs-reflock --base main --checked-sha "$sha34" --wait-timeout 5 2>&1)"
+  rc34=$?
+  [ "$rc34" -eq 4 ] || { echo "FAIL: hook spoofing the ref-lock-race parenthetical expected rc=4, got $rc34: $out34"; fails=1; }
+  echo "$out34" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out34"; fails=1; }
+  [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (hook tried to spoof the ref-lock-race parenthetical)"; fails=1; }
+  [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: spoofed ref-lock-race parenthetical was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/hook-spoofs-reflock PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: spoofed ref-lock-race parenthetical was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact spoofing bug this test guards"; fails=1; }
+
+  # ---- Test 35: (P1) CRITICAL negative test -- a genuine race on the initial push, followed by
+  # an UNRELATED failure (auth/network, matching neither a race signature nor a recognized hook
+  # rejection) on the FIRST retry, must stop immediately rather than burning a 3rd, pointless
+  # attempt. An earlier revision only escalated on a confirmed hook rejection and silently
+  # continued retrying on anything else it couldn't positively classify. ----
+  IFS='|' read -r origin35 primary35 <<<"$(_setup_repo 35)"
+  git -C "$primary35" worktree add -q "$t/wt35" -b sm/auth-fail-midrace main
+  echo "feature-authfail" >> "$t/wt35/file.txt"
+  git -C "$t/wt35" commit -qam "feature auth fail"
+  sha35="$(git -C "$t/wt35" rev-parse HEAD)"
+  fake_git_dir35="$t/fake-git-35"
+  mkdir -p "$fake_git_dir35"
+  real_git_path35="$(command -v git)"
+  counter35="$t/push-counter-35"
+  : > "$counter35"
+  cat > "$fake_git_dir35/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path35"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter35" | tr -d ' ')
+  echo "attempt" >> "$counter35"
+  if [ "\$n" = "0" ]; then
+    echo "! [rejected]  main -> main (fetch first)" >&2
+    exit 1
+  else
+    echo "fatal: Authentication failed for '\''origin'\''" >&2
+    exit 1
+  fi
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir35/git"
+  out35="$(PATH="$fake_git_dir35:$PATH" _ms --repo "$primary35" --worktree "$t/wt35" --branch sm/auth-fail-midrace --base main --checked-sha "$sha35" --wait-timeout 5 2>&1)"
+  rc35=$?
+  [ "$rc35" -eq 4 ] || { echo "FAIL: race-then-auth-failure expected rc=4, got $rc35: $out35"; fails=1; }
+  attempt_count35="$(wc -l < "$counter35" | tr -d ' ')"
+  [ "$attempt_count35" = "2" ] || { echo "FAIL: expected exactly 2 push attempts (initial race + 1 retry that hit the unrelated auth failure), got $attempt_count35 -- an unrelated failure must stop the loop immediately, not burn a pointless 3rd attempt"; fails=1; }
+  [ "$(_ledger_count sm/auth-fail-midrace PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: race-then-auth-failure was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+
+  # ---- Test 36: (P1) CRITICAL negative test -- while invocation A is mid-recovery (a real race
+  # on its first push, then a slow recovery fetch), a SECOND, concurrent invocation B targeting the
+  # SAME --repo must wait for A's lock, never merge/push into that same checkout while A's own
+  # recovery is still in progress. An earlier revision released the lock at the top of each retry
+  # attempt, letting B complete entirely mid-A's-recovery -- reproduced directly with two real
+  # concurrent invocations before this fix (B finished successfully, rc=0, while A was still
+  # recovering). The decisive assertion: once both finish, A's own final commit must be an ANCESTOR
+  # of B's resulting main -- proof B's merge only happened after A's ENTIRE recovery (including
+  # the lock's release) was done, not a race that could have landed B's commit onto a stale base. ----
+  IFS='|' read -r origin36 primary36 <<<"$(_setup_repo 36)"
+  git -C "$primary36" worktree add -q "$t/wt36a" -b sm/conc-race-a main
+  echo "feature-36a" >> "$t/wt36a/file.txt"
+  git -C "$t/wt36a" commit -qam "feature 36a"
+  sha36a="$(git -C "$t/wt36a" rev-parse HEAD)"
+  git -C "$primary36" worktree add -q "$t/wt36b" -b sm/conc-race-b main
+  echo "feature-36b" > "$t/wt36b/other-file-36.txt"
+  git -C "$t/wt36b" add other-file-36.txt
+  git -C "$t/wt36b" commit -qam "feature 36b"
+  sha36b="$(git -C "$t/wt36b" rev-parse HEAD)"
+  fake_git_dir36="$t/fake-git-36"
+  mkdir -p "$fake_git_dir36"
+  real_git_path36="$(command -v git)"
+  counter36="$t/push-counter-36"
+  : > "$counter36"
+  cat > "$fake_git_dir36/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path36"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter36" | tr -d ' ')
+  echo "attempt" >> "$counter36"
+  if [ "\$n" = "0" ]; then
+    echo "! [rejected]  main -> main (fetch first)" >&2
+    exit 1
+  fi
+elif [ "\$sub" = "fetch" ]; then
+  sleep 3
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir36/git"
+  (
+    PATH="$fake_git_dir36:$PATH" SM_LOOP_STATE="$SM_LOOP_STATE" SM_MERGE_LEDGER="$SM_MERGE_LEDGER" bash "$MS" \
+      --repo "$primary36" --worktree "$t/wt36a" --branch sm/conc-race-a --base main --checked-sha "$sha36a" \
+      --wait-timeout 20 > "$t/out36a.log" 2>&1
+    echo $? > "$t/rc36a"
+  ) &
+  pid36a=$!
+  sleep 1.2  # let A get past its initial push failure and into the (slow) recovery fetch first
+  # THE DECISIVE ASSERTION IS TIMING, NOT FINAL ANCESTRY: A's own recovery merge pulls in whatever
+  # landed on origin in the meantime, so even a BROKEN (lock-released-too-early) run can still end
+  # up with a plausible-looking, fully-linear final history -- A's recovery logic naturally
+  # subsumes an interleaved change once it happens. What it can NEVER do is make B's own git
+  # commands finish BEFORE A's lock is actually released, if the lock is genuinely held throughout.
+  # Confirmed by direct reproduction: the pre-fix code has B complete in ~0s (races straight in);
+  # the fixed code has B block for ~3s (A's full sleep) before proceeding.
+  start36b=$(date +%s)
+  SM_LOOP_STATE="$SM_LOOP_STATE" SM_MERGE_LEDGER="$SM_MERGE_LEDGER" bash "$MS" \
+    --repo "$primary36" --worktree "$t/wt36b" --branch sm/conc-race-b --base main --checked-sha "$sha36b" \
+    --wait-timeout 20 > "$t/out36b.log" 2>&1
+  rc36b=$?
+  end36b=$(date +%s)
+  elapsed36b=$((end36b - start36b))
+  wait "$pid36a"
+  rc36a="$(cat "$t/rc36a")"
+  [ "$rc36a" = 0 ] && [ "$rc36b" = 0 ] || { echo "FAIL: concurrent race-recovery test did not both succeed (rc_a=$rc36a rc_b=$rc36b)"; echo "out-a: $(cat "$t/out36a.log")"; echo "out-b: $(cat "$t/out36b.log")"; fails=1; }
+  [ "$elapsed36b" -ge 2 ] || { echo "FAIL: B completed in ${elapsed36b}s -- expected B to be BLOCKED on A's lock for close to A's full 3s recovery sleep, not race straight in (serialization violated, the exact bug this test guards)"; fails=1; }
+  [ -f "$primary36/file.txt" ] && grep -q "feature-36a" "$primary36/file.txt" || { echo "FAIL: concurrent race-recovery test lost A's change"; fails=1; }
+  [ -f "$primary36/other-file-36.txt" ] && grep -q "feature-36b" "$primary36/other-file-36.txt" || { echo "FAIL: concurrent race-recovery test lost B's change"; fails=1; }
+
+  # ---- Test 37: (P1) CRITICAL negative test -- a LOCAL 'pre-push' hook (client-side, runs BEFORE
+  # git ever attempts the network-level push at all) whose message happens to say
+  # "(incorrect old value provided)" verbatim must still be PUSH_FAILED, never a ref-lock race.
+  # Unlike a server-side hook, pre-push's stderr has NO "remote: " relay prefix (or any other
+  # marker) at all -- verified empirically -- so _client_lines_only's filter can't help here; the
+  # fix is a filesystem-level check (_repo_has_pre_push_hook), not another text pattern. ----
+  IFS='|' read -r origin37 primary37 <<<"$(_setup_repo 37)"
+  cat > "$primary37/.git/hooks/pre-push" <<'HOOKEOF'
+#!/bin/sh
+echo "(incorrect old value provided)" >&2
+exit 1
+HOOKEOF
+  chmod +x "$primary37/.git/hooks/pre-push"
+  git -C "$primary37" worktree add -q "$t/wt37" -b sm/local-prepush-reflock main
+  echo "feature-p37" >> "$t/wt37/file.txt"
+  git -C "$t/wt37" commit -qam "feature p37"
+  sha37="$(git -C "$t/wt37" rev-parse HEAD)"
+  out37="$(_ms --repo "$primary37" --worktree "$t/wt37" --branch sm/local-prepush-reflock --base main --checked-sha "$sha37" --wait-timeout 5 2>&1)"
+  rc37=$?
+  [ "$rc37" -eq 4 ] || { echo "FAIL: local pre-push hook spoofing the ref-lock-race parenthetical expected rc=4, got $rc37: $out37"; fails=1; }
+  echo "$out37" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out37"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-reflock PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (local pre-push hook, no server contact at all)"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-reflock PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: local pre-push hook rejection was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-reflock PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: local pre-push hook rejection was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact local-hook spoofing bug this test guards"; fails=1; }
+
+  # ---- Test 38: (P1) CRITICAL negative test -- the SAME local 'pre-push' hook gap, but for the
+  # PLAIN keyword race check (_is_race), not the ref-lock parenthetical -- a hook message
+  # containing an ordinary race-shaped word ("behind") with none of _is_hook_rejection's own
+  # keywords, and no "remote: " framing, must also stay PUSH_FAILED. This is a distinct sibling
+  # bug from Test 37 (different classifier function), independently confirmed real before fixing:
+  # a bare "_repo_has_pre_push_hook" guard on _is_ref_lock_race alone did NOT close this one. ----
+  IFS='|' read -r origin38 primary38 <<<"$(_setup_repo 38)"
+  cat > "$primary38/.git/hooks/pre-push" <<'HOOKEOF'
+#!/bin/sh
+echo "your branch appears behind our compliance baseline, contact IT" >&2
+exit 1
+HOOKEOF
+  chmod +x "$primary38/.git/hooks/pre-push"
+  git -C "$primary38" worktree add -q "$t/wt38" -b sm/local-prepush-keyword main
+  echo "feature-p38" >> "$t/wt38/file.txt"
+  git -C "$t/wt38" commit -qam "feature p38"
+  sha38="$(git -C "$t/wt38" rev-parse HEAD)"
+  out38="$(_ms --repo "$primary38" --worktree "$t/wt38" --branch sm/local-prepush-keyword --base main --checked-sha "$sha38" --wait-timeout 5 2>&1)"
+  rc38=$?
+  [ "$rc38" -eq 4 ] || { echo "FAIL: local pre-push hook keyword collision expected rc=4, got $rc38: $out38"; fails=1; }
+  echo "$out38" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out38"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-keyword PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (local pre-push hook, plain-keyword collision)"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-keyword PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: local pre-push hook keyword collision was wrongly classified as PUSH_RACE_RECOVERED"; fails=1; }
+  [ "$(_ledger_count sm/local-prepush-keyword PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: local pre-push hook keyword collision was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact sibling spoofing bug this test guards"; fails=1; }
+
+  # ---- Test 39: (P1) CRITICAL negative test -- a TOCTOU variant of Test 37/38: a pre-push hook
+  # that deletes ITSELF (rm -f "$0") as its own last action right before exiting nonzero must still
+  # be PUSH_FAILED, never a race -- proving the hook-presence check is sampled ONCE, BEFORE the
+  # first push attempt, not re-checked afterward (by which point the hook is provably gone from
+  # disk). An earlier revision called _repo_has_pre_push_hook fresh inside each classifier, AFTER
+  # the push had already failed -- exactly the window this hook exploits. ----
+  IFS='|' read -r origin39 primary39 <<<"$(_setup_repo 39)"
+  cat > "$primary39/.git/hooks/pre-push" <<'HOOKEOF'
+#!/bin/sh
+echo "(incorrect old value provided)" >&2
+rm -f "$0"
+exit 1
+HOOKEOF
+  chmod +x "$primary39/.git/hooks/pre-push"
+  git -C "$primary39" worktree add -q "$t/wt39" -b sm/self-removing-hook main
+  echo "feature-p39" >> "$t/wt39/file.txt"
+  git -C "$t/wt39" commit -qam "feature p39"
+  sha39="$(git -C "$t/wt39" rev-parse HEAD)"
+  out39="$(_ms --repo "$primary39" --worktree "$t/wt39" --branch sm/self-removing-hook --base main --checked-sha "$sha39" --wait-timeout 5 2>&1)"
+  rc39=$?
+  [ ! -e "$primary39/.git/hooks/pre-push" ] || { echo "FAIL: test setup invariant broken -- the hook should have deleted itself"; fails=1; }
+  [ "$rc39" -eq 4 ] || { echo "FAIL: self-removing pre-push hook expected rc=4, got $rc39: $out39"; fails=1; }
+  echo "$out39" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out39"; fails=1; }
+  [ "$(_ledger_count sm/self-removing-hook PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (self-removing pre-push hook)"; fails=1; }
+  [ "$(_ledger_count sm/self-removing-hook PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: self-removing pre-push hook was wrongly classified as PUSH_RACE_RECOVERED -- the exact TOCTOU bug this test guards"; fails=1; }
+  [ "$(_ledger_count sm/self-removing-hook PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: self-removing pre-push hook was wrongly classified as PUSH_RACE_EXHAUSTED"; fails=1; }
+
+  # ---- Test 40: (P1) CRITICAL negative test -- ANOTHER TOCTOU variant: no pre-push hook exists
+  # when the initial sample runs (attempt 1 races normally), but one is INSTALLED during the
+  # recovery fetch, before attempt 2's own push, then deletes itself. Must still stop at exactly 2
+  # push attempts with PUSH_RACE_EXHAUSTED/PUSH_FAILED-equivalent, never a 3rd, unauthorized push
+  # after the hook's rejection. Proves the monotonic re-sample (OR'd before every retry, never
+  # reset) catches a hook that only appears MID-recovery, not just one present from the start. ----
+  IFS='|' read -r origin40 primary40 <<<"$(_setup_repo 40)"
+  git -C "$primary40" worktree add -q "$t/wt40" -b sm/mid-recovery-hook main
+  echo "feature-p40" >> "$t/wt40/file.txt"
+  git -C "$t/wt40" commit -qam "feature p40"
+  sha40="$(git -C "$t/wt40" rev-parse HEAD)"
+  fake_git_dir40="$t/fake-git-40"
+  mkdir -p "$fake_git_dir40"
+  real_git_path40="$(command -v git)"
+  counter40="$t/push-counter-40"
+  : > "$counter40"
+  hook_path40="$primary40/.git/hooks/pre-push"
+  cat > "$fake_git_dir40/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path40"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  n=\$(wc -l < "$counter40" | tr -d ' ')
+  echo "attempt" >> "$counter40"
+  if [ "\$n" = "0" ]; then
+    echo "! [rejected]  main -> main (fetch first)" >&2
+    exit 1
+  fi
+elif [ "\$sub" = "fetch" ]; then
+  n=\$(wc -l < "$counter40" | tr -d ' ')
+  if [ "\$n" = "1" ] && [ ! -e "$hook_path40" ]; then
+    printf '#!/bin/sh\necho "(incorrect old value provided)" >&2\nrm -f "\$0"\nexit 1\n' > "$hook_path40"
+    chmod +x "$hook_path40"
+  fi
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir40/git"
+  out40="$(PATH="$fake_git_dir40:$PATH" _ms --repo "$primary40" --worktree "$t/wt40" --branch sm/mid-recovery-hook --base main --checked-sha "$sha40" --wait-timeout 5 2>&1)"
+  rc40=$?
+  [ "$rc40" -eq 4 ] || { echo "FAIL: hook installed mid-recovery expected rc=4, got $rc40: $out40"; fails=1; }
+  attempt_count40="$(wc -l < "$counter40" | tr -d ' ')"
+  [ "$attempt_count40" = "2" ] || { echo "FAIL: expected exactly 2 push attempts (a hook installed mid-recovery must stop the loop, not burn an unauthorized 3rd push), got $attempt_count40"; fails=1; }
+  [ "$(_ledger_count sm/mid-recovery-hook PUSH_RACE_RECOVERED)" = "0" ] || { echo "FAIL: hook installed mid-recovery was wrongly classified as PUSH_RACE_RECOVERED -- the exact TOCTOU bug this test guards"; fails=1; }
+
+  # ---- Test 41: (P2) --preflight-only's own 'git fetch origin' failing (network/permissions)
+  # must exit 7, read-only, no side effects -- an existing, correct code path with zero prior
+  # selfcheck coverage. ----
+  IFS='|' read -r origin41 primary41 <<<"$(_setup_repo 41)"
+  git -C "$primary41" worktree add -q "$t/wt41" -b sm/preflight-fetch-fail main
+  echo "feature-p41" >> "$t/wt41/file.txt"
+  git -C "$t/wt41" commit -qam "feature p41"
+  sha41="$(git -C "$t/wt41" rev-parse HEAD)"
+  git -C "$primary41" remote set-url origin "$t/nonexistent-origin-41"
+  main_before41="$(git -C "$primary41" rev-parse main)"
+  out41="$(_ms --repo "$primary41" --worktree "$t/wt41" --branch sm/preflight-fetch-fail --base main --checked-sha "$sha41" --preflight-only --wait-timeout 5 2>&1)"
+  rc41=$?
+  [ "$rc41" -eq 7 ] || { echo "FAIL: preflight fetch failure expected rc=7, got $rc41: $out41"; fails=1; }
+  echo "$out41" | grep -qi "failed to fetch" || { echo "FAIL: expected a 'failed to fetch' message, got: $out41"; fails=1; }
+  main_after41="$(git -C "$primary41" rev-parse main)"
+  [ "$main_after41" = "$main_before41" ] || { echo "FAIL: preflight fetch failure advanced main when it should be read-only"; fails=1; }
+  [ -z "$(git -C "$primary41" status --porcelain 2>/dev/null)" ] || { echo "FAIL: preflight fetch failure left the working tree dirty"; fails=1; }
+  [ ! -d "$primary41/.secondmate/merge-sequencer.lock" ] || { echo "FAIL: preflight fetch failure created a lock directory"; fails=1; }
+
+  # ---- Test 42: (P1) the recovery loop's OWN 'git fetch origin' call (inside the retry loop,
+  # before the recovery merge) failing must exit 4 with PUSH_RACE_EXHAUSTED, retaining the local
+  # merge commit -- an existing, correct code path with zero prior selfcheck coverage. ----
+  IFS='|' read -r origin42 primary42 <<<"$(_setup_repo 42)"
+  git -C "$primary42" worktree add -q "$t/wt42" -b sm/recovery-fetch-fail main
+  echo "feature-p42" >> "$t/wt42/file.txt"
+  git -C "$t/wt42" commit -qam "feature p42"
+  sha42="$(git -C "$t/wt42" rev-parse HEAD)"
+  main_before42="$(git -C "$primary42" rev-parse main)"
+  fake_git_dir42="$t/fake-git-42"
+  mkdir -p "$fake_git_dir42"
+  real_git_path42="$(command -v git)"
+  cat > "$fake_git_dir42/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path42"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "! [rejected]  main -> main (fetch first)" >&2
+  exit 1
+elif [ "\$sub" = "fetch" ]; then
+  echo "fatal: unable to access origin: simulated network failure" >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir42/git"
+  out42="$(PATH="$fake_git_dir42:$PATH" _ms --repo "$primary42" --worktree "$t/wt42" --branch sm/recovery-fetch-fail --base main --checked-sha "$sha42" --wait-timeout 5 2>&1)"
+  rc42=$?
+  [ "$rc42" -eq 4 ] || { echo "FAIL: recovery fetch failure expected rc=4, got $rc42: $out42"; fails=1; }
+  echo "$out42" | grep -qi "failed to fetch origin before attempt" || { echo "FAIL: expected a 'failed to fetch origin before attempt' message, got: $out42"; fails=1; }
+  main_after42="$(git -C "$primary42" rev-parse main)"
+  [ "$main_after42" != "$main_before42" ] || { echo "FAIL: local merge commit was not retained despite the recovery fetch failing"; fails=1; }
+  [ "$(_ledger_count sm/recovery-fetch-fail PUSH_RACE_EXHAUSTED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_RACE_EXHAUSTED ledger record for a recovery fetch failure"; fails=1; }
+
+  # ---- Test 43: (P2) '--preflight-only --message ""' and '--preflight-only --test ""' must
+  # still refuse (exit 2) -- an earlier revision checked "[ -n "$test_cmd" ]", which treats an
+  # EXPLICITLY-passed empty value the same as the flag never being given at all, silently letting
+  # a generic wrapper that always forwards "--message \"${MESSAGE:-}\"" bypass the documented
+  # "cannot be combined with --test or --message" contract. ----
+  IFS='|' read -r origin43 primary43 <<<"$(_setup_repo 43)"
+  git -C "$primary43" worktree add -q "$t/wt43" -b sm/preflight-empty-flag main
+  echo "feature-p43" >> "$t/wt43/file.txt"
+  git -C "$t/wt43" commit -qam "feature p43"
+  sha43="$(git -C "$t/wt43" rev-parse HEAD)"
+  out43a="$(_ms --repo "$primary43" --worktree "$t/wt43" --branch sm/preflight-empty-flag --base main --checked-sha "$sha43" --preflight-only --message "" --wait-timeout 5 2>&1)"
+  rc43a=$?
+  [ "$rc43a" -eq 2 ] || { echo "FAIL: --preflight-only --message '' expected rc=2, got $rc43a: $out43a"; fails=1; }
+  out43b="$(_ms --repo "$primary43" --worktree "$t/wt43" --branch sm/preflight-empty-flag --base main --checked-sha "$sha43" --preflight-only --test "" --wait-timeout 5 2>&1)"
+  rc43b=$?
+  [ "$rc43b" -eq 2 ] || { echo "FAIL: --preflight-only --test '' expected rc=2, got $rc43b: $out43b"; fails=1; }
+
+  # ---- Test 44: (P1) CRITICAL negative test -- fabricated LOCAL text (not from any hook, not
+  # from git itself -- simulating a transport helper/proxy/credential-helper writing to stderr)
+  # containing a bare race keyword ("behind") but NOT git's own "[rejected]" structural summary
+  # line must still be PUSH_FAILED, never a race. _is_race's bare keyword match was vulnerable to
+  # ANY source of local stderr text, not just pre-push hooks (which at least have an installable
+  # file _repo_has_pre_push_hook can check for) -- this has no such file at all. Fixed the same
+  # structural way _is_ref_lock_race already was: require git's own "[rejected]" (bare, non-
+  # "[remote rejected]") marker alongside the keyword, since arbitrary external text has no reason
+  # to replicate that exact structural line. ----
+  IFS='|' read -r origin44 primary44 <<<"$(_setup_repo 44)"
+  git -C "$primary44" worktree add -q "$t/wt44" -b sm/fabricated-transport-text main
+  echo "feature-p44" >> "$t/wt44/file.txt"
+  git -C "$t/wt44" commit -qam "feature p44"
+  sha44="$(git -C "$t/wt44" rev-parse HEAD)"
+  fake_git_dir44="$t/fake-git-44"
+  mkdir -p "$fake_git_dir44"
+  real_git_path44="$(command -v git)"
+  cat > "$fake_git_dir44/git" <<GITSHIM
+#!/usr/bin/env bash
+real_git="$real_git_path44"
+args=("\$@")
+i=0
+sub=""
+while [ \$i -lt \${#args[@]} ]; do
+  case "\${args[\$i]}" in
+    -C) i=\$((i+2));;
+    *) sub="\${args[\$i]}"; break;;
+  esac
+done
+if [ "\$sub" = "push" ]; then
+  echo "fatal: transport backend is behind on maintenance" >&2
+  exit 1
+fi
+exec "\$real_git" "\$@"
+GITSHIM
+  chmod +x "$fake_git_dir44/git"
+  out44="$(PATH="$fake_git_dir44:$PATH" _ms --repo "$primary44" --worktree "$t/wt44" --branch sm/fabricated-transport-text --base main --checked-sha "$sha44" --wait-timeout 5 2>&1)"
+  rc44=$?
+  [ "$rc44" -eq 4 ] || { echo "FAIL: fabricated transport-text collision expected rc=4, got $rc44: $out44"; fails=1; }
+  echo "$out44" | grep -qi "PUSH FAILED" || { echo "FAIL: expected a PUSH FAILED message, got: $out44"; fails=1; }
+  [ "$(_ledger_count sm/fabricated-transport-text PUSH_FAILED)" = "1" ] || { echo "FAIL: expected exactly one PUSH_FAILED ledger record (fabricated non-git transport text, no '[rejected]' structural marker)"; fails=1; }
+  [ "$(_ledger_count sm/fabricated-transport-text PUSH_RACE_EXHAUSTED)" = "0" ] || { echo "FAIL: fabricated transport text was wrongly classified as PUSH_RACE_EXHAUSTED -- the exact bug this test guards"; fails=1; }
+
   rm -rf "$t"
   trap - EXIT
   [ "$fails" = 0 ] && echo ok
@@ -641,7 +1609,7 @@ HOOKEOF
 fi
 
 # ============================== argument parsing ==============================
-repo="" worktree="" branch="" base="main" checked_sha="" test_cmd="" message="" wait_timeout=300
+repo="" worktree="" branch="" base="main" checked_sha="" test_cmd="" message="" wait_timeout=300 preflight_only="" test_cmd_given="" message_given=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; repo="$2"; shift 2;;
@@ -649,9 +1617,10 @@ while [ $# -gt 0 ]; do
     --branch) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; branch="$2"; shift 2;;
     --base) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; base="$2"; shift 2;;
     --checked-sha) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; checked_sha="$2"; shift 2;;
-    --test) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; test_cmd="$2"; shift 2;;
-    --message) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; message="$2"; shift 2;;
+    --test) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; test_cmd="$2"; test_cmd_given=1; shift 2;;
+    --message) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; message="$2"; message_given=1; shift 2;;
     --wait-timeout) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; wait_timeout="$2"; shift 2;;
+    --preflight-only) preflight_only=1; shift;;
     --selfcheck) shift;; # already handled above when it's $1; keep parser tolerant if it appears later
     -h|--help) _usage; exit 2;;
     *) echo "unknown arg: $1" >&2; _usage; exit 2;;
@@ -663,6 +1632,19 @@ done
 [ -n "$branch" ] || { echo "need --branch NAME" >&2; _usage; exit 2; }
 [ -n "$checked_sha" ] || { echo "need --checked-sha SHA" >&2; _usage; exit 2; }
 case "$wait_timeout" in ''|*[!0-9]*) echo "invalid --wait-timeout: $wait_timeout (want a non-negative integer)" >&2; exit 2;; esac
+
+# --preflight-only has its own dedicated execution path and cannot be combined with other options.
+# Checked via *_given (whether the flag was explicitly passed), not by testing the value for
+# emptiness -- an earlier revision used "[ -n "$test_cmd" ]", which silently let
+# "--preflight-only --message ''" (or --test '') through: the flag WAS combined, just with an
+# empty value, which is still combining it per the stated contract.
+if [ "$preflight_only" = "1" ]; then
+  if [ "$test_cmd_given" = "1" ] || [ "$message_given" = "1" ]; then
+    echo "--preflight-only is read-only and cannot be combined with --test or --message" >&2
+    _usage
+    exit 2
+  fi
+fi
 
 # Closes a real command-injection concern: reject anything that isn't a plain branch-name charset
 # before it ever reaches an unquoted-adjacent git invocation.
@@ -700,6 +1682,62 @@ if [ "$repo_branch" != "$base" ]; then
 fi
 
 [ -n "$message" ] || message="Merge $branch"
+
+# ============================== preflight-only path (no working-tree/branch-ref/lock/ledger side effects -- fetch/merge-tree's own ordinary git-internal footprint is out of scope of that guarantee, see header comment above) ==============================
+if [ "$preflight_only" = "1" ]; then
+  # Same invariant the normal merge path enforces (see the identical check later in this file,
+  # around the "Bug A fix" comment) -- --branch is the thing a merge would actually act on, so it
+  # must resolve to EXACTLY --checked-sha. Without this, a caller could pass a STALE --checked-sha
+  # (an old review) alongside a --branch that has since moved forward with new, unreviewed commits
+  # -- preflight would check the old, reviewed SHA for conflicts and report "clean" while saying
+  # nothing about the branch's actual current tip. Checked here too (not just relied upon at merge
+  # time) because --preflight-only is read-only-by-design and never reaches that later check at all.
+  branch_sha="$(git -C "$repo" rev-parse --verify "${branch}^{commit}" 2>/dev/null || echo "")"
+  if [ -z "$branch_sha" ] || [ "$branch_sha" != "$checked_sha" ]; then
+    echo "ERROR: --branch '$branch' resolves to '${branch_sha:-<does not resolve>}', which does not match --checked-sha '$checked_sha' -- --preflight-only cannot check a SHA that isn't --branch's own current tip." >&2
+    exit 7
+  fi
+  # Validate git supports --write-tree (git merge-tree requires it)
+  git merge-tree --help >/dev/null 2>&1 || { echo "UNSUPPORTED: git merge-tree --write-tree is not supported (requires git >= 2.38)" >&2; exit 7; }
+  # Fetch origin to get current state of --base. NOTE: like any 'git fetch', this writes
+  # .git/FETCH_HEAD, updates refs/remotes/origin/$base, and downloads any new objects into $repo's
+  # object database -- the ordinary footprint of fetch itself, not something this script adds on
+  # top. It does not touch $repo's working tree, index, HEAD/branch refs, lock, or ledger, and
+  # every exit path below (clean, conflict, or unsupported) is otherwise identical to a real
+  # read-only check of those five things. A caller that needs a fetch with literally zero writes
+  # of any kind should use 'git ls-remote' up front themselves and pass its own base.
+  if ! git -C "$repo" fetch origin "+refs/heads/$base:refs/remotes/origin/$base" >/dev/null 2>&1; then
+    echo "ERROR: failed to fetch origin/$base (check network/permissions)" >&2
+    exit 7
+  fi
+  # Get the current SHA of origin/<base> (the actual current state)
+  origin_base_sha="$(git -C "$repo" rev-parse --verify "origin/$base^{commit}" 2>/dev/null || echo "")"
+  if [ -z "$origin_base_sha" ]; then
+    echo "ERROR: origin/$base does not resolve to a commit (fetch may be stale or branch doesn't exist)" >&2
+    exit 7
+  fi
+  # Run git merge-tree --write-tree to check for conflicts
+  # Exit 0 = clean, exit 1 = conflict, exit other = unsupported/error
+  set +e
+  merged_tree_sha="$(git -C "$repo" merge-tree --write-tree "$origin_base_sha" "$checked_sha" 2>&1)"
+  merge_tree_rc=$?
+  set -e
+  if [ "$merge_tree_rc" -ne 0 ]; then
+    if [ "$merge_tree_rc" -eq 1 ]; then
+      # Conflict detected
+      echo "CONFLICT: --preflight-only detected merge conflict between origin/$base ($origin_base_sha) and --branch '$branch' ($checked_sha)." >&2
+      echo "ACTION: The maker must merge origin/$base INTO the branch itself (never rebase), then re-run checker+verify-gate, then re-issue the hold bound to the new SHA. bin/hold.py's existing --sha mismatch rejection already enforces this rebinding." >&2
+      exit 6
+    else
+      # Non-1 exit code = unsupported or other error
+      echo "UNSUPPORTED: git merge-tree --write-tree failed with exit code $merge_tree_rc (git may not support --write-tree)" >&2
+      exit 7
+    fi
+  fi
+  # Clean path: exit 8 with informational message
+  echo "PREFLIGHT OK: --preflight-only confirms no merge conflict (clean merge)." >&2
+  exit 8
+fi
 
 # Anchored to $repo by default -- see header comment. Two callers pointing at the SAME --repo (however
 # each one spells that path, and regardless of each one's own ambient CWD) resolve to the SAME lock and
@@ -798,15 +1836,243 @@ fi
 
 merged_sha="$(git -C "$repo" rev-parse HEAD)"
 
-push_output="$(git -C "$repo" push origin "$base" 2>&1)"
+# Sampled BEFORE the first push attempt, and monotonically re-sampled (OR'd, never reset back to
+# 0) before every retry -- see the retry loop below. A pre-push hook can delete itself, or chmod
+# itself non-executable, as its OWN last action right before exiting nonzero (verified via a
+# direct, real reproduction: an executable hook that removes itself is genuinely gone from disk by
+# the time anything checks for it afterward), and can ALSO be installed only partway through a
+# (potentially long) recovery fetch/merge, before a LATER retry's own push (also verified directly)
+# -- sampling once at the very top misses the second case; re-checking fresh on every retry (naive
+# overwrite, not OR) would have reopened the first. Monotonic accumulation closes both: once any
+# sample sees a hook, the flag stays 1 for the rest of this invocation regardless of what a later
+# sample (after the hook may have already run and cleaned up) would see on its own.
+had_pre_push_hook=0
+_repo_has_pre_push_hook() {
+  local hooks_dir
+  hooks_dir="$(git -C "$repo" rev-parse --git-path hooks 2>/dev/null)" || return 1
+  case "$hooks_dir" in
+    /*) : ;;
+    *) hooks_dir="$repo/$hooks_dir" ;;
+  esac
+  [ -x "$hooks_dir/pre-push" ]
+}
+_repo_has_pre_push_hook && had_pre_push_hook=1
+
+# P1: bounded push-race recovery with exact race-signature regex matching
+# Run push with LC_ALL=C to ensure English-language stderr for regex matching
+push_output=$(LC_ALL=C git -C "$repo" push origin "$base" 2>&1)
 push_rc=$?
 if [ "$push_rc" -ne 0 ]; then
-  _release_lock
-  echo "PUSH FAILED pushing '$base' to origin from $repo:" >&2
-  printf '%s\n' "$push_output" >&2
-  echo "NOTE: the local merge commit $merged_sha for '$branch' already landed on '$base' in $repo -- it was NOT reverted. Only the push to origin needs a manual retry, e.g.: git -C $repo push origin $base" >&2
-  _append_ledger_or_warn PUSH_FAILED ""
-  exit 4
+  # Classify the failure using bash's own '=~' (no subprocess, no pipe -- 'echo ... | grep -q'
+  # lets grep exit the instant it matches, which can SIGPIPE-kill the left-hand producer under
+  # 'set -o pipefail' (line 44) for a large enough push_output, e.g. a verbose hook dumping lots of
+  # diagnostic text before its actual rejection line -- this would silently misreport a real
+  # PUSH_FAILED/hook rejection as an unrelated failure. '=~' has no producer process to kill.
+  #
+  # REF-LOCK RACE CHECK RUNS FIRST, WITH ABSOLUTE PRIORITY over the hook check. A genuine
+  # CONCURRENT server-side ref-transaction race (two pushes landing on the receiving end at
+  # nearly the same instant) is ALSO relayed with "remote: "/"[remote rejected]" framing --
+  # verified empirically with two real concurrent pushes against a bare repo -- so the hook
+  # check below cannot be trusted to run first here.
+  #
+  # Matches ONLY the "(incorrect old value provided)" parenthetical reason, and ONLY when it
+  # appears on a line that is NOT itself a relayed "remote: <text>" line. An earlier revision
+  # matched the literal words "cannot lock ref" anywhere in the raw output (fooled by a hook
+  # message containing that exact phrase as ordinary policy English); the NEXT revision narrowed
+  # to the "(incorrect old value provided)" parenthetical but still searched the whole raw blob,
+  # which a SERVER-SIDE hook can ALSO spoof by printing that exact string itself -- verified
+  # empirically: a server-side hook's own attempt to print "(incorrect old value provided)" (or
+  # even a full fake "! [remote rejected] ... (incorrect old value provided)" line) still gets
+  # git's normal "remote: " relay prefix, and git's REAL client-generated summary line (never
+  # "remote: "-prefixed) appears as a SEPARATE line alongside it. Filtering out every
+  # "remote: "-prefixed line closes THAT class -- but a LOCAL 'pre-push' hook runs entirely
+  # client-side, BEFORE git ever attempts the network-level push at all, so its stderr has no
+  # "remote: " relay prefix (or ANY other distinguishing marker) whatsoever: verified empirically
+  # that its output is indistinguishable in shape from git's own client-generated text. Since
+  # 'pre-push' rejecting means the push never reached the server (the genuine ref-CAS failure this
+  # check exists to recognize is architecturally impossible to also have occurred in that same
+  # invocation), the correct fix is a filesystem-level check, not another text pattern: if $repo
+  # had (or ever has) an executable pre-push hook installed (respecting core.hooksPath) -- sampled
+  # into $had_pre_push_hook before the first push AND monotonically re-sampled (OR'd, never reset)
+  # before every retry, so a hook that existed at ANY sample point stays remembered even after it
+  # deletes/chmod's itself as its own last action -- never trust ANY text match here; fall through
+  # to the hook-rejection/plain-race checks below instead, which report PUSH_FAILED rather than
+  # misclassifying.
+  _client_lines_only() {
+    local out="" line
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "remote: "*) ;;  # hook/server relay -- never trust this line's content structurally
+        *) out+="$line"$'\n';;
+      esac
+    done <<< "$1"
+    printf '%s' "$out"
+  }
+  _is_ref_lock_race() {
+    [ "$had_pre_push_hook" = 1 ] && return 1
+    local client_only
+    client_only="$(_client_lines_only "$1")"
+    case "$client_only" in
+      *"(incorrect old value provided)"*) return 0;;
+    esac
+    return 1
+  }
+  # HOOK CHECK RUNS SECOND, WITH PRIORITY over the plain race-keyword check (but never over the
+  # ref-lock race above) -- not merely "excluded from" the race regex. A hook/protected-branch
+  # rejection message is admin-authored, arbitrary text, and can legitimately contain race-shaped
+  # words (e.g. "rejected because branch is behind policy") -- classifying by race-keyword-presence
+  # alone would retry a permanent policy rejection forever, hiding the real failure. Git's own
+  # rejection framing is a much more reliable, non-keyword discriminator: ANY server-side rejection
+  # (a real remote hook, or a local bare-repo pre-receive hook used by this file's own selfcheck
+  # fixtures) is relayed to the client with a literal "remote: " line prefix and shows "[remote
+  # rejected]" in the summary line -- wording git itself controls, not something a hook author can
+  # spoof through their own message text. A genuine local, client-side non-fast-forward rejection
+  # (the only thing recovery should ever retry via THIS check) has neither: plain "[rejected]" with
+  # no "remote" inside the brackets, and no "remote: " lines at all (verified empirically: a real
+  # hook rejection vs. a real fast-forward race produce exactly this observable difference on this
+  # git version).
+  _is_hook_rejection() {
+    case "$1" in
+      *"remote: "*|*"[remote rejected]"*) return 0;;
+    esac
+    local re='(pre-receive|pre-update|updatehook|hook rejection|protected branch)'
+    local rc
+    shopt -s nocasematch
+    [[ "$1" =~ $re ]]; rc=$?
+    shopt -u nocasematch
+    return "$rc"
+  }
+  # SAME '$had_pre_push_hook' guard as '_is_ref_lock_race' above, for the SAME reason via a
+  # DIFFERENT sibling path: a LOCAL 'pre-push' hook's arbitrary message can ALSO coincidentally
+  # contain one of the plain race keywords below (e.g. "your branch appears behind our compliance
+  # baseline") -- verified empirically. But a pre-push hook is not the only source of arbitrary
+  # LOCAL text a push can produce: a transport helper, proxy wrapper, or credential helper can ALSO
+  # write to stderr, and a bare keyword match anywhere in the blob (e.g. a fabricated "fatal:
+  # transport backend is behind on maintenance") was misclassified as a race the exact same way,
+  # with no installable hook file to check for at all. The fix generalizes the same way
+  # _is_ref_lock_race's own fix did: git's REAL client-side non-fast-forward rejection is always
+  # framed as a "! [rejected] <src> -> <dst> (<reason>)" structural summary line -- verified
+  # empirically for "fetch first" (and, by the same client code path, for every other reason in the
+  # keyword list below) -- which arbitrary external text has no reason to replicate. Requiring
+  # "[rejected]" (the bare, non-"remote"-prefixed form -- "[remote rejected]" is a DIFFERENT,
+  # server-side marker already handled by _is_hook_rejection/_is_ref_lock_race above) alongside the
+  # keyword closes this the same structural way, not with another enumerated exclusion.
+  _is_race() {
+    [ "$had_pre_push_hook" = 1 ] && return 1
+    case "$1" in
+      *"[rejected]"*) : ;;
+      *) return 1 ;;
+    esac
+    local re='(behind|fast[- ]?forward|stale info|fetch first|contains work that you do not have)'
+    local rc
+    shopt -s nocasematch
+    [[ "$1" =~ $re ]]; rc=$?
+    shopt -u nocasematch
+    return "$rc"
+  }
+
+  if _is_ref_lock_race "$push_output" || { ! _is_hook_rejection "$push_output" && _is_race "$push_output"; }; then
+    # Genuine race detected! Attempt bounded recovery. The initial push above already counts as
+    # attempt 1 of 3 total -- the loop below performs attempts 2 and 3 (2 more real push calls),
+    # never a 4th.
+    echo "PUSH RACE (attempt 1/3): push failed, attempting race recovery..." >&2
+
+    # The lock stays held through the ENTIRE recovery sequence below (fetch, merge, retry-push,
+    # every attempt) -- same as the normal merge+push path already holds it through both. An
+    # earlier revision released the lock at the top of each retry iteration, on the theory of not
+    # blocking other waiters during network I/O -- but $repo's WORKING TREE/INDEX/HEAD is what the
+    # lock actually protects, and recovery's own 'git merge' mutates exactly that, still inside
+    # $repo, for the full duration of every retry attempt. Releasing it there let a second,
+    # concurrent invocation targeting the SAME --repo acquire the lock and merge/push into that
+    # same checkout WHILE this invocation's recovery was still in progress -- reproduced directly
+    # with two real concurrent invocations: the second completed successfully mid-recovery of the
+    # first, defeating the entire "serialize concurrent merges to the same primary checkout"
+    # purpose this script exists for. Every _release_lock call elsewhere in this file is
+    # immediately followed by exit; this loop's own exits (below) are no different.
+    for attempt in 2 3; do
+      echo "PUSH RACE (attempt $attempt/3): push failed, attempting race recovery..." >&2
+
+      # git fetch origin (only touches remote-tracking refs, never working tree)
+      if ! git -C "$repo" fetch origin >/dev/null 2>&1; then
+        echo "PUSH RACE EXHAUSTED: failed to fetch origin before attempt $attempt" >&2
+        _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
+        exit 4
+      fi
+
+      # git merge origin/<base> INTO $repo (SECOND merge, separate from the one that already landed)
+      # Give this recovery merge commit a distinctive message
+      recovery_msg="merge-sequencer: race recovery (attempt $attempt/3)"
+      # --no-ff: without it, a merge that would otherwise fast-forward (or find nothing new at all,
+      # e.g. in a test fixture that fakes a push failure without origin actually advancing) creates
+      # NO commit at all, silently defeating the point of the distinctive per-attempt message --
+      # the whole reason this recovery is auditable via git log alone, not just the ledger.
+      merge_recovery_out=$(git -C "$repo" merge --no-ff "origin/$base" -m "$recovery_msg" 2>&1)
+      merge_recovery_rc=$?
+      if [ "$merge_recovery_rc" -ne 0 ]; then
+        # Recovery merge itself conflicted!
+        git -C "$repo" merge --abort >/dev/null 2>&1 || true
+        echo "PUSH RACE EXHAUSTED: recovery merge conflicted on attempt $attempt" >&2
+        echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
+        _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
+        exit 4
+      fi
+
+      # Re-sample immediately before EACH retry push, OR'd into the flag (never reset back to 0).
+      # Round 8 closed "a hook exists at the start, then deletes itself" by sampling once before
+      # attempt 1 and never re-checking. Round 9/10 found the OTHER direction this single sample
+      # misses: a hook installed DURING the (potentially long, real-world) recovery fetch/merge
+      # window, before attempt 2 or 3's own push, was invisible to a check that only ever ran once
+      # at the very top. Monotonic OR closes both without reopening either: once a hook is SEEN at
+      # any sample point, the flag stays 1 for the rest of this invocation regardless of whether a
+      # LATER sample (after the hook has done its own damage and possibly deleted itself) would
+      # have missed it. A naive re-sample that overwrote the flag each time would have reintroduced
+      # round 8's exact gap for attempts 2/3; this doesn't, because it only ever adds evidence.
+      _repo_has_pre_push_hook && had_pre_push_hook=1
+      # Retry push (this IS attempt $attempt -- the loop variable already counts it)
+      push_output=$(LC_ALL=C git -C "$repo" push origin "$base" 2>&1)
+      push_rc=$?
+      if [ "$push_rc" -eq 0 ]; then
+        # Recovery succeeded!
+        final_merged_sha="$(git -C "$repo" rev-parse HEAD)"
+        _append_ledger_or_warn PUSH_RACE_RECOVERED "$final_merged_sha"
+        echo "merged $branch -> $base as $final_merged_sha (pushed to origin after race recovery)" >&2
+        exit 0
+      fi
+
+      # This attempt failed too -- ESCALATE UNLESS the failure is STILL POSITIVELY CONFIRMED to be
+      # the same kind of race, using the exact same classification as the initial push above. An
+      # earlier revision of this check only escalated on a confirmed hook rejection and silently
+      # continued retrying on anything else -- which meant a completely unrelated failure mid-loop
+      # (an expired credential: "fatal: Authentication failed for origin", a transport/network
+      # error, or anything else neither a race nor a recognized hook signature) fell through to
+      # "keep retrying" by default, burning an attempt and ultimately reporting PUSH_RACE_EXHAUSTED
+      # for a failure that was never a race at all. Fail closed instead: only continue the loop
+      # when the failure is affirmatively still race-shaped.
+      if _is_ref_lock_race "$push_output" || { ! _is_hook_rejection "$push_output" && _is_race "$push_output"; }; then
+        continue  # still race-shaped -- proceed to the next attempt (or exhaust below)
+      fi
+      echo "PUSH RACE EXHAUSTED: recovery attempt $attempt/3 failed for a reason that is no longer race-shaped (hook/protected-branch rejection, or an unrelated failure such as auth/network)" >&2
+      echo "NOTE: the local merge commit $merged_sha for '$branch' is still present on '$base' in $repo" >&2
+      printf '%s\n' "$push_output" >&2
+      _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
+      exit 4
+    done
+
+    # All 3 attempts (1 initial + 2 retries) exhausted
+    _release_lock
+    echo "PUSH RACE EXHAUSTED: all 3 attempts failed" >&2
+    echo "NOTE: the local merge commit $merged_sha for '$branch' already landed on '$base' in $repo -- it was NOT reverted" >&2
+    _append_ledger_or_warn PUSH_RACE_EXHAUSTED ""
+    exit 4
+  else
+    # Not a race (or a hook/protected-branch rejection, which always takes priority) -> PUSH_FAILED, no retry
+    _release_lock
+    echo "PUSH FAILED pushing '$base' to origin from $repo:" >&2
+    printf '%s\n' "$push_output" >&2
+    echo "NOTE: the local merge commit $merged_sha for '$branch' already landed on '$base' in $repo -- it was NOT reverted. Only the push to origin needs a manual retry, e.g.: git -C $repo push origin $base" >&2
+    _append_ledger_or_warn PUSH_FAILED ""
+    exit 4
+  fi
 fi
 
 _append_ledger_or_warn SUCCESS "$merged_sha"

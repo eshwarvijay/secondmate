@@ -199,10 +199,38 @@ Each stage exists to close a specific failure mode.
    `MERGE_REJECTED` instead, quoting git's own actual output, so a human/dispatcher reaches for the right
    remediation (fix the policy issue) rather than a conflict-resolution path that was never applicable. The
    push to `origin` happens *inside the same lock*
-   as the local merge, closing an out-of-order-push race between siblings. A failed push never reverts an
-   already-landed local merge — only the push needs a manual retry. Every attempt (success or failure) appends
+   as the local merge, closing an out-of-order-push race between siblings. A push that fails for any OTHER
+   reason (e.g. a hook/protected-branch rejection) never reverts an already-landed local merge — only the push
+   needs a manual retry. A push that fails specifically because origin genuinely advanced between merge and
+   push (requiring BOTH a race-shaped keyword AND git's own bare `[rejected]` structural summary line, never a
+   keyword alone -- arbitrary local text, whether from a hook, a transport helper, or a proxy, has no reason
+   to replicate that exact git-generated line; distinguished from a hook/protected-branch rejection even
+   when its own message happens to contain a race-shaped word, and from a genuine concurrent server-side
+   ref-transaction race via git's own client-generated rejection reason rather than any hook-influenced text)
+   is recovered automatically: the singleton lock stays held through the ENTIRE recovery sequence (never
+   released mid-recovery — an earlier revision released it per-attempt, letting a second concurrent
+   invocation mutate the same primary checkout while the first was still recovering), fetch, merge
+   `origin/<base>` in with a distinctive `merge-sequencer: race recovery (attempt N/3)` commit, retry the
+   push — bounded at 3 total attempts (the initial push plus 2 retries, never a 4th); the retry loop only
+   continues when a failure is still affirmatively race-shaped, never by default, so an unrelated failure
+   mid-recovery (a hook rejection, an auth/network error) escalates immediately instead of burning a
+   pointless further attempt. **Accepted limitation:** a LOCAL `pre-push` hook (client-side, carries none of
+   the "remote: " framing this classification relies on) can defeat this text-based detection entirely — if
+   `$repo` has (or at any point during the invocation acquires) one, race auto-recovery is disabled for that
+   repo; checked before the first push AND monotonically re-checked (never reset once true) before every
+   retry, so a hook can't evade detection either by deleting itself afterward or by only appearing
+   mid-recovery. The one thing that stays un-closed: the exact instant between any single sample and the push
+   it's immediately followed by. A separate, broader accepted limitation: every classifier here trusts that
+   `git` in `PATH` is the genuine, unmodified system binary -- a PATH/transport-helper substitute could
+   fabricate any of these structural markers, the same class of threat `bin/caffeinate-guard.sh` already
+   declines to defend against. `--preflight-only` runs `git merge-tree --write-tree` against a
+   freshly-fetched `origin/<base>` to detect a conflict before ever acquiring the lock or touching `$repo`'s
+   working tree, index, branch refs, or ledger (`--branch` must still resolve to exactly `--checked-sha`) —
+   read-only with respect to those five things specifically, not with respect to fetch's/`merge-tree`'s own
+   ordinary git-internal footprint (`.git/FETCH_HEAD`, downloaded objects, an unreachable dangling
+   merge-result tree), which is outside that guarantee. Every attempt (success or failure) appends
    one JSONL record to `audit/merge-ledger.jsonl` with a closed reason-code enum
-   (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`LOCK_TIMEOUT`) for later automated triage.
+   (`SUCCESS`/`GATE_REFUSE`/`BRANCH_MISMATCH`/`MERGE_CONFLICT`/`MERGE_REJECTED`/`PUSH_FAILED`/`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`/`LOCK_TIMEOUT`) for later automated triage.
    A ledger-write failure itself (e.g. its directory colliding with a tracked file) never fails an
    otherwise-successful merge — it prints a loud `WARNING` to stderr naming the ledger path rather than
    silently reporting overall success with a missing audit record.
@@ -449,7 +477,7 @@ future task, not part of this one.
 | `bin/checker-progress.py` | filter pi's --mode json output: progress to stderr, final text to stdout |
 | `bin/verdict.py` | deterministic pass/fail/error branching; with `--lenses` cross-checks lens coverage; enforces findings validation for `fail` verdicts (must have file:line or `[NOLOC]`); writes a `git-common-dir`-anchored `audit/lens-coverage.jsonl` ledger shared across every worktree of the repo (override via `SM_LENS_COVERAGE_LEDGER`) |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
-| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never auto-retries, never rebases, never reverts a landed merge on push failure; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
+| `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never rebases, never reverts a landed local merge on push failure; a genuine push race (origin advanced, or a concurrent server-side ref-transaction race — both distinguished from a real hook/protected-branch rejection by git's own client-generated framing, never by the hook's own message text) is recovered automatically, lock held throughout, bounded at 3 total push attempts (`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`); a LOCAL `pre-push` hook (no `remote: ` framing at all) disables this text-based race detection entirely for that repo, by design — checked before the first push and monotonically re-checked (never reset once true) before every retry, so a self-deleting hook or one installed mid-recovery can't evade it; `--preflight-only` checks for a conflict via `git merge-tree --write-tree` without ever acquiring the lock or touching `$repo`'s working tree/index/branch-refs/ledger; append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval |
 | `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block used by the fan-out pattern (SKILL.md) |
 | `bin/doctor.sh` | pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects and fixes AWS Bedrock model-metadata overrides for pi's local `~/.pi/agent/models.json` (kimi-k3 and deepseek-r1 maxTokens values, verified against real Bedrock enforced ceilings); detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals; idempotent fixes preserve unrelated content |
