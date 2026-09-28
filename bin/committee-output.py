@@ -22,7 +22,9 @@ BAD_PATTERNS = (
     # ':' (whitespace is never legal *inside* the quoted key itself, so no \s*
     # there). Still requires the JSON-object shape -- a quoted key right after
     # the brace -- to avoid matching prose that puts a word next to a brace.
-    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\s*\{\s*"[^"]+"\s*:'),
+    # The key itself may be empty (JSON permits "" as a key, e.g. a leaked
+    # {"": null, "path": ...} object), so [^"]* rather than [^"]+.
+    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\s*\{\s*"[^"]*"\s*:'),
 )
 
 
@@ -139,6 +141,12 @@ def selfcheck():
     _, brace_space_leaked_tool_call = classify([_event(brace_space_leak)])
     if not brace_space_leaked_tool_call:
         failures.append("bare 'toolname{ json}' leaked fragment with a space after the brace was not classified bad")
+    # Checker-found gap (fix round 3): an empty-string first key ("") is legal
+    # JSON and must also classify as bad.
+    empty_key_leak = 'read{"": null, "path": "bin/session-activate.sh"}'
+    _, empty_key_leaked_tool_call = classify([_event(empty_key_leak)])
+    if not empty_key_leaked_tool_call:
+        failures.append("bare 'toolname{\"\": ...}' leaked fragment with an empty first key was not classified bad")
     _, prose_read_brace = classify([_event("please read { the docs } before you continue")])
     if prose_read_brace:
         failures.append("prose with 'read' before an unrelated brace was incorrectly classified bad")
