@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 38 total)
+## Recent flow (orchestration mechanics) entries (15 of 39 total)
 
-- 2026-09-17 — fan-out-agent-name: name each Agent-tool sub-supervisor sm-<task-id>, never leave it unset (`audit/flow/2026-09-17--fan-out-agent-name-name-each-agent-tool-sub-supervisor-sm-task-id-never-leave-it.md`)
 - 2026-09-17 — maker-permission-mode-auto: Claude maker launch recipe --permission-mode acceptEdits → auto (`audit/flow/2026-09-17--maker-permission-mode-auto-claude-maker-launch-recipe-permission-mode-acceptedit.md`)
 - 2026-09-17 — strict-checker-visible-pane: checker must run in a visible herdr pane when HERDR_ENV=1, no headless exceptions (`audit/flow/2026-09-17--strict-checker-visible-pane-checker-must-run-in-a-visible-herdr-pane-when-herdr.md`)
 - 2026-09-23 — kimi-k3-planner-swap: upgrade the plan-committee's Kimi planner slot from Kimi-K2-Thinking to Kimi K3 (`audit/flow/2026-09-23--kimi-k3-planner-swap-upgrade-the-plan-committee-s-kimi-planner-slot-from-kimi-k2.md`)
@@ -25,11 +24,11 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/flow/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 - 2026-09-25 — planner-prompt-quality: evidence-cited upgrade to the 6 plan-committee system prompts (`audit/flow/2026-09-25--planner-prompt-quality.md`)
 - 2026-09-28 — bin/launch-checker.sh: cd into --repo before invoking the harness (`audit/flow/2026-09-28--fix-checker-cwd.md`)
+- 2026-09-28 — plan-committee: give planners read-only repo tool access (`audit/flow/2026-09-28--planner-file-access.md`)
 - 2026-09-28 — Allow single-task delegation to a fresh sub-agent-supervisor (`audit/flow/2026-09-28--subagent-delegate.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 36 total)
+## Recent decision (choices, findings, escalations) entries (15 of 37 total)
 
-- 2026-09-17 — fan-out-agent-name: name each Agent-tool sub-supervisor sm-<task-id>, never leave it unset (`audit/decision/2026-09-17--fan-out-agent-name-name-each-agent-tool-sub-supervisor-sm-task-id-never-leave-it.md`)
 - 2026-09-17 — maker-permission-mode-auto: Claude maker launch recipe --permission-mode acceptEdits → auto (`audit/decision/2026-09-17--maker-permission-mode-auto-claude-maker-launch-recipe-permission-mode-acceptedit.md`)
 - 2026-09-17 — strict-checker-visible-pane: checker must run in a visible herdr pane when HERDR_ENV=1, no headless exceptions (`audit/decision/2026-09-17--strict-checker-visible-pane-checker-must-run-in-a-visible-herdr-pane-when-herdr.md`)
 - 2026-09-23 — kimi-k3-planner-swap: upgrade the plan-committee's Kimi planner slot from Kimi-K2-Thinking to Kimi K3 (`audit/decision/2026-09-23--kimi-k3-planner-swap-upgrade-the-plan-committee-s-kimi-planner-slot-from-kimi-k2.md`)
@@ -43,4 +42,5 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/decision/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 - 2026-09-25 — planner-prompt-quality: evidence-cited upgrade to the 6 plan-committee system prompts (`audit/decision/2026-09-25--planner-prompt-quality.md`)
 - 2026-09-28 — Fix checker cwd at the primitive level, decline touching the documented recipe (`audit/decision/2026-09-28--fix-checker-cwd.md`)
+- 2026-09-28 — Reuse checker's --exclude-tools pattern, decline new sandbox machinery (`audit/decision/2026-09-28--planner-file-access.md`)
 - 2026-09-28 — Widen fan-out trigger to N=1, decline security/config over-engineering (`audit/decision/2026-09-28--subagent-delegate.md`)
