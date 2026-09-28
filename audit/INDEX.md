@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 37 total)
+## Recent flow (orchestration mechanics) entries (15 of 38 total)
 
-- 2026-09-11 — sync-worktree-skills: backfill gitignored project-local .claude/skills/ into fresh worktrees (`audit/flow/2026-09-11--sync-worktree-skills-backfill-gitignored-project-local-claude-skills-into-fresh.md`)
 - 2026-09-17 — fan-out-agent-name: name each Agent-tool sub-supervisor sm-<task-id>, never leave it unset (`audit/flow/2026-09-17--fan-out-agent-name-name-each-agent-tool-sub-supervisor-sm-task-id-never-leave-it.md`)
 - 2026-09-17 — maker-permission-mode-auto: Claude maker launch recipe --permission-mode acceptEdits → auto (`audit/flow/2026-09-17--maker-permission-mode-auto-claude-maker-launch-recipe-permission-mode-acceptedit.md`)
 - 2026-09-17 — strict-checker-visible-pane: checker must run in a visible herdr pane when HERDR_ENV=1, no headless exceptions (`audit/flow/2026-09-17--strict-checker-visible-pane-checker-must-run-in-a-visible-herdr-pane-when-herdr.md`)
@@ -25,11 +24,11 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/flow/2026-09-24--supervisor-mistake-lessons.md`)
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/flow/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 - 2026-09-25 — planner-prompt-quality: evidence-cited upgrade to the 6 plan-committee system prompts (`audit/flow/2026-09-25--planner-prompt-quality.md`)
+- 2026-09-28 — bin/launch-checker.sh: cd into --repo before invoking the harness (`audit/flow/2026-09-28--fix-checker-cwd.md`)
 - 2026-09-28 — Allow single-task delegation to a fresh sub-agent-supervisor (`audit/flow/2026-09-28--subagent-delegate.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 35 total)
+## Recent decision (choices, findings, escalations) entries (15 of 36 total)
 
-- 2026-09-11 — sync-worktree-skills: backfill gitignored project-local .claude/skills/ into fresh worktrees (`audit/decision/2026-09-11--sync-worktree-skills-backfill-gitignored-project-local-claude-skills-into-fresh.md`)
 - 2026-09-17 — fan-out-agent-name: name each Agent-tool sub-supervisor sm-<task-id>, never leave it unset (`audit/decision/2026-09-17--fan-out-agent-name-name-each-agent-tool-sub-supervisor-sm-task-id-never-leave-it.md`)
 - 2026-09-17 — maker-permission-mode-auto: Claude maker launch recipe --permission-mode acceptEdits → auto (`audit/decision/2026-09-17--maker-permission-mode-auto-claude-maker-launch-recipe-permission-mode-acceptedit.md`)
 - 2026-09-17 — strict-checker-visible-pane: checker must run in a visible herdr pane when HERDR_ENV=1, no headless exceptions (`audit/decision/2026-09-17--strict-checker-visible-pane-checker-must-run-in-a-visible-herdr-pane-when-herdr.md`)
@@ -43,4 +42,5 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/decision/2026-09-24--supervisor-mistake-lessons.md`)
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/decision/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 - 2026-09-25 — planner-prompt-quality: evidence-cited upgrade to the 6 plan-committee system prompts (`audit/decision/2026-09-25--planner-prompt-quality.md`)
+- 2026-09-28 — Fix checker cwd at the primitive level, decline touching the documented recipe (`audit/decision/2026-09-28--fix-checker-cwd.md`)
 - 2026-09-28 — Widen fan-out trigger to N=1, decline security/config over-engineering (`audit/decision/2026-09-28--subagent-delegate.md`)
