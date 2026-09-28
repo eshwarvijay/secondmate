@@ -472,13 +472,15 @@ third — the fan-out pattern itself plus `bin/dispatch-report.py` — is descri
   (anchored the same way as the lock); a ledger-write failure warns loudly on stderr rather than either
   failing the whole operation or silently vanishing.
 
-### The third primitive: fan-out to concurrent sub-supervisors + `bin/dispatch-report.py`
+### The third primitive: fan-out to fresh sub-agent-supervisors + `bin/dispatch-report.py`
 
-Documented in `skills/secondmate/SKILL.md`'s "Fan-out to concurrent sub-supervisors (hard-capped at 2)"
-section — an **opt-in** pattern for the one case where a human hands the supervisor 2 genuinely
-independent tasks and wants them run concurrently; the single-task loop above stays the default for
-everything else. Mechanically it is ONE Agent-tool call carrying AT MOST 2 tool-use blocks (a hard cap,
-not a tunable N), each a FRESH (never `fork`) sub-agent, so each sub-supervisor reaches its own
+Documented in `skills/secondmate/SKILL.md`'s "Fan-out to fresh sub-agent-supervisors (1 or 2,
+hard-capped at 2)" section — an **opt-in** pattern with two equally valid triggers, neither automatic:
+a human hands the supervisor 2 genuinely independent tasks and wants them run concurrently, or a human
+explicitly asks to delegate a SINGLE task's whole supervisor loop to a fresh sub-agent-supervisor. The
+single-task loop above stays the default for ordinary work either way. Mechanically it is ONE Agent-tool
+call carrying AT MOST 2 tool-use blocks (a hard cap, not a tunable N — exactly 1 for the single-task
+trigger, up to 2 for the concurrent-tasks trigger), each a FRESH (never `fork`) sub-agent, so each sub-supervisor reaches its own
 triage/routing/verdict judgment calls from a clean context instead of one contaminated by a sibling
 task's state. Each sub-supervisor: claims its task-id first (`claim-ledger.py claim`, never `--steal`,
 aborting with `SM_REFUSED:claim-failed` on failure); derives every downstream name deterministically from

@@ -32,5 +32,9 @@ The maker's --thinking handles the how. The checker is the safety net.
 
 **On checker fail → loop back to the task-scoped maker, never fix inline.**
 
+**Delegating a whole supervisor loop to a fresh sub-agent** (one task, or a couple concurrently) is
+opt-in and only on an explicit human ask — invoke the `secondmate` skill for exact mechanics, never
+improvise it.
+
 Skip the apparatus for trivial edits, read-only questions, or one-shot answers.
 EOF
