@@ -12,14 +12,17 @@ BAD_PATTERNS = (
     re.compile(r"<\s*tool_call\s*>"),
     re.compile(r"<\s*\|\s*tool_call[a-zA-Z0-9_]*\s*\|\s*>"),
     re.compile(r"<\s*function\s*="),
-    # Bare "toolname{...}" or "toolname {...}" with no wrapping tags -- a leaked
-    # tool-call fragment (e.g. mistral-large3 emitting 'read{"offset": 1, ...}'
-    # as plain text instead of a real tool invocation). Anchored to the exact
-    # tool names from the planner system prompt, tolerating optional whitespace
-    # before the brace, and requiring the JSON-object shape (a quoted key
-    # immediately after the opening brace) to avoid matching prose that happens
-    # to put a word next to a curly brace.
-    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\s*\{"[^"]+"\s*:'),
+    # Bare "toolname{...}" with no wrapping tags -- a leaked tool-call fragment
+    # (e.g. mistral-large3 emitting 'read{"offset": 1, ...}' as plain text
+    # instead of a real tool invocation, in bare or pretty-printed-JSON form).
+    # Anchored to the exact tool names from the planner system prompt.
+    # \s* sits at every position JSON grammar allows whitespace within this
+    # minimal "toolname{"key":" prefix: between the tool name and '{', between
+    # '{' and the opening quote of the key, and between the closing quote and
+    # ':' (whitespace is never legal *inside* the quoted key itself, so no \s*
+    # there). Still requires the JSON-object shape -- a quoted key right after
+    # the brace -- to avoid matching prose that puts a word next to a brace.
+    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\s*\{\s*"[^"]+"\s*:'),
 )
 
 
@@ -129,7 +132,13 @@ def selfcheck():
     spaced_leak = 'read {"path": "bin/session-activate.sh"}'
     _, spaced_leaked_tool_call = classify([_event(spaced_leak)])
     if not spaced_leaked_tool_call:
-        failures.append("bare 'toolname {json}' leaked fragment with a space was not classified bad")
+        failures.append("bare 'toolname {json}' leaked fragment with a space before the brace was not classified bad")
+    # Checker-found gap (fix round 2): pretty-printed JSON with whitespace
+    # between the opening brace and the quoted key must also classify as bad.
+    brace_space_leak = 'read{ "path": "bin/session-activate.sh"}'
+    _, brace_space_leaked_tool_call = classify([_event(brace_space_leak)])
+    if not brace_space_leaked_tool_call:
+        failures.append("bare 'toolname{ json}' leaked fragment with a space after the brace was not classified bad")
     _, prose_read_brace = classify([_event("please read { the docs } before you continue")])
     if prose_read_brace:
         failures.append("prose with 'read' before an unrelated brace was incorrectly classified bad")
@@ -139,6 +148,12 @@ def selfcheck():
     _, prose_word_boundary = classify([_event("we should spread{the load} across workers")])
     if prose_word_boundary:
         failures.append("word containing 'read' as a substring was incorrectly classified bad")
+    _, prose_word_boundary2 = classify([_event("this recipe needs to be bready{crunchy} on the outside")])
+    if prose_word_boundary2:
+        failures.append("word containing 'read' as a mid-word substring was incorrectly classified bad")
+    _, unquoted_key = classify([_event('read{path: "bin/session-activate.sh"}')])
+    if unquoted_key:
+        failures.append("toolname{unquoted_key: ...} without a quoted key was incorrectly classified bad")
     null_messages = json.dumps({"type": "agent_end", "messages": None})
     null_text, null_bad = classify([null_messages])
     if null_text != "" or not null_bad:
