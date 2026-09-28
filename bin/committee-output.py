@@ -12,13 +12,14 @@ BAD_PATTERNS = (
     re.compile(r"<\s*tool_call\s*>"),
     re.compile(r"<\s*\|\s*tool_call[a-zA-Z0-9_]*\s*\|\s*>"),
     re.compile(r"<\s*function\s*="),
-    # Bare "toolname{...}" with no wrapping tags -- a leaked tool-call fragment
-    # (e.g. mistral-large3 emitting 'read{"offset": 1, ...}' as plain text
-    # instead of a real tool invocation). Anchored to the exact tool names from
-    # the planner system prompt, and requires the JSON-object shape (a quoted
-    # key immediately after the opening brace) to avoid matching prose that
-    # happens to put a word next to a curly brace.
-    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\{"[^"]+"\s*:'),
+    # Bare "toolname{...}" or "toolname {...}" with no wrapping tags -- a leaked
+    # tool-call fragment (e.g. mistral-large3 emitting 'read{"offset": 1, ...}'
+    # as plain text instead of a real tool invocation). Anchored to the exact
+    # tool names from the planner system prompt, tolerating optional whitespace
+    # before the brace, and requiring the JSON-object shape (a quoted key
+    # immediately after the opening brace) to avoid matching prose that happens
+    # to put a word next to a curly brace.
+    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\s*\{"[^"]+"\s*:'),
 )
 
 
@@ -123,9 +124,18 @@ def selfcheck():
     _, leaked_tool_call = classify([_event(mistral_leak)])
     if not leaked_tool_call:
         failures.append("bare toolname{json} leaked fragment was not classified bad")
+    # Checker-found gap (fix round 1): the same leak shape with a space between
+    # the tool name and the opening brace must also classify as bad.
+    spaced_leak = 'read {"path": "bin/session-activate.sh"}'
+    _, spaced_leaked_tool_call = classify([_event(spaced_leak)])
+    if not spaced_leaked_tool_call:
+        failures.append("bare 'toolname {json}' leaked fragment with a space was not classified bad")
     _, prose_read_brace = classify([_event("please read { the docs } before you continue")])
     if prose_read_brace:
         failures.append("prose with 'read' before an unrelated brace was incorrectly classified bad")
+    _, prose_read_word_gap = classify([_event("please read a book {later}")])
+    if prose_read_word_gap:
+        failures.append("prose with a word between 'read' and an unrelated brace was incorrectly classified bad")
     _, prose_word_boundary = classify([_event("we should spread{the load} across workers")])
     if prose_word_boundary:
         failures.append("word containing 'read' as a substring was incorrectly classified bad")
