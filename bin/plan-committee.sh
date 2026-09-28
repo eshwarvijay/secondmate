@@ -6,7 +6,7 @@
 #
 # Usage: plan-committee.sh --task TEXT [--out-dir DIR] [--timeout S]
 # Env:   SM_COMMITTEE_PROVIDER   (default: amazon-bedrock)
-#        SM_COMMITTEE_TIMEOUT    (default: 300 seconds per planner)
+#        SM_COMMITTEE_TIMEOUT    (default: 600 seconds per planner)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -183,8 +183,6 @@ BODY
 
 _prompt_qwen3_coder() {
   cat << 'BODY'
-IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
-
 Goal: Walk the concrete implementation steps and rate each one so the supervisor knows where the real difficulty is.
 
 Success means:
@@ -250,8 +248,6 @@ BODY
 
 _prompt_kimi_k3() {
   cat << 'BODY'
-IMPORTANT: You have NO tools, NO file access, and NO function-calling capability available in this session. Do not attempt to call any function or tool (e.g. read_file, Read, etc.) -- any such attempt will fail silently and produce no output. Answer using ONLY the information given below in plain prose/markdown text. If you would normally want to inspect a file, instead reason about it from the description given and clearly mark any such reasoning as an assumption.
-
 Goal: Map every system this task touches and rate the blast radius and reversibility of each connection.
 
 Success means:
@@ -494,6 +490,10 @@ BODY
 
 _planner_prompt() {
   local label="$1" task="$2" retry="${3:-}"
+  cat << 'NOTICE'
+You have read-only tool access this session: Read/Grep to inspect files and Bash for read-only inspection commands (edit and write are excluded -- you cannot modify anything). Verify any claim you can check against the real repo -- quoted code, file contents, function signatures, config values -- before stating it as fact. Reserve "Probes for Supervisor" for genuine business/product/legal decisions that are not resolvable by reading this repo; it is not a substitute for checking something you could have checked yourself.
+
+NOTICE
   case "$label" in
     deepseek-r1)    _prompt_deepseek_r1   "$task" ;;
     qwen3-80b)      _prompt_qwen3_80b     "$task" ;;
@@ -567,7 +567,7 @@ _run_planner() {
   local raw="$out.jsonl" retry_raw="$out.retry.jsonl" retry_prompt status first_run_status retry_run_status
   rm -f "$out.healed" "$out.raw" "$raw" "$retry_raw"
   "$SCRIPT_DIR/run-round.sh" --label "plan-$label" --log "$raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
-    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$prompt"
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --exclude-tools edit,write --mode json -p "$prompt"
   first_run_status=$?
   "$SCRIPT_DIR/committee-output.py" --input "$raw" --output "$out"; status=$?
   [ "$first_run_status" = 0 ] && [ "$status" = 0 ] && { rm -f "$raw"; return 0; }
@@ -576,7 +576,7 @@ _run_planner() {
   [ -s "$out" ] && cp "$out" "$out.raw" || cp "$raw" "$out.raw"
   retry_prompt="$(_planner_prompt "$label" "$task" retry)"
   "$SCRIPT_DIR/run-round.sh" --label "plan-$label-retry" --log "$retry_raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
-    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --no-tools --mode json -p "$retry_prompt"
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --exclude-tools edit,write --mode json -p "$retry_prompt"
   retry_run_status=$?
   "$SCRIPT_DIR/committee-output.py" --input "$retry_raw" --output "$out"; status=$?
   if [ "$retry_run_status" = 0 ] && [ "$status" = 0 ]; then
@@ -590,7 +590,7 @@ _run_planner() {
 }
 
 # ---- arg parsing ----
-task="" out_dir="${SM_LOOP_STATE:-.secondmate}/planning" timeout="${SM_COMMITTEE_TIMEOUT:-300}"
+task="" out_dir="${SM_LOOP_STATE:-.secondmate}/planning" timeout="${SM_COMMITTEE_TIMEOUT:-600}"
 while [ $# -gt 0 ]; do case "$1" in
   --task)    [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; task="$2"; shift 2;;
   --out-dir) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; out_dir="$2"; shift 2;;
@@ -607,7 +607,7 @@ while [ $# -gt 0 ]; do case "$1" in
     for entry in "${PLANNERS[@]}"; do
       IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
       printf "%-15s %-45s %-6s %s\n" "$_lbl" "$_mid" "$_th" "$_dim"
-      printf "  cmd: pi --provider %s --model %s --thinking %s --no-tools -p \"<task>\"\n" "$PROVIDER" "$_mid" "$_th"
+      printf "  cmd: pi --provider %s --model %s --thinking %s --exclude-tools edit,write -p \"<task>\"\n" "$PROVIDER" "$_mid" "$_th"
     done
     exit 0;;
   --list-models)
@@ -673,6 +673,8 @@ while [ $# -gt 0 ]; do case "$1" in
       echo "$_pp" | grep -q "$_m3" || { echo "FAIL: _planner_prompt [$_lbl] missing '$_m3'"; fails=1; }
       echo "$_pp" | grep -q "ASSUMED:" || { echo "FAIL: _planner_prompt [$_lbl] missing ASSUMED: convention"; fails=1; }
       echo "$_pp" | grep -Eq "do NOT|Do NOT" && { echo "FAIL: _planner_prompt [$_lbl] still has a Do NOT/do NOT negation smell"; fails=1; }
+      echo "$_pp" | grep -q "read-only tool access" || { echo "FAIL: _planner_prompt [$_lbl] missing read-only tool-access notice"; fails=1; }
+      echo "$_pp" | grep -q 'Reserve "Probes for Supervisor"' || { echo "FAIL: _planner_prompt [$_lbl] missing Probes-reservation guidance"; fails=1; }
     done
     # mistral-large3 and qwen3-80b: domain-applicability gate + Contrastive CoT worked example
     for _lbl in mistral-large3 qwen3-80b; do
@@ -700,8 +702,8 @@ while [ $# -gt 0 ]; do case "$1" in
     "$SCRIPT_DIR/committee-output.py" --selfcheck >/dev/null || { echo "FAIL: committee-output real fixture classifier"; fails=1; }
     _qwen_prompt="$(_planner_prompt qwen3-coder test-task-xyz)"
     _kimi_prompt="$(_planner_prompt kimi-k3 test-task-xyz)"
-    echo "$_qwen_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: qwen3-coder missing no-tools hardening"; fails=1; }
-    echo "$_kimi_prompt" | grep -q "NO tools, NO file access" || { echo "FAIL: kimi-k3 missing no-tools hardening"; fails=1; }
+    echo "$_qwen_prompt" | grep -q "NO tools, NO file access" && { echo "FAIL: qwen3-coder still has stale no-tools hardening"; fails=1; }
+    echo "$_kimi_prompt" | grep -q "NO tools, NO file access" && { echo "FAIL: kimi-k3 still has stale no-tools hardening"; fails=1; }
     # Exercise the actual launch/classify/retry path. The fake pi emits the captured qwen
     # failure on attempt one and clean JSON on the deliberately changed retry prompt.
     _ctmp="$(mktemp -d)"
