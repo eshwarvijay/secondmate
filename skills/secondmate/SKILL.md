@@ -291,15 +291,22 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<tas
    correlation against `audit/metrics.jsonl`, `verdict.py` output, or any other history — no such
    correlation logic exists here, and none should be built.
 
-## Fan-out to concurrent sub-supervisors (hard-capped at 2)
+## Fan-out to fresh sub-agent-supervisors (1 or 2, hard-capped at 2)
 
 Everything above is the default: one supervisor, one task, one loop at a time. This section is an
-**opt-in** variant for the one specific case where a human hands you 2 genuinely independent tasks and
-wants them run concurrently — it is never automatic, and the single-task loop above remains the default
-for everything else, including most multi-task requests (queue them sequentially through the normal loop
-unless the human explicitly wants concurrency).
+**opt-in** variant with two equally valid triggers, neither of them automatic — the single-task loop
+above remains the default for ordinary work, including most multi-task requests (queue them sequentially
+through the normal loop unless one of the two triggers below applies):
 
-**Mechanism.** Make ONE Agent-tool call carrying AT MOST 2 tool-use blocks — a **hard cap**, not a
+- A human hands you 2 genuinely independent tasks and wants them run concurrently, or
+- A human explicitly asks to delegate a SINGLE task's whole supervisor loop to a fresh
+  sub-agent-supervisor (e.g. to keep the dispatcher's own context clean, or to run that one task under
+  independent triage/routing/verdict judgment). Same mechanism, just one tool-use block instead of two —
+  it is still opt-in, still never automatic, and ordinary single-task work still defaults to running
+  inline via the loop described above rather than fanning out on its own.
+
+**Mechanism.** Make ONE Agent-tool call carrying AT MOST 2 tool-use blocks (exactly 1 for the
+single-task trigger, up to 2 for the concurrent-tasks trigger) — a **hard cap**, not a
 tunable parameter. There is no N>2 variant of this pattern; if there are more than 2 independent tasks,
 run 2 now and queue the rest for the next round. Each of the (at most 2) tool-use blocks launches a
 **FRESH** sub-agent — never `fork`. `fork` inherits the dispatcher's own conversation context, which is
