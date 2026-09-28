@@ -12,15 +12,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PROVIDER="${SM_COMMITTEE_PROVIDER:-amazon-bedrock}"
 
-# label|dimension|model-id|thinking-level
+# label|dimension|model-id|thinking-level|tools-mode
 # ponytail: thinking=high only for native reasoning models (R1, Kimi K3), off for others
+# tools-mode: exclude-edit-write (default; --exclude-tools edit,write) or no-tools
+# (--no-tools) for a slot whose model hard-rejects tool use altogether -- e.g.
+# deepseek-r1 (us.deepseek.r1-v1:0) errors on Bedrock converse-stream with tool
+# use in streaming mode. If a future model swap changes a slot's tool support,
+# flip this field -- no code change needed.
 PLANNERS=(
-  "deepseek-r1|Failure modes, edge cases, and what can go wrong|us.deepseek.r1-v1:0|high"
-  "qwen3-80b|Technical architecture and system design trade-offs|qwen.qwen3-next-80b-a3b|off"
-  "qwen3-coder|Implementation feasibility and concrete code path|qwen.qwen3-coder-next|off"
-  "kimi-k3|Holistic long-context risk and integration review|global.moonshotai.kimi-k3|high"
-  "mistral-large3|Security surface, adversarial gaps, and attack vectors|mistral.mistral-large-3-675b-instruct|off"
-  "glm5|Structured requirements, product angle, and user-facing concerns|zai.glm-5|off"
+  "deepseek-r1|Failure modes, edge cases, and what can go wrong|us.deepseek.r1-v1:0|high|no-tools"
+  "qwen3-80b|Technical architecture and system design trade-offs|qwen.qwen3-next-80b-a3b|off|exclude-edit-write"
+  "qwen3-coder|Implementation feasibility and concrete code path|qwen.qwen3-coder-next|off|exclude-edit-write"
+  "kimi-k3|Holistic long-context risk and integration review|global.moonshotai.kimi-k3|high|exclude-edit-write"
+  "mistral-large3|Security surface, adversarial gaps, and attack vectors|mistral.mistral-large-3-675b-instruct|off|exclude-edit-write"
+  "glm5|Structured requirements, product angle, and user-facing concerns|zai.glm-5|off|exclude-edit-write"
 )
 
 # Each _prompt_<label> function prints its full planner prompt to stdout.
@@ -563,11 +568,16 @@ _claim_task_marker() {
 
 # Run and JSON-classify one planner. Return 0 for clean or self-healed, 1 failed.
 _run_planner() {
-  local label="$1" model_id="$2" thinking="$3" prompt="$4" out="$5"
+  local label="$1" model_id="$2" thinking="$3" prompt="$4" out="$5" tools_mode="$6"
   local raw="$out.jsonl" retry_raw="$out.retry.jsonl" retry_prompt status first_run_status retry_run_status
+  local tools_args
+  case "$tools_mode" in
+    no-tools) tools_args=(--no-tools) ;;
+    *)        tools_args=(--exclude-tools edit,write) ;;
+  esac
   rm -f "$out.healed" "$out.raw" "$raw" "$retry_raw"
   "$SCRIPT_DIR/run-round.sh" --label "plan-$label" --log "$raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
-    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --exclude-tools edit,write --mode json -p "$prompt"
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" "${tools_args[@]}" --mode json -p "$prompt"
   first_run_status=$?
   "$SCRIPT_DIR/committee-output.py" --input "$raw" --output "$out"; status=$?
   [ "$first_run_status" = 0 ] && [ "$status" = 0 ] && { rm -f "$raw"; return 0; }
@@ -576,7 +586,7 @@ _run_planner() {
   [ -s "$out" ] && cp "$out" "$out.raw" || cp "$raw" "$out.raw"
   retry_prompt="$(_planner_prompt "$label" "$task" retry)"
   "$SCRIPT_DIR/run-round.sh" --label "plan-$label-retry" --log "$retry_raw" --timeout "$timeout" --audit "$out_dir/audit.jsonl" -- \
-    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" --exclude-tools edit,write --mode json -p "$retry_prompt"
+    pi --provider "$PROVIDER" --model "$model_id" --thinking "$thinking" "${tools_args[@]}" --mode json -p "$retry_prompt"
   retry_run_status=$?
   "$SCRIPT_DIR/committee-output.py" --input "$retry_raw" --output "$out"; status=$?
   if [ "$retry_run_status" = 0 ] && [ "$status" = 0 ]; then
@@ -602,19 +612,23 @@ while [ $# -gt 0 ]; do case "$1" in
     echo "$version"
     exit 0;;
   --dry-run)
-    printf "%-15s %-45s %-6s %s\n" "LABEL" "MODEL" "THINK" "DIMENSION"
-    printf "%-15s %-45s %-6s %s\n" "-----" "-----" "-----" "---------"
+    printf "%-15s %-45s %-6s %-18s %s\n" "LABEL" "MODEL" "THINK" "TOOLS" "DIMENSION"
+    printf "%-15s %-45s %-6s %-18s %s\n" "-----" "-----" "-----" "-----" "---------"
     for entry in "${PLANNERS[@]}"; do
-      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
-      printf "%-15s %-45s %-6s %s\n" "$_lbl" "$_mid" "$_th" "$_dim"
-      printf "  cmd: pi --provider %s --model %s --thinking %s --exclude-tools edit,write -p \"<task>\"\n" "$PROVIDER" "$_mid" "$_th"
+      IFS='|' read -r _lbl _dim _mid _th _tools <<< "$entry"
+      case "$_tools" in
+        no-tools) _flag="--no-tools" ;;
+        *)        _flag="--exclude-tools edit,write" ;;
+      esac
+      printf "%-15s %-45s %-6s %-18s %s\n" "$_lbl" "$_mid" "$_th" "$_tools" "$_dim"
+      printf "  cmd: pi --provider %s --model %s --thinking %s %s -p \"<task>\"\n" "$PROVIDER" "$_mid" "$_th" "$_flag"
     done
     exit 0;;
   --list-models)
     printf "%-15s %-45s %-6s %s\n" "LABEL" "MODEL" "THINK" "DIMENSION"
     printf "%-15s %-45s %-6s %s\n" "-----" "-----" "-----" "---------"
     for entry in "${PLANNERS[@]}"; do
-      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
+      IFS='|' read -r _lbl _dim _mid _th _tools <<< "$entry"
       printf "%-15s %-45s %-6s %s\n" "$_lbl" "$_mid" "$_th" "$_dim"
     done
     exit 0;;
@@ -642,15 +656,18 @@ while [ $# -gt 0 ]; do case "$1" in
     rc=0; "$0" --version >/dev/null 2>&1 || rc=$?
     trap - EXIT; _restore_pjson
     [ "$rc" = 1 ] || { echo "FAIL: --version null version should exit 1, got $rc"; fails=1; }
-    # static PLANNERS contract: 6 entries, 4 pipe-delimited fields each, valid thinking value
+    # static PLANNERS contract: 6 entries, 5 pipe-delimited fields each, valid thinking/tools value
     count=0
     for entry in "${PLANNERS[@]}"; do
       count=$((count + 1))
-      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
+      IFS='|' read -r _lbl _dim _mid _th _tools <<< "$entry"
       [ -n "$_lbl" ] && [ -n "$_mid" ] || { echo "FAIL: empty label or model in entry: $entry"; fails=1; }
       case "$_th" in off|high) ;; *) echo "FAIL: invalid thinking '$_th' in entry: $entry"; fails=1;; esac
+      case "$_tools" in no-tools|exclude-edit-write) ;; *) echo "FAIL: invalid tools mode '$_tools' in entry: $entry"; fails=1;; esac
     done
     [ "$count" = 6 ] || { echo "FAIL: expected 6 planners, got $count"; fails=1; }
+    IFS='|' read -r _lbl _dim _mid _th _tools <<< "${PLANNERS[0]}"
+    [ "$_lbl" = deepseek-r1 ] && [ "$_tools" = no-tools ] || { echo "FAIL: deepseek-r1 slot is not marked no-tools"; fails=1; }
     # _planner_prompt contract: common structure AND dimension-specific markers (bash 3 compatible)
     _dim_markers() { case "$1" in
       deepseek-r1)    echo "Failure Scenarios|Most Dangerous Assumption|Severity | Justification" ;;
@@ -661,7 +678,7 @@ while [ $# -gt 0 ]; do case "$1" in
       glm5)           echo "Requirements Grading|Non-Goals|Success Metrics" ;;
     esac; }
     for entry in "${PLANNERS[@]}"; do
-      IFS='|' read -r _lbl _dim _mid _th <<< "$entry"
+      IFS='|' read -r _lbl _dim _mid _th _tools <<< "$entry"
       _pp="$(_planner_prompt "$_lbl" "test-task-xyz")"
       [ -n "$_pp" ] || { echo "FAIL: _planner_prompt empty for label: $_lbl"; fails=1; }
       echo "$_pp" | grep -q "test-task-xyz" || { echo "FAIL: _planner_prompt missing task text for label: $_lbl"; fails=1; }
@@ -700,6 +717,26 @@ while [ $# -gt 0 ]; do case "$1" in
     echo "$_mistral_pp" | grep -q "planned file writes" || { echo "FAIL: mistral-large3 Contrastive CoT missing literal task-text mechanism 'planned file writes'"; fails=1; }
     echo "$_mistral_pp" | grep -q "derived from a CLI arg" && { echo "FAIL: mistral-large3 Contrastive CoT regressed to fabricated CLI-arg-derived-path mechanism"; fails=1; }
     "$SCRIPT_DIR/committee-output.py" --selfcheck >/dev/null || { echo "FAIL: committee-output real fixture classifier"; fails=1; }
+    # tools-mode is data-driven off PLANNERS: deepseek-r1's slot must invoke pi with
+    # --no-tools while an ordinary slot keeps --exclude-tools edit,write.
+    _tctmp="$(mktemp -d)"
+    cat > "$_tctmp/pi" <<'FAKEPITOOLS'
+#!/usr/bin/env bash
+all_args="$*"
+model=""
+while [ $# -gt 0 ]; do case "$1" in --model) model="$2"; shift 2;; *) shift;; esac done
+printf '%s|%s\n' "$model" "$all_args" >> "$FAKE_TOOLS_CALLS"
+python3 -c 'import json; print(json.dumps({"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"ok"}]}]}))'
+FAKEPITOOLS
+    chmod +x "$_tctmp/pi"
+    FAKE_TOOLS_CALLS="$_tctmp/calls" PATH="$_tctmp:$PATH" "$0" --task tools-flag-fixture --out-dir "$_tctmp/out" --timeout 30 >/dev/null 2>&1
+    _tsrc=$?
+    [ "$_tsrc" = 0 ] || { echo "FAIL: tools-flag fixture run exited $_tsrc"; fails=1; }
+    grep -q '^us\.deepseek\.r1-v1:0|.*--no-tools' "$_tctmp/calls" || { echo "FAIL: deepseek-r1 slot did not invoke pi with --no-tools"; fails=1; }
+    grep '^us\.deepseek\.r1-v1:0|' "$_tctmp/calls" | grep -q -- "--exclude-tools" && { echo "FAIL: deepseek-r1 slot incorrectly invoked with --exclude-tools"; fails=1; }
+    grep -q '^qwen\.qwen3-coder-next|.*--exclude-tools edit,write' "$_tctmp/calls" || { echo "FAIL: qwen3-coder slot did not invoke pi with --exclude-tools edit,write"; fails=1; }
+    grep '^qwen\.qwen3-coder-next|' "$_tctmp/calls" | grep -q -- "--no-tools" && { echo "FAIL: qwen3-coder slot incorrectly invoked with --no-tools"; fails=1; }
+    rm -rf "$_tctmp"
     _qwen_prompt="$(_planner_prompt qwen3-coder test-task-xyz)"
     _kimi_prompt="$(_planner_prompt kimi-k3 test-task-xyz)"
     echo "$_qwen_prompt" | grep -q "NO tools, NO file access" && { echo "FAIL: qwen3-coder still has stale no-tools hardening"; fails=1; }
@@ -880,10 +917,10 @@ _claim_task_marker || exit $?
 # ---- launch all planners in parallel ----
 pids=(); labels=(); outs=()
 for entry in "${PLANNERS[@]}"; do
-  IFS='|' read -r label dimension model_id thinking <<< "$entry"
+  IFS='|' read -r label dimension model_id thinking tools_mode <<< "$entry"
   out="$out_dir/$label.md"
   prompt="$(_planner_prompt "$label" "$task")"
-  _run_planner "$label" "$model_id" "$thinking" "$prompt" "$out" &
+  _run_planner "$label" "$model_id" "$thinking" "$prompt" "$out" "$tools_mode" &
   pids+=($!); labels+=("$label"); outs+=("$out")
 done
 

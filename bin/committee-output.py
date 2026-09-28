@@ -12,6 +12,13 @@ BAD_PATTERNS = (
     re.compile(r"<\s*tool_call\s*>"),
     re.compile(r"<\s*\|\s*tool_call[a-zA-Z0-9_]*\s*\|\s*>"),
     re.compile(r"<\s*function\s*="),
+    # Bare "toolname{...}" with no wrapping tags -- a leaked tool-call fragment
+    # (e.g. mistral-large3 emitting 'read{"offset": 1, ...}' as plain text
+    # instead of a real tool invocation). Anchored to the exact tool names from
+    # the planner system prompt, and requires the JSON-object shape (a quoted
+    # key immediately after the opening brace) to avoid matching prose that
+    # happens to put a word next to a curly brace.
+    re.compile(r'\b(?:read|bash|grep|find|multi_grep)\{"[^"]+"\s*:'),
 )
 
 
@@ -110,6 +117,18 @@ def selfcheck():
     _, angle_bracket_prose = classify([_event("the value is <100 and the function=foo() call succeeds")])
     if angle_bracket_prose:
         failures.append("ordinary angle-bracket prose was incorrectly classified bad")
+    # Captured production failure: mistral-large3 leaked a bare tool-call fragment
+    # with no wrapping tags at all.
+    mistral_leak = 'read{"offset": 1, "limit": 50, "path": "bin/session-activate.sh"}'
+    _, leaked_tool_call = classify([_event(mistral_leak)])
+    if not leaked_tool_call:
+        failures.append("bare toolname{json} leaked fragment was not classified bad")
+    _, prose_read_brace = classify([_event("please read { the docs } before you continue")])
+    if prose_read_brace:
+        failures.append("prose with 'read' before an unrelated brace was incorrectly classified bad")
+    _, prose_word_boundary = classify([_event("we should spread{the load} across workers")])
+    if prose_word_boundary:
+        failures.append("word containing 'read' as a substring was incorrectly classified bad")
     null_messages = json.dumps({"type": "agent_end", "messages": None})
     null_text, null_bad = classify([null_messages])
     if null_text != "" or not null_bad:
