@@ -24,7 +24,7 @@ Two principles run through every component:
 |---|---|---|---|
 | **Captain** | you (human) | state intent, approve risky actions | the only merge authority |
 | **Supervisor** | Claude Code (Sonnet) | plan, triage, orchestrate, adjudicate, integrate | never writes project code itself |
-| **Planners** | 6 open-weight models via pi | each covers one dimension of the task in parallel | headless, read-only, no tools |
+| **Planners** | 6 open-weight models via pi | each covers one dimension of the task in parallel | headless, edit-locked (Read/Grep/Bash, no edit/write) |
 | **Maker** | Claude or pi + Qwen3-Coder | implement the change in an isolated worktree | works only in its own worktree |
 | **Checker** | a *different* model (GPT-5.6-Terra) | review the diff adversarially | physically read-only, edit-locked |
 

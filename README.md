@@ -187,7 +187,7 @@ credentials only you can supply.
 | `SM_REASON_PROVIDER` | `amazon-bedrock` | reasoning provider |
 | `SM_REASON_MODEL` | `r1` | default reasoning model alias (`r1` / `gpt` / `sonnet` / full id) |
 | `SM_COMMITTEE_PROVIDER` | `amazon-bedrock` | planner provider for `plan-committee.sh` |
-| `SM_COMMITTEE_TIMEOUT` | `300` | per-planner wall-clock timeout in seconds |
+| `SM_COMMITTEE_TIMEOUT` | `600` | per-planner wall-clock timeout in seconds |
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_CLAIM_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `.secondmate/claims.jsonl` -- the common-dir's parent when its own basename is `.git` (a normal repo/worktree), else the common-dir itself (a bare repo or a submodule) (or `$SM_LOOP_STATE/claims.jsonl` if set, else a CWD-relative fallback with a loud warning outside any git repo) | task-id claim ledger for `bin/claim-ledger.py`, shared across every worktree of the same repo |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir. `bin/merge-sequencer.sh` uses this same var as an override, but its own **default** lock lives at `<repo>/.secondmate/merge-sequencer.lock` (anchored to `--repo`, not to `./`) so every caller targeting the same `--repo` shares the same lock regardless of its own ambient CWD — distinct from `bin/caffeinate-guard.sh`'s own lock under `SM_CAFFEINATE_ROOT` |
