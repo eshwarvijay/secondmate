@@ -168,7 +168,18 @@ fi
 progress_filter="$SCRIPT_DIR/checker-progress.py"
 
 # --exclude-tools edit,write is NOT optional: it makes the checker physically read-only.
+# The harness must run with cwd set to $repo_dir so its tool calls operate against the correct directory.
+# repo_dir defaults to $PWD when --repo is not passed, so this is backward compatible (cd $PWD is safe).
+# Resolve harness to absolute path BEFORE cd, so relative paths like ./harness-stub work after cd.
+if command -v realpath >/dev/null 2>&1; then
+  harness_abs="$(realpath "$(command -v "$harness")")"
+else
+  harness_dir="$(cd "$(dirname "$(command -v "$harness")")" && pwd)"
+  harness_name="$(basename "$(command -v "$harness")")"
+  harness_abs="$harness_dir/$harness_name"
+fi
+cd "$repo_dir"
 # Pipe pi's JSON output through the filter; filter writes progress to stderr, final text to stdout.
 # --mode json appears AFTER caller args so it wins if they pass --mode text. Exit code propagation
 # is preserved because of `set -o pipefail` at the top.
-exec "$harness" "${main_args[@]}" "$@" --mode json | python3 "$progress_filter"
+exec "$harness_abs" "${main_args[@]}" "$@" --mode json | python3 "$progress_filter"
