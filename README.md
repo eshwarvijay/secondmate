@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.38-4C8BF5?style=flat-square" alt="version 0.1.38" />
+  <img src="https://img.shields.io/badge/version-0.1.39-4C8BF5?style=flat-square" alt="version 0.1.39" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -91,6 +91,7 @@ flowchart LR
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize; JSON-aware output validation rejects tool-call-shaped garbage, retries once with a changed prompt, marks self-healed planners, preserves failed raw output, and refuses to overwrite a different task's planning directory |
 | `bin/committee-output.py` | Extracts final planner prose from pi's JSON event stream and classifies empty, tool-call-shaped, or structurally invalid responses |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |
+| `bin/session-staleness.sh` (SessionStart hook) | Surfaces `bin/doctor.sh`'s own secondmate plugin staleness detection (via `doctor.sh --staleness-json`, the same SHA/version comparison `/secondmate-doctor` uses — never a second copy of that logic) at the start of every session; advisory only, silent when the status is `ok`, always exits 0 |
 | `bin/scope-guard.py` (PreToolUse hook) | Confines a **marked maker session** to its own worktree — denies Bash/Read/Edit/Write/NotebookEdit outside it, credential-store commands (Keychain, `gh auth`, incl. wrapped in `sh -c`/`eval`), and common Bash evasions (shell-var indirection, inline `python3 -c`/`node -e`, any pipeline ending in a shell interpreter); recognizes literal patterns only — see the limitation callout below for what it permanently does not catch; no-op for the supervisor's primary checkout |
 | `bin/scope-guard-extension.ts` | **pi extension equivalent** of scope-guard.py — denies the same tool calls and patterns for pi maker sessions; uses pi's `tool_call` event instead of Claude's PreToolUse hook; activated by same `mark-maker.sh` convention; same heuristic limitations Apply |
 | `bin/mark-maker.sh` | The one shared call every maker-launch site uses to drop the scope-guard marker **outside** the worktree, keyed by the worktree's realpath; refuses to mark anything but an isolated linked worktree (never the primary checkout) |
@@ -236,6 +237,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/lesson-lookup.py selfcheck && bin/teardown-check.sh --selfcheck \
   && bin/audit-log.py selfcheck \
   && bin/session-activate.sh --selfcheck && bin/session-holds.sh --selfcheck \
+  && bin/session-staleness.sh --selfcheck \
   && echo ALL_OK
 claude plugin validate .
 ```

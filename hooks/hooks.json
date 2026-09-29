@@ -15,6 +15,12 @@
                         "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/session-holds.sh\"",
                         "timeout": 10,
                         "statusMessage": "secondmate: checking open decisions..."
+                    },
+                    {
+                        "type": "command",
+                        "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/session-staleness.sh\"",
+                        "timeout": 10,
+                        "statusMessage": "secondmate: checking plugin staleness..."
                     }
                 ]
             }
