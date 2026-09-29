@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.37-4C8BF5?style=flat-square" alt="version 0.1.37" />
+  <img src="https://img.shields.io/badge/version-0.1.38-4C8BF5?style=flat-square" alt="version 0.1.38" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -54,6 +54,11 @@ read-only analysis? `/secondmate-reason why does this test flake only in CI?`
 
 ## 🔁 How it works
 
+Once your task is iterative, verifiable, and risky/outward-facing, the top-level supervisor never runs
+this loop itself — it dispatches a **fresh sub-agent-supervisor** (solo for one task, or one of up to 10
+running concurrently in a batch) that executes every stage below inside its own context, then reports
+back. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the dispatch mechanics.
+
 ```mermaid
 flowchart LR
     A[loop-task: goal] --> P[plan-committee<br/>6 models in parallel]
@@ -69,9 +74,10 @@ flowchart LR
     H -- merge --> D[ship]
 ```
 
-> The planning committee runs unconditionally for every task. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3), Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. Sonnet synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder (`--thinking medium`)** for well-specified pure-code tasks.
+> The planning committee runs unconditionally for every task, inside the dispatched sub-agent-supervisor's
+> own context. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3), Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. The sub-supervisor (Sonnet) synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder (`--thinking medium`)** for well-specified pure-code tasks.
 >
-> On a checker `fail`, the supervisor synthesizes a fix plan and hands it back to the **same maker** (task-scoped agent name, same worktree) — never fixes inline. The supervisor never writes project code.
+> On a checker `fail`, the sub-supervisor synthesizes a fix plan and hands it back to the **same maker** (task-scoped agent name, same worktree) — never fixes inline. The supervisor never writes project code.
 
 > Deeper dive: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — roles, the guarantee behind every stage, and the full component map.
 
