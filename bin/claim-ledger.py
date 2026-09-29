@@ -4,24 +4,55 @@
 """claim-ledger.py -- atomic task-id claims so concurrently-running sub-agent-supervisors (each in its own
 git worktree) never work the same task at once.
 
-  claim-ledger.py claim   --task-id ID --owner LABEL                        -> claims ID iff no open claim
+  claim-ledger.py claim   --task-id ID --owner LABEL [--scope K:KEY=OP]     -> claims ID iff no open claim
                                                                                 exists; prints a --token the
-                                                                                caller must save to release it
+                                                                                caller must save to release it.
+                                                                                --scope optionally declares
+                                                                                what the claim touches (see
+                                                                                below); omitted entirely if
+                                                                                --scope isn't given.
   claim-ledger.py release --task-id ID --owner LABEL --token TOK            -> closes ID's open claim, but
                                                                                 ONLY if both --owner AND
                                                                                 --token match the open claim
   claim-ledger.py steal   --task-id ID --owner LABEL --reason TXT           -> human-supervised override:
-                                                                                unconditionally closes whatever
+                          [--scope K:KEY=OP]                                  unconditionally closes whatever
                                                                                 is open on ID (if anything) and
                                                                                 reopens it under LABEL; no
                                                                                 --token required to perform the
                                                                                 steal itself (it's the escape
                                                                                 hatch), but the new claim it
-                                                                                opens gets its own fresh token
+                                                                                opens gets its own fresh token.
+                                                                                --scope is NEVER carried forward
+                                                                                from whatever claim was stolen --
+                                                                                the new claim starts unscoped
+                                                                                unless the stealer supplies its
+                                                                                own fresh --scope.
+  claim-ledger.py conflicts --scope K:KEY=OP                                -> read-only: exits 1 (and prints
+                                                                                one JSON line per hit) if any
+                                                                                currently-open claim declares
+                                                                                the SAME scope with an OPERATION
+                                                                                in the opposite additive/
+                                                                                destructive class; exits 0
+                                                                                otherwise. Never appends to the
+                                                                                ledger. A dispatcher calls this
+                                                                                before launching a second
+                                                                                concurrent sub-agent-supervisor
+                                                                                to catch a destructive-vs-
+                                                                                additive semantic collision
+                                                                                today's textual-only merge-
+                                                                                sequencer preflight can't see.
   claim-ledger.py status | list                                            -> lists all currently-open claims
-                                                                                (owner/claimed_at -- never a token)
+                                                                                (owner/claimed_at/scope/op if
+                                                                                declared -- never a token)
   claim-ledger.py selfcheck                                                -> asserts the fold + drives the
                                                                                 real CLI paths
+
+--scope's shape is KIND:KEY=OPERATION (e.g. `--scope symbol:PaymentService=replace`), one combined flag
+so "scope declared without an operation" is unrepresentable. KIND:KEY is free text, exactly matched
+(case-sensitive, no normalization, no fuzzy matching, ever) -- same posture as the existing free-text
+--owner field. OPERATION must be one of two closed classes: ADDITIVE = {add, extend, modify} or
+DESTRUCTIVE = {replace, remove, rename, migrate}. `conflicts` flags a hit only when an open claim's scope
+string matches exactly AND its operation is in the OPPOSITE class from the one queried.
 
 Ledger path resolution (first match wins):
   1. $SM_CLAIM_LEDGER, if set -- used exactly as given.
@@ -119,9 +150,32 @@ _TASK_ID_RE = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
 # unwedgeable as a missing token, so it must be treated the same way: malformed, not a valid open claim.
 _TOKEN_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
+# --scope KIND:KEY=OPERATION -- one combined flag, not separate --scope/--operation flags, so "scope
+# declared without an operation" is unrepresentable instead of needing an extra validation branch.
+# KIND:KEY is free text like --owner (exact case-sensitive match only, never normalized/fuzzy-matched);
+# OPERATION is validated against the closed ADDITIVE/DESTRUCTIVE enum below, not by this regex.
+_SCOPE_RE = re.compile(r"\A(?P<scope>[^=]+:[^=]+)=(?P<operation>[A-Za-z]+)\Z")
+
+ADDITIVE = {"add", "extend", "modify"}
+DESTRUCTIVE = {"replace", "remove", "rename", "migrate"}
+
 
 def _valid_task_id(task_id):
     return isinstance(task_id, str) and bool(_TASK_ID_RE.match(task_id))
+
+
+def _parse_scope(raw):
+    """Parse a --scope KIND:KEY=OPERATION value. Exits (CLI-error posture, like _valid_task_id's
+    caller) on a malformed shape or an OPERATION outside the closed additive/destructive enum."""
+    m = _SCOPE_RE.match(raw)
+    if not m:
+        sys.exit(f"invalid --scope {raw!r}: must match KIND:KEY=OPERATION, e.g. "
+                  f"symbol:PaymentService=replace")
+    scope, operation = m.group("scope"), m.group("operation")
+    if operation not in ADDITIVE and operation not in DESTRUCTIVE:
+        sys.exit(f"invalid --scope operation {operation!r}: must be one of "
+                 f"{sorted(ADDITIVE | DESTRUCTIVE)}")
+    return scope, operation
 
 
 def _recs():
@@ -299,6 +353,68 @@ def _selfcheck_live():
         assert code == 0
         opened = open_claims()
         assert opened["t2"]["owner"] == "agent-f", "steal must reopen the task-id under the new owner"
+
+        # scope/operation: claim --scope renders as scope=... op=... in status; conflicts against an
+        # opposite-class operation on the SAME scope exits 1 and reports it; a same-class (additive)
+        # operation on the same scope, or any operation on a DIFFERENT scope, exits 0 and is silent; a
+        # claim made with no --scope at all is invisible to every conflicts query.
+        code, _, _ = _run(["claim", "--task-id", "scoped1", "--owner", "agent-s", "--scope", "symbol:X=add"])
+        assert code == 0, "claim with --scope must succeed"
+        code, out, _ = _run(["status"])
+        assert "scope=symbol:X op=add" in out, "status must render scope/operation when present"
+
+        code, out, exc = _run(["conflicts", "--scope", "symbol:X=remove"])
+        assert exc == 1, "an opposite-class (destructive vs. additive) operation on the same scope must exit 1"
+        assert '"task_id": "scoped1"' in out and '"operation": "add"' in out, (
+            "conflicts must report the conflicting claim as a JSON line")
+
+        code, out, exc = _run(["conflicts", "--scope", "symbol:X=extend"])
+        assert exc == 0 and out == "", "a same-class (additive) operation on the same scope must exit 0, silent"
+
+        code, out, exc = _run(["conflicts", "--scope", "other:Y=remove"])
+        assert exc == 0 and out == "", "a different scope must never conflict"
+
+        code, _, _ = _run(["claim", "--task-id", "unscoped1", "--owner", "agent-u"])
+        assert code == 0, "claim with no --scope at all must still succeed"
+        code, out, _ = _run(["status"])
+        assert "scope=" not in out.split("[unscoped1]")[1].split("\n")[0], (
+            "status must omit scope/op entirely for a claim with no declared scope")
+        code, out, exc = _run(["conflicts", "--scope", "symbol:X=remove"])
+        assert '"task_id": "unscoped1"' not in out, (
+            "a claim with no declared scope must be invisible to every conflicts query, never reported")
+
+        # steal never carries forward scope/operation automatically -- the new claim starts unscoped
+        # unless the stealer supplies its own fresh --scope on the same steal call.
+        code, _, _ = _run(["claim", "--task-id", "stealscope", "--owner", "agent-g",
+                            "--scope", "symbol:Z=replace"])
+        assert code == 0
+        code, _, _ = _run(["steal", "--task-id", "stealscope", "--owner", "agent-h",
+                            "--reason", "no scope carryover check"])
+        assert code == 0
+        assert "scope" not in open_claims()["stealscope"], (
+            "steal without its own --scope must not carry forward the stolen claim's scope")
+        code, out, exc = _run(["conflicts", "--scope", "symbol:Z=remove"])
+        assert exc == 0 and out == "", (
+            "a stolen claim with no fresh --scope must not conflict via the old (dropped) scope")
+
+        # invalid --scope shapes (missing operation, missing colon, unknown operation) must be rejected.
+        for bad_scope in ("symbol:X", "symbolX=add", "symbol:X=frobnicate", "symbol:X="):
+            code, _, _ = _run(["claim", "--task-id", "badscope", "--owner", "agent-b",
+                                "--scope", bad_scope])
+            assert code != 0, f"invalid --scope {bad_scope!r} must be rejected"
+
+        # regression: scope's KIND:KEY portion is free text like --owner -- no new sanitization beyond
+        # what json.dumps already provides, so whitespace inside it must NOT be rejected.
+        code, out, _ = _run(["claim", "--task-id", "white", "--owner", "a",
+                              "--scope", "symbol:Has Space=add"])
+        assert code == 0, "a --scope value with whitespace in KIND:KEY must be accepted, not rejected"
+        assert open_claims()["white"]["scope"] == "symbol:Has Space", (
+            "the whitespace-containing scope must be stored verbatim")
+        code, out, _ = _run(["status"])
+        assert "scope=symbol:Has Space op=add" in out, (
+            "status must render a whitespace-containing scope verbatim")
+        code, out, exc = _run(["conflicts", "--scope", "symbol:Has Space=remove"])
+        assert exc == 1, "conflicts must exact-match a whitespace-containing scope"
 
         # TOCTOU guard, forced via a GENUINE concurrent race (not a pre-written ledger line the steal
         # call then just reads normally -- that proves nothing, since nothing else is running while it
@@ -596,6 +712,7 @@ def main(argv):
     c = sub.add_parser("claim")
     c.add_argument("--task-id", required=True)
     c.add_argument("--owner", required=True)
+    c.add_argument("--scope")
 
     r = sub.add_parser("release")
     r.add_argument("--task-id", required=True)
@@ -606,10 +723,14 @@ def main(argv):
     s.add_argument("--task-id", required=True)
     s.add_argument("--owner", required=True)
     s.add_argument("--reason", required=True)
+    s.add_argument("--scope")
 
     sub.add_parser("status")
     sub.add_parser("list")
     sub.add_parser("selfcheck")
+
+    k = sub.add_parser("conflicts")
+    k.add_argument("--scope", required=True)
     args = p.parse_args(argv)
 
     if args.cmd in ("claim", "release", "steal"):
@@ -618,6 +739,10 @@ def main(argv):
                       f"(no path separators, no null bytes, no empty string)")
         if not args.owner:
             sys.exit("--owner must be non-empty")
+
+    scope = operation = None
+    if args.cmd in ("claim", "steal", "conflicts") and getattr(args, "scope", None) is not None:
+        scope, operation = _parse_scope(args.scope)
 
     if args.cmd == "claim":
         with _ledger_lock():   # read-check-append is atomic vs a concurrent claim/steal on the same task-id
@@ -630,7 +755,11 @@ def main(argv):
             # a real, unguessable secret -- --owner alone is just a human-readable label a bug or a
             # mislabeled caller could trivially repeat; this token is the actual release-time proof.
             token = secrets.token_hex(16)
-            _append({"ev": "claimed", "task_id": args.task_id, "owner": args.owner, "token": token, "ts": ts})
+            rec = {"ev": "claimed", "task_id": args.task_id, "owner": args.owner, "token": token, "ts": ts}
+            if scope is not None:
+                rec["scope"] = scope
+                rec["operation"] = operation
+            _append(rec)
         print(f"claimed {args.task_id} for {args.owner} token={token}")
 
     elif args.cmd == "release":
@@ -667,6 +796,12 @@ def main(argv):
                    "reason": args.reason}
             if prev is not None:
                 rec["previous_owner"] = prev["owner"]
+            # scope/operation NEVER carried forward from `prev` -- only from this steal call's own
+            # (possibly absent) --scope. The new owner's real intent may differ from what the claim it
+            # took over declared; a stolen claim starts unscoped unless the stealer says otherwise.
+            if scope is not None:
+                rec["scope"] = scope
+                rec["operation"] = operation
             _append(rec)
         if prev is not None:
             print(f"stole {args.task_id} from {prev['owner']} for {args.owner} token={token}: {args.reason}")
@@ -678,9 +813,22 @@ def main(argv):
         if not opened and _BAD == 0:
             print("(no open claims)", file=sys.stderr)  # stderr keeps stdout clean when empty
         for task_id, r in sorted(opened.items()):
-            print(f"[{task_id}] owner={r['owner']} claimed_at={r.get('ts', '?')}")
+            line = f"[{task_id}] owner={r['owner']} claimed_at={r.get('ts', '?')}"
+            if "scope" in r and "operation" in r:  # omitted entirely for claims with no declared scope
+                line += f" scope={r['scope']} op={r['operation']}"
+            print(line)
         if _BAD:  # surface corruption on stdout -- never fail open
             print(f"WARNING: {_BAD} malformed line(s) in {LEDGER} -- ledger may be corrupt; reconcile manually.")
+
+    elif args.cmd == "conflicts":
+        # read-only: no lock, same lock-free precedent status/list already use for open_claims().
+        opposite = DESTRUCTIVE if operation in ADDITIVE else ADDITIVE
+        hits = [r for r in open_claims().values()
+                if r.get("scope") == scope and r.get("operation") in opposite]
+        for r in hits:
+            print(json.dumps({"task_id": r["task_id"], "owner": r["owner"], "scope": r["scope"],
+                               "operation": r["operation"]}))
+        sys.exit(1 if hits else 0)
 
     elif args.cmd == "selfcheck":
         recs = [{"ev": "claimed", "task_id": "t", "owner": "a", "ts": "1"},
@@ -692,6 +840,9 @@ def main(argv):
         assert open_claims([]) == {}, "empty ledger must fold to no open claims"
         assert _valid_task_id("sm-abc_123") and not _valid_task_id("../x") and not _valid_task_id("") \
             and not _valid_task_id("a/b") and not _valid_task_id("a" * 129), "task-id validation broken"
+        assert _parse_scope("symbol:PaymentService=replace") == ("symbol:PaymentService", "replace"), (
+            "--scope parsing broken")
+        assert ADDITIVE.isdisjoint(DESTRUCTIVE), "additive/destructive operation classes must not overlap"
         _selfcheck_live()
         _selfcheck_default_ledger_path()
         _selfcheck_no_git_fallback_warns()
