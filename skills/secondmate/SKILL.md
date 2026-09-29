@@ -112,7 +112,7 @@ This is the spec the maker receives.
   After step 2 Spawn creates `<wt>`, start the Claude maker directly on the root_pane from `herdr worktree create`:
   ```bash
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
-  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. <append the maker prompt closing boilerplate defined above, substituting --task \"<goal>\"> Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop." --wait --timeout 600000
+  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop. <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<goal>\">" --wait --timeout 600000
   ```
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
@@ -121,7 +121,7 @@ This is the spec the maker receives.
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
     -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
-  herdr agent prompt sm-pi-<task-id> "<plan> <append the maker prompt closing boilerplate defined above, substituting --task \"<plan>\">" --wait --timeout 600000
+  herdr agent prompt sm-pi-<task-id> "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
   worktree **must have been marked** by calling `${CLAUDE_PLUGIN_ROOT}/bin/mark-maker.sh --cwd <wt>` BEFORE
@@ -136,7 +136,7 @@ This is the spec the maker receives.
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless:
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan> <append the maker prompt closing boilerplate defined above, substituting --task \"<plan>\">"`
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
   A good plan gives:
@@ -159,11 +159,12 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
-### Maker prompt closing boilerplate (used by every maker invocation below)
+### Maker prompt closing boilerplate (used by every maker invocation in this file)
 
-Every maker prompt below — first-round and fix-round, Claude and pi, herdr and headless — ends with
-this exact closing, appended right after the task-specific instruction (`<goal>`/`<plan>`/`<fix plan>`)
-and before the prompt's closing quote (and any trailing `--wait --timeout 600000`):
+Every maker prompt in this file — first-round and fix-round, Claude and pi, herdr and headless, whether
+its invocation appears above or below this section — ends with this exact closing, appended right
+after the task-specific instruction (`<goal>`/`<plan>`/`<fix plan>`) and before the prompt's closing
+quote (and any trailing `--wait --timeout 600000`):
 
 ```
 Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
@@ -172,9 +173,10 @@ $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { 
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal|plan|fix plan>" --task-id "<task-id>")
 ```
 
-Each call site below carries a short pointer — *"append the maker prompt closing boilerplate defined
-above, substituting `--task \"<X>\"`"* — instead of retyping this block; `<X>` is that site's own
-`<goal>`, `<plan>`, or `<fix plan>` text, substituted into the `--task` argument shown above.
+Every call site in this file carries a short pointer — *"append the \"Maker prompt closing
+boilerplate\" block, substituting `--task \"<X>\"`"* — instead of retyping this block; `<X>` is that
+site's own `<goal>`, `<plan>`, or `<fix plan>` text, substituted into the `--task` argument shown
+above.
 
 1. **Triage** — classify the task `ship` (produces a diff) vs `scout` (report only; skip the checker and
    the gate), and a rigor tier: `full` (checker + verify-gate + human hold) or `fast` (tests + gate only).
@@ -243,10 +245,10 @@ above, substituting `--task \"<X>\"`"* — instead of retyping this block; `<X>`
      `${CLAUDE_PLUGIN_ROOT}/bin/verdict.py <checker-output>` → exit 0 pass / 1 fail / 2 error|refused. When lenses were injected via `--lens`, add `--lenses <comma-separated-list>` to cross-check the envelope's `lens_coverage` field (the checker is told each lens's exact name and should report `{"lens_coverage": {"<name>": true, ...}}`). A missing lens triggers `ambiguous` (exit 2). Also for `fail` verdicts, findings must contain file:line tokens or the explicit escape hatch `[NOLOC]`; invalid findings trigger `ambiguous`.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
-     - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> <append the maker prompt closing boilerplate defined above, substituting --task \"<fix plan>\">" --wait --timeout 600000`
+     - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
      - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan> <append the maker prompt closing boilerplate defined above, substituting --task \"<fix plan>\">"`
-     - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> <append the maker prompt closing boilerplate defined above, substituting --task \"<fix plan>\">" --wait --timeout 600000`
+     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model qwen.qwen3-coder-next --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
+     - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
      **Restart amplio-style hybrid:** When the supervisor restarts a maker mid-round (due to `loop-guard.sh` exit-5 restart signal,
@@ -586,7 +588,7 @@ back to the headless path). Every split uses `--no-focus` so the captain's focus
 - **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
-  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. <append the maker prompt closing boilerplate defined above, substituting --task \"<goal>\"> Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop." --wait --timeout 600000
+  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop. <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<goal>\">" --wait --timeout 600000
   ```
   If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
