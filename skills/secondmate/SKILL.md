@@ -344,12 +344,23 @@ choice. There is no N>10 variant; if there are more than 10 independent tasks, r
 rest for the next batch. Each tool-use block launches a **FRESH** sub-agent — never `fork`, same
 contamination rationale as trigger (A). **Name each Agent-tool call `sm-<task-id>`.**
 
-**Before fanning out, mint a `<batch-id>` for this batch** — any bare identifier matching
-`[A-Za-z0-9_-]{1,128}` (e.g. a timestamp-derived label), unique enough not to collide with a prior batch.
-This is the CORRELATION KEY every sub-supervisor in this batch carries on every one of its own
-`progress-ledger.py record` calls (step (c) below) — it is what lets step (e)'s restart-reconstruction
-tell "ready for THIS batch" apart from an unrelated batch's, or a single-task-delegation trigger (A)
-task's, own `verify_gate_pass` row. Tell every sub-supervisor its shared `<batch-id>` in its own prompt.
+**Before fanning out, mint a `<batch-id>` for this batch — a UUID, e.g. `python3 -c "import uuid;
+print(uuid.uuid4())"` or `uuidgen`, NEVER a timestamp-derived label** (a timestamp is a realistic
+collision: two dispatcher runs close in time can easily land on the same value). This is the CORRELATION
+KEY every sub-supervisor in this batch carries on every one of its own `progress-ledger.py record` calls
+(step (c) below) — it is what lets step (e)'s restart-reconstruction tell "ready for THIS batch" apart
+from an unrelated batch's, or a single-task-delegation trigger (A) task's, own `verify_gate_pass` row.
+Tell every sub-supervisor its shared `<batch-id>` in its own prompt.
+
+`progress-ledger.py` itself enforces that a given task-id's `--batch-id`, once first recorded, is
+IMMUTABLE for that task-id's lifetime (a later `record` call for the SAME task-id supplying a different
+value is rejected outright) — this closes batch-id drift for one task-id reused/misused over its own
+history. **It does NOT, and cannot, prevent two genuinely different, freshly-claimed task-ids from two
+independent dispatcher runs from coincidentally binding to the identical `<batch-id>` value** — no local
+ledger can distinguish "intentionally co-batched" from "accidentally collided" for two task-ids that are
+each individually self-consistent, short of a distributed uniqueness registry (explicitly out of scope —
+see this section's own "no 1000-task hardening" boundary). Minting from a UUID makes that collision
+practically negligible; it is not a structural guarantee, and this is deliberate, not an oversight.
 
 **Each sub-supervisor's prompt must instruct it to, in this order:**
 

@@ -34,18 +34,19 @@ at a JSON file: a list of {"task_id": ..., "checked_sha": ..., "checker_verdict_
 Each entry's own `checked_sha` is carried in the hold record exactly like today's single-task `--sha`
 (this is an EXTENSION of the schema, not a replacement -- a human explicitly chose to keep the existing
 1:1 task-id:checked-sha anti-reattach binding, just per-entry instead of per-hold). Every entry's
-`checker_verdict_path` MUST point at a real, readable, parseable verdict envelope -- a missing path, an
-unreadable file, or one that doesn't contain the checker's documented envelope contract rejects the WHOLE
-`hold` call (nonzero exit, no ledger write) rather than opening a hold with a placeholder digest behind
-it; a human must never be able to approve/merge an entry with no real verdict artifact behind its
-summary. For each entry, hold.py itself derives a one-line digest FROM that entry's own real, parsed
-`checker_verdict_path` (never typed fresh by whoever opens the hold, so the human's summary is provably
-sourced from the real verdict, never a paraphrase) -- more than a bare pass/fail + count: the verdict
-word, the findings count, the distinct set of files those findings actually flagged (a faithful
-blast-radius proxy -- the envelope has no explicit "blast radius" field, but the files its own findings
-touch is the closest real signal it carries), and `lens_coverage` (the closest thing the envelope has to
-a category/tag concept) -- everything read directly off the checker's own documented envelope contract
-(bin/checker-envelope.md's fenced ```json {"verdict":..., "findings":[...], "lens_coverage":{...}} block).
+`checker_verdict_path` MUST point at a file `bin/verdict.py`'s own `read_verdict_with_envelope` accepts as
+a GENUINELY valid checker envelope (its closed verdict-word enum, plus its own findings-shape/location
+validation for a "fail" verdict -- reused directly, never a second, looser, parallel definition of "valid"
+that a bare `{"verdict": <any string>}` dict could slip through) -- a missing path, an unreadable file, or
+one verdict.py itself would call malformed/ambiguous rejects the WHOLE `hold` call (nonzero exit, no
+ledger write) rather than opening a hold with a placeholder digest behind it; a human must never be able
+to approve/merge an entry with no real verdict artifact behind its summary. For each entry, hold.py itself
+derives a one-line digest FROM that entry's own real, verdict.py-validated envelope (never typed fresh by
+whoever opens the hold, so the human's summary is provably sourced from the real verdict, never a
+paraphrase) -- more than a bare pass/fail + count: the verdict word, the findings count, the distinct set
+of files those findings actually flagged (a faithful blast-radius proxy -- the envelope has no explicit
+"blast radius" field, but the files its own findings touch is the closest real signal it carries), and
+`lens_coverage` (the closest thing the envelope has to a category/tag concept).
 
 `answer`ing a batch hold is likewise structured, matching dispatch-report.py's own anti-prose-parsing
 philosophy: `--approve`/`--reject` are each a comma-separated list of task-ids, and together they must
@@ -103,46 +104,29 @@ def _recs():
     return recs
 
 
-def _extract_verdict_envelope(text):
-    """Best-effort extraction of the checker's own DOCUMENTED envelope contract (bin/checker-envelope.md:
-    a trailing fenced ```json {"verdict":..., "findings":[...]}` block). Digest-only -- never a merge/gate
-    decision (that stays verdict.py's own job elsewhere in the SOP); this exists purely so a batch hold's
-    one-line-per-task-id digest is machine-derived FROM the real verdict artifact, never typed fresh by
-    whoever opens the hold. Prefers the LAST fenced json block (this repo's own "last block/line wins"
-    precedent, e.g. verdict.py's fenced-JSON preference, dispatch-report.py's last-tag-wins rule); falls
-    back to the last depth-0 balanced {...} object anywhere in the text that has a "verdict" key. Returns
-    None if nothing in the text matches that contract at all."""
-    fenced = re.findall(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    for block in reversed(fenced):
-        try:
-            o = json.loads(block)
-        except ValueError:
-            continue
-        if isinstance(o, dict) and "verdict" in o:
-            return o
-    depth = 0; start = None; in_str = False; esc = False; spans = []
-    for i, c in enumerate(text):
-        if in_str:
-            if esc: esc = False
-            elif c == "\\": esc = True
-            elif c == '"': in_str = False
-            continue
-        if c == '"': in_str = True
-        elif c == "{":
-            if depth == 0: start = i
-            depth += 1
-        elif c == "}" and depth > 0:
-            depth -= 1
-            if depth == 0 and start is not None:
-                spans.append(text[start:i + 1])
-    for span in reversed(spans):
-        try:
-            o = json.loads(span)
-        except ValueError:
-            continue
-        if isinstance(o, dict) and "verdict" in o:
-            return o
-    return None
+_VERDICT_MODULE = None
+
+
+def _verdict_module():
+    """Dynamically loads the sibling bin/verdict.py script as a module, so hold.py can call ITS OWN
+    authoritative verdict-envelope contract (`read_verdict_with_envelope`: the closed `VALID` verdict-word
+    enum, plus findings-shape/location validation for a "fail" verdict) directly, rather than inventing a
+    second, parallel definition of what counts as a genuinely valid checker envelope -- exactly what let
+    a batch entry with garbage like {"verdict":"anything","findings":"not-a-list"} slip through before
+    this fix, since a bare "does this dict have a 'verdict' key at all" check has no opinion on whether
+    that value is a REAL verdict word. Every bin/ script here is otherwise a standalone single-file CLI
+    by convention (no shared internal module) -- this is the one deliberate exception, loading verdict.py
+    by file path (never a package-relative import, which would require bin/ to be a real Python package)
+    so the two scripts can still ship and run independently. Cached after the first call."""
+    global _VERDICT_MODULE
+    if _VERDICT_MODULE is None:
+        import importlib.util
+        verdict_path = pathlib.Path(__file__).resolve().parent / "verdict.py"
+        spec = importlib.util.spec_from_file_location("secondmate_hold_verdict", verdict_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _VERDICT_MODULE = module
+    return _VERDICT_MODULE
 
 
 def _distinct_finding_files(findings):
@@ -389,6 +373,44 @@ def _selfcheck_live():
         assert code != 0, "an unparseable checker_verdict_path must be rejected, never open a hold anyway"
         assert len(_recs()) == pre_len, "a rejected --entries-file hold must not append any record"
 
+        # a checker_verdict_path containing arbitrary JSON that merely HAS a "verdict" key -- but whose
+        # value is not a genuinely valid verdict word, and whose "findings" isn't even a list -- must be
+        # rejected exactly like an unparseable one. This is the precise regression this fix guards: a
+        # bare "does this dict have a 'verdict' key" check (the old, too-loose validation) would have
+        # ACCEPTED this and recorded a bogus digest; reusing verdict.py's own closed VALID enum rejects
+        # it, since "anything" is not in {"pass","fail","error","refused"}.
+        v_garbage = vdir / "garbage.out"
+        v_garbage.write_text('{"verdict":"anything","findings":"not-a-list"}\n')
+        entries_garbage = pathlib.Path(tmpdir) / "entries_garbage.json"
+        entries_garbage.write_text(json.dumps([
+            {"task_id": "batch-garbage", "checked_sha": "sha-g", "checker_verdict_path": str(v_garbage)},
+        ]))
+        pre_len = len(_recs())
+        code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--entries-file", str(entries_garbage)])
+        assert code != 0, (
+            "a verdict envelope with a non-enum verdict word and non-list findings must be rejected, "
+            "not accepted with a bogus digest")
+        assert len(_recs()) == pre_len, "a rejected --entries-file hold must not append any record"
+
+        # A SUBTLER case of the same finding: verdict.py itself still returns a NON-None envelope for a
+        # "fail" verdict with an EMPTY findings array (it just also reports "ambiguous", not "fail", as
+        # the verdict word) -- so checking only "envelope is None" would wrongly ACCEPT this. Reusing
+        # verdict.py's own VALID enum check (verdict_word not in VALID) is what actually catches it,
+        # since "ambiguous" is not one of {"pass","fail","error","refused"}. This is exactly the same
+        # invalid-envelope class verdict.py itself rejects everywhere else in this codebase.
+        v_emptyfindings = vdir / "emptyfindings.out"
+        v_emptyfindings.write_text('{"verdict":"fail","findings":[]}\n')
+        entries_emptyfindings = pathlib.Path(tmpdir) / "entries_emptyfindings.json"
+        entries_emptyfindings.write_text(json.dumps([
+            {"task_id": "batch-ef", "checked_sha": "sha-ef", "checker_verdict_path": str(v_emptyfindings)},
+        ]))
+        pre_len = len(_recs())
+        code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--entries-file", str(entries_emptyfindings)])
+        assert code != 0, (
+            "a 'fail' verdict with an empty findings array is invalid per verdict.py's own rules and "
+            "must be rejected, even though verdict.py still returns a non-None envelope for it")
+        assert len(_recs()) == pre_len, "a rejected --entries-file hold must not append any record"
+
         # the hard, non-tunable N=10 concurrent-batch cap: 11 OTHERWISE-FULLY-VALID entries (real
         # checked_sha, real parseable checker_verdict_path each) must still be rejected outright -- every
         # entry here would individually pass every other validation, isolating the cap itself as the
@@ -506,11 +528,17 @@ def main(argv):
                 except OSError as e:
                     sys.exit(f"--entries-file entry for task_id {tid!r}: checker_verdict_path {cvp!r} "
                               f"could not be read: {e}")
-                envelope = _extract_verdict_envelope(text)
-                if envelope is None:
+                # Reuse verdict.py's OWN authoritative envelope contract directly -- never a second,
+                # looser definition of "valid envelope" (a bare {"verdict": <any string>} dict is NOT
+                # enough; the verdict word itself must be one of verdict.py's closed VALID enum, and a
+                # "fail" verdict must carry real, located findings, exactly as verdict.py enforces
+                # everywhere else in this codebase).
+                vmod = _verdict_module()
+                verdict_word, _exit_code, envelope = vmod.read_verdict_with_envelope(text)
+                if envelope is None or verdict_word not in vmod.VALID:
                     sys.exit(f"--entries-file entry for task_id {tid!r}: checker_verdict_path {cvp!r} "
-                              f"does not contain a parseable verdict envelope -- refusing to open a hold "
-                              f"with no real verdict behind it")
+                              f"does not contain a genuinely valid verdict envelope (verdict.py reports "
+                              f"{verdict_word!r}) -- refusing to open a hold with no real verdict behind it")
                 digest = _build_digest(tid, envelope)
                 batch.append({"task_id": tid, "checked_sha": csha, "digest": digest})
         with _ledger_lock():

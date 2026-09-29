@@ -29,9 +29,18 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            --batch-id ID` distinguish "ready for
                                                                            THIS batch" from an unrelated batch's
                                                                            (or a single-task-delegation trigger-A
-                                                                           task's) own verify_gate_pass row. Never
-                                                                           enforced or interpreted by this script
-                                                                           beyond that exact-match filter.
+                                                                           task's) own verify_gate_pass row. A
+                                                                           task-id's batch-id is IMMUTABLE once
+                                                                           established: the FIRST checkpoint for a
+                                                                           given task-id that supplies --batch-id
+                                                                           at all fixes its binding permanently --
+                                                                           a LATER record call for that SAME
+                                                                           task-id supplying a DIFFERENT --batch-id
+                                                                           is REJECTED outright (nonzero exit, no
+                                                                           ledger write); supplying the SAME value
+                                                                           again (the normal case -- every
+                                                                           checkpoint in one sub-supervisor's own
+                                                                           SOP repeats it) is always fine.
   progress-ledger.py latest | status                                  -> one line per task-id: its most
                                                                            recently recorded phase/owner/ts
                                                                            (and checked-sha/checker-verdict-path
@@ -81,18 +90,31 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            lost in-memory state. --batch-id (omitted
                                                                            by default -- see `record`'s own
                                                                            --batch-id above) restricts the reported
-                                                                           task-ids to exactly those whose terminal
-                                                                           row was recorded with that batch-id, so a
-                                                                           restarted batch dispatcher never folds an
-                                                                           UNRELATED batch's, or a single-task-
-                                                                           delegation trigger-A task's, own
-                                                                           verify_gate_pass row into the wrong
-                                                                           consolidated hold. Omitting --batch-id
-                                                                           keeps today's behavior exactly (every
-                                                                           ready task-id, unfiltered) -- this is how
-                                                                           trigger-A usage is unaffected.
+                                                                           task-ids to exactly those BOUND to that
+                                                                           batch-id -- matched against each
+                                                                           task-id's own immutable, earliest-
+                                                                           established binding (never just its
+                                                                           terminal row), and a task-id whose own
+                                                                           row history is internally inconsistent
+                                                                           is excluded outright regardless of
+                                                                           whether its terminal row happens to
+                                                                           match. Omitting --batch-id keeps today's
+                                                                           behavior exactly (every ready task-id,
+                                                                           unfiltered) -- this is how trigger-A
+                                                                           usage is unaffected.
   progress-ledger.py selfcheck                                        -> asserts the fold + drives the real
                                                                            CLI paths against a scratch ledger.
+
+HONEST LIMITATION of --batch-id (do not overclaim beyond this): the immutability guard above closes batch-id
+DRIFT for one task-id over its own lifetime (e.g. a stale/reused task-id string whose earlier history
+belongs to a different, older batch) -- it does NOT, and structurally CANNOT, prevent two GENUINELY
+DIFFERENT, freshly-claimed task-ids from two INDEPENDENT, uncoordinated dispatcher PROCESSES from both
+legitimately, self-consistently binding to the identical --batch-id string by coincidence (this ledger has
+no way to distinguish "intentionally co-batched" from "accidentally collided" for two task-ids that are each
+individually self-consistent). That would require a distributed uniqueness registry -- explicitly out of
+scope (see SKILL.md's fan-out section: "no 1000-task hardening... the cap is an explicit 10, hard, not
+tunable"). The PRACTICAL mitigation is SKILL.md's own guidance to mint --batch-id from a UUID rather than a
+timestamp, making an accidental cross-process collision negligible, not impossible.
 
 Suggested phase vocabulary (free text, NOT a closed enum -- a sub-supervisor may record any phase string
 that fits [A-Za-z0-9_-]{1,64} -- but SKILL.md's fan-out SOP records exactly these, at exactly these
@@ -249,6 +271,35 @@ def latest_by_task(recs=None):
     return latest
 
 
+def _binding_batch_id(task_id, recs):
+    """The batch-id a task-id is immutably BOUND to: the value on the EARLIEST row (ledger append order
+    -- the true chronological order under this script's own fcntl lock, same precedent latest_by_task's
+    own docstring relies on) for that task-id that carries a --batch-id at all -- established once, at
+    that task-id's first checkpoint to declare one (per SKILL.md's fan-out SOP, that is its `claimed`
+    checkpoint, the earliest in the documented phase sequence), and enforced immutable afterward by
+    `record`'s own write-time guard (see that call site) -- never re-specifiable from a later checkpoint.
+
+    Returns (binding, consistent): `binding` is None if the task-id never recorded any --batch-id at
+    all. `consistent` is False if some LATER row for the SAME task-id disagrees with the binding --
+    defense in depth against a row `record`'s own guard never saw (a hand-edited ledger line, or one
+    written by an older version of this script) -- `ready --batch-id` must never trust a task-id's
+    terminal row alone; an inconsistent task-id is excluded regardless of what its terminal row says,
+    even if that terminal row happens to nominally match the query."""
+    binding = None
+    consistent = True
+    for r in recs:
+        if r.get("task_id") != task_id:
+            continue
+        bid = r.get("batch_id")
+        if not bid:
+            continue
+        if binding is None:
+            binding = bid
+        elif bid != binding:
+            consistent = False
+    return binding, consistent
+
+
 def _all_task_ids():
     """Every task_id ever mentioned in a progress row, scanned directly and defensively -- even from a
     row that fails _recs()'s stricter validation (e.g. an unparseable ts). Used only to build the
@@ -394,6 +445,73 @@ def _selfcheck_live():
             code, _, _ = _run(["record", "--task-id", "t6", "--owner", "o", "--phase", "claimed",
                                 "--batch-id", bad])
             assert code != 0, f"invalid --batch-id {bad!r} must be rejected"
+
+        # --batch-id IMMUTABILITY (write-time enforcement): a task-id's batch-id is fixed at its
+        # earliest checkpoint that declares one. Repeating the SAME value on every later checkpoint
+        # (the normal SOP) is always fine; supplying a DIFFERENT value for that SAME task-id must be
+        # rejected outright (nonzero exit, no ledger write) -- "rejecting the second [conflicting]
+        # registration", the structural half of this fix. This closes batch-id DRIFT/reuse for one
+        # task-id's own lifetime (e.g. a stale task-id string later reused under a different, unrelated
+        # batch) -- a real, different risk from the cross-task-id collision case tested below.
+        code, _, _ = _run(["record", "--task-id", "reuse-x", "--owner", "sm-reuse-x", "--phase", "claimed",
+                            "--batch-id", "batchOLD"])
+        assert code == 0, "first-ever --batch-id for a task-id must succeed"
+        code, _, _ = _run(["record", "--task-id", "reuse-x", "--owner", "sm-reuse-x",
+                            "--phase", "maker_started", "--batch-id", "batchOLD"])
+        assert code == 0, "repeating the SAME --batch-id for the same task-id must always succeed"
+        pre_len = len(_recs())
+        code, _, exc = _run(["record", "--task-id", "reuse-x", "--owner", "sm-reuse-x",
+                              "--phase", TERMINAL_PHASE, "--batch-id", "batchNEW"])
+        assert code != 0, "rebinding an already-bound task-id to a DIFFERENT --batch-id must be rejected"
+        assert "batchOLD" in str(exc) and "batchNEW" in str(exc), (
+            "the rejection should name both the existing binding and the rejected new value")
+        assert len(_recs()) == pre_len, "a rejected rebind attempt must not append any record"
+        # the task-id's binding stays exactly what it was -- unaffected by the rejected attempt.
+        code, out, _ = _run(["latest"])
+        assert "batch_id=batchOLD" in out.split("[reuse-x]")[1].split("\n")[0], (
+            "the task-id's binding must remain batchOLD, untouched by the rejected rebind attempt")
+
+        # HONEST LIMITATION, exercised directly (the exact checker repro): two GENUINELY DIFFERENT,
+        # freshly-claimed task-ids ("old" and "new", from what would be two independent dispatcher
+        # batches) both legitimately, self-consistently bind to the IDENTICAL --batch-id "same" -- a
+        # realistic accidental collision if that id were timestamp-derived (which is exactly why
+        # SKILL.md now instructs minting it from a UUID instead). Neither task-id's own row history is
+        # internally inconsistent, so the immutability guard above -- which only rejects a task-id
+        # trying to CHANGE ITS OWN prior binding -- has nothing to reject for either of them; this
+        # ledger has no way to distinguish "intentionally co-batched" from "accidentally collided" for
+        # two independently-fresh, self-consistent task-ids without a distributed uniqueness registry
+        # (explicitly out of scope). `ready --batch-id same` STILL reports both -- this is the accepted,
+        # honestly-documented residual gap the UUID recommendation mitigates PRACTICALLY, never
+        # structurally. This assertion exists so that gap is pinned down and visible, not silently
+        # assumed fixed.
+        for tid, owner in (("old", "sm-old"), ("new", "sm-new")):
+            for phase in ("claimed", "maker_started", "checker_round", TERMINAL_PHASE):
+                code, _, _ = _run(["record", "--task-id", tid, "--owner", owner, "--phase", phase,
+                                    "--batch-id", "same"])
+                assert code == 0
+        code, out, _ = _run(["ready", "--task-id", "old", "--task-id", "new", "--batch-id", "same"])
+        assert code == 0
+        assert '"task_id": "old"' in out and '"task_id": "new"' in out, (
+            "documented residual limitation: two independently-fresh, self-consistent task-ids that "
+            "coincidentally share a --batch-id are NOT structurally distinguishable by this ledger alone")
+
+        # Defense in depth: `ready --batch-id` must exclude a task-id whose OWN row history is
+        # internally INCONSISTENT (a row `record`'s write-time guard never saw -- e.g. a hand-edited or
+        # legacy ledger line) -- excluded regardless of whether its terminal row happens to nominally
+        # match the query, never trusting the terminal row alone. Appended directly (bypassing
+        # `record`'s own guard) to simulate exactly that.
+        _append({"ev": "progress", "task_id": "corrupt-x", "owner": "o", "phase": "claimed",
+                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "batch_id": "batchA"})
+        _append({"ev": "progress", "task_id": "corrupt-x", "owner": "o", "phase": TERMINAL_PHASE,
+                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "batch_id": "batchB"})
+        code, out, _ = _run(["ready", "--task-id", "corrupt-x", "--batch-id", "batchB"])
+        assert code == 0 and '"task_id": "corrupt-x"' not in out, (
+            "an inconsistent task-id must be excluded even when queried by its OWN (later, disagreeing) "
+            "terminal batch-id")
+        code, out, _ = _run(["ready", "--task-id", "corrupt-x", "--batch-id", "batchA"])
+        assert code == 0 and '"task_id": "corrupt-x"' not in out, (
+            "an inconsistent task-id must be excluded even when queried by its OWN earliest/binding "
+            "batch-id -- an inconsistent history is never trusted for ANY match")
 
         # task-id / phase validation, matching claim-ledger.py's bare-identifier posture.
         for bad in ("", "../etc", "a/b", "a\0b", "bad id", "a" * 129, "ok\n"):
@@ -573,6 +691,18 @@ def main(argv):
         if args.batch_id:
             rec["batch_id"] = args.batch_id
         with _ledger_lock():
+            # Immutability: fold FRESH, inside the lock (same TOCTOU-safe precedent as
+            # claim-ledger.py's own steal), right before deciding -- a task-id's batch membership is
+            # fixed once, at the earliest checkpoint that declares one, and can never be changed by a
+            # later record call for that SAME task-id. This is enforced at WRITE time (rejecting the
+            # conflicting registration outright) rather than only filtered at `ready` read time, so an
+            # inconsistent row is never written in the first place under normal operation.
+            if args.batch_id:
+                existing_binding, _ = _binding_batch_id(args.task_id, _recs())
+                if existing_binding is not None and existing_binding != args.batch_id:
+                    sys.exit(f"task-id {args.task_id} is already bound to batch-id {existing_binding!r} "
+                              f"(established at its earliest checkpoint) -- refusing to rebind it to "
+                              f"{args.batch_id!r}; a task-id's batch membership is immutable once set")
             _append(rec)
         print(f"recorded {args.task_id} phase={args.phase}")
 
@@ -615,19 +745,25 @@ def main(argv):
         # read-only, no lock -- same lock-free precedent as `stale`/claim-ledger.py's `conflicts`. Always
         # exits 0: unlike `stale`, a "ready" hit is the WANTED outcome, not a problem to report via exit
         # code -- callers get the actual list via stdout.
-        latest = latest_by_task()
+        recs = _recs()
+        latest = latest_by_task(recs)
         task_ids = args.task_id if args.task_id is not None else sorted(_all_task_ids())
         for task_id in task_ids:
             r = latest.get(task_id)
             if r is None or r["phase"] != TERMINAL_PHASE:
                 continue
-            # --batch-id restricts to task-ids whose OWN terminal row was recorded with this exact
-            # batch-id -- the correlation key a restarted batch dispatcher needs so it never folds an
-            # unrelated batch's (or a single-task-delegation trigger-A task's) ready row into its own
-            # consolidated hold. Omitted entirely (None) means "no filtering", preserving trigger-A's
-            # existing no-filter usage exactly.
-            if args.batch_id is not None and r.get("batch_id") != args.batch_id:
-                continue
+            # --batch-id restricts to task-ids BOUND to this exact batch-id -- matched against the
+            # task-id's own immutable, earliest-established binding (_binding_batch_id), never just its
+            # terminal row. A task-id whose own row history is internally INCONSISTENT is excluded
+            # outright, regardless of whether its terminal row happens to nominally match the query --
+            # `record`'s own write-time guard should make this case rare under normal operation, but
+            # `ready` never trusts a row that guard didn't see (e.g. a hand-edited/legacy ledger line).
+            # Omitted --batch-id entirely means "no filtering", preserving trigger-A's existing
+            # no-filter usage exactly.
+            if args.batch_id is not None:
+                binding, consistent = _binding_batch_id(task_id, recs)
+                if not consistent or binding != args.batch_id:
+                    continue
             hit = {"task_id": task_id, "ts": r["ts"]}
             if r.get("checked_sha"):
                 hit["checked_sha"] = r["checked_sha"]
