@@ -426,8 +426,10 @@ Each stage exists to close a specific failure mode.
 Today's loop is single-supervisor and sequential: one Sonnet supervisor drives one maker/checker/gate/merge
 cycle at a time. The next evolution is a supervisor that can fan out to a small number of independent
 sub-agent-supervisors, each running its own maker/checker/gate/merge loop for a different task in its own
-git worktree. `claim-ledger.py` and `merge-sequencer.sh` are the first two of the three primitives; the
-third — the fan-out pattern itself plus `bin/dispatch-report.py` — is described below, now delivered:
+git worktree. `claim-ledger.py` and `merge-sequencer.sh` are the first two primitives; the third — the
+fan-out pattern itself plus `bin/dispatch-report.py` — is described below, now delivered, along with a
+fourth, `bin/progress-ledger.py`, that gives the fan-out pattern's dispatcher a way to detect (never
+recover from) a sub-supervisor that goes silent:
 
 - `bin/claim-ledger.py` — before a sub-agent-supervisor starts work on a task-id, it must `claim` it. Claim key
   is the task-id itself (this repo's existing one task-id : one worktree : one branch (`sm/<task-id>`)
@@ -471,6 +473,20 @@ third — the fan-out pattern itself plus `bin/dispatch-report.py` — is descri
   merge. Every attempt appends one closed-enum JSONL record to `<repo>/audit/merge-ledger.jsonl`
   (anchored the same way as the lock); a ledger-write failure warns loudly on stderr rather than either
   failing the whole operation or silently vanishing.
+- `bin/progress-ledger.py` — self-reported `{task-id, phase, ts}` checkpoint rows, same `fcntl`-locked
+  JSONL / `git-common-dir`-anchored-shared-ledger idiom as `claim-ledger.py`. Exists because today's
+  Agent-tool background sub-agents give a dispatcher no way to poll a launched sub-supervisor's liveness
+  from outside — if one dies silently before ever reaching verify-gate, the dispatcher otherwise gets no
+  signal at all. Each sub-supervisor `record`s a checkpoint at four points in its own SOP (`claimed`,
+  `maker_started`, `checker_round` per round, and the terminal `verify_gate_pass`, which also carries
+  `--checked-sha`/`--checker-verdict-path` for a later consumer to read off that one row). The dispatcher
+  never watches continuously — on a `ScheduleWakeup`-driven interval it re-runs read-only `stale
+  --threshold-seconds N --task-id ...` for the exact set of task-ids it fanned out, which reports (exit 1,
+  one JSON line each) any task-id that has never recorded a checkpoint at all, or whose latest phase's
+  timestamp is older than the threshold — exit 0, silent, otherwise. Same disclosure stance as
+  `claim-ledger.py`: no heartbeat/TTL logic decides anything, a `stale` hit is a signal to a human, never a
+  confirmed crash or an automatic trigger to release/steal/reap anything. This is scheduled detection, not
+  real-time monitoring — a hard platform limitation, not a shortcut deferred here.
 
 ### The third primitive: fan-out to fresh sub-agent-supervisors + `bin/dispatch-report.py`
 
@@ -485,7 +501,9 @@ triage/routing/verdict judgment calls from a clean context instead of one contam
 task's state. Each sub-supervisor: claims its task-id first (`claim-ledger.py claim`, never `--steal`,
 aborting with `SM_REFUSED:claim-failed` on failure); derives every downstream name deterministically from
 the task-id using this repo's existing convention (`sm/<task-id>` branch, `sm-<task-id>`/`sm-pi-<task-id>`
-agent name, `root_pane` from `herdr worktree create`); runs the existing solo SOP completely untouched;
+agent name, `root_pane` from `herdr worktree create`); runs the existing solo SOP completely untouched,
+recording a `progress-ledger.py record` checkpoint (`claimed` right after the claim, `maker_started`,
+`checker_round` per round, terminal `verify_gate_pass` with `--checked-sha`) at each of those points;
 once verify-gate has passed, opens its own `hold.py hold` entry for the merge decision and waits for a
 genuine human answer (never assuming, never auto-answering, never deferring that judgment to the
 dispatcher) — matching the existing single-task loop's Gate → Hold → Integrate contract exactly; only
@@ -502,10 +520,17 @@ its own code, more cautious than even "stuck", since it means the parser can't t
 all). On `SM_STUCK_NEED_HUMAN` the dispatcher's only allowed action is relaying that sub-supervisor's own
 reported reason to the human verbatim, never resolving it itself.
 
-**Named limitation, deliberately not solved here:** this pattern has no liveness/reaping mechanism. If a
-sub-supervisor's process dies mid-task, its claim is not automatically released and its worktree is not
-automatically cleaned up — a human must notice and manually run `claim-ledger.py release`/`--steal` plus
-manual worktree teardown. A liveness/reaping diagnostic that could close this gap is a separate, deferred
+**Named limitation — detection now exists (self-reported, on a schedule); automatic recovery still does
+not.** The dispatcher is required to poll `progress-ledger.py stale --threshold-seconds N --task-id ...`
+on a `ScheduleWakeup`-driven interval for every task-id it fanned out (see the primitives section above),
+so a sub-supervisor that dies mid-task without ever recording `verify_gate_pass` will eventually surface
+as `stale` or `no_progress_recorded`. But this is scheduled detection, not real-time monitoring — it
+notices staleness, not a proven crash, since a merely slow-but-alive sub-supervisor looks identical to a
+dead one until its next checkpoint lands — and recovery is still entirely manual: a `stale` hit is
+relayed to the human verbatim, never auto-resolved. Its claim is not automatically released and its
+worktree is not automatically cleaned up — a human must notice and manually run `claim-ledger.py
+release`/`--steal` plus manual worktree teardown. Closing the remaining automatic-recovery half of this
+gap is a separate, deferred
 future task, not part of this one.
 
 ## Component map
@@ -529,6 +554,7 @@ future task, not part of this one.
 | `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never rebases, never reverts a landed local merge on push failure; a genuine push race (origin advanced, or a concurrent server-side ref-transaction race — both distinguished from a real hook/protected-branch rejection by git's own client-generated framing, never by the hook's own message text) is recovered automatically, lock held throughout, bounded at 3 total push attempts (`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`); a LOCAL `pre-push` hook (no `remote: ` framing at all) disables this text-based race detection entirely for that repo, by design — checked before the first push and monotonically re-checked (never reset once true) before every retry, so a self-deleting hook or one installed mid-recovery can't evade it; `--preflight-only` checks for a conflict via `git merge-tree --write-tree` without ever acquiring the lock or touching `$repo`'s working tree/index/branch-refs/ledger; prints an advisory pre-merge version/docs-sync reminder right before every real merge (never on `--preflight-only`); append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
 | `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval; `answer` prints an advisory genuine-human-decision reminder on success |
 | `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block used by the fan-out pattern (SKILL.md). `claim`/`steal` optionally declare `--scope KIND:KEY=OPERATION` (closed additive `add/extend/modify` vs. destructive `replace/remove/rename/migrate` operation classes; exact string match, never fuzzy; never carried forward across a `steal`); read-only `conflicts --scope ...` (lock-free, like `status`) exits 1 and reports any open claim sharing that scope with an opposite-class operation, exits 0 otherwise — an optional dispatcher pre-launch check for a destructive-vs-additive semantic collision on the same scope, which the textual-only `merge-sequencer.sh` preflight has no way to see (wiring a dispatcher to call it is not yet done) |
+| `bin/progress-ledger.py` | self-reported `{task-id, phase, ts}` checkpoint rows for the fan-out pattern (SKILL.md), same `fcntl`-locked JSONL / `git-common-dir`-anchored-shared-ledger idiom as `claim-ledger.py`; `record` appends a checkpoint (`--phase claimed\|maker_started\|checker_round\|verify_gate_pass`, the last optionally carrying `--checked-sha`/`--checker-verdict-path` for a later consumer); `latest`/`status` folds to each task-id's most recent checkpoint; read-only `stale --threshold-seconds N [--task-id ...]` (lock-free, like `claim-ledger.py`'s `conflicts`) reports (exit 1) any given task-id with no recorded checkpoint at all or whose latest is older than the threshold, exit 0 silent otherwise — closes the *detection* half of the fan-out pattern's no-liveness gap (a dispatcher can now notice a silently-dead sub-supervisor on a `ScheduleWakeup`-driven schedule), never the *recovery* half: no automated action, no auto-`--steal`, a hit is relayed to a human verbatim |
 | `bin/doctor.sh` | pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects and fixes AWS Bedrock model-metadata overrides for pi's local `~/.pi/agent/models.json` (kimi-k3 and deepseek-r1 maxTokens values, verified against real Bedrock enforced ceilings); detects skill discovery asymmetry between pi and Claude Code for the current repo's project skills, scanned at ANY depth via `os.walk` (monorepo-safe, matching `bin/sync-worktree-skills.sh`'s own scan of the identical three conventions, so a nested subproject's skill — exactly the kind already backfilled into a fresh worktree by that script — is never silently missed) — pi reads `.pi/skills/` and `.agents/skills/`, Claude Code reads `.claude/skills/` and `.agents/skills/`, so a skill present under only one non-`.agents` convention is invisible to the other harness; rows are keyed by (subproject-relative-path, name), not name alone, so two different subprojects with a same-named skill each get their own unambiguous row (e.g. `packages/widget/foo`); a Claude-only skill gets an offered fix (`bash -c`-run by the generic heal loop) that copies its resolved real content into that same subproject's `.agents/skills/<name>` — never overwrites an existing entry there, never follows a symlink resolving outside the repo root (mirrors `bin/sync-worktree-skills.sh`'s own guard), and never constructs a shell command from a name or relative-path prefix that fails its safe-pattern check (`bin/claim-ledger.py`'s own `[A-Za-z0-9_-]{1,128}` pattern for names) — a Claude-Code-invisible skill (`.pi/skills/` only) is reported with no auto-fix offered; detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals; idempotent fixes preserve unrelated content |
 | `bin/dispatch-report.py` | parses a sub-supervisor's final output for the fan-out pattern — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line (a tag embedded mid-prose does not match), last matching line wins if several appear; exits `0`/`1`/`2`/`3` (done / refused / stuck / no-tag-found); the dispatcher acts only on this exit code, never on the sub-supervisor's prose |
 | `bin/prune-output.sh` | context hygiene |

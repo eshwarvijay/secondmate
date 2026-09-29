@@ -95,6 +95,7 @@ flowchart LR
 | `bin/launch-checker.sh` | Edit-locked (`--exclude-tools edit,write`) cross-model checker + verdict-envelope contract; streams pi's `--mode json` output through `checker-progress.py` for live progress visibility |
 | `bin/verdict.py` | Parse the checker's `{verdict}` → exit `0` pass / `1` fail / `2` error·refused·ambiguous; with `--lenses <list>` cross-checks lens coverage; enforces findings validation for `fail` verdicts (must have file:line or `[NOLOC]`) |
 | `bin/dispatch-report.py` | Parses a sub-supervisor's final output for the fan-out pattern below — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line so a tag echoed mid-prose (e.g. from the sub-supervisor's own instructions) can't be mistaken for the real signal; last matching line wins → exit `0` done / `1` refused / `2` stuck / `3` no tag found (its own, more-cautious-than-stuck code) |
+| `bin/progress-ledger.py` | Self-reported `{task-id, phase, ts}` checkpoint rows for the fan-out pattern below — same `fcntl`-locked JSONL + `git-common-dir`-anchored shared-ledger idiom as `claim-ledger.py`; each sub-supervisor `record`s a checkpoint (`--phase claimed\|maker_started\|checker_round\|verify_gate_pass`, the terminal one optionally carrying `--checked-sha`/`--checker-verdict-path`); `latest`/`status` shows each task-id's most recent checkpoint; read-only `stale --threshold-seconds N [--task-id ...]` (no lock, same precedent as `claim-ledger.py`'s `conflicts`) reports (exit 1, one JSON line per hit) any task-id with no checkpoint at all or whose latest is older than the threshold, exit 0 silent otherwise — this is how a dispatcher detects a silently-dead sub-supervisor on a `ScheduleWakeup`-driven schedule; detection only, never automatic recovery (no auto-release, no auto-`--steal`) |
 | `bin/checker-progress.py` | Filter pi's `--mode json` output: prints one progress line per tool execution to stderr (live activity), extracts final assistant message text from `agent_end` and writes to stdout (exactly as `--mode text` would); handles malformed JSON lines gracefully; preserves exit code propagation via pipefail
 | `bin/loop-guard.sh` | Stuck-loop abort (exit 3) + per-run round/spawn caps + machine-parseable restart signal (exit 5) via `action --key`; `round-state.md` handoff file; `reset` clears only loop state (`action.key`, `action.count`, `rounds`, `spawns`), not task state |
 | `bin/run-round.sh` | Wall-clock timeout + idle watchdog + paired audit record (even on kill) |
@@ -190,6 +191,7 @@ credentials only you can supply.
 | `SM_COMMITTEE_TIMEOUT` | `600` | per-planner wall-clock timeout in seconds |
 | `SM_HOLD_LEDGER` | `./decisions.jsonl` | per-repo decision ledger |
 | `SM_CLAIM_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `.secondmate/claims.jsonl` -- the common-dir's parent when its own basename is `.git` (a normal repo/worktree), else the common-dir itself (a bare repo or a submodule) (or `$SM_LOOP_STATE/claims.jsonl` if set, else a CWD-relative fallback with a loud warning outside any git repo) | task-id claim ledger for `bin/claim-ledger.py`, shared across every worktree of the same repo |
+| `SM_PROGRESS_LEDGER` | shared `git rev-parse --git-common-dir`-anchored `.secondmate/progress.jsonl`, same anchoring rule as `SM_CLAIM_LEDGER` (or `$SM_LOOP_STATE/progress.jsonl` if set, else a CWD-relative fallback with a loud warning outside any git repo) | self-reported checkpoint ledger for `bin/progress-ledger.py`, shared across every worktree of the same repo |
 | `SM_LOOP_STATE` | `./.secondmate` | loop-guard state dir. `bin/merge-sequencer.sh` uses this same var as an override, but its own **default** lock lives at `<repo>/.secondmate/merge-sequencer.lock` (anchored to `--repo`, not to `./`) so every caller targeting the same `--repo` shares the same lock regardless of its own ambient CWD — distinct from `bin/caffeinate-guard.sh`'s own lock under `SM_CAFFEINATE_ROOT` |
 | `SM_WT_ROOT` | `~/.secondmate-worktrees` | where maker worktrees are created |
 | `SM_MARKER_ROOT` | `~/.secondmate-markers` | where `mark-maker.sh` drops the scope-guard activation marker (must stay outside every worktree) |
@@ -223,7 +225,7 @@ bin/verdict.py selfcheck && bin/loop-guard.sh selfcheck && bin/verify-gate.sh --
   && bin/herdr-pane.sh --selfcheck \
   && bin/log-round.sh --selfcheck && bin/caffeinate-guard.sh --selfcheck && bin/checker-progress.py selfcheck \
   && bin/hold.py selfcheck && bin/committee-output.py --selfcheck \
-  && bin/claim-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
+  && bin/claim-ledger.py selfcheck && bin/progress-ledger.py selfcheck && bin/merge-sequencer.sh --selfcheck \
   && bin/dispatch-report.py selfcheck && bin/launch-checker.sh --selfcheck \
   && bin/lesson-lookup.py selfcheck && bin/teardown-check.sh --selfcheck \
   && bin/audit-log.py selfcheck \

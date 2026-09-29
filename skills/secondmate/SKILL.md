@@ -321,11 +321,13 @@ to resume a sub-supervisor later via `SendMessage` (passing it as the `to` field
 
 **Each sub-supervisor's prompt must instruct it to, in this order:**
 
-a. **Claim first, as its literal first action.** Run `bin/claim-ledger.py claim --task-id <task-id>
-   --owner sm-<task-id>` before anything else. If the claim fails, abort immediately and emit
+a. **Claim first, as its literal first action, then record it.** Run `bin/claim-ledger.py claim --task-id
+   <task-id> --owner sm-<task-id>` before anything else. If the claim fails, abort immediately and emit
    `SM_REFUSED:claim-failed` as its final output — do not proceed, do not retry, do not fall back to
    `--steal`. `--steal` is a human-supervised override and stays exactly that under this pattern too: a
-   sub-supervisor must never call it itself.
+   sub-supervisor must never call it itself. Immediately after a successful claim, run
+   `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed` — the first of
+   four self-reported checkpoints this SOP requires (see the staleness-watchdog step below for why).
 
 b. **Derive every downstream name deterministically from `<task-id>`, using this repo's own existing
    convention — never invent a new one:**
@@ -334,10 +336,18 @@ b. **Derive every downstream name deterministically from `<task-id>`, using this
    - pane: whatever `herdr worktree create` returns as `.result.root_pane.pane_id` — never independently
      named or guessed.
 
-c. **Run the existing solo secondmate SOP completely untouched** — plan-committee, maker routing, checker
-   rounds, verify-gate, exactly as described everywhere above. This pattern changes nothing about how a
-   single task runs, only how it gets launched. A sub-supervisor is not a different kind of supervisor; it
-   is this same SOP, running with its own claimed task-id.
+c. **Run the existing solo secondmate SOP completely untouched, recording three more checkpoints along the
+   way** — plan-committee, maker routing, checker rounds, verify-gate, exactly as described everywhere
+   above. This pattern changes nothing about how a single task runs, only how it gets launched. A
+   sub-supervisor is not a different kind of supervisor; it is this same SOP, running with its own claimed
+   task-id. At these points, also run `bin/progress-ledger.py record --task-id <task-id> --owner
+   sm-<task-id> --phase <phase>`:
+   - `--phase maker_started` immediately after its maker begins running.
+   - `--phase checker_round` immediately after each checker round completes (once per round — the
+     timestamp alone is what a poller checks, no round number needed).
+   - `--phase verify_gate_pass` once verify-gate has passed, ALSO carrying
+     `--checked-sha <checked-sha>` — the terminal checkpoint. A sub-supervisor that never reaches this
+     phase is exactly the case the staleness watchdog below exists to catch.
 
 d. **Open its own `bin/hold.py hold --task <task-id> --q "..." --sha <checked-sha>` entry for the merge
    decision once verify-gate has passed, and WAIT for a genuine human answer** — never assume, never
@@ -376,13 +386,41 @@ ${CLAUDE_PLUGIN_ROOT}/bin/dispatch-report.py <sub-supervisor-final-output-file>
 # exit 3 = no tag found at all -> treat as a parse failure and escalate; do not guess what happened
 ```
 
-**Named limitation — no liveness/reaping, by design, matching `claim-ledger.py`'s own existing
-disclosure style.** This pattern has NO liveness/reaping mechanism of any kind. If a sub-supervisor's
-process dies mid-task (crash, killed pane, disconnected agent), its claim is **not** automatically
-released and its worktree is **not** automatically cleaned up. A human must notice and manually run
+**Required: schedule a staleness watchdog for every outstanding task-id, once fanned out.** Immediately
+after launching, and again on every `ScheduleWakeup` firing until every fanned-out task-id has reached a
+terminal `dispatch-report.py` exit code, run:
+
+```
+bin/progress-ledger.py stale --threshold-seconds <N> --task-id <task-id-1> [--task-id <task-id-2>]
+# exit 0, no output   -> every given task-id has reported progress within the threshold; nothing to do.
+# exit 1, one JSON line per hit -> {"task_id":..., "status":"no_progress_recorded"} (never even reported
+#   its first "claimed" checkpoint) or {"task_id":..., "status":"stale", "phase":..., "last_ts":...,
+#   "age_seconds":...} (hasn't advanced past that phase in over N seconds).
+```
+
+Pick `<N>` (a threshold in seconds) generously relative to how long a normal round takes in this
+repo — long enough that a merely-slow-but-alive checker round doesn't false-positive. On any hit, **relay
+it to the human verbatim** — task-id, phase, age — exactly like the `SM_STUCK_NEED_HUMAN` relay above.
+**Never auto-restart, never auto-`--steal`, never treat a hit as a confirmed crash and clean up on your
+own.** This is scheduled *detection*, not real-time monitoring: it can only notice that a task-id hasn't
+self-reported in a while, on whatever cadence you choose to re-check — it cannot distinguish "dead" from
+"alive but wedged on something slow that just hasn't hit its next checkpoint yet." That ambiguity is a
+hard platform limitation (Claude Code gives a dispatcher no way to poll an Agent-tool background
+sub-agent's liveness from outside), not a shortcut being deferred here.
+
+**Named limitation — detection now exists (self-reported, on a schedule); automatic recovery still does
+not.** `bin/progress-ledger.py` closes the *visibility* half of the original gap: a sub-supervisor that
+dies without ever recording `verify_gate_pass` will eventually show up as `stale` or
+`no_progress_recorded` the next time the dispatcher's watchdog runs `stale`. It does **not** close the
+*recovery* half, by the same design stance as `claim-ledger.py`'s own disclosure: no automated
+liveness/heartbeat/TTL check decides anything on its own, no claim is ever automatically released, no
+worktree is ever automatically torn down, and a `stale` hit is never itself proof of a crash — only a
+signal that a human should go look. A human must notice the relayed hit and manually run
 `bin/claim-ledger.py release` (or, if truly abandoned, `--steal` with a reason) plus manual worktree
-teardown. Closing this gap — a liveness/reaping diagnostic that can tell a genuinely dead sub-supervisor
-apart from one that is merely slow — is a separate, deferred future task, not part of this one.
+teardown, exactly as before. And detection is only as good as the watchdog's own cadence: a dispatcher
+that stops calling `stale` (or an Agent-tool session that ends without a live wakeup ever firing) gets no
+signal either — the same gap as before this primitive existed, just narrowed to "when the dispatcher
+itself is still polling" rather than "never."
 
 ## Visible orchestration in herdr (when HERDR_ENV=1)
 
