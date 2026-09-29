@@ -486,40 +486,84 @@ recover from) a sub-supervisor that goes silent:
   timestamp is older than the threshold — exit 0, silent, otherwise. Same disclosure stance as
   `claim-ledger.py`: no heartbeat/TTL logic decides anything, a `stale` hit is a signal to a human, never a
   confirmed crash or an automatic trigger to release/steal/reap anything. This is scheduled detection, not
-  real-time monitoring — a hard platform limitation, not a shortcut deferred here.
+  real-time monitoring — a hard platform limitation, not a shortcut deferred here. A separate,
+  always-exit-0 read-only query, `ready [--task-id ...] [--batch-id ID]`, reports one JSON line per task-id whose LATEST
+  phase is exactly the terminal `verify_gate_pass` — the one query a batch dispatcher (see below) needs to
+  collect "everything ready to fold into the next batch close" straight off disk, with no reliance on its
+  own in-memory batch state; combined with `claim-ledger.py status`'s open-claims list, it survives a
+  dispatcher restart/crash mid-batch. `--batch-id` is a new, optional CORRELATION KEY a dispatcher mints
+  once per batch and passes to every `record` call for every task-id it fans out (also rendered by
+  `latest`/`status` when present) — a task-id's own `--batch-id` binding is IMMUTABLE once first set
+  (`record` rejects outright a later call for the same task-id supplying a different value), and
+  `ready --batch-id ID` matches against that binding (never just a terminal row), which is what lets a
+  restarted dispatcher tell "ready for THIS batch" apart from an unrelated batch's or a single-task-
+  delegation trigger's own `verify_gate_pass` row, PROVIDED that task-id's own binding stayed internally
+  consistent. This is NOT a distributed-uniqueness guarantee: two genuinely different, freshly-claimed
+  task-ids from two independent dispatcher processes can still coincidentally bind to the identical
+  `--batch-id` value, which no local ledger can distinguish from an intentional co-batching — minting
+  `--batch-id` from a UUID (SKILL.md's own guidance) makes that practically negligible, not structurally
+  impossible; this is a deliberate, documented scope boundary, not a gap to close further here. Omitting
+  `--batch-id` keeps the original no-filter behavior exactly (every ready task-id, regardless of batch).
+  `stale`, reused with a
+  SEPARATE (larger) threshold against task-ids already at `verify_gate_pass`, doubles as the batch-close
+  TTL escalation for a `ready` task-id stuck waiting on a slower sibling — no second staleness mechanism
+  was built for this.
 
 ### The third primitive: fan-out to fresh sub-agent-supervisors + `bin/dispatch-report.py`
 
-Documented in `skills/secondmate/SKILL.md`'s "Fan-out to fresh sub-agent-supervisors (1 or 2,
-hard-capped at 2)" section — an **opt-in** pattern with two equally valid triggers, neither automatic:
-a human hands the supervisor 2 genuinely independent tasks and wants them run concurrently, or a human
-explicitly asks to delegate a SINGLE task's whole supervisor loop to a fresh sub-agent-supervisor. The
-single-task loop above stays the default for ordinary work either way. Mechanically it is ONE Agent-tool
-call carrying AT MOST 2 tool-use blocks (a hard cap, not a tunable N — exactly 1 for the single-task
-trigger, up to 2 for the concurrent-tasks trigger), each a FRESH (never `fork`) sub-agent, so each sub-supervisor reaches its own
-triage/routing/verdict judgment calls from a clean context instead of one contaminated by a sibling
-task's state. Each sub-supervisor: claims its task-id first (`claim-ledger.py claim`, never `--steal`,
-aborting with `SM_REFUSED:claim-failed` on failure); derives every downstream name deterministically from
-the task-id using this repo's existing convention (`sm/<task-id>` branch, `sm-<task-id>`/`sm-pi-<task-id>`
-agent name, `root_pane` from `herdr worktree create`); runs the existing solo SOP completely untouched,
-recording a `progress-ledger.py record` checkpoint (`claimed` right after the claim, `maker_started`,
-`checker_round` per round, terminal `verify_gate_pass` — expected, but not enforced by the script itself,
-to also carry `--checked-sha`) at each of those points;
-once verify-gate has passed, opens its own `hold.py hold` entry for the merge decision and waits for a
-genuine human answer (never assuming, never auto-answering, never deferring that judgment to the
-dispatcher) — matching the existing single-task loop's Gate → Hold → Integrate contract exactly; only
-once that hold is answered does it call `merge-sequencer.sh` itself (legitimately queueing behind a
-sibling's concurrent merge attempt on the same `--repo` — the lock working as intended); releases its
-claim on every terminal path; and emits exactly one completion tag, on its own line, as its final output:
-`SM_DONE_MERGED:<sha>`,
-`SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`. `bin/dispatch-report.py` is how the dispatcher
-turns that final text into a decision without ever re-reading the sub-supervisor's prose itself: it
-recognizes the three tags anchored at start-of-line only (so a tag echoed mid-prose, e.g. from the
-sub-supervisor's own instructions being quoted back, can't be mistaken for the real signal), takes the
-LAST matching line if several appear, and exits `0`/`1`/`2`/`3` (done / refused / stuck / no-tag-found —
-its own code, more cautious than even "stuck", since it means the parser can't tell what happened at
-all). On `SM_STUCK_NEED_HUMAN` the dispatcher's only allowed action is relaying that sub-supervisor's own
-reported reason to the human verbatim, never resolving it itself.
+Documented in `skills/secondmate/SKILL.md`'s "Fan-out to fresh sub-agent-supervisors" section — **opt-in**,
+never automatic, with two INDEPENDENT triggers, each its own mechanism:
+
+- **Single-task delegation** — a human asks to delegate one task's whole loop to a fresh
+  sub-agent-supervisor. Unchanged from the original design: that one sub-supervisor claims its task-id
+  first (`claim-ledger.py claim`, never `--steal`, aborting with `SM_REFUSED:claim-failed` on failure),
+  derives every downstream name deterministically from the task-id (`sm/<task-id>` branch,
+  `sm-<task-id>`/`sm-pi-<task-id>` agent name, `root_pane` from `herdr worktree create`), runs the
+  existing solo SOP completely untouched while recording `progress-ledger.py record` checkpoints
+  (`claimed`, `maker_started`, `checker_round` per round, terminal `verify_gate_pass`), opens its OWN
+  `hold.py hold` entry once verify-gate passes and waits for a genuine human answer, only then calls
+  `merge-sequencer.sh` itself, releases its claim on every terminal path, and emits exactly one completion
+  tag: `SM_DONE_MERGED:<sha>`, `SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`.
+- **Concurrent batch (up to 10, hard-capped, one consolidated hold)** — a human hands the dispatcher
+  several genuinely independent tasks. Mechanically ONE Agent-tool call carrying AT MOST 10 tool-use
+  blocks — an explicit, non-tunable constant (`N=10`, matching how the earlier `N=2` was itself a
+  non-tunable choice before this scaling), each a FRESH (never `fork`) sub-agent. Each sub-supervisor
+  claims, derives names, and runs the solo SOP exactly like single-task delegation, but EVERY checkpoint
+  it records also carries a dispatcher-minted `--batch-id` (the correlation key shared by every task-id
+  in this one batch), and its `verify_gate_pass` checkpoint ALWAYS also carries `--checker-verdict-path`
+  — and there it **stops**: no hold, no self-merge, no claim release. It emits
+  `SM_READY_UNMERGED:<checked-sha>` instead of `SM_DONE_MERGED:<sha>` and waits. The DISPATCHER then
+  (never any individual sub-supervisor):
+  1. Collects every `ready` task-id from `progress-ledger.py ready --batch-id <batch-id>` — ledger-driven,
+     not in-memory, so a dispatcher restart mid-batch reconstructs that same set; `--batch-id` is what
+     keeps this from also picking up an unrelated batch's or a single-task-delegation task's own
+     `verify_gate_pass` row, PROVIDED that task-id's own batch-id binding stayed internally consistent —
+     `--batch-id` is immutable per task-id and minted from a UUID, which together make an accidental
+     cross-dispatcher collision practically negligible, not a structural/distributed-uniqueness
+     guarantee (see the primitives section above for the honest limitation this is scoped to).
+  2. Closes the batch once every fanned-out task-id has reached a terminal exit code, or a bounded TTL
+     elapses first (reusing `progress-ledger.py stale --threshold-seconds <TTL>` against the batch's own
+     task-ids to auto-escalate both a genuinely dead straggler AND a `ready` task-id rotting too long
+     waiting on one — the same primitive, two purposes, no third mechanism).
+  3. Opens exactly ONE `hold.py hold --entries-file ...` batch hold covering every `ready` task-id, each
+     entry carrying its own `checked_sha` (the schema EXTENSION described in the component-map row below
+     — the original 1:1 `--sha` binding is not dropped, just generalized to per-entry) plus a digest
+     `hold.py` itself derives from that entry's own `checker_verdict_path` — never typed fresh.
+  4. Waits for a genuine human answer, structured as `hold.py answer --approve "..." --reject "..."` —
+     every task-id in the batch classified exactly once, never freeform prose.
+  5. Sequences `merge-sequencer.sh` for each APPROVED task-id only, one at a time, then tears each down
+     (`herdr worktree remove`, branch delete, `claim-ledger.py release`, `teardown-check.sh` confirmation).
+     A REJECTED task-id's claim, worktree, and branch are untouched — `claimed, needs rework`, resumed in
+     the same worktree next round, never silently released.
+
+`bin/dispatch-report.py` is how the dispatcher turns a sub-supervisor's final text into a decision without
+ever re-reading its prose: it recognizes the four tags anchored at start-of-line only (a tag echoed
+mid-prose can't be mistaken for the real signal), takes the LAST matching line if several appear, and
+exits `0`/`1`/`2`/`3`/`4` (`SM_DONE_MERGED` / `SM_REFUSED` / `SM_STUCK_NEED_HUMAN` / no-tag-found /
+`SM_READY_UNMERGED`). Exit `4` is deliberately distinct from exit `0`: reusing `SM_DONE_MERGED` for "reached
+the gate but not yet merged" would falsify the documented "exit 0 = integration done" contract this same
+table relies on elsewhere. On `SM_STUCK_NEED_HUMAN` the dispatcher's only allowed action is relaying that
+sub-supervisor's own reported reason to the human verbatim, never resolving it itself.
 
 **Named limitation — detection now exists (self-reported, on a schedule); automatic recovery still does
 not.** The dispatcher is required to poll `progress-ledger.py stale --threshold-seconds N --task-id ...`
@@ -531,8 +575,9 @@ dead one until its next checkpoint lands — and recovery is still entirely manu
 relayed to the human verbatim, never auto-resolved. Its claim is not automatically released and its
 worktree is not automatically cleaned up — a human must notice and manually run `claim-ledger.py
 release`/`--steal` plus manual worktree teardown. Closing the remaining automatic-recovery half of this
-gap is a separate, deferred
-future task, not part of this one.
+gap is a separate, deferred future task, not part of this one. The same limitation applies to the batch
+trigger's own TTL-driven close: it forces the DISPATCHER to stop waiting, it never proves a straggler is
+dead, and it never auto-releases or auto-tears-down anything on its own.
 
 ## Component map
 
@@ -553,11 +598,11 @@ future task, not part of this one.
 | `bin/verdict.py` | deterministic pass/fail/error branching; with `--lenses` cross-checks lens coverage; enforces findings validation for `fail` verdicts (must have file:line or `[NOLOC]`); writes a `git-common-dir`-anchored `audit/lens-coverage.jsonl` ledger shared across every worktree of the repo (override via `SM_LENS_COVERAGE_LEDGER`) |
 | `bin/verify-gate.sh` | pre-integration ground-truth gate |
 | `bin/merge-sequencer.sh` | serializes concurrent merges to `main`; validates `--worktree` is an ACTUAL linked worktree of `--repo` (matching `git-common-dir`) before doing anything else, refusing an independent/stale clone; re-invokes `verify-gate.sh` fresh inside a singleton lock immediately before merging; confirms `--branch` itself resolves to exactly `--checked-sha` (`BRANCH_MISMATCH` otherwise); refuses before merging if `$repo` already has an unrelated in-progress merge/dirty state (excluding the EXACT paths of its own lock dir and ledger file, never a basename match, from that check); on its own merge attempt failing, distinguishes a real content conflict (`MERGE_CONFLICT`, `git ls-files -u` non-empty) from a policy-hook rejection with no actual conflict (`MERGE_REJECTED`), aborting cleanly either way; never rebases, never reverts a landed local merge on push failure; a genuine push race (origin advanced, or a concurrent server-side ref-transaction race — both distinguished from a real hook/protected-branch rejection by git's own client-generated framing, never by the hook's own message text) is recovered automatically, lock held throughout, bounded at 3 total push attempts (`PUSH_RACE_RECOVERED`/`PUSH_RACE_EXHAUSTED`); a LOCAL `pre-push` hook (no `remote: ` framing at all) disables this text-based race detection entirely for that repo, by design — checked before the first push and monotonically re-checked (never reset once true) before every retry, so a self-deleting hook or one installed mid-recovery can't evade it; `--preflight-only` checks for a conflict via `git merge-tree --write-tree` without ever acquiring the lock or touching `$repo`'s working tree/index/branch-refs/ledger; prints an advisory pre-merge version/docs-sync reminder right before every real merge (never on `--preflight-only`); append-only `audit/merge-ledger.jsonl` with a closed reason-code enum, and a ledger-write failure itself is a loud stderr `WARNING`, never a silent loss |
-| `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a hold/answer to an exact commit, `next` serializes one-at-a-time retrieval; `answer` prints an advisory genuine-human-decision reminder on success |
+| `bin/hold.py` | durable human-gate decisions; optional `--sha` binds a single-task hold/answer to an exact commit, `next` serializes one-at-a-time retrieval; `answer` prints an advisory genuine-human-decision reminder on success. `--entries-file` on `hold` opens a CONSOLIDATED BATCH hold instead (schema extension, not a replacement — the per-task `--sha` binding still exists per-entry, and the whole batch is capped at 10 entries, the same hard N=10 fan-out cap): a JSON list of `{task_id, checked_sha, checker_verdict_path}` — every entry's `checker_verdict_path` MUST resolve to a genuinely valid verdict envelope per `bin/verdict.py`'s own `read_verdict_with_envelope` — loaded and called directly (never a second, looser, parallel definition of "valid" that a bare `{"verdict": <any string>}` dict could slip through), so the closed verdict-word enum and the findings-shape/location validation for a "fail" verdict are the SAME rules verdict.py enforces everywhere else in this codebase — or the WHOLE `hold` call is rejected (nonzero exit, no ledger write), never a placeholder digest for a missing/unreadable/unparseable/bogus verdict artifact; each entry's digest is machine-derived from that real, already-validated envelope (`verdict`, findings count, the distinct set of files those findings flagged — a faithful blast-radius proxy, since the envelope has no explicit field for that — and `lens_coverage`'s own lens names, the closest thing the envelope has to a category/tag concept) — never typed fresh by whoever opens the hold. `answer --approve "id,id" --reject "id,id"` closes a batch hold structurally (every entry's task-id classified exactly once — a duplicate within one list, or split across both, is rejected outright, never silently deduped via a set) instead of freeform prose, matching `dispatch-report.py`'s own anti-prose-parsing philosophy |
 | `bin/claim-ledger.py` | atomic task-id claims (`claim`/`release --token`/`steal --reason`/`status`) so parallel sub-agent-supervisors never work the same task-id; default ledger anchored to `git rev-parse --git-common-dir` so every worktree of a repo shares one ledger; `release` requires a real token, not just an `--owner` label; same `fcntl` ledger-lock idiom as `hold.py`; building block used by the fan-out pattern (SKILL.md). `claim`/`steal` optionally declare `--scope KIND:KEY=OPERATION` (closed additive `add/extend/modify` vs. destructive `replace/remove/rename/migrate` operation classes; exact string match, never fuzzy; never carried forward across a `steal`); read-only `conflicts --scope ...` (lock-free, like `status`) exits 1 and reports any open claim sharing that scope with an opposite-class operation, exits 0 otherwise — an optional dispatcher pre-launch check for a destructive-vs-additive semantic collision on the same scope, which the textual-only `merge-sequencer.sh` preflight has no way to see (wiring a dispatcher to call it is not yet done) |
-| `bin/progress-ledger.py` | self-reported `{task-id, phase, ts}` checkpoint rows for the fan-out pattern (SKILL.md), same `fcntl`-locked JSONL / `git-common-dir`-anchored-shared-ledger idiom as `claim-ledger.py`; `record` appends a checkpoint (`--phase claimed\|maker_started\|checker_round\|verify_gate_pass`, the last optionally carrying `--checked-sha`/`--checker-verdict-path` for a later consumer); `latest`/`status` folds to each task-id's most recent checkpoint; read-only `stale --threshold-seconds N [--task-id ...]` (lock-free, like `claim-ledger.py`'s `conflicts`) reports (exit 1) any given task-id with no recorded checkpoint at all or whose latest is older than the threshold, exit 0 silent otherwise — closes the *detection* half of the fan-out pattern's no-liveness gap (a dispatcher can now notice a silently-dead sub-supervisor on a `ScheduleWakeup`-driven schedule), never the *recovery* half: no automated action, no auto-`--steal`, a hit is relayed to a human verbatim |
+| `bin/progress-ledger.py` | self-reported `{task-id, phase, ts}` checkpoint rows for the fan-out pattern (SKILL.md), same `fcntl`-locked JSONL / `git-common-dir`-anchored-shared-ledger idiom as `claim-ledger.py`; `record` appends a checkpoint (`--phase claimed\|maker_started\|checker_round\|verify_gate_pass`, the last optionally carrying `--checked-sha`/`--checker-verdict-path` for a later consumer; any checkpoint may also optionally carry `--batch-id ID`, a dispatcher-minted correlation key repeated on every checkpoint for every task-id in one batch — IMMUTABLE per task-id once first set: `record` rejects outright, at write time, a later call for the SAME task-id supplying a DIFFERENT batch-id, closing batch-id drift/reuse over one task-id's own lifetime; this canNOT by itself stop two genuinely different, freshly-claimed task-ids from two independent dispatcher processes coincidentally binding to the identical value, which is a fundamentally different, harder problem this ledger alone cannot solve without a distributed uniqueness registry — see SKILL.md's own honest documentation and its UUID-minting mitigation); `latest`/`status` folds to each task-id's most recent checkpoint (rendering `batch_id` too, when present); read-only `stale --threshold-seconds N [--task-id ...]` (lock-free, like `claim-ledger.py`'s `conflicts`) reports (exit 1) any given task-id with no recorded checkpoint at all or whose latest is older than the threshold, exit 0 silent otherwise — closes the *detection* half of the fan-out pattern's no-liveness gap (a dispatcher can now notice a silently-dead sub-supervisor on a `ScheduleWakeup`-driven schedule), never the *recovery* half: no automated action, no auto-`--steal`, a hit is relayed to a human verbatim; a batch dispatcher also reuses `stale` with a separate, larger threshold against task-ids already at `verify_gate_pass` to auto-escalate a `ready` task-id stuck awaiting a slower sibling. Read-only `ready [--task-id ...] [--batch-id ID]` (always exits 0 — an information query, not an error signal) reports one JSON line per task-id whose LATEST phase is exactly the terminal `verify_gate_pass`, carrying its `checked_sha`/`checker_verdict_path` — the query a batch dispatcher uses to collect "everything ready for the next batch close" straight off disk, so batch-close survives a dispatcher restart/crash mid-batch with no reliance on in-memory state; `--batch-id`, when given, restricts the report to task-ids BOUND to that exact batch-id — matched against each task-id's own immutable, earliest-established binding, never just its terminal row, and a task-id whose own row history is internally inconsistent is excluded outright regardless of what its terminal row says — which keeps a restarted dispatcher from folding an unrelated batch's or a single-task-delegation task's own ready row into the wrong consolidated hold AS LONG AS each task-id's own binding stayed internally consistent; this is not a distributed-uniqueness guarantee against two independent dispatchers coincidentally picking the identical batch-id for two genuinely different, freshly-claimed task-ids (UUID minting makes that practically negligible, not structurally impossible — a deliberate, documented scope boundary) — omitted, it keeps the original no-filter behavior exactly |
 | `bin/doctor.sh` | pre-flight + self-heal: detects missing requirements (herdr, ponytail, adhd) and installs them on demand; detects and fixes AWS Bedrock model-metadata overrides for pi's local `~/.pi/agent/models.json` (kimi-k3 and deepseek-r1 maxTokens values, verified against real Bedrock enforced ceilings); detects skill discovery asymmetry between pi and Claude Code for the current repo's project skills, scanned at ANY depth via `os.walk` (monorepo-safe, matching `bin/sync-worktree-skills.sh`'s own scan of the identical three conventions, so a nested subproject's skill — exactly the kind already backfilled into a fresh worktree by that script — is never silently missed) — pi reads `.pi/skills/` and `.agents/skills/`, Claude Code reads `.claude/skills/` and `.agents/skills/`, so a skill present under only one non-`.agents` convention is invisible to the other harness; rows are keyed by (subproject-relative-path, name), not name alone, so two different subprojects with a same-named skill each get their own unambiguous row (e.g. `packages/widget/foo`); a Claude-only skill gets an offered fix (`bash -c`-run by the generic heal loop) that copies its resolved real content into that same subproject's `.agents/skills/<name>` — never overwrites an existing entry there, never follows a symlink resolving outside the repo root (mirrors `bin/sync-worktree-skills.sh`'s own guard), and never constructs a shell command from a name or relative-path prefix that fails its safe-pattern check (`bin/claim-ledger.py`'s own `[A-Za-z0-9_-]{1,128}` pattern for names) — a Claude-Code-invisible skill (`.pi/skills/` only) is reported with no auto-fix offered; detects secondmate plugin staleness (SHA behind marketplace checkout), heals with `git pull --ff-only` + `claude plugin update`, and warns about the `/reload-plugins` requirement. Safe aborts on dirty tree, detached HEAD, or non-fast-forward; uses mkdir-based lock to prevent concurrent heals; idempotent fixes preserve unrelated content |
-| `bin/dispatch-report.py` | parses a sub-supervisor's final output for the fan-out pattern — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>`, anchored at start-of-line (a tag embedded mid-prose does not match), last matching line wins if several appear; exits `0`/`1`/`2`/`3` (done / refused / stuck / no-tag-found); the dispatcher acts only on this exit code, never on the sub-supervisor's prose |
+| `bin/dispatch-report.py` | parses a sub-supervisor's final output for the fan-out pattern — exactly one of `SM_DONE_MERGED:<sha>` / `SM_STUCK_NEED_HUMAN:<reason>` / `SM_REFUSED:<reason>` / `SM_READY_UNMERGED:<sha>`, anchored at start-of-line (a tag embedded mid-prose does not match), last matching line wins if several appear; exits `0`/`1`/`2`/`3`/`4` (done-merged / refused / stuck / no-tag-found / ready-unmerged); `SM_READY_UNMERGED` (exit 4) is a DISTINCT tag/code from `SM_DONE_MERGED` (exit 0) — it means the batch trigger's sub-supervisor reached verify-gate PASS but did not merge itself, never conflated with "integration done"; the dispatcher acts only on this exit code, never on the sub-supervisor's prose |
 | `bin/prune-output.sh` | context hygiene |
 | `bin/reason.sh` | read-only reasoning one-shots |
 | `bin/log-round.sh` | append-only per-round metrics ledger (`audit/metrics.jsonl`) — task, round, maker, verdict, finding-category tags, repeatable lesson ids injected that round, optional cost/duration |

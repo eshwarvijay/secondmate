@@ -291,33 +291,76 @@ $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<fix plan>" --task-id "<tas
    correlation against `audit/metrics.jsonl`, `verdict.py` output, or any other history — no such
    correlation logic exists here, and none should be built.
 
-## Fan-out to fresh sub-agent-supervisors (1 or 2, hard-capped at 2)
+## Fan-out to fresh sub-agent-supervisors
 
-Everything above is the default: one supervisor, one task, one loop at a time. This section is an
-**opt-in** variant with two equally valid triggers, neither of them automatic — the single-task loop
-above remains the default for ordinary work, including most multi-task requests (queue them sequentially
-through the normal loop unless one of the two triggers below applies):
+Everything above is the default: one supervisor, one task, one loop at a time. This section is
+**opt-in**, never automatic, with TWO INDEPENDENT triggers, each its own mechanism — pick the one that
+matches the situation, never mix them in one Agent-tool call:
 
-- A human hands you 2 genuinely independent tasks and wants them run concurrently, or
-- A human explicitly asks to delegate a SINGLE task's whole supervisor loop to a fresh
-  sub-agent-supervisor (e.g. to keep the dispatcher's own context clean, or to run that one task under
-  independent triage/routing/verdict judgment). Same mechanism, just one tool-use block instead of two —
-  it is still opt-in, still never automatic, and ordinary single-task work still defaults to running
-  inline via the loop described above rather than fanning out on its own.
+- **(A) Delegate a single task's whole loop** to a fresh sub-agent-supervisor (e.g. to keep the
+  dispatcher's own context clean, or to run one task under independent triage/routing/verdict judgment).
+  That one sub-supervisor still owns its own hold and its own merge, exactly as the solo loop above does
+  — a consolidated batch hold buys nothing for a batch of one.
+- **(B) A human hands you several genuinely independent tasks** (up to 10) and wants them run
+  concurrently. This is the batch mechanism: **ONE genuine human decision per batch, not one per
+  task-id.**
 
-**Mechanism.** Make ONE Agent-tool call carrying AT MOST 2 tool-use blocks (exactly 1 for the
-single-task trigger, up to 2 for the concurrent-tasks trigger) — a **hard cap**, not a
-tunable parameter. There is no N>2 variant of this pattern; if there are more than 2 independent tasks,
-run 2 now and queue the rest for the next round. Each of the (at most 2) tool-use blocks launches a
-**FRESH** sub-agent — never `fork`. `fork` inherits the dispatcher's own conversation context, which is
-wrong here: each sub-supervisor must reach its own triage/routing/verdict judgment calls from a clean,
-unpolluted context with its own autonomous Bash/herdr access, not one contaminated by a sibling task's
-planning, findings, or in-flight state. **Name each Agent-tool call `sm-<task-id>`** — never leave `name`
-unset, which defaults to a generic, indistinguishable label (e.g. just the subagent_type). This outer,
-dispatcher-level name is distinct from step (b) below's inner maker naming (`sm-<task-id>`/`sm-pi-<task-id>`),
-which is decided later once the sub-supervisor itself routes to a maker — use plain `sm-<task-id>` here
-regardless of which maker that sub-supervisor ends up choosing internally. The name is also the handle used
-to resume a sub-supervisor later via `SendMessage` (passing it as the `to` field) once its hold is answered.
+Ordinary single-task work still defaults to running inline via the loop described above rather than
+fanning out on its own; queue anything beyond trigger (A)/(B)'s scope sequentially through the normal loop.
+
+### (A) Single-task delegation — unchanged mechanism
+
+Make ONE Agent-tool call carrying exactly 1 tool-use block, launching a **FRESH** sub-agent — never
+`fork` (which inherits the dispatcher's own conversation context; the sub-supervisor needs a clean,
+unpolluted one). **Name the Agent-tool call `sm-<task-id>`** — never leave `name` unset. Instruct it to:
+
+1. Claim first (`bin/claim-ledger.py claim --task-id <task-id> --owner sm-<task-id>`), never `--steal`
+   itself; abort with `SM_REFUSED:claim-failed` on failure.
+2. Derive every downstream name deterministically from `<task-id>` (`sm/<task-id>` branch,
+   `sm-<task-id>`/`sm-pi-<task-id>` agent name, `root_pane` from `herdr worktree create`).
+3. Run the existing solo SOP completely untouched — plan-committee, maker routing, checker rounds,
+   verify-gate.
+4. Once verify-gate passes, open its OWN `bin/hold.py hold --task <task-id> --q "..." --sha
+   <checked-sha>` and wait for a genuine human answer — never assume, never auto-answer, never defer that
+   judgment call to the dispatcher.
+5. Only once answered, call `bin/merge-sequencer.sh` itself with its own claimed
+   `--branch`/`--worktree`/`--checked-sha` (queueing behind a sibling's concurrent merge on the same
+   `--repo` is the singleton lock working as intended, not a bug).
+6. Release its claim on every terminal path (`bin/claim-ledger.py release --task-id <task-id> --owner
+   sm-<task-id> --token <token>`).
+7. Emit exactly one completion tag, on its own line, as its literal final output: `SM_DONE_MERGED:<sha>`,
+   `SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`.
+
+The dispatcher parses that final text with `bin/dispatch-report.py` (never re-reading the prose itself)
+and acts only on the exit code: `0` = `SM_DONE_MERGED` (integration done), `1` = `SM_REFUSED` (relay the
+reason), `2` = `SM_STUCK_NEED_HUMAN` (relay the reason verbatim, never resolve it yourself), `3` = no tag
+found (treat as an escalation-worthy parse failure).
+
+### (B) Concurrent batch (up to 10, hard-capped, one consolidated hold)
+
+**Mechanism.** Make ONE Agent-tool call carrying AT MOST 10 tool-use blocks — a **hard cap**, an explicit
+constant (`N=10`), not a tunable parameter, matching how the earlier `N=2` cap was itself a non-tunable
+choice. There is no N>10 variant; if there are more than 10 independent tasks, run 10 now and queue the
+rest for the next batch. Each tool-use block launches a **FRESH** sub-agent — never `fork`, same
+contamination rationale as trigger (A). **Name each Agent-tool call `sm-<task-id>`.**
+
+**Before fanning out, mint a `<batch-id>` for this batch — a UUID, e.g. `python3 -c "import uuid;
+print(uuid.uuid4())"` or `uuidgen`, NEVER a timestamp-derived label** (a timestamp is a realistic
+collision: two dispatcher runs close in time can easily land on the same value). This is the CORRELATION
+KEY every sub-supervisor in this batch carries on every one of its own `progress-ledger.py record` calls
+(step (c) below) — it is what lets step (e)'s restart-reconstruction tell "ready for THIS batch" apart
+from an unrelated batch's, or a single-task-delegation trigger (A) task's, own `verify_gate_pass` row.
+Tell every sub-supervisor its shared `<batch-id>` in its own prompt.
+
+`progress-ledger.py` itself enforces that a given task-id's `--batch-id`, once first recorded, is
+IMMUTABLE for that task-id's lifetime (a later `record` call for the SAME task-id supplying a different
+value is rejected outright) — this closes batch-id drift for one task-id reused/misused over its own
+history. **It does NOT, and cannot, prevent two genuinely different, freshly-claimed task-ids from two
+independent dispatcher runs from coincidentally binding to the identical `<batch-id>` value** — no local
+ledger can distinguish "intentionally co-batched" from "accidentally collided" for two task-ids that are
+each individually self-consistent, short of a distributed uniqueness registry (explicitly out of scope —
+see this section's own "no 1000-task hardening" boundary). Minting from a UUID makes that collision
+practically negligible; it is not a structural guarantee, and this is deliberate, not an oversight.
 
 **Each sub-supervisor's prompt must instruct it to, in this order:**
 
@@ -326,8 +369,8 @@ a. **Claim first, as its literal first action, then record it.** Run `bin/claim-
    `SM_REFUSED:claim-failed` as its final output — do not proceed, do not retry, do not fall back to
    `--steal`. `--steal` is a human-supervised override and stays exactly that under this pattern too: a
    sub-supervisor must never call it itself. Immediately after a successful claim, run
-   `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed` — the first of
-   four self-reported checkpoints this SOP requires (see the staleness-watchdog step below for why).
+   `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed --batch-id
+   <batch-id>`.
 
 b. **Derive every downstream name deterministically from `<task-id>`, using this repo's own existing
    convention — never invent a new one:**
@@ -336,61 +379,126 @@ b. **Derive every downstream name deterministically from `<task-id>`, using this
    - pane: whatever `herdr worktree create` returns as `.result.root_pane.pane_id` — never independently
      named or guessed.
 
-c. **Run the existing solo secondmate SOP completely untouched, recording three more checkpoints along the
-   way** — plan-committee, maker routing, checker rounds, verify-gate, exactly as described everywhere
-   above. This pattern changes nothing about how a single task runs, only how it gets launched. A
-   sub-supervisor is not a different kind of supervisor; it is this same SOP, running with its own claimed
-   task-id. At these points, also run `bin/progress-ledger.py record --task-id <task-id> --owner
-   sm-<task-id> --phase <phase>`:
+c. **Run the existing solo secondmate SOP completely untouched, recording checkpoints along the way** —
+   plan-committee, maker routing, checker rounds, verify-gate, exactly as described everywhere above.
+   This pattern changes nothing about how a single task runs, only how it gets launched and how its
+   verify-gate PASS gets turned into a merge. At these points, run `bin/progress-ledger.py record
+   --task-id <task-id> --owner sm-<task-id> --phase <phase> --batch-id <batch-id>` (the SAME `<batch-id>`
+   on every call, per the mint-once-per-batch step above):
    - `--phase maker_started` immediately after its maker begins running.
-   - `--phase checker_round` immediately after each checker round completes (once per round — the
-     timestamp alone is what a poller checks, no round number needed).
-   - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint. Also pass
-     `--checked-sha <checked-sha>` here in normal fan-out usage (a later batch-close consumer reads it off
-     this exact row), but `progress-ledger.py` itself never enforces it — `--checked-sha` is optional at
-     the CLI level, expected but not required in this SOP's own usage. A sub-supervisor that never reaches
-     this phase is exactly the case the staleness watchdog below exists to catch.
+   - `--phase checker_round` immediately after each checker round completes (once per round).
+   - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint. ALWAYS also pass
+     `--checked-sha <checked-sha>` and `--checker-verdict-path <path>` here (the dispatcher's batch close
+     reads both off this exact row — `--checker-verdict-path` is what `hold.py`'s batch digest is
+     machine-derived from, see step (e) below).
 
-d. **Open its own `bin/hold.py hold --task <task-id> --q "..." --sha <checked-sha>` entry for the merge
-   decision once verify-gate has passed, and WAIT for a genuine human answer** — never assume, never
-   auto-answer, matching the existing single-task loop's Gate → Hold → Integrate contract exactly (e.g.
-   `bin/hold.py hold --task <task-id> --q "merge <task-id> (checker PASS, verify-gate PASS at
-   <checked-sha>)?" --sha <checked-sha>` — `--task` and `--q` are required, `--sha` is optional but should
-   always be supplied here so the hold is bound to the exact reviewed commit). The merge-or-not judgment
-   call belongs to that sub-supervisor and the human who answers its hold — it must NEVER defer that
-   decision to the top-level dispatcher, which has no visibility into that task's actual diff/findings.
+d. **STOP once that checkpoint is recorded — do NOT open a hold, do NOT self-merge.** Under this batch
+   trigger the merge-or-not judgment is ONE decision for the whole batch, made by the dispatcher's
+   consolidated hold below, not N separate per-task decisions. **Do NOT release its claim either** — the
+   claim stays open (it is the dispatcher's own later record of "this task-id is still mine to
+   merge-or-rework"; releasing it here would let anything re-claim a task-id that's actually just waiting
+   on a human). Emit `SM_READY_UNMERGED:<checked-sha>` as its literal final output and stop.
+   On a refusal or stuck path instead (claim never succeeded, or genuinely wedged before reaching the
+   gate), behave exactly as trigger (A) does: release the claim and emit `SM_REFUSED:<reason>` or
+   `SM_STUCK_NEED_HUMAN:<reason>`.
 
-e. **Only once that hold is answered, merge: call `bin/merge-sequencer.sh` itself** with its own claimed
-   `--branch`/`--worktree`/`--checked-sha`. It may legitimately queue behind a sibling sub-supervisor's own
-   concurrent merge attempt on the same `--repo` — that is the singleton lock working exactly as intended,
-   not a bug to diagnose or work around.
+**The dispatcher's own role, once it has fanned out a batch:**
 
-f. **Release its claim on every terminal path** — success, refusal, or stuck — via `bin/claim-ledger.py
-   release --task-id <task-id> --owner sm-<task-id> --token <token>`. A claim released only on the happy
-   path leaks on every other path.
+e. **Collect ready task-ids, ledger-driven, never from your own in-memory batch state.** Poll (on a
+   `ScheduleWakeup`-driven schedule, never continuously) with:
+   ```
+   ${CLAUDE_PLUGIN_ROOT}/bin/progress-ledger.py ready --batch-id <batch-id>
+   # one JSON line per task-id whose latest phase is the terminal verify_gate_pass AND whose own
+   # terminal row was recorded under THIS exact --batch-id, each carrying its own
+   # checked_sha/checker_verdict_path; always exits 0 (this is the wanted signal, not an error).
+   ```
+   `--batch-id` is the correlation key from the mint-once-per-batch step above — without it, `ready` would
+   report EVERY task-id anywhere at `verify_gate_pass`, including an unrelated batch's or a single-task-
+   delegation trigger (A) task's own ready row that just happens to be sitting there awaiting its own
+   individual hold; filtering by `--batch-id` is what keeps this batch's consolidated hold from folding in
+   a task-id that was never part of it, AS LONG AS that task-id's own batch-id binding is internally
+   consistent (see the mint-once-per-batch step's own honest caveat above — this is NOT a distributed-
+   uniqueness guarantee against two independent dispatchers coincidentally picking the same `<batch-id>`
+   for two genuinely different, freshly-claimed task-ids; UUID minting makes that practically negligible,
+   not structurally impossible). This is also why batch-close survives a dispatcher restart/crash
+   mid-batch: nothing about "which task-ids are ready, for THIS batch" lives only in this conversation's
+   memory — a dispatcher that comes back after a crash need only remember (or re-derive) the same
+   `<batch-id>` label to reconstruct that same set (subject to the same honest caveat). Cross-check against
+   `bin/claim-ledger.py status`'s own currently-OPEN claims too — anything already merged and released
+   from a prior round of this same batch drops out on its own, since its claim is gone.
 
-g. **Emit exactly ONE completion tag, on its own line, as its literal final output:**
-   `SM_DONE_MERGED:<sha>`, `SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`. Nothing after it,
-   nothing instead of it.
+f. **Close the batch at the cap or a bounded TTL, whichever comes first — never wait indefinitely for a
+   straggler.** The batch is DONE (close now) once every task-id fanned out in it has reached a terminal
+   `dispatch-report.py` exit code (ready, refused, or stuck — the cap, since a batch never exceeds 10, is
+   reached by construction once everyone's finished). Otherwise, pick a TTL (seconds, generous relative to
+   a normal round) for how long you're willing to wait for the slowest task-id in the batch, and reuse the
+   EXACT SAME staleness primitive for two purposes at once, both against that TTL:
+   ```
+   ${CLAUDE_PLUGIN_ROOT}/bin/progress-ledger.py stale --threshold-seconds <batch-close-TTL> --task-id <id-1> ...
+   # a task-id still mid-loop (never reached any terminal tag) -> "stale"/"no_progress_recorded": relay to
+   #   the human verbatim, exactly like the single-task watchdog below.
+   # a task-id already at verify_gate_pass, sitting "ready, awaiting batch close" too long because a
+   #   SIBLING task-id in the batch is the slow one -> ALSO reported "stale" here (its phase hasn't
+   #   advanced since verify_gate_pass, which is exactly what this reuse of `stale` is for) -> this is the
+   #   auto-escalation for a ready task-id rotting in limbo: relay it to the human too, then close the
+   #   batch anyway with whoever is ready right now.
+   ```
+   On TTL expiry, close the batch with whatever `ready` reports at that moment; any task-id still mid-loop
+   folds into a LATER batch once it finishes (or gets manually reclaimed if a human judges it abandoned).
+   No new mechanism beyond `stale`+`ready` is needed for this — the cap/TTL decision is dispatcher logic,
+   not a new ledger primitive.
 
-**The dispatcher's (top-level supervisor's) own role is a hard boundary — state it to yourself explicitly
-before fanning out:** you only launch the (at most 2) sub-agents and, once each finishes, parse its final
-text with `bin/dispatch-report.py`. You NEVER re-read a sub-supervisor's prose to make your own judgment
-call about what happened — the tag is the only signal you act on. On `SM_STUCK_NEED_HUMAN`, your only
-allowed action is relaying that sub-supervisor's own reported reason to the real human, verbatim — never
-attempting to resolve it yourself, even if you think you know how.
+g. **Open ONE consolidated batch hold**, entries built from every task-id `ready` reported at close time:
+   ```
+   # write a JSON file: [{"task_id":..., "checked_sha":..., "checker_verdict_path":...}, ...]
+   ${CLAUDE_PLUGIN_ROOT}/bin/hold.py hold --task "<batch-label>" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
+     --entries-file <that JSON file>
+   ```
+   Every entry's `checker_verdict_path` MUST resolve to a real, parseable verdict envelope — `hold.py`
+   rejects the WHOLE call (nonzero exit, no ledger write) otherwise, never opening a hold with no real
+   verdict behind an entry's digest. `hold.py` itself derives a one-line, machine-sourced digest per entry
+   straight from that real envelope — its `verdict`, findings count, the distinct files those findings
+   flagged (a blast-radius proxy), and `lens_coverage`'s own lens names (the closest thing the envelope
+   has to a category/tag concept) — never typed fresh by whoever opens the hold, so the human's summary is
+   provably sourced from the real verdict. **Wait for a genuine human
+   answer, never self-answer, no exceptions** — including this batch hold itself. A clean `conflicts`
+   check between two task-ids' scopes is signal to SHOW in the digest if you have it, never a reason to
+   skip the human step.
 
+h. **The answer is structured, not freeform prose:**
+   ```
+   ${CLAUDE_PLUGIN_ROOT}/bin/hold.py answer <hold-id> --approve "<task-id>,<task-id>,..." --reject "<task-id>,..."
+   # every task-id in the batch's own entries must appear in exactly one of --approve/--reject.
+   ```
+
+i. **The dispatcher — never an individual sub-supervisor — sequences the actual merges and teardowns for
+   every APPROVED task-id, one at a time, using an argv array for any loop over them (never shell-string
+   interpolation, matching claim-ledger.py's/merge-sequencer.sh's own hygiene):**
+   1. `bin/merge-sequencer.sh --repo <repo> --worktree <worktree> --branch sm/<task-id> --base main
+      --checked-sha <that entry's checked_sha>`.
+   2. On success: `herdr worktree remove`, delete branch `sm/<task-id>`, `bin/claim-ledger.py release
+      --task-id <task-id> --owner sm-<task-id> --token <token>` (the dispatcher needs the token the
+      sub-supervisor's own `claim` call printed — carry it forward from step (a)'s launch, or have the
+      sub-supervisor report it in its final text alongside the tag), and confirm with
+      `bin/teardown-check.sh --task-id <task-id>`.
+   3. On a REJECTED task-id: do nothing to its claim, worktree, or branch — it stays exactly as-is,
+      `claimed, needs rework`, never silently released, never ambiguous. The next round for that task-id
+      resumes in the SAME worktree/claim (this is ordinary rework, not a special case).
+
+**Dispatcher exit-code contract (`bin/dispatch-report.py`):**
 ```
 ${CLAUDE_PLUGIN_ROOT}/bin/dispatch-report.py <sub-supervisor-final-output-file>
-# exit 0 = SM_DONE_MERGED   -> integration for that task-id is done
-# exit 1 = SM_REFUSED       -> relay the refusal reason to the human, task-id never started
+# exit 0 = SM_DONE_MERGED     -> (trigger A only) integration for that task-id is already done
+# exit 1 = SM_REFUSED         -> relay the refusal reason to the human, task-id never started
 # exit 2 = SM_STUCK_NEED_HUMAN -> relay the reported reason verbatim to the human; do not resolve it yourself
 # exit 3 = no tag found at all -> treat as a parse failure and escalate; do not guess what happened
+# exit 4 = SM_READY_UNMERGED  -> (trigger B only) reached verify-gate PASS, awaiting this batch's hold —
+#                                 NOT yet merged; never conflate with exit 0
 ```
 
-**Required: schedule a staleness watchdog for every outstanding task-id, once fanned out.** Immediately
-after launching, and again on every `ScheduleWakeup` firing until every fanned-out task-id has reached a
-terminal `dispatch-report.py` exit code, run:
+**Required, for BOTH triggers: schedule a staleness watchdog for every outstanding task-id, once fanned
+out.** Immediately after launching, and again on every `ScheduleWakeup` firing until every fanned-out
+task-id has reached a terminal `dispatch-report.py` exit code, run:
 
 ```
 bin/progress-ledger.py stale --threshold-seconds <N> --task-id <task-id-1> [--task-id <task-id-2>]
@@ -408,7 +516,9 @@ own.** This is scheduled *detection*, not real-time monitoring: it can only noti
 self-reported in a while, on whatever cadence you choose to re-check — it cannot distinguish "dead" from
 "alive but wedged on something slow that just hasn't hit its next checkpoint yet." That ambiguity is a
 hard platform limitation (Claude Code gives a dispatcher no way to poll an Agent-tool background
-sub-agent's liveness from outside), not a shortcut being deferred here.
+sub-agent's liveness from outside), not a shortcut being deferred here. (This same `stale` call, with a
+different, larger threshold, is also how trigger (B)'s batch-close TTL escalation works — see step (f)
+above; it is not a second mechanism.)
 
 **Named limitation — detection now exists (self-reported, on a schedule); automatic recovery still does
 not.** `bin/progress-ledger.py` closes the *visibility* half of the original gap: a sub-supervisor that
@@ -423,6 +533,13 @@ teardown, exactly as before. And detection is only as good as the watchdog's own
 that stops calling `stale` (or an Agent-tool session that ends without a live wakeup ever firing) gets no
 signal either — the same gap as before this primitive existed, just narrowed to "when the dispatcher
 itself is still polling" rather than "never."
+
+**Explicitly out of scope for trigger (B), by design, not an oversight:** no `--preflight-only`/rebase
+wiring for mid-batch staleness (the TTL above already bounds that exposure — a documented future
+enhancement, not this one); no "batch by scope-safety via `conflicts`-check" sizing policy (ship the
+count/TTL version above); a passing `claim-ledger.py conflicts` check is NEVER a substitute for the human
+hold, only a signal to show inside its digest; no multi-tenant auth/ownership model (single-operator,
+local-git); no 1000-task hardening (the cap is an explicit 10, hard, not tunable).
 
 ## Visible orchestration in herdr (when HERDR_ENV=1)
 

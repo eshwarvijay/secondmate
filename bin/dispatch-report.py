@@ -7,7 +7,8 @@ its own line, as its literal final output. This script is how the dispatcher tur
 exit code instead of re-reading it to make its own judgment call.
 
   dispatch-report.py [FILE]   # FILE or stdin = sub-supervisor's final text; prints the matched tag line
-                              # exit: 0=SM_DONE_MERGED  1=SM_REFUSED  2=SM_STUCK_NEED_HUMAN  3=no tag found
+                              # exit: 0=SM_DONE_MERGED  1=SM_REFUSED  2=SM_STUCK_NEED_HUMAN
+                              #       3=no tag found     4=SM_READY_UNMERGED
   dispatch-report.py selfcheck
 
 Tags are recognized ONLY at the start of a line (`^`, re.MULTILINE) -- a tag substring embedded mid-line
@@ -20,11 +21,19 @@ Exit code 3 (no tag found at all) is deliberately its own distinct code, MORE ca
 SM_STUCK_NEED_HUMAN (2), because it means this parser cannot tell what happened at all -- not even a
 self-reported "I'm stuck". The dispatcher must treat exit 3 as an escalation-worthy parse failure, not
 assume anything about the sub-supervisor's actual state.
+
+`SM_READY_UNMERGED:<sha>` (exit 4) is DISTINCT from `SM_DONE_MERGED:<sha>` (exit 0) -- it means the
+sub-supervisor reached its own verify-gate PASS at <sha> but did NOT merge it itself (a batch dispatcher
+fanning out to several concurrent sub-supervisors sequences the actual `merge-sequencer.sh` call and
+teardown itself, once a consolidated human hold approves it -- see SKILL.md's fan-out section). Reusing
+`SM_DONE_MERGED` for this would falsify the documented "exit 0 = integration is done" contract this
+script's own callers (and README/ARCHITECTURE/SKILL.md's exit-code tables) rely on: a dispatcher that
+saw exit 0 and assumed the merge had already landed would be wrong.
 """
 import re, sys
 
-_TAG_RE = re.compile(r"^(SM_DONE_MERGED|SM_STUCK_NEED_HUMAN|SM_REFUSED):(.+)$", re.MULTILINE)
-EXIT = {"SM_DONE_MERGED": 0, "SM_REFUSED": 1, "SM_STUCK_NEED_HUMAN": 2}
+_TAG_RE = re.compile(r"^(SM_DONE_MERGED|SM_STUCK_NEED_HUMAN|SM_REFUSED|SM_READY_UNMERGED):(.+)$", re.MULTILINE)
+EXIT = {"SM_DONE_MERGED": 0, "SM_REFUSED": 1, "SM_STUCK_NEED_HUMAN": 2, "SM_READY_UNMERGED": 4}
 
 
 def read_report(text):
@@ -42,6 +51,11 @@ def main(argv):
         assert rr("SM_DONE_MERGED:1a2b3c4d\n") == ("SM_DONE_MERGED:1a2b3c4d", 0)
         assert rr("SM_REFUSED:claim-failed\n") == ("SM_REFUSED:claim-failed", 1)
         assert rr("SM_STUCK_NEED_HUMAN:checker keeps flip-flopping\n") == ("SM_STUCK_NEED_HUMAN:checker keeps flip-flopping", 2)
+        assert rr("SM_READY_UNMERGED:cafef00d\n") == ("SM_READY_UNMERGED:cafef00d", 4)
+        # SM_READY_UNMERGED and SM_DONE_MERGED are DISTINCT exit codes -- exit 0 must mean "actually
+        # merged", never conflated with "reached verify-gate, still awaiting a batch merge".
+        assert EXIT["SM_READY_UNMERGED"] != EXIT["SM_DONE_MERGED"], (
+            "SM_READY_UNMERGED must not reuse SM_DONE_MERGED's exit code")
         # payload containing colons/slashes (a real sha, a punctuated reason) must not be truncated
         assert rr("SM_DONE_MERGED:1a2b3c4d5e6f7890abcdef1234567890abcdef12\n") == \
             ("SM_DONE_MERGED:1a2b3c4d5e6f7890abcdef1234567890abcdef12", 0)
@@ -52,6 +66,7 @@ def main(argv):
         assert rr("SM_REFUSED:first-attempt\nSM_DONE_MERGED:deadbeef\n") == ("SM_DONE_MERGED:deadbeef", 0)
         assert rr("SM_DONE_MERGED:deadbeef\nSM_STUCK_NEED_HUMAN:changed my mind\n") == \
             ("SM_STUCK_NEED_HUMAN:changed my mind", 2)
+        assert rr("SM_READY_UNMERGED:aaa111\nSM_DONE_MERGED:bbb222\n") == ("SM_DONE_MERGED:bbb222", 0)
         # no tag at all -> malformed, exit 3
         assert rr("just some prose with no completion tag anywhere") == ("malformed", 3)
         # a tag pattern embedded mid-line / in prose (not at start-of-line) must NOT match -- direct
