@@ -18,6 +18,12 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo "$out" | grep -qi "consolidated batch hold" || { echo "FAIL: missing the consolidated-batch-hold wording"; fails=1; }
   echo "$out" | grep -q "hard-capped at 2" && { echo "FAIL: stale N=2 wording still present"; fails=1; }
   echo "$out" | grep -qi "opt-in and only on an explicit human ask" && { echo "FAIL: stale opt-in-delegation wording still present"; fails=1; }
+  echo "$out" | grep -qi "Headless / not in herdr" || { echo "FAIL: missing the headless/not-in-herdr spawn path"; fails=1; }
+  echo "$out" | grep -q "new-worktree.sh" || { echo "FAIL: missing new-worktree.sh as the non-herdr spawn command"; fails=1; }
+  echo "$out" | grep -qi "In herdr (HERDR_ENV=1)" || { echo "FAIL: missing the in-herdr spawn path"; fails=1; }
+  echo "$out" | grep -q "herdr worktree create" || { echo "FAIL: missing herdr worktree create as the in-herdr spawn command"; fails=1; }
+  echo "$out" | grep -qi "never self-answered" || { echo "FAIL: missing the never-self-answered-hold wording"; fails=1; }
+  echo "$out" | grep -qi "narrows to: recognize the trigger, dispatch" || { echo "FAIL: missing the top-level supervisor's narrowed-job framing"; fails=1; }
   [ "$fails" = 0 ] && echo ok
   exit "$fails"
 fi
@@ -42,7 +48,7 @@ dispatch a FRESH sub-agent-supervisor instead: **solo dispatch** for one task, *
 dispatched sub-supervisor runs the mandatory sequence inside its own context:
   1. Invoke the `secondmate` skill — it is the single source of truth
   2. Load the `herdr` skill if HERDR_ENV=1
-  3. `herdr worktree create` → worktree + root_pane BEFORE touching any file
+  3. Spawn BEFORE touching any file — **In herdr (HERDR_ENV=1):** `herdr worktree create` → worktree + root_pane. **Headless / not in herdr:** `new-worktree.sh` instead (never the primary checkout)
   4. Route maker per step 0d: Claude (complex) or pi+Qwen --thinking medium (simple)
   5. Names are task-scoped: sm-<task-id> / sm-pi-<task-id> — never shared globals
   6. Checker via herdr pane run + pane wait-output (unique ___SM_R<N>_DONE_ markers) — **when HERDR_ENV=1, headless checker invocation is prohibited, no exceptions** — any checker invocation carrying more than one shell token/command must be written to a script file on disk first and invoked as `herdr pane run <pane> bash <script-path>`, never as an inline multi-command string (the argv-to-PTY-line reconstruction doesn't preserve quoting, causing it to silently run in the wrong cwd and produce false refusals)
