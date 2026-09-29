@@ -35,7 +35,39 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            Never appends. A dispatcher calls this
                                                                            on a `ScheduleWakeup`-driven interval
                                                                            for the exact set of task-ids it fanned
-                                                                           out, never continuously.
+                                                                           out, never continuously. A batch
+                                                                           dispatcher also reuses this exact same
+                                                                           call, with a SEPARATE (larger) threshold,
+                                                                           against task-ids already at the terminal
+                                                                           `verify_gate_pass` phase -- since that
+                                                                           phase never advances further, `stale`
+                                                                           against a batch-close TTL is exactly
+                                                                           "ready, awaiting batch close, too long"
+                                                                           -- no separate staleness mechanism needed.
+  progress-ledger.py ready [--task-id ID ...]                         -> read-only: for each given --task-id
+                                                                           (repeatable; every task-id ever seen in
+                                                                           the ledger if none given), reports one
+                                                                           JSON line for each whose LATEST recorded
+                                                                           phase is exactly the terminal
+                                                                           `verify_gate_pass` -- {"task_id":...,
+                                                                           "checked_sha":..., "checker_verdict_path":...,
+                                                                           "ts":...} ("checked_sha"/
+                                                                           "checker_verdict_path" omitted if never
+                                                                           supplied on that row). Always exits 0 --
+                                                                           this is a normal informational query, not
+                                                                           an error signal (unlike `stale`). Never
+                                                                           appends. This is the one query a batch
+                                                                           dispatcher needs to collect "all task-ids
+                                                                           ready to fold into the next batch close"
+                                                                           straight from disk -- combined with
+                                                                           `claim-ledger.py status`'s own open-claims
+                                                                           list (to exclude anything already merged
+                                                                           and released from a prior batch), a
+                                                                           dispatcher that crashes and restarts mid-
+                                                                           batch can reconstruct the exact same
+                                                                           "ready, awaiting batch" set from the two
+                                                                           ledgers alone, with no reliance on its own
+                                                                           lost in-memory state.
   progress-ledger.py selfcheck                                        -> asserts the fold + drives the real
                                                                            CLI paths against a scratch ledger.
 
@@ -271,6 +303,34 @@ def _selfcheck_live():
             and "checker_verdict_path=/tmp/v.json" in out, (
             "latest must render checked-sha/checker-verdict-path when present on the latest row")
 
+        # ready: t1 is at the terminal phase (verify_gate_pass, set above) -- must be reported, carrying
+        # its checked-sha/checker-verdict-path off that exact row.
+        code, out, _ = _run(["ready", "--task-id", "t1"])
+        assert code == 0 and '"task_id": "t1"' in out and '"checked_sha": "deadbeef"' in out, (
+            "ready must report a task-id whose latest phase is the terminal phase, with its checked-sha")
+
+        # ready: a task-id whose latest phase is NOT terminal (e.g. still at maker_started) must not be
+        # reported, even though it has recorded progress.
+        code, _, _ = _run(["record", "--task-id", "t3", "--owner", "sm-t3", "--phase", "maker_started"])
+        assert code == 0
+        code, out, _ = _run(["ready", "--task-id", "t3"])
+        assert code == 0 and out == "", "ready must not report a task-id stuck at a non-terminal phase"
+
+        # ready: a task-id with no progress at all must not be reported (never crash on a missing row).
+        code, out, _ = _run(["ready", "--task-id", "never-recorded-ready"])
+        assert code == 0 and out == "", "ready must not report a task-id with zero progress rows"
+
+        # ready never appends -- it's read-only, like `stale`.
+        pre_len = len(_recs())
+        _run(["ready", "--task-id", "t1"])
+        assert len(_recs()) == pre_len, "ready must never append to the ledger"
+
+        # ready with no --task-id at all scans every known task-id, reporting only those at the terminal
+        # phase -- t1 (terminal) yes, t3 (maker_started) no.
+        code, out, _ = _run(["ready"])
+        assert code == 0 and '"task_id": "t1"' in out and '"task_id": "t3"' not in out, (
+            "ready with no --task-id must scan every known task-id but only report terminal-phase ones")
+
         # task-id / phase validation, matching claim-ledger.py's bare-identifier posture.
         for bad in ("", "../etc", "a/b", "a\0b", "bad id", "a" * 129, "ok\n"):
             code, _, _ = _run(["record", "--task-id", bad, "--owner", "o", "--phase", "claimed"])
@@ -421,6 +481,10 @@ def main(argv):
     st.add_argument("--task-id", action="append", default=None,
                      help="repeatable; every task-id ever seen in the ledger if omitted")
 
+    rd = sub.add_parser("ready")
+    rd.add_argument("--task-id", action="append", default=None,
+                     help="repeatable; every task-id ever seen in the ledger if omitted")
+
     args = p.parse_args(argv)
 
     if args.cmd == "record":
@@ -472,6 +536,23 @@ def main(argv):
         for h in hits:
             print(json.dumps(h))
         sys.exit(1 if hits else 0)
+
+    elif args.cmd == "ready":
+        # read-only, no lock -- same lock-free precedent as `stale`/claim-ledger.py's `conflicts`. Always
+        # exits 0: unlike `stale`, a "ready" hit is the WANTED outcome, not a problem to report via exit
+        # code -- callers get the actual list via stdout.
+        latest = latest_by_task()
+        task_ids = args.task_id if args.task_id is not None else sorted(_all_task_ids())
+        for task_id in task_ids:
+            r = latest.get(task_id)
+            if r is None or r["phase"] != TERMINAL_PHASE:
+                continue
+            hit = {"task_id": task_id, "ts": r["ts"]}
+            if r.get("checked_sha"):
+                hit["checked_sha"] = r["checked_sha"]
+            if r.get("checker_verdict_path"):
+                hit["checker_verdict_path"] = r["checker_verdict_path"]
+            print(json.dumps(hit))
 
     elif args.cmd == "selfcheck":
         recs = [{"ev": "progress", "task_id": "a", "owner": "o", "phase": "claimed", "ts": "1"},

@@ -32,9 +32,12 @@ The maker's --thinking handles the how. The checker is the safety net.
 
 **On checker fail → loop back to the task-scoped maker, never fix inline.**
 
-**Delegating a whole supervisor loop to a fresh sub-agent** (one task, or a couple concurrently) is
-opt-in and only on an explicit human ask — invoke the `secondmate` skill for exact mechanics, never
-improvise it.
+**Delegating a whole supervisor loop to a fresh sub-agent** is opt-in and only on an explicit human ask
+— invoke the `secondmate` skill for exact mechanics, never improvise it. Two independent triggers, each
+its own mechanism: a single task delegated to one fresh sub-agent (unchanged — that sub-agent still owns
+its own hold and its own merge), or several genuinely independent tasks (hard-capped at 10 concurrent,
+not tunable) fanned out together, in which case each sub-agent stops at its own verify-gate PASS and the
+dispatcher opens ONE consolidated batch hold covering the whole batch instead of one hold per task.
 
 Skip the apparatus for trivial edits, read-only questions, or one-shot answers.
 EOF
