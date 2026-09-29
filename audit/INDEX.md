@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 40 total)
+## Recent flow (orchestration mechanics) entries (15 of 41 total)
 
-- 2026-09-17 — strict-checker-visible-pane: checker must run in a visible herdr pane when HERDR_ENV=1, no headless exceptions (`audit/flow/2026-09-17--strict-checker-visible-pane-checker-must-run-in-a-visible-herdr-pane-when-herdr.md`)
 - 2026-09-23 — kimi-k3-planner-swap: upgrade the plan-committee's Kimi planner slot from Kimi-K2-Thinking to Kimi K3 (`audit/flow/2026-09-23--kimi-k3-planner-swap-upgrade-the-plan-committee-s-kimi-planner-slot-from-kimi-k2.md`)
 - 2026-09-24 — audit-trail-restructure: restructure secondmate's audit trail into a lookup-only, generic mechanism (bin/audit-log.py) (`audit/flow/2026-09-24--audit-trail-restructure.md`)
 - 2026-09-24 — doctor-pi-model-overrides: bin/doctor.sh detects and heals AWS Bedrock model-metadata overrides (kimi-k3, deepseek-r1... (`audit/flow/2026-09-24--doctor-pi-model-overrides-bin-doctor-sh-detects-and-heals-aws-bedrock-model-meta.md`)
@@ -25,11 +24,11 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-28 — bin/launch-checker.sh: cd into --repo before invoking the harness (`audit/flow/2026-09-28--fix-checker-cwd.md`)
 - 2026-09-28 — plan-committee: give planners read-only repo tool access (`audit/flow/2026-09-28--planner-file-access.md`)
 - 2026-09-28 — Allow single-task delegation to a fresh sub-agent-supervisor (`audit/flow/2026-09-28--subagent-delegate.md`)
+- 2026-09-29 — claim-ledger.py: declared scope+operation claims + read-only conflicts check (stolen idea from foremerge) (`audit/flow/2026-09-29--claim-ledger-scope-conflict.md`)
 - 2026-09-29 — plan-committee: fix deepseek-r1 tool-use incompatibility + 3 rounds of leak-detection gaps (`audit/flow/2026-09-29--fix-planner-tools.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 38 total)
+## Recent decision (choices, findings, escalations) entries (15 of 39 total)
 
-- 2026-09-17 — strict-checker-visible-pane: checker must run in a visible herdr pane when HERDR_ENV=1, no headless exceptions (`audit/decision/2026-09-17--strict-checker-visible-pane-checker-must-run-in-a-visible-herdr-pane-when-herdr.md`)
 - 2026-09-23 — kimi-k3-planner-swap: upgrade the plan-committee's Kimi planner slot from Kimi-K2-Thinking to Kimi K3 (`audit/decision/2026-09-23--kimi-k3-planner-swap-upgrade-the-plan-committee-s-kimi-planner-slot-from-kimi-k2.md`)
 - 2026-09-24 — audit-trail-restructure: restructure secondmate's audit trail into a lookup-only, generic mechanism (bin/audit-log.py) (`audit/decision/2026-09-24--audit-trail-restructure.md`)
 - 2026-09-24 — doctor-pi-model-overrides: bin/doctor.sh detects and heals AWS Bedrock model-metadata overrides (kimi-k3, deepseek-r1) (`audit/decision/2026-09-24--doctor-pi-model-overrides-bin-doctor-sh-detects-and-heals-aws-bedrock-model-meta.md`)
@@ -43,4 +42,5 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-28 — Fix checker cwd at the primitive level, decline touching the documented recipe (`audit/decision/2026-09-28--fix-checker-cwd.md`)
 - 2026-09-28 — Reuse checker's --exclude-tools pattern, decline new sandbox machinery (`audit/decision/2026-09-28--planner-file-access.md`)
 - 2026-09-28 — Widen fan-out trigger to N=1, decline security/config over-engineering (`audit/decision/2026-09-28--subagent-delegate.md`)
+- 2026-09-29 — Ship declared-scope+operation mechanism only; decline foremerge's SQLite/MCP/HTTP machinery (`audit/decision/2026-09-29--claim-ledger-scope-conflict.md`)
 - 2026-09-29 — Data-driven per-slot tools mode; accept round-4 finding as documented residual limitation (`audit/decision/2026-09-29--fix-planner-tools.md`)
