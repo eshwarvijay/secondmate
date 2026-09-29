@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 45 total)
+## Recent flow (orchestration mechanics) entries (15 of 46 total)
 
-- 2026-09-24 — lesson-store: turn hardcoded "Known failure patterns" into a retrievable lesson store (`audit/flow/2026-09-24--lesson-store-turn-hardcoded-known-failure-patterns-into-a-retrievable-lesson-sto.md`)
 - 2026-09-24 — maker-restart-handoff: round-state.md structured handoff file (P1) + loop-guard.sh RESTART/exit-5 signal (P2) (`audit/flow/2026-09-24--maker-restart-handoff-round-state-md-structured-handoff-file-p1-loop-guard-sh-re.md`)
 - 2026-09-24 — pi-skill-discovery-sync: close pi-vs-Claude-Code skill discovery gap + harden doctor.sh heal-fix against symlink esca... (`audit/flow/2026-09-24--pi-skill-discovery-sync.md`)
 - 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/flow/2026-09-24--supervisor-mistake-lessons.md`)
@@ -24,12 +23,12 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-29 — progress-ledger.py: self-reported checkpoints + scheduled staleness detection for fan-out (Task A of 2) (`audit/flow/2026-09-29--fanout-liveness-watchdog.md`)
 - 2026-09-29 — plan-committee: fix deepseek-r1 tool-use incompatibility + 3 rounds of leak-detection gaps (`audit/flow/2026-09-29--fix-planner-tools.md`)
 - 2026-09-30 — batch-hold-scaling: extend consolidated batch hold to N=10 concurrent sub-supervisors (`audit/flow/2026-09-30--batch-hold-scaling.md`)
+- 2026-09-30 — dedupe-maker-prompt: consolidate 7 duplicate maker-prompt closing boilerplate sites in SKILL.md (`audit/flow/2026-09-30--dedupe-maker-prompt.md`)
 - 2026-09-30 — delegate-default-flip: flip secondmate's default so any triggered task dispatches to a fresh sub-agent-supervisor, ne... (`audit/flow/2026-09-30--delegate-default-flip.md`)
 - 2026-09-30 — session-staleness-check: wire doctor.sh's staleness detection into a SessionStart hook (`audit/flow/2026-09-30--session-staleness-check.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 43 total)
+## Recent decision (choices, findings, escalations) entries (15 of 44 total)
 
-- 2026-09-24 — lesson-store: turn hardcoded "Known failure patterns" into a retrievable lesson store (`audit/decision/2026-09-24--lesson-store-turn-hardcoded-known-failure-patterns-into-a-retrievable-lesson-sto.md`)
 - 2026-09-24 — maker-restart-handoff: round-state.md structured handoff file (P1) + loop-guard.sh RESTART/exit-5 signal (P2) (`audit/decision/2026-09-24--maker-restart-handoff-round-state-md-structured-handoff-file-p1-loop-guard-sh-re.md`)
 - 2026-09-24 — pi-skill-discovery-sync: close pi-vs-Claude-Code skill discovery gap + harden doctor.sh heal-fix against symlink esca... (`audit/decision/2026-09-24--pi-skill-discovery-sync.md`)
 - 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/decision/2026-09-24--supervisor-mistake-lessons.md`)
@@ -42,5 +41,6 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-29 — Self-reported checkpoint ledger, not dispatcher polling -- verified no polling primitive exists (`audit/decision/2026-09-29--fanout-liveness-watchdog.md`)
 - 2026-09-29 — Data-driven per-slot tools mode; accept round-4 finding as documented residual limitation (`audit/decision/2026-09-29--fix-planner-tools.md`)
 - 2026-09-30 — batch-hold-scaling: structural batch-id binding + verdict.py reuse; human-approved merge (`audit/decision/2026-09-30--batch-hold-scaling.md`)
+- 2026-09-30 — One canonical boilerplate block + 7 pointers; fixed direction wording and byte-fidelity drift on checker fail (`audit/decision/2026-09-30--dedupe-maker-prompt.md`)
 - 2026-09-30 — Fold fan-out into the standard path; fix a real HERDR_ENV-conditional spawn bug the checker caught in round 1 (`audit/decision/2026-09-30--delegate-default-flip.md`)
 - 2026-09-30 — Advisory-only SessionStart staleness surfacing; reuse doctor.sh detection unchanged (`audit/decision/2026-09-30--session-staleness-check.md`)
