@@ -154,7 +154,7 @@ _TOKEN_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 # declared without an operation" is unrepresentable instead of needing an extra validation branch.
 # KIND:KEY is free text like --owner (exact case-sensitive match only, never normalized/fuzzy-matched);
 # OPERATION is validated against the closed ADDITIVE/DESTRUCTIVE enum below, not by this regex.
-_SCOPE_RE = re.compile(r"\A(?P<scope>[^\s=]+:[^\s=]+)=(?P<operation>[A-Za-z]+)\Z")
+_SCOPE_RE = re.compile(r"\A(?P<scope>[^=]+:[^=]+)=(?P<operation>[A-Za-z]+)\Z")
 
 ADDITIVE = {"add", "extend", "modify"}
 DESTRUCTIVE = {"replace", "remove", "rename", "migrate"}
@@ -402,6 +402,19 @@ def _selfcheck_live():
             code, _, _ = _run(["claim", "--task-id", "badscope", "--owner", "agent-b",
                                 "--scope", bad_scope])
             assert code != 0, f"invalid --scope {bad_scope!r} must be rejected"
+
+        # regression: scope's KIND:KEY portion is free text like --owner -- no new sanitization beyond
+        # what json.dumps already provides, so whitespace inside it must NOT be rejected.
+        code, out, _ = _run(["claim", "--task-id", "white", "--owner", "a",
+                              "--scope", "symbol:Has Space=add"])
+        assert code == 0, "a --scope value with whitespace in KIND:KEY must be accepted, not rejected"
+        assert open_claims()["white"]["scope"] == "symbol:Has Space", (
+            "the whitespace-containing scope must be stored verbatim")
+        code, out, _ = _run(["status"])
+        assert "scope=symbol:Has Space op=add" in out, (
+            "status must render a whitespace-containing scope verbatim")
+        code, out, exc = _run(["conflicts", "--scope", "symbol:Has Space=remove"])
+        assert exc == 1, "conflicts must exact-match a whitespace-containing scope"
 
         # TOCTOU guard, forced via a GENUINE concurrent race (not a pre-written ledger line the steal
         # call then just reads normally -- that proves nothing, since nothing else is running while it
