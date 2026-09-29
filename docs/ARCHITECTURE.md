@@ -503,7 +503,8 @@ aborting with `SM_REFUSED:claim-failed` on failure); derives every downstream na
 the task-id using this repo's existing convention (`sm/<task-id>` branch, `sm-<task-id>`/`sm-pi-<task-id>`
 agent name, `root_pane` from `herdr worktree create`); runs the existing solo SOP completely untouched,
 recording a `progress-ledger.py record` checkpoint (`claimed` right after the claim, `maker_started`,
-`checker_round` per round, terminal `verify_gate_pass` with `--checked-sha`) at each of those points;
+`checker_round` per round, terminal `verify_gate_pass` — expected, but not enforced by the script itself,
+to also carry `--checked-sha`) at each of those points;
 once verify-gate has passed, opens its own `hold.py hold` entry for the merge decision and waits for a
 genuine human answer (never assuming, never auto-answering, never deferring that judgment to the
 dispatcher) — matching the existing single-task loop's Gate → Hold → Integrate contract exactly; only

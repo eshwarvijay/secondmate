@@ -345,9 +345,11 @@ c. **Run the existing solo secondmate SOP completely untouched, recording three 
    - `--phase maker_started` immediately after its maker begins running.
    - `--phase checker_round` immediately after each checker round completes (once per round — the
      timestamp alone is what a poller checks, no round number needed).
-   - `--phase verify_gate_pass` once verify-gate has passed, ALSO carrying
-     `--checked-sha <checked-sha>` — the terminal checkpoint. A sub-supervisor that never reaches this
-     phase is exactly the case the staleness watchdog below exists to catch.
+   - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint. Also pass
+     `--checked-sha <checked-sha>` here in normal fan-out usage (a later batch-close consumer reads it off
+     this exact row), but `progress-ledger.py` itself never enforces it — `--checked-sha` is optional at
+     the CLI level, expected but not required in this SOP's own usage. A sub-supervisor that never reaches
+     this phase is exactly the case the staleness watchdog below exists to catch.
 
 d. **Open its own `bin/hold.py hold --task <task-id> --q "..." --sha <checked-sha>` entry for the merge
    decision once verify-gate has passed, and WAIT for a genuine human answer** — never assume, never

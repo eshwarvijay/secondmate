@@ -122,6 +122,20 @@ def _valid_phase(phase):
     return isinstance(phase, str) and bool(_PHASE_RE.match(phase))
 
 
+def _valid_ts(ts):
+    # a "ts" that isn't a string in this script's own written shape can never be folded into an epoch by
+    # _ts_to_epoch (stale would otherwise crash on time.strptime's ValueError) -- same posture as
+    # claim-ledger.py treating a non-token-shaped "token" as malformed rather than a valid open claim: a
+    # row this script itself could never have produced is corruption, not a checkpoint.
+    if not isinstance(ts, str):
+        return False
+    try:
+        time.strptime(ts, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return False
+    return True
+
+
 def _recs():
     # tolerant parse: skip malformed/incomplete lines but COUNT them (same discipline as hold.py /
     # claim-ledger.py), so `latest`/`stale` warn instead of a partial write silently hiding a checkpoint.
@@ -139,7 +153,7 @@ def _recs():
             _BAD += 1; continue
         valid = (isinstance(o, dict) and o.get("ev") == "progress"
                  and isinstance(o.get("task_id"), str) and isinstance(o.get("owner"), str)
-                 and isinstance(o.get("phase"), str) and isinstance(o.get("ts"), str))
+                 and isinstance(o.get("phase"), str) and _valid_ts(o.get("ts")))
         if valid:
             recs.append(o)
         else:
@@ -266,6 +280,22 @@ def _selfcheck_live():
         assert '"task_id": "old"' in out and '"status": "stale"' in out and '"phase": "claimed"' in out
         code, out, exc = _run(["stale", "--threshold-seconds", "36000", "--task-id", "old"])
         assert exc == 0 and out == "", "the same checkpoint must NOT be stale against a huge threshold"
+
+        # regression: a row with an unparseable "ts" (e.g. hand-corrupted, or a future format-change bug)
+        # must NOT crash `stale` -- it must be treated as malformed/excluded, same as any other corrupt
+        # row, so the task-id it belongs to folds to "no progress recorded" rather than an uncaught
+        # exception silently disabling the dispatcher's only staleness signal.
+        bad_before = _BAD
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"ev": "progress", "task_id": "badts", "owner": "o", "phase": "claimed",
+                                 "ts": "bogus"}) + "\n")
+        assert "badts" not in latest_by_task(), "a row with an unparseable ts must not fold into latest"
+        code, out, exc = _run(["stale", "--threshold-seconds", "1", "--task-id", "badts"])
+        assert exc == 1, "stale must not crash on an unparseable ts -- it must report the task-id instead"
+        assert '"task_id": "badts"' in out and '"status": "no_progress_recorded"' in out, (
+            "a task-id whose only row has an unparseable ts must be reported no_progress_recorded")
+        _recs()  # refresh _BAD as a side effect
+        assert _BAD > bad_before, "an unparseable-ts row must be counted as malformed (_BAD)"
 
         # stale with no --task-id at all considers every task-id ever seen in the ledger.
         code, out, exc = _run(["stale", "--threshold-seconds", "60"])
