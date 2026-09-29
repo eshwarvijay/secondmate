@@ -194,6 +194,28 @@ def latest_by_task(recs=None):
     return latest
 
 
+def _all_task_ids():
+    """Every task_id ever mentioned in a progress row, scanned directly and defensively -- even from a
+    row that fails _recs()'s stricter validation (e.g. an unparseable ts). Used only to build the
+    candidate set for a whole-ledger `stale` scan (no --task-id given): without this, a task-id whose
+    ONLY checkpoint is corrupted would be invisible to latest_by_task's fold and silently vanish from
+    the watchdog's view instead of surfacing as no_progress_recorded, exactly the false-negative a
+    staleness watchdog exists to avoid."""
+    ids = set()
+    if not LEDGER.exists():
+        return ids
+    for line in LEDGER.read_text(errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(o, dict) and o.get("ev") == "progress" and isinstance(o.get("task_id"), str):
+            ids.add(o["task_id"])
+    return ids
+
+
 def _ts_to_epoch(ts):
     # ts is always written by this script's own time.strftime("%Y-%m-%dT%H:%M:%S") (local time, matching
     # claim-ledger.py/hold.py) -- parse it back with the same local-time interpretation via mktime.
@@ -297,10 +319,15 @@ def _selfcheck_live():
         _recs()  # refresh _BAD as a side effect
         assert _BAD > bad_before, "an unparseable-ts row must be counted as malformed (_BAD)"
 
-        # stale with no --task-id at all considers every task-id ever seen in the ledger.
+        # stale with no --task-id at all considers every task-id ever seen in the ledger -- INCLUDING one
+        # whose only row failed the ts-shape fold above ("badts"), which must still surface as
+        # no_progress_recorded rather than silently vanish from a whole-ledger scan just because its one
+        # row never made it into latest_by_task.
         code, out, exc = _run(["stale", "--threshold-seconds", "60"])
         assert exc == 1 and '"task_id": "old"' in out and '"task_id": "t1"' not in out, (
             "omitting --task-id must scan every known task-id, reporting only the actually-stale ones")
+        assert '"task_id": "badts", "status": "no_progress_recorded"' in out, (
+            "a whole-ledger scan must still report a task-id whose only row failed ts validation")
 
         # `stale` never appends -- it's read-only, like claim-ledger.py's own `conflicts`.
         pre_len = len(_recs())
@@ -312,6 +339,30 @@ def _selfcheck_live():
             f.write("not json at all\n")
         code, out, _ = _run(["latest"])
         assert code == 0 and "malformed" in out.lower(), "latest must surface malformed-line corruption"
+    finally:
+        LEDGER = orig_ledger
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _selfcheck_stale_scan_sees_corrupted_only_task():
+    # Round-2 regression, isolated: a ledger containing ONLY a malformed-ts row for some task-id (no
+    # other row, valid or otherwise, for anything) must still surface that task-id as
+    # no_progress_recorded on a whole-ledger `stale` scan (no --task-id given) -- not exit 0/silent. The
+    # earlier bug derived the whole-ledger candidate set from latest_by_task's keys alone, which excludes
+    # any row that failed the ts-shape fold, so a task-id whose ONLY checkpoint was corrupted vanished
+    # from the watchdog's view entirely instead of surfacing as needing attention.
+    global LEDGER
+    orig_ledger = LEDGER
+    tmpdir = tempfile.mkdtemp(prefix="progress-ledger-selfcheck-corrupt-only-")
+    LEDGER = pathlib.Path(tmpdir) / "progress.jsonl"
+    try:
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"ev": "progress", "task_id": "badts", "owner": "o", "phase": "claimed",
+                                 "ts": "bogus"}) + "\n")
+        code, out, exc = _run(["stale", "--threshold-seconds", "1"])
+        assert exc == 1, "a ledger with only a malformed-ts row must not exit 0 on a whole-ledger scan"
+        assert '"task_id": "badts"' in out and '"status": "no_progress_recorded"' in out, (
+            "the corrupted-only task-id must be reported no_progress_recorded, not silently dropped")
     finally:
         LEDGER = orig_ledger
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -406,7 +457,7 @@ def main(argv):
     elif args.cmd == "stale":
         # read-only, no lock -- same lock-free precedent as claim-ledger.py's own `conflicts`.
         latest = latest_by_task()
-        task_ids = args.task_id if args.task_id is not None else sorted(latest.keys())
+        task_ids = args.task_id if args.task_id is not None else sorted(_all_task_ids())
         now = time.time()
         hits = []
         for task_id in task_ids:
@@ -435,6 +486,7 @@ def main(argv):
         assert _valid_phase(TERMINAL_PHASE) and not _valid_phase("") and not _valid_phase("bad phase"), (
             "phase validation broken")
         _selfcheck_live()
+        _selfcheck_stale_scan_sees_corrupted_only_task()
         _selfcheck_default_ledger_path()
         print("ok")
 
