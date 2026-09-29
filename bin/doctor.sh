@@ -4,6 +4,7 @@
 #   doctor.sh            # report; exit 0 only if CORE + a checker harness are present
 #   doctor.sh --json     # machine-readable status (consumed by /secondmate-doctor)
 #   doctor.sh --heal [--yes]   # install each missing item that has a known fix (confirm each unless --yes)
+#   doctor.sh --staleness-json # {"status":...,"details":...} for the secondmate plugin only (consumed by session-staleness.sh)
 #   doctor.sh --selfcheck
 #
 # Maintainer: the COMPANIONS block below is the one place to edit when you distribute your own
@@ -612,6 +613,15 @@ _detect_secondmate_staleness() {
       ;;
   esac
 }
+
+# Machine-readable staleness-only output for other callers (e.g. a SessionStart hook) that just
+# want the status/details _detect_secondmate_status already computes, without pulling in
+# detect()/emit_table()/heal(). Exits immediately so this stays a cheap, single-purpose call.
+if [ "${1:-}" = "--staleness-json" ]; then
+  _detect_secondmate_status
+  python3 -c "import json,sys; print(json.dumps({'status': sys.argv[1], 'details': sys.argv[2]}))" "$_sm_status" "$_sm_details"
+  exit 0
+fi
 
 # Lock mechanism for heal operations (mkdir-based atomic lock)
 # Returns 0 if lock acquired or stolen, 1 if in-use or timeout
