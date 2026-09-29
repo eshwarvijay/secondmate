@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 42 total)
+## Recent flow (orchestration mechanics) entries (15 of 43 total)
 
-- 2026-09-24 — audit-trail-restructure: restructure secondmate's audit trail into a lookup-only, generic mechanism (bin/audit-log.py) (`audit/flow/2026-09-24--audit-trail-restructure.md`)
 - 2026-09-24 — doctor-pi-model-overrides: bin/doctor.sh detects and heals AWS Bedrock model-metadata overrides (kimi-k3, deepseek-r1... (`audit/flow/2026-09-24--doctor-pi-model-overrides-bin-doctor-sh-detects-and-heals-aws-bedrock-model-meta.md`)
 - 2026-09-24 — git-coordinator: bounded push-race recovery (P1) + read-only preflight check (P2) for bin/merge-sequencer.sh (`audit/flow/2026-09-24--git-coordinator-bounded-push-race-recovery-p1-read-only-preflight-check-p2-for-b.md`)
 - 2026-09-24 — lesson-store: turn hardcoded "Known failure patterns" into a retrievable lesson store (`audit/flow/2026-09-24--lesson-store-turn-hardcoded-known-failure-patterns-into-a-retrievable-lesson-sto.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-29 — claim-ledger.py: declared scope+operation claims + read-only conflicts check (stolen idea from foremerge) (`audit/flow/2026-09-29--claim-ledger-scope-conflict.md`)
 - 2026-09-29 — progress-ledger.py: self-reported checkpoints + scheduled staleness detection for fan-out (Task A of 2) (`audit/flow/2026-09-29--fanout-liveness-watchdog.md`)
 - 2026-09-29 — plan-committee: fix deepseek-r1 tool-use incompatibility + 3 rounds of leak-detection gaps (`audit/flow/2026-09-29--fix-planner-tools.md`)
+- 2026-09-30 — batch-hold-scaling: extend consolidated batch hold to N=10 concurrent sub-supervisors (`audit/flow/2026-09-30--batch-hold-scaling.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 40 total)
+## Recent decision (choices, findings, escalations) entries (15 of 41 total)
 
-- 2026-09-24 — audit-trail-restructure: restructure secondmate's audit trail into a lookup-only, generic mechanism (bin/audit-log.py) (`audit/decision/2026-09-24--audit-trail-restructure.md`)
 - 2026-09-24 — doctor-pi-model-overrides: bin/doctor.sh detects and heals AWS Bedrock model-metadata overrides (kimi-k3, deepseek-r1) (`audit/decision/2026-09-24--doctor-pi-model-overrides-bin-doctor-sh-detects-and-heals-aws-bedrock-model-meta.md`)
 - 2026-09-24 — git-coordinator: bounded push-race recovery (P1) + read-only preflight check (P2) (`audit/decision/2026-09-24--git-coordinator-bounded-push-race-recovery-p1-read-only-preflight-check-p2.md`)
 - 2026-09-24 — lesson-store: turn hardcoded "Known failure patterns" into a retrievable lesson store (`audit/decision/2026-09-24--lesson-store-turn-hardcoded-known-failure-patterns-into-a-retrievable-lesson-sto.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-29 — Ship declared-scope+operation mechanism only; decline foremerge's SQLite/MCP/HTTP machinery (`audit/decision/2026-09-29--claim-ledger-scope-conflict.md`)
 - 2026-09-29 — Self-reported checkpoint ledger, not dispatcher polling -- verified no polling primitive exists (`audit/decision/2026-09-29--fanout-liveness-watchdog.md`)
 - 2026-09-29 — Data-driven per-slot tools mode; accept round-4 finding as documented residual limitation (`audit/decision/2026-09-29--fix-planner-tools.md`)
+- 2026-09-30 — batch-hold-scaling: structural batch-id binding + verdict.py reuse; human-approved merge (`audit/decision/2026-09-30--batch-hold-scaling.md`)
