@@ -415,11 +415,15 @@ e. **Collect ready task-ids, ledger-driven, never from your own in-memory batch 
    `--batch-id` is the correlation key from the mint-once-per-batch step above — without it, `ready` would
    report EVERY task-id anywhere at `verify_gate_pass`, including an unrelated batch's or a single-task-
    delegation trigger (A) task's own ready row that just happens to be sitting there awaiting its own
-   individual hold; filtering by `--batch-id` is what keeps this batch's consolidated hold from ever
-   folding in something that was never part of it. This is also why batch-close survives a dispatcher
-   restart/crash mid-batch: nothing about "which task-ids are ready, for THIS batch" lives only in this
-   conversation's memory — a dispatcher that comes back after a crash need only remember (or re-derive)
-   the same `<batch-id>` label to reconstruct the exact same set. Cross-check against
+   individual hold; filtering by `--batch-id` is what keeps this batch's consolidated hold from folding in
+   a task-id that was never part of it, AS LONG AS that task-id's own batch-id binding is internally
+   consistent (see the mint-once-per-batch step's own honest caveat above — this is NOT a distributed-
+   uniqueness guarantee against two independent dispatchers coincidentally picking the same `<batch-id>`
+   for two genuinely different, freshly-claimed task-ids; UUID minting makes that practically negligible,
+   not structurally impossible). This is also why batch-close survives a dispatcher restart/crash
+   mid-batch: nothing about "which task-ids are ready, for THIS batch" lives only in this conversation's
+   memory — a dispatcher that comes back after a crash need only remember (or re-derive) the same
+   `<batch-id>` label to reconstruct that same set (subject to the same honest caveat). Cross-check against
    `bin/claim-ledger.py status`'s own currently-OPEN claims too — anything already merged and released
    from a prior round of this same batch drops out on its own, since its claim is gone.
 
