@@ -29,16 +29,23 @@ the exact code state the human was shown, not silently reattached to whatever st
 
 Batch holds -- for a batch dispatcher fanning out to several concurrent sub-supervisors (see SKILL.md's
 fan-out section): ONE genuine human decision per batch, not one per task-id. `--entries-file PATH` points
-at a JSON file: a list of {"task_id": ..., "checked_sha": ..., "checker_verdict_path": ...}. Each entry's
-own `checked_sha` is carried in the hold record exactly like today's single-task `--sha` (this is an
-EXTENSION of the schema, not a replacement -- a human explicitly chose to keep the existing 1:1
-task-id:checked-sha anti-reattach binding, just per-entry instead of per-hold). For each entry, hold.py
-itself derives a one-line digest FROM that entry's own `checker_verdict_path` (never typed fresh by
-whoever opens the hold, so the human's summary is provably sourced from the real verdict, never a
-paraphrase) -- the verdict word (pass/fail/error/refused) plus a findings count, read directly off the
-checker's own documented envelope contract (bin/checker-envelope.md's fenced ```json {"verdict":...,
-"findings":[...]} block). If a `checker_verdict_path` can't be read or parsed, the digest says so
-explicitly (`verdict=UNKNOWN (could not parse ...)`) rather than silently omitting it.
+at a JSON file: a list of {"task_id": ..., "checked_sha": ..., "checker_verdict_path": ...}, capped at
+10 entries (the same hard, non-tunable N=10 concurrent-batch cap SKILL.md's fan-out section enforces).
+Each entry's own `checked_sha` is carried in the hold record exactly like today's single-task `--sha`
+(this is an EXTENSION of the schema, not a replacement -- a human explicitly chose to keep the existing
+1:1 task-id:checked-sha anti-reattach binding, just per-entry instead of per-hold). Every entry's
+`checker_verdict_path` MUST point at a real, readable, parseable verdict envelope -- a missing path, an
+unreadable file, or one that doesn't contain the checker's documented envelope contract rejects the WHOLE
+`hold` call (nonzero exit, no ledger write) rather than opening a hold with a placeholder digest behind
+it; a human must never be able to approve/merge an entry with no real verdict artifact behind its
+summary. For each entry, hold.py itself derives a one-line digest FROM that entry's own real, parsed
+`checker_verdict_path` (never typed fresh by whoever opens the hold, so the human's summary is provably
+sourced from the real verdict, never a paraphrase) -- more than a bare pass/fail + count: the verdict
+word, the findings count, the distinct set of files those findings actually flagged (a faithful
+blast-radius proxy -- the envelope has no explicit "blast radius" field, but the files its own findings
+touch is the closest real signal it carries), and `lens_coverage` (the closest thing the envelope has to
+a category/tag concept) -- everything read directly off the checker's own documented envelope contract
+(bin/checker-envelope.md's fenced ```json {"verdict":..., "findings":[...], "lens_coverage":{...}} block).
 
 `answer`ing a batch hold is likewise structured, matching dispatch-report.py's own anti-prose-parsing
 philosophy: `--approve`/`--reject` are each a comma-separated list of task-ids, and together they must
@@ -138,24 +145,44 @@ def _extract_verdict_envelope(text):
     return None
 
 
-def _verdict_digest(task_id, checker_verdict_path):
-    """One-line, machine-derived digest for a batch-hold entry, built FROM checker_verdict_path's own
-    content -- never typed fresh by whoever opens the hold. Always succeeds (never raises): an
-    unreadable or unparseable path renders an explicit UNKNOWN digest instead of silently omitting the
-    entry, matching this file's own fail-loud-not-silent convention elsewhere (_BAD warnings, etc)."""
-    if not checker_verdict_path:
-        return f"{task_id}: verdict=UNKNOWN (no checker_verdict_path supplied)"
-    try:
-        text = pathlib.Path(checker_verdict_path).read_text(errors="replace")
-    except OSError as e:
-        return f"{task_id}: verdict=UNKNOWN (could not read checker_verdict_path {checker_verdict_path!r}: {e})"
-    envelope = _extract_verdict_envelope(text)
-    if envelope is None:
-        return f"{task_id}: verdict=UNKNOWN (could not parse a verdict envelope out of {checker_verdict_path!r})"
+def _distinct_finding_files(findings):
+    """Distinct file paths referenced by a checker's own findings list (its own documented `file:line`
+    tokens, per bin/checker-envelope.md) -- a faithful blast-radius proxy sourced directly from the real
+    envelope, never invented: the envelope format has no explicit "blast radius" field, but the SET OF
+    FILES its findings actually touch is the closest real signal it does carry. Same path-vs-URL
+    exclusion as verdict.py's own `_finding_has_location` (a candidate starting with '//' is a URL
+    host:port, not a path)."""
+    files = set()
+    if not isinstance(findings, list):
+        return files
+    for f in findings:
+        if not isinstance(f, str):
+            continue
+        for m in re.finditer(r'([^\s:]+):\d+', f):
+            path = m.group(1)
+            if path.startswith("//"):
+                continue  # URL host:port, not a file path
+            files.add(path)
+    return files
+
+
+def _build_digest(task_id, envelope):
+    """Pure formatting of an ALREADY-PARSED, ALREADY-VALIDATED verdict envelope dict into one line --
+    never fails, never touches a file (reading/parsing happens earlier in `hold`'s own --entries-file
+    validation, where a failure there must reject the WHOLE hold call, never render a placeholder
+    digest for a missing/unparseable verdict -- see that call site). Deliberately richer than a bare
+    pass/fail + count: surfaces `lens_coverage` (the closest thing this envelope format has to a
+    category/tag concept -- which lenses the checker itself reports having exercised) and the distinct
+    set of files its own findings flagged (the blast-radius proxy from `_distinct_finding_files` above)
+    -- both read directly off the real envelope, never invented."""
     verdict = envelope.get("verdict", "UNKNOWN")
     findings = envelope.get("findings")
-    n = len(findings) if isinstance(findings, list) else "?"
-    return f"{task_id}: verdict={verdict} findings={n}"
+    n = len(findings) if isinstance(findings, list) else 0
+    files = _distinct_finding_files(findings)
+    lens_coverage = envelope.get("lens_coverage")
+    lenses = sorted(lens_coverage.keys()) if isinstance(lens_coverage, dict) else []
+    return (f"{task_id}: verdict={verdict} findings={n} files={len(files)} "
+            f"lenses={','.join(lenses) if lenses else 'none'}")
 
 
 def _append(rec):
@@ -188,6 +215,17 @@ def _mkid(task, q, ts, sha=""):
     # sha (if given) is folded into the hash too, so the id itself is bound to that state, not just
     # carried as separate metadata that could be silently ignored.
     return hashlib.sha1(f"{task}{q}{ts}{sha}{os.urandom(4).hex()}".encode()).hexdigest()[:8]
+
+
+def _dupes(items):
+    """Items appearing more than once in `items`, preserving nothing about order -- used to reject a
+    batch answer's --approve/--reject lists outright rather than silently deduping them via a set."""
+    seen = set(); dupes = set()
+    for i in items:
+        if i in seen:
+            dupes.add(i)
+        seen.add(i)
+    return dupes
 
 
 def _oldest_open(recs=None):
@@ -285,15 +323,85 @@ def _selfcheck_live():
         assert "sha" not in brec, "a batch hold must not carry a single top-level sha"
         assert len(brec["batch"]) == 2, "batch hold must carry both entries"
         digest_by_task = {e["task_id"]: e["digest"] for e in brec["batch"]}
-        assert digest_by_task["batch-a"] == "batch-a: verdict=pass findings=0", (
+        assert digest_by_task["batch-a"] == "batch-a: verdict=pass findings=0 files=0 lenses=none", (
             f"digest must be machine-derived from the real verdict envelope, got {digest_by_task['batch-a']!r}")
-        assert digest_by_task["batch-b"] == "batch-b: verdict=fail findings=2", (
-            f"digest must reflect the real findings count, got {digest_by_task['batch-b']!r}")
+        assert digest_by_task["batch-b"] == "batch-b: verdict=fail findings=2 files=2 lenses=none", (
+            f"digest must reflect the real findings count and the distinct files those findings flagged "
+            f"(blast-radius proxy), got {digest_by_task['batch-b']!r}")
+
+        # a digest with lens_coverage present must surface those lenses -- the closest thing the envelope
+        # format has to a category/tag concept -- proving the digest is demonstrably richer than a bare
+        # pass/fail + count, not just a differently-worded bare count.
+        v_lens = vdir / "lens.out"
+        v_lens.write_text("```json\n" +
+                           '{"verdict":"fail","findings":["x.py:5 issue"],'
+                           '"lens_coverage":{"risk-flagging":true,"qa/coverage":true}}' + "\n```\n")
+        entries_lens = pathlib.Path(tmpdir) / "entries_lens.json"
+        entries_lens.write_text(json.dumps([
+            {"task_id": "batch-lens", "checked_sha": "sha-lens", "checker_verdict_path": str(v_lens)},
+        ]))
+        code, bdid_lens, _ = _run(["hold", "--task", "batch-lens-1", "--q", "merge?",
+                                    "--entries-file", str(entries_lens)])
+        assert code == 0
+        brec_lens = next(r for r in _recs() if r["ev"] == "hold" and r["id"] == bdid_lens)
+        assert brec_lens["batch"][0]["digest"] == (
+            "batch-lens: verdict=fail findings=1 files=1 lenses=qa/coverage,risk-flagging"), (
+            f"digest must surface lens_coverage's own lens names, got {brec_lens['batch'][0]['digest']!r}")
 
         # --entries-file and --sha are mutually exclusive.
         code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--sha", "x",
                               "--entries-file", str(entries_file)])
         assert code != 0, "--entries-file and --sha together must be rejected"
+
+        # a batch entry with NO checker_verdict_path must reject the WHOLE hold call -- no ledger write,
+        # never a placeholder "UNKNOWN" digest. A human must never be able to approve/merge an entry with
+        # no real verdict artifact behind its digest.
+        entries_missing = pathlib.Path(tmpdir) / "entries_missing.json"
+        entries_missing.write_text(json.dumps([
+            {"task_id": "batch-nopath", "checked_sha": "sha-x"},
+        ]))
+        pre_len = len(_recs())
+        code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--entries-file", str(entries_missing)])
+        assert code != 0, "a batch entry with no checker_verdict_path must be rejected"
+        assert len(_recs()) == pre_len, "a rejected --entries-file hold must not append any record"
+
+        # a checker_verdict_path that doesn't exist on disk must also reject the whole call.
+        entries_unreadable = pathlib.Path(tmpdir) / "entries_unreadable.json"
+        entries_unreadable.write_text(json.dumps([
+            {"task_id": "batch-noread", "checked_sha": "sha-x",
+             "checker_verdict_path": str(vdir / "does-not-exist.out")},
+        ]))
+        pre_len = len(_recs())
+        code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--entries-file", str(entries_unreadable)])
+        assert code != 0, "an unreadable checker_verdict_path must be rejected"
+        assert len(_recs()) == pre_len, "a rejected --entries-file hold must not append any record"
+
+        # a checker_verdict_path whose content has no parseable verdict envelope must also reject the
+        # whole call -- never render a placeholder "UNKNOWN" digest and open the hold anyway.
+        v_bad = vdir / "unparseable.out"
+        v_bad.write_text("no envelope here at all, just prose\n")
+        entries_unparseable = pathlib.Path(tmpdir) / "entries_unparseable.json"
+        entries_unparseable.write_text(json.dumps([
+            {"task_id": "batch-c", "checked_sha": "sha-c", "checker_verdict_path": str(v_bad)},
+        ]))
+        pre_len = len(_recs())
+        code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--entries-file", str(entries_unparseable)])
+        assert code != 0, "an unparseable checker_verdict_path must be rejected, never open a hold anyway"
+        assert len(_recs()) == pre_len, "a rejected --entries-file hold must not append any record"
+
+        # the hard, non-tunable N=10 concurrent-batch cap: 11 OTHERWISE-FULLY-VALID entries (real
+        # checked_sha, real parseable checker_verdict_path each) must still be rejected outright -- every
+        # entry here would individually pass every other validation, isolating the cap itself as the
+        # only thing that can reject this batch (a weaker fixture with e.g. missing checker_verdict_path
+        # would be rejected for the wrong reason even with the cap check removed entirely).
+        entries_toomany = pathlib.Path(tmpdir) / "entries_toomany.json"
+        entries_toomany.write_text(json.dumps(
+            [{"task_id": f"cap-{i}", "checked_sha": "sha-x", "checker_verdict_path": str(v_pass)}
+             for i in range(11)]))
+        pre_len = len(_recs())
+        code, _, exc = _run(["hold", "--task", "t", "--q", "q", "--entries-file", str(entries_toomany)])
+        assert code != 0, "an --entries-file batch of 11 otherwise-valid entries must be rejected (N=10 hard cap)"
+        assert len(_recs()) == pre_len, "a rejected over-cap --entries-file hold must not append any record"
 
         # a batch hold cannot be answered with --a.
         pre_len = len(_recs())
@@ -314,6 +422,15 @@ def _selfcheck_live():
         code, _, exc = _run(["answer", bdid, "--approve", "batch-a,batch-b", "--reject", "batch-a"])
         assert code != 0, "a task-id classified in both --approve and --reject must be rejected"
 
+        # a DUPLICATE task-id WITHIN a single --approve (or --reject) list must be rejected outright --
+        # never silently deduped via a set, which would corrupt an otherwise-auditable classification.
+        code, _, exc = _run(["answer", bdid, "--approve", "batch-a,batch-a", "--reject", "batch-b"])
+        assert code != 0, "a duplicate task-id within --approve must be rejected"
+        assert "batch-a" in str(exc), "the rejection should name the duplicated task-id"
+        code, _, exc = _run(["answer", bdid, "--approve", "batch-a", "--reject", "batch-b,batch-b"])
+        assert code != 0, "a duplicate task-id within --reject must be rejected"
+        assert "batch-b" in str(exc), "the rejection should name the duplicated task-id"
+
         # the real, complete classification succeeds and records structured approved/rejected lists.
         code, out, _ = _run(["answer", bdid, "--approve", "batch-a", "--reject", "batch-b"])
         assert code == 0, "a complete, non-overlapping batch classification must succeed"
@@ -329,24 +446,10 @@ def _selfcheck_live():
         code, _, exc = _run(["answer", did4, "--approve", "whatever"])
         assert code != 0, "a single-task hold must reject --approve/--reject"
 
-        # a batch hold's own digest must be honest when the checker-verdict-path can't be parsed at all
-        # (never silently omitted).
-        v_bad = vdir / "unparseable.out"
-        v_bad.write_text("no envelope here at all, just prose\n")
-        entries_file2 = pathlib.Path(tmpdir) / "entries2.json"
-        entries_file2.write_text(json.dumps([
-            {"task_id": "batch-c", "checked_sha": "sha-c", "checker_verdict_path": str(v_bad)},
-        ]))
-        code, bdid2, _ = _run(["hold", "--task", "batch-2", "--q", "merge?",
-                                "--entries-file", str(entries_file2)])
-        assert code == 0
-        brec2 = next(r for r in _recs() if r["ev"] == "hold" and r["id"] == bdid2)
-        assert "UNKNOWN" in brec2["batch"][0]["digest"], (
-            "an unparseable checker-verdict-path must render an explicit UNKNOWN digest, never a blank one")
-
-        # `open` must render batch entries (task-id, checked_sha, digest), not just the top-level question.
+        # `open` must render a batch hold's per-task-id entries (task-id, checked_sha, digest), not just
+        # its top-level question.
         code, out, _ = _run(["open"])
-        assert "batch-c" in out and "sha-c" in out and "UNKNOWN" in out, (
+        assert "batch-lens" in out and "sha-lens" in out and "qa/coverage" in out, (
             "open must surface a batch hold's per-task-id entries, not just its top-level question")
     finally:
         LEDGER = orig_ledger
@@ -373,6 +476,9 @@ def main(argv):
                 sys.exit(f"--entries-file {args.entries_file!r} could not be read/parsed as JSON: {e}")
             if not isinstance(raw, list) or not raw:
                 sys.exit(f"--entries-file {args.entries_file!r} must contain a non-empty JSON list of entries")
+            if len(raw) > 10:
+                sys.exit(f"--entries-file has {len(raw)} entries, exceeding the hard, non-tunable "
+                          f"N=10 concurrent-batch cap")
             batch = []
             seen_ids = set()
             for i, entry in enumerate(raw):
@@ -387,7 +493,25 @@ def main(argv):
                 csha = entry.get("checked_sha")
                 if not csha or not isinstance(csha, str):
                     sys.exit(f"--entries-file entry for task_id {tid!r} is missing a non-empty checked_sha")
-                digest = _verdict_digest(tid, entry.get("checker_verdict_path"))
+                # every batch entry MUST have a real, parseable verdict artifact behind its digest -- a
+                # human must never be able to approve/merge an entry whose digest was never actually
+                # sourced from anything (see _build_digest's own docstring for why this validation lives
+                # HERE, before any ledger write, rather than inside a "never fails" digest builder).
+                cvp = entry.get("checker_verdict_path")
+                if not cvp or not isinstance(cvp, str):
+                    sys.exit(f"--entries-file entry for task_id {tid!r} is missing a checker_verdict_path "
+                              f"-- every batch entry must have a real verdict artifact behind its digest")
+                try:
+                    text = pathlib.Path(cvp).read_text(errors="replace")
+                except OSError as e:
+                    sys.exit(f"--entries-file entry for task_id {tid!r}: checker_verdict_path {cvp!r} "
+                              f"could not be read: {e}")
+                envelope = _extract_verdict_envelope(text)
+                if envelope is None:
+                    sys.exit(f"--entries-file entry for task_id {tid!r}: checker_verdict_path {cvp!r} "
+                              f"does not contain a parseable verdict envelope -- refusing to open a hold "
+                              f"with no real verdict behind it")
+                digest = _build_digest(tid, envelope)
                 batch.append({"task_id": tid, "checked_sha": csha, "digest": digest})
         with _ledger_lock():
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -419,8 +543,21 @@ def main(argv):
                 if args.sha:
                     sys.exit(f"decision {args.id} is a consolidated BATCH hold -- it has no single "
                               f"top-level sha to match (each entry already carries its own checked_sha)")
-                approve_ids = {t for t in (args.approve or "").split(",") if t}
-                reject_ids = {t for t in (args.reject or "").split(",") if t}
+                # LISTS, not sets -- a duplicate within one list (or split across both) must be REJECTED,
+                # never silently coerced away by a set's own dedup. Every task-id must be classified
+                # EXACTLY once for this to be an auditable, unambiguous decision.
+                approve_list = [t for t in (args.approve or "").split(",") if t]
+                reject_list = [t for t in (args.reject or "").split(",") if t]
+                approve_dupes = _dupes(approve_list)
+                if approve_dupes:
+                    sys.exit(f"decision {args.id}: task-id(s) {sorted(approve_dupes)} appear more than "
+                              f"once in --approve")
+                reject_dupes = _dupes(reject_list)
+                if reject_dupes:
+                    sys.exit(f"decision {args.id}: task-id(s) {sorted(reject_dupes)} appear more than "
+                              f"once in --reject")
+                approve_ids = set(approve_list)
+                reject_ids = set(reject_list)
                 batch_ids = {e["task_id"] for e in batch}
                 overlap = approve_ids & reject_ids
                 if overlap:

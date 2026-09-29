@@ -13,14 +13,25 @@ crash -- a slow-but-alive sub-supervisor looks identical to a dead one until it 
 checkpoint. This is a hard platform limitation, not a shortcut deferred here.
 
   progress-ledger.py record --task-id ID --owner LABEL --phase PHASE  -> appends a checkpoint row.
-    [--checked-sha SHA] [--checker-verdict-path PATH]                    --checked-sha/--checker-verdict-path
+    [--checked-sha SHA] [--checker-verdict-path PATH] [--batch-id ID]    --checked-sha/--checker-verdict-path
                                                                            are free-form optional extras, meant
                                                                            for the terminal `verify_gate_pass`
                                                                            phase (see vocabulary below) so a
                                                                            later batch-close consumer can read
                                                                            them off that one row -- this script
                                                                            does not enforce which phase they're
-                                                                           attached to.
+                                                                           attached to. --batch-id (same bare-
+                                                                           identifier charset as --task-id) is the
+                                                                           CORRELATION KEY a batch dispatcher
+                                                                           assigns once per fan-out and passes on
+                                                                           every checkpoint for every task-id in
+                                                                           that batch -- it is what lets `ready
+                                                                           --batch-id ID` distinguish "ready for
+                                                                           THIS batch" from an unrelated batch's
+                                                                           (or a single-task-delegation trigger-A
+                                                                           task's) own verify_gate_pass row. Never
+                                                                           enforced or interpreted by this script
+                                                                           beyond that exact-match filter.
   progress-ledger.py latest | status                                  -> one line per task-id: its most
                                                                            recently recorded phase/owner/ts
                                                                            (and checked-sha/checker-verdict-path
@@ -44,7 +55,7 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            against a batch-close TTL is exactly
                                                                            "ready, awaiting batch close, too long"
                                                                            -- no separate staleness mechanism needed.
-  progress-ledger.py ready [--task-id ID ...]                         -> read-only: for each given --task-id
+  progress-ledger.py ready [--task-id ID ...] [--batch-id ID]          -> read-only: for each given --task-id
                                                                            (repeatable; every task-id ever seen in
                                                                            the ledger if none given), reports one
                                                                            JSON line for each whose LATEST recorded
@@ -67,7 +78,19 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            batch can reconstruct the exact same
                                                                            "ready, awaiting batch" set from the two
                                                                            ledgers alone, with no reliance on its own
-                                                                           lost in-memory state.
+                                                                           lost in-memory state. --batch-id (omitted
+                                                                           by default -- see `record`'s own
+                                                                           --batch-id above) restricts the reported
+                                                                           task-ids to exactly those whose terminal
+                                                                           row was recorded with that batch-id, so a
+                                                                           restarted batch dispatcher never folds an
+                                                                           UNRELATED batch's, or a single-task-
+                                                                           delegation trigger-A task's, own
+                                                                           verify_gate_pass row into the wrong
+                                                                           consolidated hold. Omitting --batch-id
+                                                                           keeps today's behavior exactly (every
+                                                                           ready task-id, unfiltered) -- this is how
+                                                                           trigger-A usage is unaffected.
   progress-ledger.py selfcheck                                        -> asserts the fold + drives the real
                                                                            CLI paths against a scratch ledger.
 
@@ -331,6 +354,47 @@ def _selfcheck_live():
         assert code == 0 and '"task_id": "t1"' in out and '"task_id": "t3"' not in out, (
             "ready with no --task-id must scan every known task-id but only report terminal-phase ones")
 
+        # --batch-id correlation: a restarted batch dispatcher must be able to tell "ready for THIS
+        # batch" apart from an unrelated batch's (or a trigger-A task's) own verify_gate_pass row. t1
+        # (above) was recorded with no --batch-id at all (the trigger-A/no-filter usage); t4 and t5 below
+        # are recorded at the terminal phase under two DIFFERENT batch-ids.
+        code, _, _ = _run(["record", "--task-id", "t4", "--owner", "sm-t4", "--phase", TERMINAL_PHASE,
+                            "--checked-sha", "t4sha", "--batch-id", "batchA"])
+        assert code == 0
+        code, _, _ = _run(["record", "--task-id", "t5", "--owner", "sm-t5", "--phase", TERMINAL_PHASE,
+                            "--checked-sha", "t5sha", "--batch-id", "batchB"])
+        assert code == 0
+
+        # `latest` renders batch_id when present, omits it when absent -- same "only when given"
+        # convention as checked_sha/checker_verdict_path.
+        code, out, _ = _run(["latest"])
+        assert "[t4]" in out and "batch_id=batchA" in out, "latest must render batch_id when present"
+        assert "[t1]" in out, "sanity: t1 must still appear in latest"
+        assert "batch_id=" not in out.split("[t1]")[1].split("\n")[0], (
+            "latest must omit batch_id entirely for a row that never supplied one")
+
+        # ready --batch-id batchA reports ONLY t4 -- never t5 (a different batch-id) and never t1 (no
+        # batch-id at all, i.e. an unrelated trigger-A task or a row predating this correlation key).
+        code, out, _ = _run(["ready", "--task-id", "t1", "--task-id", "t4", "--task-id", "t5",
+                              "--batch-id", "batchA"])
+        assert code == 0, "ready --batch-id must still exit 0 (an informational query, not an error signal)"
+        assert '"task_id": "t4"' in out, "ready --batch-id must report the task-id recorded under that batch-id"
+        assert '"task_id": "t5"' not in out, "ready --batch-id must NOT report a different batch-id's task-id"
+        assert '"task_id": "t1"' not in out, "ready --batch-id must NOT report a task-id with no batch-id at all"
+
+        # omitting --batch-id entirely must keep TODAY's no-filter behavior exactly -- every ready
+        # task-id regardless of batch-id, so trigger-A's existing no-filter usage is unaffected.
+        code, out, _ = _run(["ready", "--task-id", "t1", "--task-id", "t4", "--task-id", "t5"])
+        assert code == 0
+        assert '"task_id": "t1"' in out and '"task_id": "t4"' in out and '"task_id": "t5"' in out, (
+            "omitting --batch-id must report every ready task-id regardless of its own batch-id")
+
+        # --batch-id validation on `record` matches --task-id's own bare-identifier posture.
+        for bad in ("", "bad id", "a/b", "a" * 129):
+            code, _, _ = _run(["record", "--task-id", "t6", "--owner", "o", "--phase", "claimed",
+                                "--batch-id", bad])
+            assert code != 0, f"invalid --batch-id {bad!r} must be rejected"
+
         # task-id / phase validation, matching claim-ledger.py's bare-identifier posture.
         for bad in ("", "../etc", "a/b", "a\0b", "bad id", "a" * 129, "ok\n"):
             code, _, _ = _run(["record", "--task-id", bad, "--owner", "o", "--phase", "claimed"])
@@ -471,6 +535,7 @@ def main(argv):
     r.add_argument("--phase", required=True)
     r.add_argument("--checked-sha")
     r.add_argument("--checker-verdict-path")
+    r.add_argument("--batch-id")
 
     sub.add_parser("latest")
     sub.add_parser("status")
@@ -484,6 +549,9 @@ def main(argv):
     rd = sub.add_parser("ready")
     rd.add_argument("--task-id", action="append", default=None,
                      help="repeatable; every task-id ever seen in the ledger if omitted")
+    rd.add_argument("--batch-id", default=None,
+                     help="restrict to task-ids whose terminal row was recorded with this --batch-id; "
+                          "omit to see every ready task-id regardless of batch-id (trigger-A usage)")
 
     args = p.parse_args(argv)
 
@@ -494,12 +562,16 @@ def main(argv):
             sys.exit("--owner must be non-empty")
         if not _valid_phase(args.phase):
             sys.exit(f"invalid --phase {args.phase!r}: must match [A-Za-z0-9_-] and be 1-64 chars")
+        if args.batch_id is not None and not _valid_task_id(args.batch_id):
+            sys.exit(f"invalid --batch-id {args.batch_id!r}: must match [A-Za-z0-9_-] and be 1-128 chars")
         rec = {"ev": "progress", "task_id": args.task_id, "owner": args.owner, "phase": args.phase,
                "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
         if args.checked_sha:
             rec["checked_sha"] = args.checked_sha
         if args.checker_verdict_path:
             rec["checker_verdict_path"] = args.checker_verdict_path
+        if args.batch_id:
+            rec["batch_id"] = args.batch_id
         with _ledger_lock():
             _append(rec)
         print(f"recorded {args.task_id} phase={args.phase}")
@@ -514,6 +586,8 @@ def main(argv):
                 line += f" checked_sha={r['checked_sha']}"
             if r.get("checker_verdict_path"):
                 line += f" checker_verdict_path={r['checker_verdict_path']}"
+            if r.get("batch_id"):
+                line += f" batch_id={r['batch_id']}"
             print(line)
         if _BAD:
             print(f"WARNING: {_BAD} malformed line(s) in {LEDGER} -- ledger may be corrupt; reconcile manually.")
@@ -546,6 +620,13 @@ def main(argv):
         for task_id in task_ids:
             r = latest.get(task_id)
             if r is None or r["phase"] != TERMINAL_PHASE:
+                continue
+            # --batch-id restricts to task-ids whose OWN terminal row was recorded with this exact
+            # batch-id -- the correlation key a restarted batch dispatcher needs so it never folds an
+            # unrelated batch's (or a single-task-delegation trigger-A task's) ready row into its own
+            # consolidated hold. Omitted entirely (None) means "no filtering", preserving trigger-A's
+            # existing no-filter usage exactly.
+            if args.batch_id is not None and r.get("batch_id") != args.batch_id:
                 continue
             hit = {"task_id": task_id, "ts": r["ts"]}
             if r.get("checked_sha"):

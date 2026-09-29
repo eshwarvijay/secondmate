@@ -344,6 +344,13 @@ choice. There is no N>10 variant; if there are more than 10 independent tasks, r
 rest for the next batch. Each tool-use block launches a **FRESH** sub-agent — never `fork`, same
 contamination rationale as trigger (A). **Name each Agent-tool call `sm-<task-id>`.**
 
+**Before fanning out, mint a `<batch-id>` for this batch** — any bare identifier matching
+`[A-Za-z0-9_-]{1,128}` (e.g. a timestamp-derived label), unique enough not to collide with a prior batch.
+This is the CORRELATION KEY every sub-supervisor in this batch carries on every one of its own
+`progress-ledger.py record` calls (step (c) below) — it is what lets step (e)'s restart-reconstruction
+tell "ready for THIS batch" apart from an unrelated batch's, or a single-task-delegation trigger (A)
+task's, own `verify_gate_pass` row. Tell every sub-supervisor its shared `<batch-id>` in its own prompt.
+
 **Each sub-supervisor's prompt must instruct it to, in this order:**
 
 a. **Claim first, as its literal first action, then record it.** Run `bin/claim-ledger.py claim --task-id
@@ -351,7 +358,8 @@ a. **Claim first, as its literal first action, then record it.** Run `bin/claim-
    `SM_REFUSED:claim-failed` as its final output — do not proceed, do not retry, do not fall back to
    `--steal`. `--steal` is a human-supervised override and stays exactly that under this pattern too: a
    sub-supervisor must never call it itself. Immediately after a successful claim, run
-   `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed`.
+   `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed --batch-id
+   <batch-id>`.
 
 b. **Derive every downstream name deterministically from `<task-id>`, using this repo's own existing
    convention — never invent a new one:**
@@ -364,7 +372,8 @@ c. **Run the existing solo secondmate SOP completely untouched, recording checkp
    plan-committee, maker routing, checker rounds, verify-gate, exactly as described everywhere above.
    This pattern changes nothing about how a single task runs, only how it gets launched and how its
    verify-gate PASS gets turned into a merge. At these points, run `bin/progress-ledger.py record
-   --task-id <task-id> --owner sm-<task-id> --phase <phase>`:
+   --task-id <task-id> --owner sm-<task-id> --phase <phase> --batch-id <batch-id>` (the SAME `<batch-id>`
+   on every call, per the mint-once-per-batch step above):
    - `--phase maker_started` immediately after its maker begins running.
    - `--phase checker_round` immediately after each checker round completes (once per round).
    - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint. ALWAYS also pass
@@ -387,15 +396,21 @@ d. **STOP once that checkpoint is recorded — do NOT open a hold, do NOT self-m
 e. **Collect ready task-ids, ledger-driven, never from your own in-memory batch state.** Poll (on a
    `ScheduleWakeup`-driven schedule, never continuously) with:
    ```
-   ${CLAUDE_PLUGIN_ROOT}/bin/progress-ledger.py ready --task-id <id-1> [--task-id <id-2> ...]
-   # one JSON line per task-id whose latest phase is the terminal verify_gate_pass, each carrying its own
+   ${CLAUDE_PLUGIN_ROOT}/bin/progress-ledger.py ready --batch-id <batch-id>
+   # one JSON line per task-id whose latest phase is the terminal verify_gate_pass AND whose own
+   # terminal row was recorded under THIS exact --batch-id, each carrying its own
    # checked_sha/checker_verdict_path; always exits 0 (this is the wanted signal, not an error).
    ```
-   This is why batch-close survives a dispatcher restart/crash mid-batch: nothing about "which task-ids
-   are ready" lives only in this conversation's memory. A dispatcher that comes back after a crash
-   reconstructs the exact same set by intersecting `ready` (no `--task-id` filter, scans every task-id
-   ever seen) with `bin/claim-ledger.py status`'s own currently-OPEN claims — anything already merged and
-   released from a prior batch drops out on its own, since its claim is gone.
+   `--batch-id` is the correlation key from the mint-once-per-batch step above — without it, `ready` would
+   report EVERY task-id anywhere at `verify_gate_pass`, including an unrelated batch's or a single-task-
+   delegation trigger (A) task's own ready row that just happens to be sitting there awaiting its own
+   individual hold; filtering by `--batch-id` is what keeps this batch's consolidated hold from ever
+   folding in something that was never part of it. This is also why batch-close survives a dispatcher
+   restart/crash mid-batch: nothing about "which task-ids are ready, for THIS batch" lives only in this
+   conversation's memory — a dispatcher that comes back after a crash need only remember (or re-derive)
+   the same `<batch-id>` label to reconstruct the exact same set. Cross-check against
+   `bin/claim-ledger.py status`'s own currently-OPEN claims too — anything already merged and released
+   from a prior round of this same batch drops out on its own, since its claim is gone.
 
 f. **Close the batch at the cap or a bounded TTL, whichever comes first — never wait indefinitely for a
    straggler.** The batch is DONE (close now) once every task-id fanned out in it has reached a terminal
@@ -424,9 +439,13 @@ g. **Open ONE consolidated batch hold**, entries built from every task-id `ready
    ${CLAUDE_PLUGIN_ROOT}/bin/hold.py hold --task "<batch-label>" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
      --entries-file <that JSON file>
    ```
-   `hold.py` itself derives a one-line, machine-sourced digest per entry straight from that task-id's own
-   `checker_verdict_path` (its real `verdict` + findings count) — never typed fresh by whoever opens the
-   hold, so the human's summary is provably sourced from the real verdict. **Wait for a genuine human
+   Every entry's `checker_verdict_path` MUST resolve to a real, parseable verdict envelope — `hold.py`
+   rejects the WHOLE call (nonzero exit, no ledger write) otherwise, never opening a hold with no real
+   verdict behind an entry's digest. `hold.py` itself derives a one-line, machine-sourced digest per entry
+   straight from that real envelope — its `verdict`, findings count, the distinct files those findings
+   flagged (a blast-radius proxy), and `lens_coverage`'s own lens names (the closest thing the envelope
+   has to a category/tag concept) — never typed fresh by whoever opens the hold, so the human's summary is
+   provably sourced from the real verdict. **Wait for a genuine human
    answer, never self-answer, no exceptions** — including this batch hold itself. A clean `conflicts`
    check between two task-ids' scopes is signal to SHOW in the digest if you have it, never a reason to
    skip the human step.

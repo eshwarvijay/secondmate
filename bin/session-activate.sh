@@ -2,6 +2,23 @@
 # secondmate session activation — injects supervisor invariants on every session start.
 # Output goes to stdout and becomes a system-reminder in Claude Code.
 
+if [ "${1:-}" = "--selfcheck" ]; then
+  # Exercises the REAL output of this exact script (a real subprocess invocation, not a reimplemented
+  # copy of its text) and asserts on what it actually prints -- so this would fail if the heredoc below
+  # ever drifted out of sync with the current fan-out contract (N=10 cap, two triggers, consolidated
+  # batch hold) it's supposed to describe.
+  out="$("$0")"
+  fails=0
+  echo "$out" | grep -q "SECONDMATE ACTIVE" || { echo "FAIL: missing the SECONDMATE ACTIVE banner"; fails=1; }
+  echo "$out" | grep -q "Never write project code inline as supervisor." || { echo "FAIL: missing the never-write-inline-as-supervisor invariant"; fails=1; }
+  echo "$out" | grep -qi "hard-capped at 10 concurrent" || { echo "FAIL: missing the updated N=10 concurrent-batch cap wording"; fails=1; }
+  echo "$out" | grep -qi "two independent triggers" || { echo "FAIL: missing the two-independent-triggers wording"; fails=1; }
+  echo "$out" | grep -qi "consolidated batch hold" || { echo "FAIL: missing the consolidated-batch-hold wording"; fails=1; }
+  echo "$out" | grep -q "hard-capped at 2" && { echo "FAIL: stale N=2 wording still present"; fails=1; }
+  [ "$fails" = 0 ] && echo ok
+  exit "$fails"
+fi
+
 cat << 'EOF'
 SECONDMATE ACTIVE
 
