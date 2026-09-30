@@ -122,8 +122,13 @@ themselves.
      sections (Objective, Active, Blocked, Next Move), and — only when the task decomposed into checkable
      sub-goals — a cumulative, current-state `feature-list.json` ledger (`{id, description, status,
      verified_by, round}`, same atomic temp-file+mv idiom, optional and never required for a single-round
-     task). Both files are `cat`'d back into every subsequent prompt (first round, fix round, or restart)
-     automatically. Before that, the boilerplate requires a **session-startup checklist**: read both files
+     task). Both files are injected back into every subsequent prompt (first round, fix round, or restart)
+     via the identical conditional pattern in SKILL.md's command-substitution block —
+     `$([ -f <path> ] && cat <path>)` — never an unconditional cat: `round-state.md` produces real content
+     from round 2 onward, once the maker has actually written one; `feature-list.json` produces real
+     content only for a task that decomposed into sub-goals and created one, and zero bytes for every
+     other task, including any task's own first round. Before that, the
+     boilerplate requires a **session-startup checklist**: read both files
      if present, check `git log` for committed work the handoff might not mention, and re-run the test/build
      command if the handoff doesn't already show a fresh result — treating both files' claims as
      self-reported, not verified. It also enforces a **premature-victory guard**: a maker cannot reply DONE
