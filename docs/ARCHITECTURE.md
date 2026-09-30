@@ -117,7 +117,26 @@ themselves.
      prints `RESTART: identical action nx — kill this maker and restart fresh with the round-state handoff file.`
      and exits `5` to signal the supervisor to kill and restart the maker with fresh state
      (`SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md`).
-   *Guards against:* hung rounds stalling an unattended run; models spinning on the same broken action forever.
+   - The **maker prompt closing boilerplate** (SKILL.md, appended to every maker invocation) is what actually
+     writes and reads that continuity state: every maker atomically writes `round-state.md`'s four prose
+     sections (Objective, Active, Blocked, Next Move), and — only when the task decomposed into checkable
+     sub-goals — a cumulative, current-state `feature-list.json` ledger (`{id, description, status,
+     verified_by, round}`, same atomic temp-file+mv idiom, optional and never required for a single-round
+     task). Both files are injected back into every subsequent prompt (first round, fix round, or restart)
+     via the identical conditional pattern in SKILL.md's command-substitution block —
+     `$([ -f <path> ] && cat <path>)` — never an unconditional cat: `round-state.md` produces real content
+     from round 2 onward, once the maker has actually written one; `feature-list.json` produces real
+     content only for a task that decomposed into sub-goals and created one, and zero bytes for every
+     other task, including any task's own first round. Before that, the
+     boilerplate requires a **session-startup checklist**: read both files
+     if present, check `git log` for committed work the handoff might not mention, and re-run the test/build
+     command if the handoff doesn't already show a fresh result — treating both files' claims as
+     self-reported, not verified. It also enforces a **premature-victory guard**: a maker cannot reply DONE
+     on code inspection alone — it must show an actual test/build/live-check result, either as a
+     `feature-list.json` `verified_by` citation or named in round-state.md's Active/Next Move section.
+   *Guards against:* hung rounds stalling an unattended run; models spinning on the same broken action forever;
+   a restarted maker re-doing already-committed work or trusting an untested self-reported claim; a maker
+   declaring victory without having run anything.
 
 4. **Check.** The diff is trimmed with `prune-output.sh` (model-free head/tail truncation), then
    `launch-checker.sh` runs the cross-model, edit-locked checker with the verdict-envelope contract injected.
