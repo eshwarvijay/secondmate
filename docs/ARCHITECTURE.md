@@ -134,9 +134,15 @@ themselves.
      self-reported, not verified. It also enforces a **premature-victory guard**: a maker cannot reply DONE
      on code inspection alone — it must show an actual test/build/live-check result, either as a
      `feature-list.json` `verified_by` citation or named in round-state.md's Active/Next Move section.
+     It also holds the maker to **two conduct rules**: never tamper with a test to force it to pass
+     (including indirectly, via a mock/stub/fixture that stops it exercising real behavior), and keep
+     git hygiene tight (stage only exact files by explicit path, never a blind `add`/`commit -a`, never
+     force-push in any form) — stopping to record a stuck Blocked entry rather than silently retrying a
+     failing approach a third time.
    *Guards against:* hung rounds stalling an unattended run; models spinning on the same broken action forever;
    a restarted maker re-doing already-committed work or trusting an untested self-reported claim; a maker
-   declaring victory without having run anything.
+   declaring victory without having run anything; a maker faking a passing test or blind-staging/force-pushing
+   its way past a real failure.
 
 4. **Check.** The diff is trimmed with `prune-output.sh` (model-free head/tail truncation), then
    `launch-checker.sh` runs the cross-model, edit-locked checker with the verdict-envelope contract injected.
