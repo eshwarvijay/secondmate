@@ -169,7 +169,14 @@ quote (and any trailing `--wait --timeout 600000`):
 ```
 Before replying DONE, write/update the round-state handoff file (`${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`). Write it ATOMICALLY (write to a temp file in the same directory, then `mv` over the real path — never a direct partial write). Include the four prose sections you have direct knowledge of: Objective, Active, Blocked, Next Move. The supervisor will populate Completed and Relevant Files from git history when synthesizing a restart; you can leave placeholder text or omit them.
 
+If this task decomposes into checkable sub-goals, also maintain `${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}}/feature-list.json`: a cumulative, current-state (not append-only) JSON array of `{id, description, status: "pending"|"pass"|"fail", verified_by, round}`, written with the same atomic temp-file+mv idiom as round-state.md above — never a direct partial write. `verified_by` names the concrete command/test/check and its actual result and is required (non-null) whenever status is pass or fail; null is only valid for pending. This file is optional — a single-round task is never required to create it.
+
+Before replying DONE, you must have actually run something — tests, a build, or a live check appropriate to the task — with the result visible in what you write; code inspection alone ("I read it and it looks right") is never sufficient. If feature-list.json exists, its pass/fail sub-goals' `verified_by` citations ARE that evidence. If it doesn't exist, round-state.md's Active or Next Move section must name what you ran and what it showed.
+
+Start every invocation — first round, fix round, or restart — with this checklist, in order, before touching any code: (1) read round-state.md and feature-list.json below if present (both already injected just below this line), (2) check `git log` for prior committed work the handoff might not mention, (3) run `git status`, and re-run this project's test/build command if the handoff doesn't already show a fresh result — both files' claims are self-reported, git log and a fresh test run are what corroborate them, (4) only then start new work. On a discrepancy (uncommitted work, an untested claim, git log showing work the handoff omits), reconcile it in round-state.md's Active or Blocked section — do not invent a new escalation signal.
+
 $([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}" ] && { echo '--- Previous round handoff ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"; })
+$([ -f "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/feature-list.json}" ] && { echo '--- Feature list ---'; cat "${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/feature-list.json}"; })
 $(${CLAUDE_PLUGIN_ROOT}/bin/lesson-lookup.py --task "<goal|plan|fix plan>" --task-id "<task-id>")
 ```
 
