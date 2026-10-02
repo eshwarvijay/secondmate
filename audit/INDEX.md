@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 48 total)
+## Recent flow (orchestration mechanics) entries (15 of 49 total)
 
-- 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/flow/2026-09-24--supervisor-mistake-lessons.md`)
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/flow/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 - 2026-09-25 — planner-prompt-quality: evidence-cited upgrade to the 6 plan-committee system prompts (`audit/flow/2026-09-25--planner-prompt-quality.md`)
 - 2026-09-28 — bin/launch-checker.sh: cd into --repo before invoking the harness (`audit/flow/2026-09-28--fix-checker-cwd.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-30 — loop-harness-upgrades: feature-list.json ledger (P1) + premature-victory guard (P2) + startup checklist (P3) in maker... (`audit/flow/2026-09-30--loop-harness-upgrades.md`)
 - 2026-09-30 — maker-prompt-guardrails: test-tampering + git-hygiene guardrails added to Maker prompt closing boilerplate (`audit/flow/2026-09-30--maker-prompt-guardrails.md`)
 - 2026-09-30 — session-staleness-check: wire doctor.sh's staleness detection into a SessionStart hook (`audit/flow/2026-09-30--session-staleness-check.md`)
+- 2026-10-02 — sub-supervisor-todo-list: require dispatched sub-supervisors to self-track SOP steps via TodoWrite (`audit/flow/2026-10-02--sub-supervisor-todo-list.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 46 total)
+## Recent decision (choices, findings, escalations) entries (15 of 47 total)
 
-- 2026-09-24 — supervisor-mistake-lessons: moment-of-action echoes (P1) + lesson feedback loop (P2) (`audit/decision/2026-09-24--supervisor-mistake-lessons.md`)
 - 2026-09-24 — verdict-hardening: file:line-enforced findings validation + --lenses cross-check/ledger for bin/verdict.py (`audit/decision/2026-09-24--verdict-hardening-file-line-enforced-findings-validation-lenses-cross-check-ledg.md`)
 - 2026-09-25 — planner-prompt-quality: evidence-cited upgrade to the 6 plan-committee system prompts (`audit/decision/2026-09-25--planner-prompt-quality.md`)
 - 2026-09-28 — Fix checker cwd at the primitive level, decline touching the documented recipe (`audit/decision/2026-09-28--fix-checker-cwd.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-09-30 — Reuse round-state.md's write idiom for feature-list.json, decline new bin/script; independently re-verify hold answer... (`audit/decision/2026-09-30--loop-harness-upgrades.md`)
 - 2026-09-30 — Shell-safe prose over the plan's own drop-in draft; no automated enforcement, human-approved merge (`audit/decision/2026-09-30--maker-prompt-guardrails.md`)
 - 2026-09-30 — Advisory-only SessionStart staleness surfacing; reuse doctor.sh detection unchanged (`audit/decision/2026-09-30--session-staleness-check.md`)
+- 2026-10-02 — Single insertion point at 'The loop' header; non-conflation with progress-ledger.py verified by checker (`audit/decision/2026-10-02--sub-supervisor-todo-list.md`)
