@@ -82,6 +82,12 @@ one task, batched for up to 10 concurrent) is the one path once the trigger fire
 this loop. See "Primitives for dispatched sub-agent-supervisors" further down for the dispatch mechanics
 themselves.
 
+Right after claiming its task-id and before stage 0, the sub-agent-supervisor seeds a self-reported
+TodoWrite checklist (or an equivalent plain checklist if TodoWrite isn't available) mirroring the
+stages below, updating each item's status as it actually progresses — a same-process tracking aid
+local to its own run, distinct from `progress-ledger.py`'s cross-task checkpoint mechanism; see
+SKILL.md for the exact requirement.
+
 0. **Plan Committee** *(runs unconditionally before triage for every task)*.
    `plan-committee.sh` spawns 6 headless pi planners in parallel (DeepSeek-R1, Qwen3-Next-80B,
    Qwen3-Coder-Next, Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3),
