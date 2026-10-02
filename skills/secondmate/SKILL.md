@@ -159,6 +159,23 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
+Immediately after claiming and recording the `claimed` progress-ledger checkpoint, and before
+beginning step 1 (Triage), the sub-agent-supervisor itself — solo or batch — seeds a TodoWrite
+checklist with one pending item per named SOP step it is about to run (Plan Committee 0a-0d, then
+Triage, Spawn, Guard the round, Check, Gate, Hold, Integrate, Teardown, Audit trail, Lesson
+feedback), and self-reports each item's status (pending → in_progress → completed) as it actually
+reaches and finishes that step — same self-reported philosophy as the rest of this SOP, not polled
+or enforced by any script — so a silently dropped step shows up as a lingering item instead of
+vanishing. If TodoWrite isn't available in a given harness, keep an equivalent plain checklist in
+working notes instead; the practice matters more than the tool. This is a same-process, local
+self-tracking aid for the sub-agent-supervisor's own run only — it does not replace, feed into, or
+duplicate `progress-ledger.py`'s cross-task-visible checkpoint mechanism (used by the dispatcher's
+staleness watchdog and batch-close logic), which keeps working exactly as documented elsewhere in
+this file. It does not apply to the maker (which tracks its own continuity via round-state.md /
+feature-list.json) or the checker (stateless per round). Each solo or batch dispatch sub-supervisor
+seeds and owns its own list for its own task-id only — never shared or cross-referenced with a
+sibling task in the same batch.
+
 ### Maker prompt closing boilerplate (used by every maker invocation in this file)
 
 Every maker prompt in this file — first-round and fix-round, Claude and pi, herdr and headless, whether
