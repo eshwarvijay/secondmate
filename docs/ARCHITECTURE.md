@@ -82,11 +82,13 @@ one task, batched for up to 10 concurrent) is the one path once the trigger fire
 this loop. See "Primitives for dispatched sub-agent-supervisors" further down for the dispatch mechanics
 themselves.
 
-Right after claiming its task-id and before stage 0, the sub-agent-supervisor seeds a self-reported
-TodoWrite checklist (or an equivalent plain checklist if TodoWrite isn't available) mirroring the
-stages below, updating each item's status as it actually progresses — a same-process tracking aid
-local to its own run, distinct from `progress-ledger.py`'s cross-task checkpoint mechanism; see
-SKILL.md for the exact requirement.
+Right after claiming its task-id and before stage 0, the sub-agent-supervisor checks what default
+Claude Code task-tracking tool is actually available in its own session (the single `TodoWrite`
+tool, or the newer four-tool `TaskCreate`/`TaskGet`/`TaskUpdate`/`TaskList` set) and seeds a
+self-reported checklist with whichever is present, falling back to an equivalent plain checklist
+only if neither is available, mirroring the stages below and updating each item's status as it
+actually progresses — a same-process tracking aid local to its own run, distinct from
+`progress-ledger.py`'s cross-task checkpoint mechanism; see SKILL.md for the exact requirement.
 
 0. **Plan Committee** *(runs unconditionally before triage for every task)*.
    `plan-committee.sh` spawns 6 headless pi planners in parallel (DeepSeek-R1, Qwen3-Next-80B,

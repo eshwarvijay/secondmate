@@ -160,14 +160,20 @@ Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
 Immediately after claiming and recording the `claimed` progress-ledger checkpoint, and before
-beginning step 1 (Triage), the sub-agent-supervisor itself — solo or batch — seeds a TodoWrite
-checklist with one pending item per named SOP step it is about to run (Plan Committee 0a-0d, then
-Triage, Spawn, Guard the round, Check, Gate, Hold, Integrate, Teardown, Audit trail, Lesson
-feedback), and self-reports each item's status (pending → in_progress → completed) as it actually
-reaches and finishes that step — same self-reported philosophy as the rest of this SOP, not polled
-or enforced by any script — so a silently dropped step shows up as a lingering item instead of
-vanishing. If TodoWrite isn't available in a given harness, keep an equivalent plain checklist in
-working notes instead; the practice matters more than the tool. This is a same-process, local
+beginning step 1 (Triage), the sub-agent-supervisor itself — solo or batch — checks what default
+Claude Code task-tracking tool is actually available in its own session right now, and uses
+whichever one is present: the single `TodoWrite` tool, or the newer four-tool `TaskCreate` /
+`TaskGet` / `TaskUpdate` / `TaskList` set. Whichever shape is present, it seeds that tool with one
+pending item per named SOP step it is about to run (Plan Committee 0a-0d, then Triage, Spawn, Guard
+the round, Check, Gate, Hold, Integrate, Teardown, Audit trail, Lesson feedback), and self-reports
+each item's status (pending → in_progress → completed) as it actually reaches and finishes that
+step — same self-reported philosophy as the rest of this SOP, not polled or enforced by any script
+— so a silently dropped step shows up as a lingering item instead of vanishing. When a real
+built-in task-tracking tool is available, the sub-agent-supervisor must use it rather than
+inventing its own ad-hoc tracking scheme — a bespoke progress file, a custom markdown checklist
+format, or any other home-grown mechanism. Only when no built-in task-tracking tool is available
+at all does it fall back to keeping an equivalent plain checklist in working notes, as a last
+resort. This is a same-process, local
 self-tracking aid for the sub-agent-supervisor's own run only — it does not replace, feed into, or
 duplicate `progress-ledger.py`'s cross-task-visible checkpoint mechanism (used by the dispatcher's
 staleness watchdog and batch-close logic), which keeps working exactly as documented elsewhere in
