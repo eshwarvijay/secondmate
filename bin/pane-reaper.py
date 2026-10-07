@@ -332,9 +332,15 @@ def find_quiet(by_pane, threshold_seconds, now=None):
         if since_idx == len(obs) - 1:
             continue  # the signature changed since the observation right before latest -- not quiet
         since = obs[since_idx]
+        # CONFIRMED BUG (checker, post-round-5): checking only `since` (the earliest observation in the
+        # run) let a LATER observation in the same contiguous run with an unconvertible ts (e.g. an
+        # out-of-range year) slip through unnoticed, since only `since_epoch` feeds the age math below --
+        # the pane would be wrongly reported quiet using the earlier, convertible timestamp. Must check
+        # EVERY observation in the run [since_idx:latest]; if any is unconvertible, exclude the pane
+        # entirely -- same never-false-positive posture as the single-observation case.
+        if any(_ts_to_epoch(o["ts"]) is None for o in obs[since_idx:]):
+            continue
         since_epoch = _ts_to_epoch(since["ts"])
-        if since_epoch is None:
-            continue  # unconvertible timestamp -- never prove staleness from it, conservative by design
         age = now - since_epoch
         if age >= threshold_seconds:
             hits.append({"pane_id": pane_id, "status": "quiet", "revision": sig[0], "agent_status": sig[1],
@@ -522,6 +528,22 @@ def _selfcheck_live():
         assert exc in (0, 1), f"quiet must never crash on an extreme-but-format-valid timestamp: {out!r}"
         assert '"pane_id": "extreme-ts"' not in out, (
             f"a pane whose timestamp can't be converted to an epoch must never be reported quiet: {out!r}")
+
+        # CONFIRMED BUG (checker, post-round-5): the round-5 fix above only checked the EARLIEST
+        # ('since') observation's timestamp for convertibility, not every observation in the contiguous
+        # same-signature run [since_idx:latest]. Two observations, same signature, where the EARLIER ts
+        # is convertible but the LATER one is not: `quiet` must still exclude the pane entirely -- it
+        # must never use the earlier, convertible timestamp to wrongly prove staleness while ignoring a
+        # later, unconvertible one in the same run.
+        _append({"ev": "pane_observed", "pane_id": "mixed", "revision": 1, "agent_status": "idle",
+                 "ts": "2000-01-01T00:00:00"})
+        _append({"ev": "pane_observed", "pane_id": "mixed", "revision": 1, "agent_status": "idle",
+                 "ts": "0001-01-01T00:00:00"})
+        code, out, exc = _run(["quiet", "--threshold-seconds", "1"])
+        assert exc in (0, 1), f"quiet must never crash on a mixed-convertibility run: {out!r}"
+        assert '"pane_id": "mixed"' not in out, (
+            f"a pane with ANY unconvertible timestamp in its quiet run must never be reported quiet, "
+            f"even when an earlier observation in the same run IS convertible: {out!r}")
 
         # herdr command failure -> ERR_HERDR (2), distinct from quiet's own 0/1, never silently "observed
         # nothing". No new rows must be appended either.
