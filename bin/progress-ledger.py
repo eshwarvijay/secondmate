@@ -14,8 +14,8 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
 
   progress-ledger.py record --task-id ID --owner LABEL --phase PHASE  -> appends a checkpoint row.
     [--checked-sha SHA] [--checker-verdict-path PATH] [--batch-id ID]    --checked-sha/--checker-verdict-path
-                                                                           are free-form optional extras, meant
-                                                                           for the terminal `verify_gate_pass`
+    [--cost N] [--tokens N] [--duration-seconds N]                        are free-form optional extras, meant
+    [--still-achievable {yes,no}] [--note TEXT]                          for the terminal `verify_gate_pass`
                                                                            phase (see vocabulary below) so a
                                                                            later batch-close consumer can read
                                                                            them off that one row -- this script
@@ -41,6 +41,27 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            again (the normal case -- every
                                                                            checkpoint in one sub-supervisor's own
                                                                            SOP repeats it) is always fine.
+                                                                           --cost/--tokens/--duration-seconds are
+                                                                           self-reported, per-checkpoint budget
+                                                                           numbers (finite, >= 0) -- a free-form
+                                                                           caller-defined number, NOT cumulative,
+                                                                           and NOT reconciled with bin/log-round.sh's
+                                                                           own separate --cost/--duration (a
+                                                                           different ledger, a different purpose).
+                                                                           --still-achievable {yes,no} is a
+                                                                           checkpoint self-estimate -- a plain
+                                                                           self-report, not a trained predictor --
+                                                                           with zero automated consequence
+                                                                           anywhere in this codebase (never read
+                                                                           by `stale`/`ready`, never gates
+                                                                           anything). --note (optional, capped
+                                                                           length, only accepted alongside
+                                                                           --still-achievable) is free text
+                                                                           explaining that estimate. All five
+                                                                           fields are strictly additive: omitted
+                                                                           entirely from the written row when not
+                                                                           supplied, and rendered by
+                                                                           `latest`/`status` only when present.
   progress-ledger.py latest | status                                  -> one line per task-id: its most
                                                                            recently recorded phase/owner/ts
                                                                            (and checked-sha/checker-verdict-path
@@ -145,7 +166,7 @@ side configuring anything:
 This script never touches claim-ledger.py's own ledger, schema, or event types -- it is a separate file,
 a separate ledger, a separate concern (progress checkpoints, not claim ownership).
 """
-import json, sys, os, time, re, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
+import json, sys, os, time, re, math, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
 try:
     import fcntl
 except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
@@ -197,6 +218,16 @@ def _valid_task_id(task_id):
 
 def _valid_phase(phase):
     return isinstance(phase, str) and bool(_PHASE_RE.match(phase))
+
+
+NOTE_MAX_LEN = 500  # bounded free-text cap for --note, same "bounded length" posture as every other field
+
+
+def _valid_budget_number(x):
+    # same finite guard bin/log-round.sh's own _is_finite_number applies to --cost/--duration (nan/inf
+    # are valid floats but not valid JSON), plus a non-negative floor: a cost/token/duration count can
+    # never be negative, which log-round.sh's own precedent does not need to enforce for its freeform use.
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
 
 
 def _valid_ts(ts):
@@ -576,6 +607,74 @@ def _selfcheck_live():
         _run(["stale", "--threshold-seconds", "1", "--task-id", "t1"])
         assert len(_recs()) == pre_len, "stale must never append to the ledger"
 
+        # Budget-aware checkpoint fields (--cost/--tokens/--duration-seconds/--still-achievable/--note):
+        # THE single most important invariant -- a record call that omits all five new flags must
+        # produce output byte-for-byte identical to pre-change behavior. "nofields" below never supplies
+        # any of them.
+        code, _, _ = _run(["record", "--task-id", "nofields", "--owner", "sm-nofields", "--phase", "claimed"])
+        assert code == 0
+        r = latest_by_task()["nofields"]
+        expected_line = f"[nofields] phase=claimed owner=sm-nofields ts={r['ts']}"
+        code, out, _ = _run(["latest"])
+        actual_line = [l for l in out.splitlines() if l.startswith("[nofields]")][0]
+        assert actual_line == expected_line, (
+            f"a record omitting all 5 new fields must render identically to pre-change behavior: "
+            f"got {actual_line!r}, expected {expected_line!r}")
+        for key in ("cost", "tokens", "duration_seconds", "still_achievable", "note"):
+            assert key not in r, f"{key} must be entirely absent from the written row when not supplied"
+
+        # round-trip: all five fields present (including cost=0, a falsy-but-valid value) render on
+        # latest/status, and are stored verbatim.
+        code, _, _ = _run(["record", "--task-id", "budgetrow", "--owner", "sm-budget", "--phase", "checker_round",
+                            "--cost", "0", "--tokens", "1500", "--duration-seconds", "42.5",
+                            "--still-achievable", "yes", "--note", "on track"])
+        assert code == 0, "a record call with all 5 new fields must succeed"
+        code, out, _ = _run(["latest"])
+        line = [l for l in out.splitlines() if l.startswith("[budgetrow]")][0]
+        assert "cost=0.0" in line and "tokens=1500.0" in line and "duration_seconds=42.5" in line \
+            and "still_achievable=yes" in line and "note='on track'" in line, (
+            f"latest must render all 5 new fields when present: {line!r}")
+
+        # rejection: non-finite/negative numeric fields, and bad --still-achievable, must all be rejected.
+        # "--flag=value" form (not separate argv tokens) sidesteps argparse's own "-inf looks like an
+        # unknown option, not a value" ambiguity -- irrelevant to what this script itself validates.
+        for combined in ("--cost=-1", "--cost=nan", "--cost=inf", "--cost=-inf",
+                          "--tokens=-5", "--tokens=nan",
+                          "--duration-seconds=-0.01", "--duration-seconds=nan"):
+            code, _, _ = _run(["record", "--task-id", "badnum", "--owner", "o", "--phase", "claimed", combined])
+            assert code != 0, f"{combined!r} must be rejected"
+        code, _, _ = _run(["record", "--task-id", "badchoice", "--owner", "o", "--phase", "claimed",
+                            "--still-achievable", "maybe"])
+        assert code != 0, "--still-achievable must reject a value outside {yes,no}"
+
+        # --note is only valid alongside --still-achievable.
+        code, _, _ = _run(["record", "--task-id", "noteonly", "--owner", "o", "--phase", "claimed",
+                            "--note", "orphan note"])
+        assert code != 0, "--note without --still-achievable must be rejected"
+
+        # --note is length-capped.
+        code, _, _ = _run(["record", "--task-id", "longnote", "--owner", "o", "--phase", "claimed",
+                            "--still-achievable", "no", "--note", "x" * (NOTE_MAX_LEN + 1)])
+        assert code != 0, "--note over the length cap must be rejected"
+        code, _, _ = _run(["record", "--task-id", "longnote", "--owner", "o", "--phase", "claimed",
+                            "--still-achievable", "no", "--note", "x" * NOTE_MAX_LEN])
+        assert code == 0, "--note exactly at the length cap must be accepted"
+
+        # `stale`/`ready` byte-for-byte unaffected: a row carrying the new budget fields must produce the
+        # exact same stale/ready shape as a row that never used them -- the new fields must never leak
+        # into either query's output.
+        code, _, _ = _run(["record", "--task-id", "budgetrow", "--owner", "sm-budget", "--phase", TERMINAL_PHASE,
+                            "--checked-sha", "cafef00d", "--cost", "3.3", "--tokens", "999",
+                            "--duration-seconds", "10", "--still-achievable", "no", "--note", "slipping"])
+        assert code == 0
+        code, out, _ = _run(["ready", "--task-id", "budgetrow"])
+        assert code == 0 and '"task_id": "budgetrow"' in out and '"checked_sha": "cafef00d"' in out, (
+            "ready must still report a terminal-phase row that happens to carry budget fields")
+        for key in ("cost", "tokens", "duration_seconds", "still_achievable", "note"):
+            assert f'"{key}"' not in out, f"ready's output must never include {key!r} -- stale/ready stay unaware of it"
+        code, out, exc = _run(["stale", "--threshold-seconds", "3600", "--task-id", "budgetrow"])
+        assert exc == 0 and out == "", "stale's threshold filtering must be unaffected by a row carrying budget fields"
+
         # status must warn (not silently hide) when the ledger has malformed lines.
         with LEDGER.open("a") as f:
             f.write("not json at all\n")
@@ -654,6 +753,11 @@ def main(argv):
     r.add_argument("--checked-sha")
     r.add_argument("--checker-verdict-path")
     r.add_argument("--batch-id")
+    r.add_argument("--cost", type=float)
+    r.add_argument("--tokens", type=float)
+    r.add_argument("--duration-seconds", type=float)
+    r.add_argument("--still-achievable", choices=["yes", "no"])
+    r.add_argument("--note")
 
     sub.add_parser("latest")
     sub.add_parser("status")
@@ -682,6 +786,16 @@ def main(argv):
             sys.exit(f"invalid --phase {args.phase!r}: must match [A-Za-z0-9_-] and be 1-64 chars")
         if args.batch_id is not None and not _valid_task_id(args.batch_id):
             sys.exit(f"invalid --batch-id {args.batch_id!r}: must match [A-Za-z0-9_-] and be 1-128 chars")
+        if args.cost is not None and not _valid_budget_number(args.cost):
+            sys.exit(f"invalid --cost {args.cost!r}: must be a finite number >= 0")
+        if args.tokens is not None and not _valid_budget_number(args.tokens):
+            sys.exit(f"invalid --tokens {args.tokens!r}: must be a finite number >= 0")
+        if args.duration_seconds is not None and not _valid_budget_number(args.duration_seconds):
+            sys.exit(f"invalid --duration-seconds {args.duration_seconds!r}: must be a finite number >= 0")
+        if args.note is not None and args.still_achievable is None:
+            sys.exit("--note is only valid alongside --still-achievable")
+        if args.note is not None and len(args.note) > NOTE_MAX_LEN:
+            sys.exit(f"--note is too long ({len(args.note)} chars; max {NOTE_MAX_LEN})")
         rec = {"ev": "progress", "task_id": args.task_id, "owner": args.owner, "phase": args.phase,
                "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
         if args.checked_sha:
@@ -690,6 +804,16 @@ def main(argv):
             rec["checker_verdict_path"] = args.checker_verdict_path
         if args.batch_id:
             rec["batch_id"] = args.batch_id
+        if args.cost is not None:
+            rec["cost"] = args.cost
+        if args.tokens is not None:
+            rec["tokens"] = args.tokens
+        if args.duration_seconds is not None:
+            rec["duration_seconds"] = args.duration_seconds
+        if args.still_achievable is not None:
+            rec["still_achievable"] = args.still_achievable
+        if args.note is not None:
+            rec["note"] = args.note
         with _ledger_lock():
             # Immutability: fold FRESH, inside the lock (same TOCTOU-safe precedent as
             # claim-ledger.py's own steal), right before deciding -- a task-id's batch membership is
@@ -718,6 +842,16 @@ def main(argv):
                 line += f" checker_verdict_path={r['checker_verdict_path']}"
             if r.get("batch_id"):
                 line += f" batch_id={r['batch_id']}"
+            if r.get("cost") is not None:
+                line += f" cost={r['cost']}"
+            if r.get("tokens") is not None:
+                line += f" tokens={r['tokens']}"
+            if r.get("duration_seconds") is not None:
+                line += f" duration_seconds={r['duration_seconds']}"
+            if r.get("still_achievable") is not None:
+                line += f" still_achievable={r['still_achievable']}"
+            if r.get("note") is not None:
+                line += f" note={r['note']!r}"
             print(line)
         if _BAD:
             print(f"WARNING: {_BAD} malformed line(s) in {LEDGER} -- ledger may be corrupt; reconcile manually.")
