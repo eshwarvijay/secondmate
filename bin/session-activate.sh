@@ -23,6 +23,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo "$out" | grep -qi "In herdr (HERDR_ENV=1)" || { echo "FAIL: missing the in-herdr spawn path"; fails=1; }
   echo "$out" | grep -q "herdr worktree create" || { echo "FAIL: missing herdr worktree create as the in-herdr spawn command"; fails=1; }
   echo "$out" | grep -qi "never self-answered" || { echo "FAIL: missing the never-self-answered-hold wording"; fails=1; }
+  echo "$out" | grep -qi "self-reported task-tracking checklist" || { echo "FAIL: missing the task-tracking checklist seeding wording"; fails=1; }
   echo "$out" | grep -qi "narrows to: recognize the trigger, dispatch" || { echo "FAIL: missing the top-level supervisor's narrowed-job framing"; fails=1; }
   [ "$fails" = 0 ] && echo ok
   exit "$fails"
@@ -46,6 +47,7 @@ When the trigger holds, you (the top-level supervisor) NEVER run the maker/check
 dispatch a FRESH sub-agent-supervisor instead: **solo dispatch** for one task, **batch dispatch**
 (hard-capped at 10 concurrent, not tunable) for several genuinely independent tasks at once. The
 dispatched sub-supervisor runs the mandatory sequence inside its own context:
+  0. Seed a self-reported task-tracking checklist (TodoWrite / Task* set / plain fallback) mirroring SOP steps, update items as you progress, so a silently-dropped step shows up as pending
   1. Invoke the `secondmate` skill — it is the single source of truth
   2. Load the `herdr` skill if HERDR_ENV=1
   3. Spawn BEFORE touching any file — **In herdr (HERDR_ENV=1):** `herdr worktree create` → worktree + root_pane. **Headless / not in herdr:** `new-worktree.sh` instead (never the primary checkout)
