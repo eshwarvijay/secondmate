@@ -371,7 +371,15 @@ def _all_task_ids():
 def _ts_to_epoch(ts):
     # ts is always written by this script's own time.strftime("%Y-%m-%dT%H:%M:%S") (local time, matching
     # claim-ledger.py/hold.py) -- parse it back with the same local-time interpretation via mktime.
-    return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    # CONFIRMED BUG (checker round 4): a ts that passes _valid_ts's own strptime-based format check fine
+    # (e.g. "0001-01-01T00:00:00") can still be numerically out of time.mktime's representable range,
+    # raising an uncaught OverflowError -- same root-cause class already fixed in bin/pane-reaper.py's own
+    # _ts_to_epoch. Returns None on failure so callers (e.g. `stale`) can treat the row as unusable/corrupt
+    # rather than crash, the same tolerant posture _recs() already applies to other malformed rows.
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _run(argv):
@@ -606,6 +614,23 @@ def _selfcheck_live():
             "a task-id whose only row has an unparseable ts must be reported no_progress_recorded")
         _recs()  # refresh _BAD as a side effect
         assert _BAD > bad_before, "an unparseable-ts row must be counted as malformed (_BAD)"
+
+        # CONFIRMED BUG (checker round 4): a row whose "ts" is SYNTACTICALLY valid (passes _valid_ts's
+        # own strptime-based format check, e.g. "0001-01-01T00:00:00") but numerically out of
+        # time.mktime's representable range previously crashed `stale` with an uncaught OverflowError --
+        # unlike "badts" above, this row DOES fold into latest_by_task (it's format-valid), so the crash
+        # happened inside stale's own age computation, not _recs()'s validation. Must be treated as
+        # unusable/corrupt for staleness purposes -- excluded from hits, never a crash.
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"ev": "progress", "task_id": "extreme-ts-task", "owner": "o",
+                                 "phase": "claimed", "ts": "0001-01-01T00:00:00"}) + "\n")
+        assert "extreme-ts-task" in latest_by_task(), (
+            "an extreme-but-format-valid ts row IS format-valid and must fold into latest_by_task")
+        code, out, exc = _run(["stale", "--threshold-seconds", "1", "--task-id", "extreme-ts-task"])
+        assert exc in (0, 1), f"stale must never crash on an extreme-but-format-valid ts: {out!r}"
+        assert '"task_id": "extreme-ts-task"' not in out, (
+            f"a task-id whose latest row has an unconvertible ts must never be reported by stale "
+            f"(neither stale nor no_progress_recorded -- it has a row, just an unusable one): {out!r}")
 
         # stale with no --task-id at all considers every task-id ever seen in the ledger -- INCLUDING one
         # whose only row failed the ts-shape fold above ("badts"), which must still surface as
@@ -892,7 +917,10 @@ def main(argv):
             if r is None:
                 hits.append({"task_id": task_id, "status": "no_progress_recorded"})
                 continue
-            age = now - _ts_to_epoch(r["ts"])
+            epoch = _ts_to_epoch(r["ts"])
+            if epoch is None:
+                continue  # unconvertible timestamp -- never prove staleness from it, conservative by design
+            age = now - epoch
             if age > args.threshold_seconds:
                 hits.append({"task_id": task_id, "status": "stale", "phase": r["phase"],
                              "last_ts": r["ts"], "age_seconds": int(age)})

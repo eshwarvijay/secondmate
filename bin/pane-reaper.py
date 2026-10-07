@@ -223,6 +223,12 @@ def _herdr_json(argv):
         return json.loads(out.stdout)
     except ValueError as e:
         raise _HerdrError(f"`herdr {' '.join(argv)}` produced unparseable JSON: {e}")
+    except RecursionError as e:
+        # CONFIRMED BUG (checker round 4): a deeply-nested but otherwise syntactically valid JSON response
+        # overflows the recursive JSON decoder's call stack -- an uncaught RecursionError instead of the
+        # designed ERR_HERDR path. Fold it into the same _HerdrError handling as any other malformed herdr
+        # response rather than letting it crash `observe` with exit 1.
+        raise _HerdrError(f"`herdr {' '.join(argv)}` produced too-deeply-nested JSON: {e}")
 
 
 def _require_list(obj, path, context):
@@ -558,6 +564,19 @@ def _selfcheck_live():
         _write_fake_herdr(bindir, raw_pane_list="not json at all", raw_agent_list="{}")
         code, out, exc = _run(["observe"])
         assert code == 1 and exc == ERR_HERDR, "unparseable JSON from herdr must exit ERR_HERDR, not crash"
+
+        # CONFIRMED BUG (checker round 4): a deeply nested but otherwise SYNTACTICALLY VALID JSON
+        # response (e.g. ~1100 levels of nested arrays) overflows Python's recursive JSON decoder with an
+        # uncaught RecursionError, which is NOT a ValueError and so was NOT caught by the existing
+        # unparseable-JSON handling above -- `observe` crashed with exit 1 and a traceback instead of the
+        # designed ERR_HERDR path. Must be folded into the same ERR_HERDR handling as any other
+        # unparseable herdr response.
+        deeply_nested = "[" * 1100 + "]" * 1100
+        _write_fake_herdr(bindir, raw_pane_list=deeply_nested, raw_agent_list="{}")
+        code, out, exc = _run(["observe"])
+        assert code == 1 and exc == ERR_HERDR, (
+            f"deeply-nested-but-valid JSON from herdr must exit ERR_HERDR, not crash with RecursionError: "
+            f"code={code} exc={exc} out={out!r}")
 
         # CONFIRMED BUG (checker, round 1): syntactically VALID JSON that is missing the expected
         # top-level `result.panes`/`result.agents` shape (e.g. a bare `{}`, or a future herdr API shape
