@@ -297,7 +297,17 @@ def _observations_by_pane(recs=None):
 
 
 def _ts_to_epoch(ts):
-    return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    # a ts that passed _valid_ts's own format check (so it parses fine as a *syntactically* valid
+    # timestamp via strptime) can still be numerically out of time.mktime's representable range -- e.g.
+    # an extreme/corrupted year like "0001". CONFIRMED BUG (checker): this previously crashed `quiet`
+    # with an uncaught OverflowError instead of being treated as unusable/corrupt data, the same
+    # tolerant-parse-but-don't-crash discipline progress-ledger.py's own _recs() already applies
+    # elsewhere. Returns None on failure so the caller can skip the observation conservatively -- same
+    # never-false-positive posture already used for insufficient history.
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def find_quiet(by_pane, threshold_seconds, now=None):
@@ -322,7 +332,10 @@ def find_quiet(by_pane, threshold_seconds, now=None):
         if since_idx == len(obs) - 1:
             continue  # the signature changed since the observation right before latest -- not quiet
         since = obs[since_idx]
-        age = now - _ts_to_epoch(since["ts"])
+        since_epoch = _ts_to_epoch(since["ts"])
+        if since_epoch is None:
+            continue  # unconvertible timestamp -- never prove staleness from it, conservative by design
+        age = now - since_epoch
         if age >= threshold_seconds:
             hits.append({"pane_id": pane_id, "status": "quiet", "revision": sig[0], "agent_status": sig[1],
                          "state_change_seq": sig[2], "since_ts": since["ts"], "age_seconds": int(age)})
@@ -493,6 +506,22 @@ def _selfcheck_live():
             f"a very large (1000-digit) positive integer --threshold-seconds must be accepted cleanly, "
             f"never crash: code={code} exc={exc} out={out!r}")
         assert _valid_positive_number(huge), "a huge positive int must be a VALID threshold (finite, > 0)"
+
+        # CONFIRMED BUG (checker, full-diff review): two format-valid observations with an extreme
+        # timestamp (e.g. year 0001) pass _valid_ts's own strptime-based format check fine, but
+        # time.mktime on that same parsed struct raises an uncaught OverflowError -- the exact same
+        # class of bug as the --threshold-seconds OverflowError fixed above, on the ledger-READ side
+        # instead of the CLI-argument side. `quiet` must never crash on this; the pane with the
+        # unconvertible timestamp must simply never be reported (same conservative,
+        # never-false-positive posture as insufficient history), everything else unaffected.
+        _append({"ev": "pane_observed", "pane_id": "extreme-ts", "revision": 1, "agent_status": "idle",
+                 "ts": "0001-01-01T00:00:00"})
+        _append({"ev": "pane_observed", "pane_id": "extreme-ts", "revision": 1, "agent_status": "idle",
+                 "ts": "0001-01-01T00:00:01"})
+        code, out, exc = _run(["quiet", "--threshold-seconds", "1"])
+        assert exc in (0, 1), f"quiet must never crash on an extreme-but-format-valid timestamp: {out!r}"
+        assert '"pane_id": "extreme-ts"' not in out, (
+            f"a pane whose timestamp can't be converted to an epoch must never be reported quiet: {out!r}")
 
         # herdr command failure -> ERR_HERDR (2), distinct from quiet's own 0/1, never silently "observed
         # nothing". No new rows must be appended either.
