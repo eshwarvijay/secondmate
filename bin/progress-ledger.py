@@ -227,7 +227,22 @@ def _valid_budget_number(x):
     # same finite guard bin/log-round.sh's own _is_finite_number applies to --cost/--duration (nan/inf
     # are valid floats but not valid JSON), plus a non-negative floor: a cost/token/duration count can
     # never be negative, which log-round.sh's own precedent does not need to enforce for its freeform use.
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x >= 0
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, int):
+        # CONFIRMED BUG (checker, same pattern already fixed in bin/pane-reaper.py's
+        # _valid_positive_number): calling math.isfinite(x) on a native Python int implicitly converts
+        # it to a float first -- for an arbitrarily large int (e.g. 10**10000) that conversion itself
+        # raises OverflowError ("int too large to convert to float"), an UNCAUGHT exception instead of a
+        # clean accept/reject. Today's CLI only ever passes this function a float (argparse's own
+        # type=float on --cost/--tokens/--duration-seconds), but the function's own signature explicitly
+        # accepts int too, so any direct/reused caller passing a native int must not crash. A native int
+        # has no "infinite" representation at all (arbitrary precision, never nan/inf), so math.isfinite
+        # is unnecessary and actively harmful here: just compare directly.
+        return x >= 0
+    if isinstance(x, float):
+        return math.isfinite(x) and x >= 0
+    return False
 
 
 def _valid_ts(ts):
@@ -927,6 +942,15 @@ def main(argv):
             and not _valid_task_id("a/b") and not _valid_task_id("a" * 129), "task-id validation broken"
         assert _valid_phase(TERMINAL_PHASE) and not _valid_phase("") and not _valid_phase("bad phase"), (
             "phase validation broken")
+        # CONFIRMED BUG (checker, same pattern already fixed in bin/pane-reaper.py's
+        # _valid_positive_number): a native int this large previously crashed _valid_budget_number with
+        # an uncaught OverflowError inside math.isfinite(x) (int-to-float conversion overflow), instead
+        # of being accepted (it IS finite and >= 0 as a native Python int, which has no "infinite"
+        # representation at all). Today's CLI only ever passes this function a float (argparse's own
+        # type=float on --cost/--tokens/--duration-seconds), so this is exercised via a direct call,
+        # mirroring pane-reaper.py's own 1000-digit-integer regression for the identical root cause.
+        assert _valid_budget_number(10 ** 10000), "a huge native int must be a VALID budget number (finite, >= 0)"
+        assert not _valid_budget_number(-(10 ** 10000)), "a huge NEGATIVE native int must still be rejected"
         _selfcheck_live()
         _selfcheck_stale_scan_sees_corrupted_only_task()
         _selfcheck_default_ledger_path()
