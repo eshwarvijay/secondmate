@@ -47,7 +47,7 @@ When the trigger holds, you (the top-level supervisor) NEVER run the maker/check
 dispatch a FRESH sub-agent-supervisor instead: **solo dispatch** for one task, **batch dispatch**
 (hard-capped at 10 concurrent, not tunable) for several genuinely independent tasks at once. The
 dispatched sub-supervisor runs the mandatory sequence inside its own context:
-  0. Seed a self-reported task-tracking checklist (TodoWrite / Task* set / plain fallback) mirroring SOP steps, update items as you progress, so a silently-dropped step shows up as pending
+  0. Seed a self-reported task-tracking checklist (TodoWrite / Task* set / plain fallback) mirroring SOP steps, update items as you progress — especially Teardown or Audit trail — right after claiming and before Triage so a silently-dropped step shows up as pending
   1. Invoke the `secondmate` skill — it is the single source of truth
   2. Load the `herdr` skill if HERDR_ENV=1
   3. Spawn BEFORE touching any file — **In herdr (HERDR_ENV=1):** `herdr worktree create` → worktree + root_pane. **Headless / not in herdr:** `new-worktree.sh` instead (never the primary checkout)
