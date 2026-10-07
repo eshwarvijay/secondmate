@@ -22,8 +22,10 @@ exists.
                                                                    is unparseable -- NEVER folded silently
                                                                    into "observed nothing", so a tooling
                                                                    outage is never mistaken for "all quiet".
-  pane-reaper.py quiet --threshold-seconds N                  -> read-only, mirrors progress-ledger.py's
-                                                                   own `stale` contract exactly: one JSON
+  pane-reaper.py quiet --threshold-seconds N                  -> N must be a finite number > 0 (rejected
+                                                                   otherwise, nonzero exit); read-only,
+                                                                   mirrors progress-ledger.py's own
+                                                                   `stale` contract exactly: one JSON
                                                                    line per quiet pane, exit 1 if any hit,
                                                                    exit 0 if clean. Never appends, never
                                                                    calls herdr. A pane is reported only once
@@ -70,7 +72,7 @@ wins), for the same shared-worktree reason:
 This script never touches claim-ledger.py's or progress-ledger.py's own ledgers, schemas, or event types --
 a separate file, a separate ledger, a separate concern (pane activity, not claim ownership or checkpoints).
 """
-import json, sys, os, time, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
+import json, sys, os, time, math, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
 try:
     import fcntl
 except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
@@ -110,6 +112,16 @@ def _default_ledger_path():
 
 LEDGER = _default_ledger_path()
 _BAD = 0  # count of malformed/incomplete ledger lines seen by the last _recs()
+
+
+def _valid_positive_number(x):
+    # same finite-number idiom as progress-ledger.py's own budget-field validator, but requiring
+    # STRICTLY positive: a "quiet for N seconds" threshold of zero or less describes no real duration.
+    # CONFIRMED BUG (checker, round 1): a negative --threshold-seconds was previously accepted with no
+    # validation at all, making `age >= threshold_seconds` trivially true for any observed age (age is
+    # never negative), so every multi-observation pane was reported quiet instantly regardless of actual
+    # elapsed time.
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
 
 
 def _valid_ts(ts):
@@ -192,30 +204,50 @@ def _herdr_json(argv):
         raise _HerdrError(f"`herdr {' '.join(argv)}` produced unparseable JSON: {e}")
 
 
+def _require_list(obj, path, context):
+    """Walk `obj` via a dotted `path` of nested dict keys (e.g. "result.panes") and return the list at
+    that path -- raises _HerdrError if ANY key along the way is missing, or if the final value isn't a
+    list. This is the TOP-LEVEL shape check: CONFIRMED BUG (checker, round 1) -- a syntactically valid
+    but structurally wrong response (e.g. a bare `{}`, or a future herdr API shape change dropping
+    `result.panes`/`result.agents` entirely) previously fell through to an empty list silently, so
+    `observe` reported "observed 0 pane(s)" with exit 0 -- a false-clean result that hides a genuine
+    herdr-output problem behind the exact "nothing to see" signal this watchdog exists to never give.
+    This is DELIBERATELY distinct from an individual malformed ENTRY inside an otherwise well-shaped
+    list (e.g. one pane dict missing its own `pane_id`) -- that case is still tolerated and the single
+    bad entry is just skipped, by the per-entry loops in `_snapshot_panes` below; only a broken TOP-LEVEL
+    shape escalates to a loud, distinct herdr-output failure."""
+    cur = obj
+    keys = path.split(".")
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            raise _HerdrError(f"expected `{path}` in herdr's {context} response, got {obj!r}")
+        cur = cur[k]
+    if not isinstance(cur, list):
+        raise _HerdrError(f"expected `{path}` in herdr's {context} response to be a list, got {cur!r}")
+    return cur
+
+
 def _snapshot_panes():
     """Query herdr's own read-only pane/agent list (never anything mutating) and fold them into one
     {pane_id: {revision, agent_status, focused, state_change_seq}} snapshot -- state_change_seq is only
-    present for panes `agent list` itself returns (a pane with no agent attached has none). Tolerant of a
-    malformed or missing field on any individual entry -- a single bad entry is skipped, not a crash;
-    this is a DIFFERENT failure mode from _HerdrError (herdr itself failing), which must still propagate
-    to the caller rather than silently yield an empty snapshot."""
+    present for panes `agent list` itself returns (a pane with no agent attached has none). The TOP-LEVEL
+    `result.panes`/`result.agents` shape must actually be present (see _require_list) -- that failure
+    mode propagates to the caller as _HerdrError, never silently yielding an empty snapshot. Tolerant
+    only of a malformed or missing field on an individual ENTRY within an otherwise well-shaped list -- a
+    single bad entry is skipped, not a crash."""
     pane_list = _herdr_json(["pane", "list"])
     agent_list = _herdr_json(["agent", "list"])
 
-    panes_raw = []
-    if isinstance(pane_list, dict) and isinstance(pane_list.get("result"), dict):
-        panes_raw = pane_list["result"].get("panes", [])
-    agents_raw = []
-    if isinstance(agent_list, dict) and isinstance(agent_list.get("result"), dict):
-        agents_raw = agent_list["result"].get("agents", [])
+    panes_raw = _require_list(pane_list, "result.panes", "`herdr pane list`")
+    agents_raw = _require_list(agent_list, "result.agents", "`herdr agent list`")
 
     state_change_seq_by_pane = {}
-    for a in agents_raw if isinstance(agents_raw, list) else []:
+    for a in agents_raw:
         if isinstance(a, dict) and isinstance(a.get("pane_id"), str) and "state_change_seq" in a:
             state_change_seq_by_pane[a["pane_id"]] = a.get("state_change_seq")
 
     snapshot = {}
-    for p in panes_raw if isinstance(panes_raw, list) else []:
+    for p in panes_raw:
         if not (isinstance(p, dict) and isinstance(p.get("pane_id"), str)):
             continue  # malformed entry (e.g. no pane_id) -- skip, don't crash the whole poll
         pane_id = p["pane_id"]
@@ -355,10 +387,11 @@ def _selfcheck_live():
         assert len(_recs()) == 2, "observe must append exactly one row per pane"
 
         # a brand-new pane with only ONE observation ever must NEVER be reported, no matter the
-        # threshold -- there is no second data point to prove staleness against yet.
-        code, out, exc = _run(["quiet", "--threshold-seconds", "0"])
+        # threshold -- there is no second data point to prove staleness against yet. "1" is the
+        # smallest valid --threshold-seconds (0 and negative values are rejected -- see below).
+        code, out, exc = _run(["quiet", "--threshold-seconds", "1"])
         assert exc == 0 and out == "", (
-            "a pane with only one observation ever must never be reported, even with threshold 0")
+            "a pane with only one observation ever must never be reported, even at the smallest valid threshold")
 
         # Poll 2: p1's signature is IDENTICAL to poll 1 (unchanging over this window); p2's signature
         # CHANGED (its revision/state_change_seq advanced -- genuinely busy).
@@ -382,13 +415,20 @@ def _selfcheck_live():
         assert '"pane_id": "p2"' not in out, (
             f"p2's signature changed between polls -- it must never be reported quiet: {out}")
 
-        # isolate the "signature changed -> never reported" guard from timing entirely: even against
-        # threshold-seconds 0 (trivially satisfied by age alone), p2 must still never be reported, since
-        # its two observations disagree -- only p1 (unchanged) may appear.
-        code, out, exc = _run(["quiet", "--threshold-seconds", "0"])
-        assert exc == 1 and '"pane_id": "p1"' in out, "p1 (unchanged) must be reported even at threshold 0"
-        assert '"pane_id": "p2"' not in out, (
-            f"p2 must never be reported even at threshold 0 -- its signature genuinely changed: {out}")
+        # isolate the "signature changed -> never reported" guard from real-time timing entirely: append
+        # (bypassing observe) two DISAGREEING, hours-old observations for a synthetic pane "p4". If the
+        # guard that excludes a changed-signature pane were ever missing, a naive fallback to "the
+        # latest observation's own age" would trivially exceed almost any threshold here (p4's latest
+        # observation is itself 1 hour old) -- p4 must still never be reported, no matter how old its
+        # observations are, because its last two disagree.
+        hour_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 7200))
+        half_hour_ago = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+        _append({"ev": "pane_observed", "pane_id": "p4", "revision": 1, "agent_status": "idle", "ts": hour_ago})
+        _append({"ev": "pane_observed", "pane_id": "p4", "revision": 2, "agent_status": "idle", "ts": half_hour_ago})
+        code, out, exc = _run(["quiet", "--threshold-seconds", "1800"])
+        assert '"pane_id": "p4"' not in out, (
+            f"p4's last two observations disagree -- it must never be reported quiet no matter how old "
+            f"its latest observation is: {out}")
 
         # the same ledger against a huge threshold must report nothing -- p1 hasn't been unchanged THAT
         # long yet.
@@ -399,6 +439,25 @@ def _selfcheck_live():
         pre_len = len(_recs())
         _run(["quiet", "--threshold-seconds", "1"])
         assert len(_recs()) == pre_len, "quiet must never append to the ledger"
+
+        # --threshold-seconds must be a finite, strictly positive number -- CONFIRMED BUG (checker,
+        # round 1): a negative value was previously accepted with no validation at all, making
+        # `age >= threshold_seconds` trivially true for any observed age (age is never negative), so
+        # every multi-observation pane was reported quiet instantly regardless of real elapsed time.
+        # Zero is rejected too (no real "unchanged for zero seconds" duration), matching this script's
+        # own strictly-positive posture, not merely >= 0.
+        pre_len = len(_recs())
+        for bad in ("-1", "0", "-100", "nan", "inf", "-inf", "abc", "1.5"):
+            code, out, _ = _run(["quiet", "--threshold-seconds", bad])
+            # a bare `code != 0` alone is NOT sufficient here: the exact bug being guarded against makes
+            # a negative/zero threshold trivially report every multi-observation pane as a HIT, which
+            # ALSO exits nonzero (1) -- that would make this assertion pass even with the validation
+            # missing. Require that NO hit was reported either -- true rejection happens before any fold
+            # is even attempted, so no "quiet" JSON can appear on either path.
+            assert code != 0 and '"status": "quiet"' not in out, (
+                f"--threshold-seconds {bad!r} must be REJECTED outright, not silently treated as "
+                f"'everything is quiet' (which would also exit nonzero, masking a missing validation): {out!r}")
+        assert len(_recs()) == pre_len, "a rejected --threshold-seconds must never append to the ledger"
 
         # herdr command failure -> ERR_HERDR (2), distinct from quiet's own 0/1, never silently "observed
         # nothing". No new rows must be appended either.
@@ -413,6 +472,35 @@ def _selfcheck_live():
         _write_fake_herdr(bindir, raw_pane_list="not json at all", raw_agent_list="{}")
         code, out, exc = _run(["observe"])
         assert code == 1 and exc == ERR_HERDR, "unparseable JSON from herdr must exit ERR_HERDR, not crash"
+
+        # CONFIRMED BUG (checker, round 1): syntactically VALID JSON that is missing the expected
+        # top-level `result.panes`/`result.agents` shape (e.g. a bare `{}`, or a future herdr API shape
+        # change) must ALSO raise ERR_HERDR -- it must never silently fall through to an empty snapshot
+        # and report "observed 0 pane(s)" with exit 0, which would hide a real herdr-output problem
+        # behind the exact false-clean signal this watchdog exists to avoid. Exercised for both calls
+        # independently: pane list missing its shape (agent list well-formed), and vice versa.
+        pre_len = len(_recs())
+        _write_fake_herdr(bindir, raw_pane_list="{}", raw_agent_list=json.dumps(_agent_list_json([])))
+        code, out, exc = _run(["observe"])
+        assert code == 1 and exc == ERR_HERDR, (
+            f"a bare {{}} `pane list` response (missing result.panes) must exit ERR_HERDR, not fall "
+            f"through to an empty snapshot: exc={exc}")
+        _write_fake_herdr(bindir, raw_pane_list=json.dumps(_pane_list_json([])), raw_agent_list="{}")
+        code, out, exc = _run(["observe"])
+        assert code == 1 and exc == ERR_HERDR, (
+            f"a bare {{}} `agent list` response (missing result.agents) must exit ERR_HERDR, not fall "
+            f"through to an empty snapshot: exc={exc}")
+        assert len(_recs()) == pre_len, "neither bad-shape observe attempt must append any row"
+
+        # per-ENTRY tolerance must still hold even though the TOP-LEVEL shape is now strictly enforced --
+        # a single malformed pane/agent dict inside an otherwise well-shaped list is still just skipped,
+        # never escalated to ERR_HERDR (that's the distinction _require_list's own docstring draws).
+        _write_fake_herdr(bindir,
+            _pane_list_json([{"pane_id": "pshape", "revision": 1, "agent_status": "idle"}]),
+            _agent_list_json([{"revision": 1}]))  # agent entry missing pane_id -- tolerated, not an error
+        code, out, exc = _run(["observe"])
+        assert code == 0 and exc is None, (
+            "a malformed INDIVIDUAL agent entry inside a well-shaped list must still be tolerated, not ERR_HERDR")
 
         # a pane entry missing pane_id must be skipped tolerantly, never crash the whole observe call --
         # other, well-formed entries in the same poll must still be recorded.
@@ -524,6 +612,8 @@ def main(argv):
         print(f"observed {len(snapshot)} pane(s)")
 
     elif args.cmd == "quiet":
+        if not _valid_positive_number(args.threshold_seconds):
+            sys.exit(f"invalid --threshold-seconds {args.threshold_seconds!r}: must be a finite number > 0")
         # read-only, no lock -- same lock-free precedent progress-ledger.py's own `stale` establishes.
         by_pane = _observations_by_pane()
         hits = find_quiet(by_pane, args.threshold_seconds)

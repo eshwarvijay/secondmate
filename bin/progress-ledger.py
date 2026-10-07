@@ -611,8 +611,14 @@ def _selfcheck_live():
         # THE single most important invariant -- a record call that omits all five new flags must
         # produce output byte-for-byte identical to pre-change behavior. "nofields" below never supplies
         # any of them.
-        code, _, _ = _run(["record", "--task-id", "nofields", "--owner", "sm-nofields", "--phase", "claimed"])
+        code, out, _ = _run(["record", "--task-id", "nofields", "--owner", "sm-nofields", "--phase", "claimed"])
         assert code == 0
+        # record's own success message, not just latest's later rendering, must match legacy output
+        # exactly for a no-new-flags call -- CONFIRMED TEST GAP (checker, round 1): the prior version of
+        # this selfcheck never asserted record's own stdout at all, so an accidental mutation to that
+        # print (e.g. appending stray text) would have gone undetected.
+        assert out == "recorded nofields phase=claimed", (
+            f"record's own success message for a no-new-flags call must match legacy output exactly: {out!r}")
         r = latest_by_task()["nofields"]
         expected_line = f"[nofields] phase=claimed owner=sm-nofields ts={r['ts']}"
         code, out, _ = _run(["latest"])
@@ -638,11 +644,15 @@ def _selfcheck_live():
         # rejection: non-finite/negative numeric fields, and bad --still-achievable, must all be rejected.
         # "--flag=value" form (not separate argv tokens) sidesteps argparse's own "-inf looks like an
         # unknown option, not a value" ambiguity -- irrelevant to what this script itself validates.
-        for combined in ("--cost=-1", "--cost=nan", "--cost=inf", "--cost=-inf",
-                          "--tokens=-5", "--tokens=nan",
-                          "--duration-seconds=-0.01", "--duration-seconds=nan"):
-            code, _, _ = _run(["record", "--task-id", "badnum", "--owner", "o", "--phase", "claimed", combined])
-            assert code != 0, f"{combined!r} must be rejected"
+        # CONFIRMED TEST GAP (checker, round 1): the prior version of this loop only exercised
+        # nan/inf/-inf for --cost, not for --tokens/--duration-seconds (the validator already rejected
+        # all three correctly -- this closes the missing REGRESSION coverage, symmetric across all three
+        # numeric fields so a future regression in any one of them would be caught).
+        for flag in ("--cost", "--tokens", "--duration-seconds"):
+            for bad in ("-1", "nan", "inf", "-inf"):
+                combined = f"{flag}={bad}"
+                code, _, _ = _run(["record", "--task-id", "badnum", "--owner", "o", "--phase", "claimed", combined])
+                assert code != 0, f"{combined!r} must be rejected"
         code, _, _ = _run(["record", "--task-id", "badchoice", "--owner", "o", "--phase", "claimed",
                             "--still-achievable", "maybe"])
         assert code != 0, "--still-achievable must reject a value outside {yes,no}"
