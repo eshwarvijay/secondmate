@@ -6,7 +6,7 @@ tags:
   - discipline
 evidence: E4
 earned-in: seed
-helpful_count: 3
+helpful_count: 4
 ---
 
 Stay within the literal scope of the task — do not edit, delete, or 'clean up' lines unrelated to the stated change, even if they look adjacent, inconsistent, or improvable. If you notice something else that seems wrong, mention it in your DONE summary instead of changing it.

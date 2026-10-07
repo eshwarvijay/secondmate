@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 51 total)
+## Recent flow (orchestration mechanics) entries (15 of 52 total)
 
-- 2026-09-28 — bin/launch-checker.sh: cd into --repo before invoking the harness (`audit/flow/2026-09-28--fix-checker-cwd.md`)
 - 2026-09-28 — plan-committee: give planners read-only repo tool access (`audit/flow/2026-09-28--planner-file-access.md`)
 - 2026-09-28 — Allow single-task delegation to a fresh sub-agent-supervisor (`audit/flow/2026-09-28--subagent-delegate.md`)
 - 2026-09-29 — claim-ledger.py: declared scope+operation claims + read-only conflicts check (stolen idea from foremerge) (`audit/flow/2026-09-29--claim-ledger-scope-conflict.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-02 — sub-supervisor-todo-list: require dispatched sub-supervisors to self-track SOP steps via TodoWrite (`audit/flow/2026-10-02--sub-supervisor-todo-list.md`)
 - 2026-10-04 — STE-style sentence pass on maker boilerplate + checker prompts (cross-model clarity) (`audit/flow/2026-10-04--ste-style-cross-model-prompts.md`)
 - 2026-10-04 — use-default-todo-tool: generic check-then-use task-tracking tool wording for sub-agent-supervisors (`audit/flow/2026-10-04--use-default-todo-tool.md`)
+- 2026-10-08 — session-banner-todo-mention: close the deferred follow-up from 2026-10-02 by mentioning task-tracking-checklist seedi... (`audit/flow/2026-10-08--session-banner-todo-mention.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 49 total)
+## Recent decision (choices, findings, escalations) entries (15 of 50 total)
 
-- 2026-09-28 — Fix checker cwd at the primitive level, decline touching the documented recipe (`audit/decision/2026-09-28--fix-checker-cwd.md`)
 - 2026-09-28 — Reuse checker's --exclude-tools pattern, decline new sandbox machinery (`audit/decision/2026-09-28--planner-file-access.md`)
 - 2026-09-28 — Widen fan-out trigger to N=1, decline security/config over-engineering (`audit/decision/2026-09-28--subagent-delegate.md`)
 - 2026-09-29 — Ship declared-scope+operation mechanism only; decline foremerge's SQLite/MCP/HTTP machinery (`audit/decision/2026-09-29--claim-ledger-scope-conflict.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-02 — Single insertion point at 'The loop' header; non-conflation with progress-ledger.py verified by checker (`audit/decision/2026-10-02--sub-supervisor-todo-list.md`)
 - 2026-10-04 — STE rewrite preserves all rules/guardrails verbatim; checker side-by-side diff confirms, human-approved merge (`audit/decision/2026-10-04--ste-style-cross-model-prompts.md`)
 - 2026-10-04 — Generic tool-detection wording, decline partial-availability branching and version bump (`audit/decision/2026-10-04--use-default-todo-tool.md`)
+- 2026-10-08 — Insert a new "0." banner item (not a trailing bullet), closed by two checker-driven precision fixes; three process re... (`audit/decision/2026-10-08--session-banner-todo-mention.md`)
