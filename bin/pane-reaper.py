@@ -22,10 +22,17 @@ exists.
                                                                    is unparseable -- NEVER folded silently
                                                                    into "observed nothing", so a tooling
                                                                    outage is never mistaken for "all quiet".
-  pane-reaper.py quiet --threshold-seconds N                  -> N must be a finite number > 0 (rejected
-                                                                   otherwise, nonzero exit); read-only,
-                                                                   mirrors progress-ledger.py's own
-                                                                   `stale` contract exactly: one JSON
+  pane-reaper.py quiet --threshold-seconds N                  -> N must be a WHOLE number of seconds > 0
+                                                                   (argparse `type=int`, same int-only
+                                                                   posture as progress-ledger.py's own
+                                                                   `stale --threshold-seconds`; a
+                                                                   fractional value like "1.5" is
+                                                                   rejected at the argparse layer itself,
+                                                                   before this script's own validation
+                                                                   ever runs) -- rejected otherwise,
+                                                                   nonzero exit; read-only, mirrors
+                                                                   progress-ledger.py's own `stale`
+                                                                   contract exactly: one JSON
                                                                    line per quiet pane, exit 1 if any hit,
                                                                    exit 0 if clean. Never appends, never
                                                                    calls herdr. A pane is reported only once
@@ -121,7 +128,21 @@ def _valid_positive_number(x):
     # validation at all, making `age >= threshold_seconds` trivially true for any observed age (age is
     # never negative), so every multi-observation pane was reported quiet instantly regardless of actual
     # elapsed time.
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, int):
+        # CONFIRMED BUG (checker round 2 -> round 3, independently reconfirmed by the supervisor):
+        # calling math.isfinite(x) on a native Python int implicitly converts it to a float first --
+        # for an arbitrarily large int (argparse's own type=int on --threshold-seconds imposes no upper
+        # bound), that conversion itself raises OverflowError ("int too large to convert to float"), an
+        # UNCAUGHT exception/stack trace instead of a clean accept or reject. A native int has no
+        # "infinite" representation at all (arbitrary precision, never nan/inf -- those strings already
+        # fail earlier at argparse's own int() parsing), so math.isfinite is unnecessary and actively
+        # harmful here: just compare directly.
+        return x > 0
+    if isinstance(x, float):
+        return math.isfinite(x) and x > 0
+    return False
 
 
 def _valid_ts(ts):
@@ -459,6 +480,20 @@ def _selfcheck_live():
                 f"'everything is quiet' (which would also exit nonzero, masking a missing validation): {out!r}")
         assert len(_recs()) == pre_len, "a rejected --threshold-seconds must never append to the ledger"
 
+        # CONFIRMED BUG (checker round 2 -> round 3, independently reconfirmed by the supervisor): a
+        # very large positive integer --threshold-seconds (e.g. a 1000-digit number) previously crashed
+        # with an uncaught `OverflowError: int too large to convert to float` inside
+        # _valid_positive_number's own math.isfinite(x) call, instead of being accepted (it IS finite
+        # and > 0 as a native Python int, which has no "infinite" representation at all). Must now be
+        # ACCEPTED and produce a clean, ordinary result -- no crash, no stack trace, exit 0 on an empty
+        # ledger.
+        huge = 10 ** 1000
+        code, out, exc = _run(["quiet", "--threshold-seconds", str(huge)])
+        assert exc == 0 and out == "", (
+            f"a very large (1000-digit) positive integer --threshold-seconds must be accepted cleanly, "
+            f"never crash: code={code} exc={exc} out={out!r}")
+        assert _valid_positive_number(huge), "a huge positive int must be a VALID threshold (finite, > 0)"
+
         # herdr command failure -> ERR_HERDR (2), distinct from quiet's own 0/1, never silently "observed
         # nothing". No new rows must be appended either.
         _write_fake_herdr(bindir, fail=True)
@@ -491,6 +526,27 @@ def _selfcheck_live():
             f"a bare {{}} `agent list` response (missing result.agents) must exit ERR_HERDR, not fall "
             f"through to an empty snapshot: exc={exc}")
         assert len(_recs()) == pre_len, "neither bad-shape observe attempt must append any row"
+
+        # COVERAGE GAP (checker, round 2 -> round 3): the above only tests the "key missing entirely"
+        # branch of _require_list. A key that's PRESENT but the WRONG TYPE (e.g. `result.panes: null` or
+        # `result.panes: "not-a-list"` -- a real herdr response reshape could plausibly do either) must
+        # ALSO raise ERR_HERDR, never silently coerce or crash differently. Exercised for both calls
+        # independently, with two different wrong-type shapes (null and a bare string) for extra
+        # coverage.
+        pre_len = len(_recs())
+        _write_fake_herdr(bindir, raw_pane_list=json.dumps({"result": {"panes": None}}),
+                           raw_agent_list=json.dumps(_agent_list_json([])))
+        code, out, exc = _run(["observe"])
+        assert code == 1 and exc == ERR_HERDR, (
+            f"result.panes present but null (wrong type) must exit ERR_HERDR, not crash or silently "
+            f"coerce: exc={exc}")
+        _write_fake_herdr(bindir, raw_pane_list=json.dumps(_pane_list_json([])),
+                           raw_agent_list=json.dumps({"result": {"agents": "not-a-list"}}))
+        code, out, exc = _run(["observe"])
+        assert code == 1 and exc == ERR_HERDR, (
+            f"result.agents present but a bare string (wrong type) must exit ERR_HERDR, not crash or "
+            f"silently coerce: exc={exc}")
+        assert len(_recs()) == pre_len, "neither wrong-type-shape observe attempt must append any row"
 
         # per-ENTRY tolerance must still hold even though the TOP-LEVEL shape is now strictly enforced --
         # a single malformed pane/agent dict inside an otherwise well-shaped list is still just skipped,
