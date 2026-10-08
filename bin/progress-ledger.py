@@ -272,7 +272,12 @@ def _recs():
             continue
         try:
             o = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # CONFIRMED BUG (checker): a deeply-nested but syntactically valid JSON line (e.g. ~1100
+            # levels of nested arrays) raises RecursionError, not ValueError -- the same class already
+            # fixed in this script's own _ts_to_epoch/stale and in pane-reaper.py's _herdr_json. Must be
+            # treated as any other malformed/unparseable line: counted in _BAD, skipped, never crash the
+            # whole read.
             _BAD += 1; continue
         valid = (isinstance(o, dict) and o.get("ev") == "progress"
                  and isinstance(o.get("task_id"), str) and isinstance(o.get("owner"), str)
@@ -641,6 +646,23 @@ def _selfcheck_live():
             "omitting --task-id must scan every known task-id, reporting only the actually-stale ones")
         assert '"task_id": "badts", "status": "no_progress_recorded"' in out, (
             "a whole-ledger scan must still report a task-id whose only row failed ts validation")
+
+        # CONFIRMED BUG (checker): a deeply-nested but SYNTACTICALLY VALID JSON line stored directly in
+        # the ledger file (e.g. ~1100 levels of nested arrays) raises an uncaught RecursionError from
+        # json.loads, not ValueError -- the existing `except ValueError` in _recs()'s own parse loop does
+        # not catch it, so the whole read (and therefore `stale`/`latest`) crashed instead of treating the
+        # one line as malformed like any other unparseable row. Placed last (after every whole-ledger
+        # `--task-id`-omitted scan above) since this corrupt line, once appended, persists in the shared
+        # ledger for the rest of this function -- it must never again crash a later full scan either, but
+        # there are none left after this point in this test function.
+        bad_before = _BAD
+        with LEDGER.open("a") as f:
+            f.write("[" * 1100 + "]" * 1100 + "\n")
+        code, out, exc = _run(["stale", "--threshold-seconds", "1", "--task-id", "whatever"])
+        assert exc in (0, 1), (
+            f"a deeply-nested-but-valid JSON ledger line must never crash stale with a RecursionError: {out!r}")
+        _recs()  # refresh _BAD as a side effect
+        assert _BAD > bad_before, "a deeply-nested JSON ledger line must be counted as malformed (_BAD)"
 
         # `stale` never appends -- it's read-only, like claim-ledger.py's own `conflicts`.
         pre_len = len(_recs())

@@ -172,7 +172,11 @@ def _recs():
             continue
         try:
             o = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # CONFIRMED BUG (checker): a deeply-nested but syntactically valid JSON line (e.g. ~1100
+            # levels of nested arrays) raises RecursionError, not ValueError -- the same class already
+            # fixed in this script's own _herdr_json. Must be treated as any other malformed/unparseable
+            # line: counted in _BAD, skipped, never crash the whole read.
             _BAD += 1; continue
         valid = (isinstance(o, dict) and o.get("ev") == "pane_observed"
                  and isinstance(o.get("pane_id"), str) and _valid_ts(o.get("ts")))
@@ -648,6 +652,20 @@ def _selfcheck_live():
         bad_before = _BAD
         _recs()
         assert _BAD > bad_before, "a malformed ledger line must be counted as corruption"
+
+        # CONFIRMED BUG (checker): a deeply-nested but SYNTACTICALLY VALID JSON line stored directly in
+        # the ledger file (e.g. ~1100 levels of nested arrays) raises an uncaught RecursionError from
+        # json.loads, not ValueError -- the existing `except ValueError` in _recs()'s own parse loop does
+        # not catch it, so the whole read (and therefore `quiet`) crashed instead of treating the one
+        # line as malformed like any other unparseable row.
+        bad_before = _BAD
+        with LEDGER.open("a") as f:
+            f.write("[" * 1100 + "]" * 1100 + "\n")
+        code, out, exc = _run(["quiet", "--threshold-seconds", "1"])
+        assert exc in (0, 1), (
+            f"a deeply-nested-but-valid JSON ledger line must never crash quiet with a RecursionError: {out!r}")
+        _recs()
+        assert _BAD > bad_before, "a deeply-nested JSON ledger line must be counted as malformed (_BAD)"
     finally:
         LEDGER = orig_ledger
         os.environ["PATH"] = orig_path
