@@ -602,11 +602,12 @@ bin/pane-reaper.py observe
 # below needs at least two of these recorded for a given pane before it can ever report anything, so
 # skipping this call would make `quiet` silently never fire.
 
-bin/pane-reaper.py quiet --threshold-seconds <N> | grep -F -e "<root_pane_id>" [-e "<checker_pane_id>" ...]
+bin/pane-reaper.py quiet --threshold-seconds <N> | grep -F -e "\"pane_id\": \"<root_pane_id>\"" [-e "\"pane_id\": \"<checker_pane_id>\"" ...]
 # one JSON line per quiet pane across pane-reaper's WHOLE shared ledger — it has no pane-id filter of its
 # own, so filter its JSON-lines output down to just the pane ids this dispatch itself knows (its
 # root_pane, and any checker pane it created), the same spirit as `ready --batch-id`'s own filtering
-# above.
+# above. Match the quoted `"pane_id": "<id>"` key form pane-reaper.py itself writes each hit as, never
+# the bare id — a bare id substring-collides (e.g. "p1" wrongly matching an unrelated "p10").
 ```
 
 Pick `<N>` (a threshold in seconds) generously relative to how long a normal round takes in this
