@@ -120,9 +120,9 @@ This is the spec the maker receives.
   # Prerequisite: step 2 must have called mark-maker.sh after herdr worktree create (see step 2 for the full sequence)
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
   # immediately before this start, run the "Nested context-file args" block (with <wt> = this worktree's
-  # path, fresh at every launch); its "${nested_ctx_args[@]}" splices into the pi argv below (empty array = zero words)
+  # path, fresh at every launch); its set -u-safe splice goes into the pi argv below (empty array = zero words)
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}"
+    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"
   herdr agent prompt sm-pi-<task-id> "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
@@ -139,8 +139,8 @@ This is the spec the maker receives.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless (immediately before launching, run the "Nested
   context-file args" block with `<wt>` = this worktree's path, fresh at every launch; its
-  `"${nested_ctx_args[@]}"` splices into the pi argv below — an empty array splices to zero words):
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
+  set -u-safe splice goes into the pi argv below — an empty array splices to zero words):
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
   A good plan gives:
@@ -230,18 +230,26 @@ a state file:
 nested_ctx_args=()
 while IFS= read -r -d '' f; do
   nested_ctx_args+=(--append-system-prompt "$f")
-done < <(find <wt> -mindepth 2 -not -path '*/.git/*' \( -iname 'CLAUDE.md' -o -iname 'CLAUDE.MD' -o -iname 'AGENTS.md' -o -iname 'AGENTS.MD' -o -iname 'AGENTS.override.md' \) -print0)
+done < <(find <wt> -mindepth 2 -not -path '*/.git/*' -type f \( -iname 'CLAUDE.md' -o -iname 'CLAUDE.MD' -o -iname 'AGENTS.md' -o -iname 'AGENTS.MD' -o -iname 'AGENTS.override.md' \) -print0)
 ```
 
 `-mindepth 2` is what excludes the root-level file (find depth 1) while still catching
 strictly-nested ones — pi already ancestor-walks to the root-level file on its own, so passing it
 again would double it. The `.git` exclusion must stay a `-not -path` TEST, never a `-prune` ACTION —
 a `-prune` combined with `-mindepth` silently never fires (confirmed empirically: `.git`-internal
-files leak straight through). Then splice `"${nested_ctx_args[@]}"` into that pi invocation's argv,
-each nested file becoming its own `--append-system-prompt <path>` pair (pi auto-detects an existing
-file path there and injects its contents — pi's own documented behavior, nothing to add on pi's
-side). An empty array splices to zero words, so a worktree with no nested context files yields a
-byte-identical invocation — no empty flag, no broken argv, no special-case branch. Every pi launch
+files leak straight through). `-type f` must stay in the find too: the `-iname` group matches by
+basename only, so without it a nested DIRECTORY that happens to be named like a context file (e.g. a
+`CLAUDE.md/` folder) would match as well — a directory is not a context file. Then splice
+`"${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"` into that pi invocation's argv, each nested file
+becoming its own `--append-system-prompt <path>` pair (pi auto-detects an existing file path there
+and injects its contents — pi's own documented behavior, nothing to add on pi's side). The splice
+must keep exactly this `${arr[@]+"${arr[@]}"}` form, never the plainer `"${nested_ctx_args[@]}"`:
+under `set -u`, bash 3.2 (macOS's default) treats a declared-but-EMPTY array's plain `"${arr[@]}"`
+expansion as an unbound-variable error and kills the launch, while the `+` form expands its inner
+expansion only when the array holds at least one element — so the empty case still splices to zero
+words, the populated case expands normally (embedded spaces in paths included), and a worktree
+with no nested context files yields a byte-identical invocation — no empty flag, no broken argv, no
+special-case branch. Every pi launch
 call site in this file carries a short pointer to this block instead of retyping it (same convention
 as the block above); the "Pi herdr maker (still running)" prompt-only site never runs it — no new pi
 process starts there, so there is nothing to inject.
@@ -314,8 +322,8 @@ process starts there, so there is nothing to inject.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
-     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}"`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
+     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"`, then prompt with the same fix plan and checklist.
+     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
      - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
