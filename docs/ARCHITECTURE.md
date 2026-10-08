@@ -26,7 +26,7 @@ Two principles run through every component:
 | **Top-level supervisor** | Claude Code (Sonnet), human-facing | recognize the trigger, dispatch a fresh sub-agent-supervisor, watch for progress/staleness, relay stuck/hold situations verbatim, stay free for the next input | never runs the maker/checker/gate/hold/merge loop itself once the trigger fires |
 | **Sub-agent-supervisor** | Claude Code (Sonnet), dispatched | plan, triage, orchestrate, adjudicate, integrate — the loop's stages 0-10 all run here | never writes project code itself |
 | **Planners** | 6 open-weight models via pi | each covers one dimension of the task in parallel | headless, edit-locked (Read/Grep/Bash, no edit/write) |
-| **Maker** | Claude or pi + Qwen3-Coder | implement the change in an isolated worktree | works only in its own worktree |
+| **Maker** | Claude or pi + GLM-5.3 | implement the change in an isolated worktree | works only in its own worktree |
 | **Checker** | a *different* model (GPT-5.6-Terra) | review the diff adversarially | physically read-only, edit-locked |
 
 The separation is the point: **maker is not checker, and they run different model families** so their
@@ -46,7 +46,7 @@ flowchart TD
     PC --> SYN[Sub-supervisor synthesizes<br/>consolidated plan]
     SYN --> ROUTE{Route maker}
     ROUTE -->|needs judgment / MCP| MKC[Claude maker]
-    ROUTE -->|well-specified / pure code| MKQ[pi + Qwen3-Coder maker]
+    ROUTE -->|well-specified / pure code| MKQ[pi + GLM-5.3 maker]
     MKC --> TRI{Triage: ship or scout, full or fast}
     MKQ --> TRI
     TRI -->|reasoning one-shot| RS[reason.sh: different model, read-only]

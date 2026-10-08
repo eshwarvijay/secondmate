@@ -63,7 +63,7 @@ back. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the dispatch mechanic
 flowchart LR
     A[loop-task: goal] --> P[plan-committee<br/>6 models in parallel]
     P --> S[supervisor: Sonnet<br/>synthesizes plan]
-    S --> M[maker<br/>Claude or pi+Qwen --thinking medium]
+    S --> M[maker<br/>Claude or pi+GLM-5.3 --thinking medium]
     M --> C[checker<br/>gpt-terra, read-only]
     C --> V{verdict}
     V -- fail --> S2[supervisor<br/>synthesizes fix plan]
@@ -75,7 +75,7 @@ flowchart LR
 ```
 
 > The planning committee runs unconditionally for every task, inside the dispatched sub-agent-supervisor's
-> own context. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3), Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. The sub-supervisor (Sonnet) synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + Qwen3-Coder (`--thinking medium`)** for well-specified pure-code tasks.
+> own context. For complex tasks it runs 6 open-weight models (DeepSeek-R1, Qwen3-Next-80B, Qwen3-Coder-Next, Kimi K3 (bedrock cross-region inference profile: global.moonshotai.kimi-k3), Mistral-Large-3, GLM-5) in parallel, each covering a different dimension. The sub-supervisor (Sonnet) synthesizes all outputs into one consolidated plan, then routes to the right maker: **Claude** for tasks needing judgment or MCP tools, **pi + GLM-5.3 (`global.zai.glm-5.3`, `--thinking medium`)** for well-specified pure-code tasks.
 >
 > On a checker `fail`, the sub-supervisor synthesizes a fix plan and hands it back to the **same maker** (task-scoped agent name, same worktree) — never fixes inline. The supervisor never writes project code.
 
