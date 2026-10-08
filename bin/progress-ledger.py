@@ -366,7 +366,12 @@ def _all_task_ids():
             continue
         try:
             o = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # CONFIRMED BUG (checker, round 9): a deeply-nested but syntactically valid JSON line (e.g.
+            # ~1100 levels of nested arrays) raises RecursionError, not ValueError -- the same class
+            # already fixed in this script's own _recs() (round 8). This is a SEPARATE json.loads loop
+            # over the same ledger file, so round 8's fix did not cover it; a whole-ledger `stale`/`ready`
+            # scan (no --task-id) still crashed via this path.
             continue
         if isinstance(o, dict) and o.get("ev") == "progress" and isinstance(o.get("task_id"), str):
             ids.add(o["task_id"])
@@ -781,6 +786,43 @@ def _selfcheck_stale_scan_sees_corrupted_only_task():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _selfcheck_recursionerror_in_all_task_ids():
+    """CONFIRMED BUG (checker, round 9): _all_task_ids() has its OWN separate json.loads loop over the
+    SAME ledger file as _recs() -- round 8 fixed _recs()'s RecursionError handling but missed this second
+    loop, which still only caught ValueError. A deeply-nested-but-syntactically-valid JSONL line (e.g.
+    ~1100 levels of nested arrays) still crashed a whole-ledger `stale`/`ready` scan (no --task-id, which
+    is the only code path that calls _all_task_ids()) with an uncaught RecursionError. Isolated in its own
+    fresh ledger/tmpdir (same precedent as _selfcheck_stale_scan_sees_corrupted_only_task above) so it
+    never interacts with any other test's ledger state."""
+    global LEDGER
+    orig_ledger = LEDGER
+    tmpdir = tempfile.mkdtemp(prefix="progress-ledger-selfcheck-deepnest-")
+    LEDGER = pathlib.Path(tmpdir) / "progress.jsonl"
+    try:
+        code, _, _ = _run(["record", "--task-id", "normal-task", "--owner", "sm-normal",
+                            "--phase", TERMINAL_PHASE])
+        assert code == 0, "setup: a normal record must succeed"
+        with LEDGER.open("a") as f:
+            f.write("[" * 1100 + "]" * 1100 + "\n")
+
+        code, out, exc = _run(["stale", "--threshold-seconds", "3600"])
+        assert exc in (0, 1), (
+            f"a whole-ledger `stale` scan (no --task-id) must never crash with a RecursionError on a "
+            f"deeply-nested JSONL line: {out!r}")
+        assert '"task_id": "normal-task"' not in out, (
+            "normal-task was just recorded and must not be reported stale against a huge threshold")
+
+        code, out, exc = _run(["ready"])
+        assert code == 0 and exc is None, (
+            f"a whole-ledger `ready` scan (no --task-id) must never crash with a RecursionError on a "
+            f"deeply-nested JSONL line: {out!r}")
+        assert '"task_id": "normal-task"' in out, (
+            "a whole-ledger ready scan must still find the one legitimate terminal-phase task-id")
+    finally:
+        LEDGER = orig_ledger
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _selfcheck_default_ledger_path():
     # Same cross-worktree-sharing regression as claim-ledger.py's own _selfcheck_default_ledger_path:
     # a dispatcher (in the primary checkout) and a sub-supervisor (in a linked worktree) must resolve to
@@ -1003,6 +1045,7 @@ def main(argv):
         assert not _valid_budget_number(-(10 ** 10000)), "a huge NEGATIVE native int must still be rejected"
         _selfcheck_live()
         _selfcheck_stale_scan_sees_corrupted_only_task()
+        _selfcheck_recursionerror_in_all_task_ids()
         _selfcheck_default_ledger_path()
         print("ok")
 

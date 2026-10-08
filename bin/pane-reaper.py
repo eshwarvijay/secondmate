@@ -217,14 +217,22 @@ class _HerdrError(Exception):
 
 
 def _herdr_json(argv):
+    # CONFIRMED BUG (checker, round 9): text=True makes subprocess.run decode stdout/stderr as UTF-8
+    # itself -- if herdr exits 0 but emits an invalid UTF-8 byte (e.g. a stray 0xff) in its stdout, that
+    # decode raises an uncaught UnicodeDecodeError, crashing `observe` with exit 1 instead of the designed
+    # ERR_HERDR path. Capture raw bytes instead and decode tolerantly (errors="replace") ourselves, so an
+    # invalid-byte response degrades to a parseable-but-wrong string -- which then correctly fails
+    # json.loads below and raises _HerdrError -- rather than crashing at the decode step itself.
     try:
-        out = subprocess.run(["herdr"] + argv, capture_output=True, text=True, timeout=30)
+        out = subprocess.run(["herdr"] + argv, capture_output=True, text=False, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise _HerdrError(f"could not run `herdr {' '.join(argv)}`: {e}")
+    stdout = out.stdout.decode("utf-8", errors="replace")
+    stderr = out.stderr.decode("utf-8", errors="replace")
     if out.returncode != 0:
-        raise _HerdrError(f"`herdr {' '.join(argv)}` exited {out.returncode}: {out.stderr.strip()}")
+        raise _HerdrError(f"`herdr {' '.join(argv)}` exited {out.returncode}: {stderr.strip()}")
     try:
-        return json.loads(out.stdout)
+        return json.loads(stdout)
     except ValueError as e:
         raise _HerdrError(f"`herdr {' '.join(argv)}` produced unparseable JSON: {e}")
     except RecursionError as e:
@@ -581,6 +589,32 @@ def _selfcheck_live():
         assert code == 1 and exc == ERR_HERDR, (
             f"deeply-nested-but-valid JSON from herdr must exit ERR_HERDR, not crash with RecursionError: "
             f"code={code} exc={exc} out={out!r}")
+
+        # CONFIRMED BUG (checker, round 9): a herdr that exits 0 but emits an invalid UTF-8 byte (e.g. a
+        # stray 0xff) in its stdout previously crashed with an uncaught UnicodeDecodeError at
+        # subprocess.run's own text=True decode step, before _herdr_json's own json.loads try/except ever
+        # ran -- `observe` exited 1 with a traceback instead of the designed ERR_HERDR path. Written
+        # directly (not via _write_fake_herdr, which only shapes well-formed JSON payloads): `printf
+        # '\xff'` emits one raw invalid-UTF-8 byte to stdout, then exits 0.
+        invalid_utf8_herdr = """#!/usr/bin/env bash
+if [ "$1" = "pane" ] && [ "$2" = "list" ]; then
+printf '\\xff'
+exit 0
+fi
+if [ "$1" = "agent" ] && [ "$2" = "list" ]; then
+echo '{}'
+exit 0
+fi
+echo "unexpected herdr args: $@" >&2
+exit 1
+"""
+        herdr_script = bindir / "herdr"
+        herdr_script.write_text(invalid_utf8_herdr)
+        herdr_script.chmod(0o755)
+        code, out, exc = _run(["observe"])
+        assert code == 1 and exc == ERR_HERDR, (
+            f"an invalid-UTF-8 byte in herdr's stdout must exit ERR_HERDR, not crash with "
+            f"UnicodeDecodeError: code={code} exc={exc} out={out!r}")
 
         # CONFIRMED BUG (checker, round 1): syntactically VALID JSON that is missing the expected
         # top-level `result.panes`/`result.agents` shape (e.g. a bare `{}`, or a future herdr API shape
