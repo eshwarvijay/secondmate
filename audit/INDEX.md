@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 55 total)
+## Recent flow (orchestration mechanics) entries (15 of 56 total)
 
-- 2026-09-29 — progress-ledger.py: self-reported checkpoints + scheduled staleness detection for fan-out (Task A of 2) (`audit/flow/2026-09-29--fanout-liveness-watchdog.md`)
 - 2026-09-29 — plan-committee: fix deepseek-r1 tool-use incompatibility + 3 rounds of leak-detection gaps (`audit/flow/2026-09-29--fix-planner-tools.md`)
 - 2026-09-30 — batch-hold-scaling: extend consolidated batch hold to N=10 concurrent sub-supervisors (`audit/flow/2026-09-30--batch-hold-scaling.md`)
 - 2026-09-30 — dedupe-maker-prompt: consolidate 7 duplicate maker-prompt closing boilerplate sites in SKILL.md (`audit/flow/2026-09-30--dedupe-maker-prompt.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-08 — budget-aware-checkpoints: 9-round checkpoint-hardening task + fork-collision process incident (`audit/flow/2026-10-08--budget-aware-checkpoints.md`)
 - 2026-10-08 — session-banner-todo-mention: close the deferred follow-up from 2026-10-02 by mentioning task-tracking-checklist seedi... (`audit/flow/2026-10-08--session-banner-todo-mention.md`)
 - 2026-10-08 — wire-budget-aware-sop: SKILL.md checkpoint cost/self-estimate flags + pane-reaper watchdog wiring (`audit/flow/2026-10-08--wire-budget-aware-sop.md`)
+- 2026-10-09 — Wire nested-context-file discovery into 4 pi-maker launch sites in SKILL.md (`audit/flow/2026-10-09--pi-nested-context-files.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 53 total)
+## Recent decision (choices, findings, escalations) entries (15 of 54 total)
 
-- 2026-09-29 — Self-reported checkpoint ledger, not dispatcher polling -- verified no polling primitive exists (`audit/decision/2026-09-29--fanout-liveness-watchdog.md`)
 - 2026-09-29 — Data-driven per-slot tools mode; accept round-4 finding as documented residual limitation (`audit/decision/2026-09-29--fix-planner-tools.md`)
 - 2026-09-30 — batch-hold-scaling: structural batch-id binding + verdict.py reuse; human-approved merge (`audit/decision/2026-09-30--batch-hold-scaling.md`)
 - 2026-09-30 — One canonical boilerplate block + 7 pointers; fixed direction wording and byte-fidelity drift on checker fail (`audit/decision/2026-09-30--dedupe-maker-prompt.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-08 — Ship additive-only budget fields + detection-only pane reaper; decline learned predictor/auto-kill; stop whack-a-mole... (`audit/decision/2026-10-08--budget-aware-checkpoints.md`)
 - 2026-10-08 — Insert a new "0." banner item (not a trailing bullet), closed by two checker-driven precision fixes; three process re... (`audit/decision/2026-10-08--session-banner-todo-mention.md`)
 - 2026-10-08 — wire-budget-aware-sop: substring-collision bug caught+fixed round 1->2; hold answer independently re-verified (`audit/decision/2026-10-08--wire-budget-aware-sop.md`)
+- 2026-10-09 — pi-nested-context-files: set-u-safe splice + -type f fixes; two integration escalations resolved by human/dispatcher (`audit/decision/2026-10-09--pi-nested-context-files.md`)
