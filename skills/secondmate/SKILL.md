@@ -119,8 +119,10 @@ This is the spec the maker receives.
   ```bash
   # Prerequisite: step 2 must have called mark-maker.sh after herdr worktree create (see step 2 for the full sequence)
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
+  # immediately before this start, run the "Nested context-file args" block (with <wt> = this worktree's
+  # path, fresh at every launch); its "${nested_ctx_args[@]}" splices into the pi argv below (empty array = zero words)
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"
+    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}"
   herdr agent prompt sm-pi-<task-id> "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
@@ -135,8 +137,10 @@ This is the spec the maker receives.
   before deciding what to send — do not advance to Check while the maker is blocked. If `agent_prompt_stalled`
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
-  If `HERDR_ENV` is not 1, fall back to headless:
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
+  If `HERDR_ENV` is not 1, fall back to headless (immediately before launching, run the "Nested
+  context-file args" block with `<wt>` = this worktree's path, fresh at every launch; its
+  `"${nested_ctx_args[@]}"` splices into the pi argv below — an empty array splices to zero words):
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
   A good plan gives:
@@ -210,6 +214,38 @@ Every call site in this file carries a short pointer, instead of retyping this b
 site's own `<goal>`, `<plan>`, or `<fix plan>` text. The call site substitutes `<X>` into the `--task`
 argument shown above.
 
+### Nested context-file args (used by every pi maker launch site in this file)
+
+pi's own project-context discovery (`loadProjectContextFiles`) ancestor-walks from pi's launch cwd up
+to the filesystem root, so it already loads any CLAUDE.md/AGENTS.md-family file sitting directly at
+the worktree root `<wt>` — never re-inject that root-level file. But it does not descend into
+subdirectories, so a context file nested strictly below `<wt>` (e.g. `<wt>/services/api/CLAUDE.md`)
+would otherwise be invisible to the pi maker. At every pi maker launch site in this file — first
+round and fix round, herdr and headless, whether the site appears above or below this section — run
+this block immediately BEFORE starting the pi process, substituting `<wt>` with that launch's
+worktree path. Run it fresh at every launch, every time — never cache the array, never persist it to
+a state file:
+
+```bash
+nested_ctx_args=()
+while IFS= read -r -d '' f; do
+  nested_ctx_args+=(--append-system-prompt "$f")
+done < <(find <wt> -mindepth 2 -not -path '*/.git/*' \( -iname 'CLAUDE.md' -o -iname 'CLAUDE.MD' -o -iname 'AGENTS.md' -o -iname 'AGENTS.MD' -o -iname 'AGENTS.override.md' \) -print0)
+```
+
+`-mindepth 2` is what excludes the root-level file (find depth 1) while still catching
+strictly-nested ones — pi already ancestor-walks to the root-level file on its own, so passing it
+again would double it. The `.git` exclusion must stay a `-not -path` TEST, never a `-prune` ACTION —
+a `-prune` combined with `-mindepth` silently never fires (confirmed empirically: `.git`-internal
+files leak straight through). Then splice `"${nested_ctx_args[@]}"` into that pi invocation's argv,
+each nested file becoming its own `--append-system-prompt <path>` pair (pi auto-detects an existing
+file path there and injects its contents — pi's own documented behavior, nothing to add on pi's
+side). An empty array splices to zero words, so a worktree with no nested context files yields a
+byte-identical invocation — no empty flag, no broken argv, no special-case branch. Every pi launch
+call site in this file carries a short pointer to this block instead of retyping it (same convention
+as the block above); the "Pi herdr maker (still running)" prompt-only site never runs it — no new pi
+process starts there, so there is nothing to inject.
+
 1. **Triage** — classify the task `ship` (produces a diff) vs `scout` (report only; skip the checker and
    the gate), and a rigor tier: `full` (checker + verify-gate + human hold) or `fast` (tests + gate only).
    For a reasoning-heavy question with no tools needed (root-cause, triage, plan review, pre-mortem),
@@ -278,8 +314,8 @@ argument shown above.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
-     - *Pi herdr maker (exited/done):* `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts"`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
+     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}"`, then prompt with the same fix plan and checklist.
+     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
      - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
