@@ -378,17 +378,29 @@ unpolluted one). **Name the Agent-tool call `sm-<task-id>`** — never leave `na
 
 1. Claim first (`bin/claim-ledger.py claim --task-id <task-id> --owner sm-<task-id>`), never `--steal`
    itself; abort with `SM_REFUSED:claim-failed` on failure. Immediately after a successful claim, record
-   the checkpoint: `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed`.
+   the checkpoint: `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed
+   --still-achievable {yes,no} [--note "..."]` (derived from the claim/triage decision that just judged
+   this task-id feasible to take on) and `[--cost <n>] [--tokens <n>] [--duration-seconds <n>]` when
+   already at hand (optional, same posture as the log-round.sh bullet above — never estimate; omit
+   instead).
 2. Derive every downstream name deterministically from `<task-id>` (`sm/<task-id>` branch,
    `sm-<task-id>`/`sm-pi-<task-id>` agent name, `root_pane` from `herdr worktree create`).
 3. Run the existing solo SOP completely untouched — plan-committee, maker routing, checker rounds,
    verify-gate — recording the SAME checkpoints a batch dispatch's sub-supervisor records (just without a
    `--batch-id`, since a solo dispatch has no batch to correlate against): `bin/progress-ledger.py record
-   --task-id <task-id> --owner sm-<task-id> --phase maker_started` immediately after the maker begins
-   running, and `--phase checker_round` immediately after each checker round completes (once per round).
+   --task-id <task-id> --owner sm-<task-id> --phase maker_started --still-achievable yes` (the maker
+   having actually started is itself the signal) immediately after the maker begins running, and `--phase
+   checker_round --still-achievable {yes,no}` (derived from that round's own checker verdict — e.g.
+   pass/fail still achievable, error/refused not) immediately after each checker round completes (once
+   per round). At both checkpoints, also pass `[--cost <n>] [--tokens <n>] [--duration-seconds <n>]
+   [--note "..."]` when already at hand (optional, same posture as the log-round.sh bullet above — never
+   estimate; omit instead).
 4. Once verify-gate passes, record the terminal checkpoint — `bin/progress-ledger.py record --task-id
    <task-id> --owner sm-<task-id> --phase verify_gate_pass --checked-sha <checked-sha>
-   --checker-verdict-path <path>` — then open its OWN `bin/hold.py hold --task <task-id> --q "..." --sha
+   --checker-verdict-path <path> --still-achievable yes` (the gate result that just passed is itself the
+   signal) and `[--cost <n>] [--tokens <n>] [--duration-seconds <n>] [--note "..."]` when already at hand
+   (optional, same posture as the log-round.sh bullet above — never estimate; omit instead) — then open
+   its OWN `bin/hold.py hold --task <task-id> --q "..." --sha
    <checked-sha>` and wait for a genuine human answer — never assume, never auto-answer, never defer that
    judgment call to the dispatcher.
 5. Only once answered, call `bin/merge-sequencer.sh` itself with its own claimed
@@ -438,7 +450,10 @@ a. **Claim first, as its literal first action, then record it.** Run `bin/claim-
    `--steal`. `--steal` is a human-supervised override and stays exactly that under this pattern too: a
    sub-supervisor must never call it itself. Immediately after a successful claim, run
    `bin/progress-ledger.py record --task-id <task-id> --owner sm-<task-id> --phase claimed --batch-id
-   <batch-id>`.
+   <batch-id> --still-achievable {yes,no} [--note "..."]` (derived from the claim/triage decision that
+   just judged this task-id feasible to take on) and `[--cost <n>] [--tokens <n>]
+   [--duration-seconds <n>]` when already at hand (optional, same posture as the log-round.sh bullet
+   above — never estimate; omit instead).
 
 b. **Derive every downstream name deterministically from `<task-id>`, using this repo's own existing
    convention — never invent a new one:**
@@ -452,10 +467,17 @@ c. **Run the existing solo secondmate SOP completely untouched, recording checkp
    This pattern changes nothing about how a single task runs, only how it gets launched and how its
    verify-gate PASS gets turned into a merge. At these points, run `bin/progress-ledger.py record
    --task-id <task-id> --owner sm-<task-id> --phase <phase> --batch-id <batch-id>` (the SAME `<batch-id>`
-   on every call, per the mint-once-per-batch step above):
-   - `--phase maker_started` immediately after its maker begins running.
-   - `--phase checker_round` immediately after each checker round completes (once per round).
-   - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint. ALWAYS also pass
+   on every call, per the mint-once-per-batch step above), also passing `--still-achievable {yes,no}
+   [--note "..."]` derived from the signal already evaluated at that exact checkpoint, and
+   `[--cost <n>] [--tokens <n>] [--duration-seconds <n>]` when already at hand (optional, same posture as
+   the log-round.sh bullet above — never estimate; omit instead):
+   - `--phase maker_started` immediately after its maker begins running (`--still-achievable yes` — the
+     maker having actually started is itself the signal).
+   - `--phase checker_round` immediately after each checker round completes (once per round)
+     (`--still-achievable` derived from that round's own checker verdict — e.g. pass/fail still
+     achievable, error/refused not).
+   - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint
+     (`--still-achievable yes` — the gate result that just passed is itself the signal). ALWAYS also pass
      `--checked-sha <checked-sha>` and `--checker-verdict-path <path>` here (the dispatcher's batch close
      reads both off this exact row — `--checker-verdict-path` is what `hold.py`'s batch digest is
      machine-derived from, see step (e) below).
@@ -574,11 +596,24 @@ bin/progress-ledger.py stale --threshold-seconds <N> --task-id <task-id-1> [--ta
 # exit 1, one JSON line per hit -> {"task_id":..., "status":"no_progress_recorded"} (never even reported
 #   its first "claimed" checkpoint) or {"task_id":..., "status":"stale", "phase":..., "last_ts":...,
 #   "age_seconds":...} (hasn't advanced past that phase in over N seconds).
+
+bin/pane-reaper.py observe
+# appends one observation row per herdr pane to pane-reaper's own ledger, on this SAME cadence. `quiet`
+# below needs at least two of these recorded for a given pane before it can ever report anything, so
+# skipping this call would make `quiet` silently never fire.
+
+bin/pane-reaper.py quiet --threshold-seconds <N> | grep -F -e "\"pane_id\": \"<root_pane_id>\"" [-e "\"pane_id\": \"<checker_pane_id>\"" ...]
+# one JSON line per quiet pane across pane-reaper's WHOLE shared ledger — it has no pane-id filter of its
+# own, so filter its JSON-lines output down to just the pane ids this dispatch itself knows (its
+# root_pane, and any checker pane it created), the same spirit as `ready --batch-id`'s own filtering
+# above. Match the quoted `"pane_id": "<id>"` key form pane-reaper.py itself writes each hit as, never
+# the bare id — a bare id substring-collides (e.g. "p1" wrongly matching an unrelated "p10").
 ```
 
 Pick `<N>` (a threshold in seconds) generously relative to how long a normal round takes in this
-repo — long enough that a merely-slow-but-alive checker round doesn't false-positive. On any hit, **relay
-it to the human verbatim** — task-id, phase, age — exactly like the `SM_STUCK_NEED_HUMAN` relay above.
+repo — long enough that a merely-slow-but-alive checker round doesn't false-positive. On any hit — from
+`stale` or from a filtered `quiet` — **relay it to the human verbatim** — task-id or pane-id, phase or
+status, age — exactly like the `SM_STUCK_NEED_HUMAN` relay above.
 **Never auto-restart, never auto-`--steal`, never treat a hit as a confirmed crash and clean up on your
 own.** This is scheduled *detection*, not real-time monitoring: it can only notice that a task-id hasn't
 self-reported in a while, on whatever cadence you choose to re-check — it cannot distinguish "dead" from
