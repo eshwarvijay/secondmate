@@ -14,8 +14,8 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
 
   progress-ledger.py record --task-id ID --owner LABEL --phase PHASE  -> appends a checkpoint row.
     [--checked-sha SHA] [--checker-verdict-path PATH] [--batch-id ID]    --checked-sha/--checker-verdict-path
-                                                                           are free-form optional extras, meant
-                                                                           for the terminal `verify_gate_pass`
+    [--cost N] [--tokens N] [--duration-seconds N]                        are free-form optional extras, meant
+    [--still-achievable {yes,no}] [--note TEXT]                          for the terminal `verify_gate_pass`
                                                                            phase (see vocabulary below) so a
                                                                            later batch-close consumer can read
                                                                            them off that one row -- this script
@@ -41,6 +41,27 @@ checkpoint. This is a hard platform limitation, not a shortcut deferred here.
                                                                            again (the normal case -- every
                                                                            checkpoint in one sub-supervisor's own
                                                                            SOP repeats it) is always fine.
+                                                                           --cost/--tokens/--duration-seconds are
+                                                                           self-reported, per-checkpoint budget
+                                                                           numbers (finite, >= 0) -- a free-form
+                                                                           caller-defined number, NOT cumulative,
+                                                                           and NOT reconciled with bin/log-round.sh's
+                                                                           own separate --cost/--duration (a
+                                                                           different ledger, a different purpose).
+                                                                           --still-achievable {yes,no} is a
+                                                                           checkpoint self-estimate -- a plain
+                                                                           self-report, not a trained predictor --
+                                                                           with zero automated consequence
+                                                                           anywhere in this codebase (never read
+                                                                           by `stale`/`ready`, never gates
+                                                                           anything). --note (optional, capped
+                                                                           length, only accepted alongside
+                                                                           --still-achievable) is free text
+                                                                           explaining that estimate. All five
+                                                                           fields are strictly additive: omitted
+                                                                           entirely from the written row when not
+                                                                           supplied, and rendered by
+                                                                           `latest`/`status` only when present.
   progress-ledger.py latest | status                                  -> one line per task-id: its most
                                                                            recently recorded phase/owner/ts
                                                                            (and checked-sha/checker-verdict-path
@@ -145,7 +166,7 @@ side configuring anything:
 This script never touches claim-ledger.py's own ledger, schema, or event types -- it is a separate file,
 a separate ledger, a separate concern (progress checkpoints, not claim ownership).
 """
-import json, sys, os, time, re, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
+import json, sys, os, time, re, math, subprocess, argparse, pathlib, contextlib, io, tempfile, shutil
 try:
     import fcntl
 except ImportError:  # non-Unix (e.g. Windows) -> best-effort, no locking
@@ -199,6 +220,31 @@ def _valid_phase(phase):
     return isinstance(phase, str) and bool(_PHASE_RE.match(phase))
 
 
+NOTE_MAX_LEN = 500  # bounded free-text cap for --note, same "bounded length" posture as every other field
+
+
+def _valid_budget_number(x):
+    # same finite guard bin/log-round.sh's own _is_finite_number applies to --cost/--duration (nan/inf
+    # are valid floats but not valid JSON), plus a non-negative floor: a cost/token/duration count can
+    # never be negative, which log-round.sh's own precedent does not need to enforce for its freeform use.
+    if isinstance(x, bool):
+        return False
+    if isinstance(x, int):
+        # CONFIRMED BUG (checker, same pattern already fixed in bin/pane-reaper.py's
+        # _valid_positive_number): calling math.isfinite(x) on a native Python int implicitly converts
+        # it to a float first -- for an arbitrarily large int (e.g. 10**10000) that conversion itself
+        # raises OverflowError ("int too large to convert to float"), an UNCAUGHT exception instead of a
+        # clean accept/reject. Today's CLI only ever passes this function a float (argparse's own
+        # type=float on --cost/--tokens/--duration-seconds), but the function's own signature explicitly
+        # accepts int too, so any direct/reused caller passing a native int must not crash. A native int
+        # has no "infinite" representation at all (arbitrary precision, never nan/inf), so math.isfinite
+        # is unnecessary and actively harmful here: just compare directly.
+        return x >= 0
+    if isinstance(x, float):
+        return math.isfinite(x) and x >= 0
+    return False
+
+
 def _valid_ts(ts):
     # a "ts" that isn't a string in this script's own written shape can never be folded into an epoch by
     # _ts_to_epoch (stale would otherwise crash on time.strptime's ValueError) -- same posture as
@@ -226,7 +272,12 @@ def _recs():
             continue
         try:
             o = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # CONFIRMED BUG (checker): a deeply-nested but syntactically valid JSON line (e.g. ~1100
+            # levels of nested arrays) raises RecursionError, not ValueError -- the same class already
+            # fixed in this script's own _ts_to_epoch/stale and in pane-reaper.py's _herdr_json. Must be
+            # treated as any other malformed/unparseable line: counted in _BAD, skipped, never crash the
+            # whole read.
             _BAD += 1; continue
         valid = (isinstance(o, dict) and o.get("ev") == "progress"
                  and isinstance(o.get("task_id"), str) and isinstance(o.get("owner"), str)
@@ -315,7 +366,12 @@ def _all_task_ids():
             continue
         try:
             o = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # CONFIRMED BUG (checker, round 9): a deeply-nested but syntactically valid JSON line (e.g.
+            # ~1100 levels of nested arrays) raises RecursionError, not ValueError -- the same class
+            # already fixed in this script's own _recs() (round 8). This is a SEPARATE json.loads loop
+            # over the same ledger file, so round 8's fix did not cover it; a whole-ledger `stale`/`ready`
+            # scan (no --task-id) still crashed via this path.
             continue
         if isinstance(o, dict) and o.get("ev") == "progress" and isinstance(o.get("task_id"), str):
             ids.add(o["task_id"])
@@ -325,7 +381,15 @@ def _all_task_ids():
 def _ts_to_epoch(ts):
     # ts is always written by this script's own time.strftime("%Y-%m-%dT%H:%M:%S") (local time, matching
     # claim-ledger.py/hold.py) -- parse it back with the same local-time interpretation via mktime.
-    return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    # CONFIRMED BUG (checker round 4): a ts that passes _valid_ts's own strptime-based format check fine
+    # (e.g. "0001-01-01T00:00:00") can still be numerically out of time.mktime's representable range,
+    # raising an uncaught OverflowError -- same root-cause class already fixed in bin/pane-reaper.py's own
+    # _ts_to_epoch. Returns None on failure so callers (e.g. `stale`) can treat the row as unusable/corrupt
+    # rather than crash, the same tolerant posture _recs() already applies to other malformed rows.
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%dT%H:%M:%S"))
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _run(argv):
@@ -561,6 +625,23 @@ def _selfcheck_live():
         _recs()  # refresh _BAD as a side effect
         assert _BAD > bad_before, "an unparseable-ts row must be counted as malformed (_BAD)"
 
+        # CONFIRMED BUG (checker round 4): a row whose "ts" is SYNTACTICALLY valid (passes _valid_ts's
+        # own strptime-based format check, e.g. "0001-01-01T00:00:00") but numerically out of
+        # time.mktime's representable range previously crashed `stale` with an uncaught OverflowError --
+        # unlike "badts" above, this row DOES fold into latest_by_task (it's format-valid), so the crash
+        # happened inside stale's own age computation, not _recs()'s validation. Must be treated as
+        # unusable/corrupt for staleness purposes -- excluded from hits, never a crash.
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({"ev": "progress", "task_id": "extreme-ts-task", "owner": "o",
+                                 "phase": "claimed", "ts": "0001-01-01T00:00:00"}) + "\n")
+        assert "extreme-ts-task" in latest_by_task(), (
+            "an extreme-but-format-valid ts row IS format-valid and must fold into latest_by_task")
+        code, out, exc = _run(["stale", "--threshold-seconds", "1", "--task-id", "extreme-ts-task"])
+        assert exc in (0, 1), f"stale must never crash on an extreme-but-format-valid ts: {out!r}"
+        assert '"task_id": "extreme-ts-task"' not in out, (
+            f"a task-id whose latest row has an unconvertible ts must never be reported by stale "
+            f"(neither stale nor no_progress_recorded -- it has a row, just an unusable one): {out!r}")
+
         # stale with no --task-id at all considers every task-id ever seen in the ledger -- INCLUDING one
         # whose only row failed the ts-shape fold above ("badts"), which must still surface as
         # no_progress_recorded rather than silently vanish from a whole-ledger scan just because its one
@@ -571,10 +652,105 @@ def _selfcheck_live():
         assert '"task_id": "badts", "status": "no_progress_recorded"' in out, (
             "a whole-ledger scan must still report a task-id whose only row failed ts validation")
 
+        # CONFIRMED BUG (checker): a deeply-nested but SYNTACTICALLY VALID JSON line stored directly in
+        # the ledger file (e.g. ~1100 levels of nested arrays) raises an uncaught RecursionError from
+        # json.loads, not ValueError -- the existing `except ValueError` in _recs()'s own parse loop does
+        # not catch it, so the whole read (and therefore `stale`/`latest`) crashed instead of treating the
+        # one line as malformed like any other unparseable row. Placed last (after every whole-ledger
+        # `--task-id`-omitted scan above) since this corrupt line, once appended, persists in the shared
+        # ledger for the rest of this function -- it must never again crash a later full scan either, but
+        # there are none left after this point in this test function.
+        bad_before = _BAD
+        with LEDGER.open("a") as f:
+            f.write("[" * 1100 + "]" * 1100 + "\n")
+        code, out, exc = _run(["stale", "--threshold-seconds", "1", "--task-id", "whatever"])
+        assert exc in (0, 1), (
+            f"a deeply-nested-but-valid JSON ledger line must never crash stale with a RecursionError: {out!r}")
+        _recs()  # refresh _BAD as a side effect
+        assert _BAD > bad_before, "a deeply-nested JSON ledger line must be counted as malformed (_BAD)"
+
         # `stale` never appends -- it's read-only, like claim-ledger.py's own `conflicts`.
         pre_len = len(_recs())
         _run(["stale", "--threshold-seconds", "1", "--task-id", "t1"])
         assert len(_recs()) == pre_len, "stale must never append to the ledger"
+
+        # Budget-aware checkpoint fields (--cost/--tokens/--duration-seconds/--still-achievable/--note):
+        # THE single most important invariant -- a record call that omits all five new flags must
+        # produce output byte-for-byte identical to pre-change behavior. "nofields" below never supplies
+        # any of them.
+        code, out, _ = _run(["record", "--task-id", "nofields", "--owner", "sm-nofields", "--phase", "claimed"])
+        assert code == 0
+        # record's own success message, not just latest's later rendering, must match legacy output
+        # exactly for a no-new-flags call -- CONFIRMED TEST GAP (checker, round 1): the prior version of
+        # this selfcheck never asserted record's own stdout at all, so an accidental mutation to that
+        # print (e.g. appending stray text) would have gone undetected.
+        assert out == "recorded nofields phase=claimed", (
+            f"record's own success message for a no-new-flags call must match legacy output exactly: {out!r}")
+        r = latest_by_task()["nofields"]
+        expected_line = f"[nofields] phase=claimed owner=sm-nofields ts={r['ts']}"
+        code, out, _ = _run(["latest"])
+        actual_line = [l for l in out.splitlines() if l.startswith("[nofields]")][0]
+        assert actual_line == expected_line, (
+            f"a record omitting all 5 new fields must render identically to pre-change behavior: "
+            f"got {actual_line!r}, expected {expected_line!r}")
+        for key in ("cost", "tokens", "duration_seconds", "still_achievable", "note"):
+            assert key not in r, f"{key} must be entirely absent from the written row when not supplied"
+
+        # round-trip: all five fields present (including cost=0, a falsy-but-valid value) render on
+        # latest/status, and are stored verbatim.
+        code, _, _ = _run(["record", "--task-id", "budgetrow", "--owner", "sm-budget", "--phase", "checker_round",
+                            "--cost", "0", "--tokens", "1500", "--duration-seconds", "42.5",
+                            "--still-achievable", "yes", "--note", "on track"])
+        assert code == 0, "a record call with all 5 new fields must succeed"
+        code, out, _ = _run(["latest"])
+        line = [l for l in out.splitlines() if l.startswith("[budgetrow]")][0]
+        assert "cost=0.0" in line and "tokens=1500.0" in line and "duration_seconds=42.5" in line \
+            and "still_achievable=yes" in line and "note='on track'" in line, (
+            f"latest must render all 5 new fields when present: {line!r}")
+
+        # rejection: non-finite/negative numeric fields, and bad --still-achievable, must all be rejected.
+        # "--flag=value" form (not separate argv tokens) sidesteps argparse's own "-inf looks like an
+        # unknown option, not a value" ambiguity -- irrelevant to what this script itself validates.
+        # CONFIRMED TEST GAP (checker, round 1): the prior version of this loop only exercised
+        # nan/inf/-inf for --cost, not for --tokens/--duration-seconds (the validator already rejected
+        # all three correctly -- this closes the missing REGRESSION coverage, symmetric across all three
+        # numeric fields so a future regression in any one of them would be caught).
+        for flag in ("--cost", "--tokens", "--duration-seconds"):
+            for bad in ("-1", "nan", "inf", "-inf"):
+                combined = f"{flag}={bad}"
+                code, _, _ = _run(["record", "--task-id", "badnum", "--owner", "o", "--phase", "claimed", combined])
+                assert code != 0, f"{combined!r} must be rejected"
+        code, _, _ = _run(["record", "--task-id", "badchoice", "--owner", "o", "--phase", "claimed",
+                            "--still-achievable", "maybe"])
+        assert code != 0, "--still-achievable must reject a value outside {yes,no}"
+
+        # --note is only valid alongside --still-achievable.
+        code, _, _ = _run(["record", "--task-id", "noteonly", "--owner", "o", "--phase", "claimed",
+                            "--note", "orphan note"])
+        assert code != 0, "--note without --still-achievable must be rejected"
+
+        # --note is length-capped.
+        code, _, _ = _run(["record", "--task-id", "longnote", "--owner", "o", "--phase", "claimed",
+                            "--still-achievable", "no", "--note", "x" * (NOTE_MAX_LEN + 1)])
+        assert code != 0, "--note over the length cap must be rejected"
+        code, _, _ = _run(["record", "--task-id", "longnote", "--owner", "o", "--phase", "claimed",
+                            "--still-achievable", "no", "--note", "x" * NOTE_MAX_LEN])
+        assert code == 0, "--note exactly at the length cap must be accepted"
+
+        # `stale`/`ready` byte-for-byte unaffected: a row carrying the new budget fields must produce the
+        # exact same stale/ready shape as a row that never used them -- the new fields must never leak
+        # into either query's output.
+        code, _, _ = _run(["record", "--task-id", "budgetrow", "--owner", "sm-budget", "--phase", TERMINAL_PHASE,
+                            "--checked-sha", "cafef00d", "--cost", "3.3", "--tokens", "999",
+                            "--duration-seconds", "10", "--still-achievable", "no", "--note", "slipping"])
+        assert code == 0
+        code, out, _ = _run(["ready", "--task-id", "budgetrow"])
+        assert code == 0 and '"task_id": "budgetrow"' in out and '"checked_sha": "cafef00d"' in out, (
+            "ready must still report a terminal-phase row that happens to carry budget fields")
+        for key in ("cost", "tokens", "duration_seconds", "still_achievable", "note"):
+            assert f'"{key}"' not in out, f"ready's output must never include {key!r} -- stale/ready stay unaware of it"
+        code, out, exc = _run(["stale", "--threshold-seconds", "3600", "--task-id", "budgetrow"])
+        assert exc == 0 and out == "", "stale's threshold filtering must be unaffected by a row carrying budget fields"
 
         # status must warn (not silently hide) when the ledger has malformed lines.
         with LEDGER.open("a") as f:
@@ -605,6 +781,43 @@ def _selfcheck_stale_scan_sees_corrupted_only_task():
         assert exc == 1, "a ledger with only a malformed-ts row must not exit 0 on a whole-ledger scan"
         assert '"task_id": "badts"' in out and '"status": "no_progress_recorded"' in out, (
             "the corrupted-only task-id must be reported no_progress_recorded, not silently dropped")
+    finally:
+        LEDGER = orig_ledger
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _selfcheck_recursionerror_in_all_task_ids():
+    """CONFIRMED BUG (checker, round 9): _all_task_ids() has its OWN separate json.loads loop over the
+    SAME ledger file as _recs() -- round 8 fixed _recs()'s RecursionError handling but missed this second
+    loop, which still only caught ValueError. A deeply-nested-but-syntactically-valid JSONL line (e.g.
+    ~1100 levels of nested arrays) still crashed a whole-ledger `stale`/`ready` scan (no --task-id, which
+    is the only code path that calls _all_task_ids()) with an uncaught RecursionError. Isolated in its own
+    fresh ledger/tmpdir (same precedent as _selfcheck_stale_scan_sees_corrupted_only_task above) so it
+    never interacts with any other test's ledger state."""
+    global LEDGER
+    orig_ledger = LEDGER
+    tmpdir = tempfile.mkdtemp(prefix="progress-ledger-selfcheck-deepnest-")
+    LEDGER = pathlib.Path(tmpdir) / "progress.jsonl"
+    try:
+        code, _, _ = _run(["record", "--task-id", "normal-task", "--owner", "sm-normal",
+                            "--phase", TERMINAL_PHASE])
+        assert code == 0, "setup: a normal record must succeed"
+        with LEDGER.open("a") as f:
+            f.write("[" * 1100 + "]" * 1100 + "\n")
+
+        code, out, exc = _run(["stale", "--threshold-seconds", "3600"])
+        assert exc in (0, 1), (
+            f"a whole-ledger `stale` scan (no --task-id) must never crash with a RecursionError on a "
+            f"deeply-nested JSONL line: {out!r}")
+        assert '"task_id": "normal-task"' not in out, (
+            "normal-task was just recorded and must not be reported stale against a huge threshold")
+
+        code, out, exc = _run(["ready"])
+        assert code == 0 and exc is None, (
+            f"a whole-ledger `ready` scan (no --task-id) must never crash with a RecursionError on a "
+            f"deeply-nested JSONL line: {out!r}")
+        assert '"task_id": "normal-task"' in out, (
+            "a whole-ledger ready scan must still find the one legitimate terminal-phase task-id")
     finally:
         LEDGER = orig_ledger
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -654,6 +867,11 @@ def main(argv):
     r.add_argument("--checked-sha")
     r.add_argument("--checker-verdict-path")
     r.add_argument("--batch-id")
+    r.add_argument("--cost", type=float)
+    r.add_argument("--tokens", type=float)
+    r.add_argument("--duration-seconds", type=float)
+    r.add_argument("--still-achievable", choices=["yes", "no"])
+    r.add_argument("--note")
 
     sub.add_parser("latest")
     sub.add_parser("status")
@@ -682,6 +900,16 @@ def main(argv):
             sys.exit(f"invalid --phase {args.phase!r}: must match [A-Za-z0-9_-] and be 1-64 chars")
         if args.batch_id is not None and not _valid_task_id(args.batch_id):
             sys.exit(f"invalid --batch-id {args.batch_id!r}: must match [A-Za-z0-9_-] and be 1-128 chars")
+        if args.cost is not None and not _valid_budget_number(args.cost):
+            sys.exit(f"invalid --cost {args.cost!r}: must be a finite number >= 0")
+        if args.tokens is not None and not _valid_budget_number(args.tokens):
+            sys.exit(f"invalid --tokens {args.tokens!r}: must be a finite number >= 0")
+        if args.duration_seconds is not None and not _valid_budget_number(args.duration_seconds):
+            sys.exit(f"invalid --duration-seconds {args.duration_seconds!r}: must be a finite number >= 0")
+        if args.note is not None and args.still_achievable is None:
+            sys.exit("--note is only valid alongside --still-achievable")
+        if args.note is not None and len(args.note) > NOTE_MAX_LEN:
+            sys.exit(f"--note is too long ({len(args.note)} chars; max {NOTE_MAX_LEN})")
         rec = {"ev": "progress", "task_id": args.task_id, "owner": args.owner, "phase": args.phase,
                "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
         if args.checked_sha:
@@ -690,6 +918,16 @@ def main(argv):
             rec["checker_verdict_path"] = args.checker_verdict_path
         if args.batch_id:
             rec["batch_id"] = args.batch_id
+        if args.cost is not None:
+            rec["cost"] = args.cost
+        if args.tokens is not None:
+            rec["tokens"] = args.tokens
+        if args.duration_seconds is not None:
+            rec["duration_seconds"] = args.duration_seconds
+        if args.still_achievable is not None:
+            rec["still_achievable"] = args.still_achievable
+        if args.note is not None:
+            rec["note"] = args.note
         with _ledger_lock():
             # Immutability: fold FRESH, inside the lock (same TOCTOU-safe precedent as
             # claim-ledger.py's own steal), right before deciding -- a task-id's batch membership is
@@ -718,6 +956,16 @@ def main(argv):
                 line += f" checker_verdict_path={r['checker_verdict_path']}"
             if r.get("batch_id"):
                 line += f" batch_id={r['batch_id']}"
+            if r.get("cost") is not None:
+                line += f" cost={r['cost']}"
+            if r.get("tokens") is not None:
+                line += f" tokens={r['tokens']}"
+            if r.get("duration_seconds") is not None:
+                line += f" duration_seconds={r['duration_seconds']}"
+            if r.get("still_achievable") is not None:
+                line += f" still_achievable={r['still_achievable']}"
+            if r.get("note") is not None:
+                line += f" note={r['note']!r}"
             print(line)
         if _BAD:
             print(f"WARNING: {_BAD} malformed line(s) in {LEDGER} -- ledger may be corrupt; reconcile manually.")
@@ -733,7 +981,10 @@ def main(argv):
             if r is None:
                 hits.append({"task_id": task_id, "status": "no_progress_recorded"})
                 continue
-            age = now - _ts_to_epoch(r["ts"])
+            epoch = _ts_to_epoch(r["ts"])
+            if epoch is None:
+                continue  # unconvertible timestamp -- never prove staleness from it, conservative by design
+            age = now - epoch
             if age > args.threshold_seconds:
                 hits.append({"task_id": task_id, "status": "stale", "phase": r["phase"],
                              "last_ts": r["ts"], "age_seconds": int(age)})
@@ -783,8 +1034,18 @@ def main(argv):
             and not _valid_task_id("a/b") and not _valid_task_id("a" * 129), "task-id validation broken"
         assert _valid_phase(TERMINAL_PHASE) and not _valid_phase("") and not _valid_phase("bad phase"), (
             "phase validation broken")
+        # CONFIRMED BUG (checker, same pattern already fixed in bin/pane-reaper.py's
+        # _valid_positive_number): a native int this large previously crashed _valid_budget_number with
+        # an uncaught OverflowError inside math.isfinite(x) (int-to-float conversion overflow), instead
+        # of being accepted (it IS finite and >= 0 as a native Python int, which has no "infinite"
+        # representation at all). Today's CLI only ever passes this function a float (argparse's own
+        # type=float on --cost/--tokens/--duration-seconds), so this is exercised via a direct call,
+        # mirroring pane-reaper.py's own 1000-digit-integer regression for the identical root cause.
+        assert _valid_budget_number(10 ** 10000), "a huge native int must be a VALID budget number (finite, >= 0)"
+        assert not _valid_budget_number(-(10 ** 10000)), "a huge NEGATIVE native int must still be rejected"
         _selfcheck_live()
         _selfcheck_stale_scan_sees_corrupted_only_task()
+        _selfcheck_recursionerror_in_all_task_ids()
         _selfcheck_default_ledger_path()
         print("ok")
 
