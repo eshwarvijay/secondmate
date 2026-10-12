@@ -112,17 +112,18 @@ This is the spec the maker receives.
   After step 2 Spawn creates `<wt>`, start the Claude maker directly on the root_pane from `herdr worktree create`:
   ```bash
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
-  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop. <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<goal>\">" --wait --timeout 600000
+  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop. Operate under ponytail for this task — if it is not already active this session, invoke the ponytail skill via the Skill tool before writing any code. <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<goal>\">" --wait --timeout 600000
   ```
   The root_pane comes from `.result.root_pane.pane_id` of the `herdr worktree create` call. No split needed since the root_pane's cwd is already the worktree. Guard on the agent name before prompting — if the agent fails to start, abort rather than routing to a stale agent. Same `<task-id>` slug as the worktree branch. Give the goal + key constraints; Claude's own reasoning resolves the how — do not pre-specify steps that the maker's thinking can figure out.
 - **Simple** (well-specified, pure code, no external deps) → pi maker via herdr (when `HERDR_ENV=1`):
   ```bash
   # Prerequisite: step 2 must have called mark-maker.sh after herdr worktree create (see step 2 for the full sequence)
   # agent name is TASK-SCOPED (sm-pi-<task-id>) — never a shared global name
-  # immediately before this start, run the "Nested context-file args" block (with <wt> = this worktree's
-  # path, fresh at every launch); its set -u-safe splice goes into the pi argv below (empty array = zero words)
+  # immediately before this start, run the "Nested context-file args" and "Ponytail context arg" blocks
+  # (with <wt> = this worktree's path, fresh at every launch); their set -u-safe splices go into the pi
+  # argv below (empty array = zero words)
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"
+    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" "${ponytail_args[@]+"${ponytail_args[@]}"}"
   herdr agent prompt sm-pi-<task-id> "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
@@ -144,9 +145,10 @@ This is the spec the maker receives.
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
   Maker output is always read from `git -C <wt> diff`, not pi's terminal.
   If `HERDR_ENV` is not 1, fall back to headless (immediately before launching, run the "Nested
-  context-file args" block with `<wt>` = this worktree's path, fresh at every launch; its
-  set -u-safe splice goes into the pi argv below — an empty array splices to zero words):
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
+  context-file args" and "Ponytail context arg" blocks with `<wt>` = this worktree's path, fresh at
+  every launch; their set -u-safe splices go into the pi argv below — an empty array splices to zero
+  words):
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" "${ponytail_args[@]+"${ponytail_args[@]}"}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
 
   **Plan format — intent + constraints, not a recipe.** The maker has `--thinking max`; let it reason.
   A good plan gives:
@@ -260,6 +262,29 @@ call site in this file carries a short pointer to this block instead of retyping
 as the block above); the "Pi herdr maker (still running)" prompt-only site never runs it — no new pi
 process starts there, so there is nothing to inject.
 
+### Ponytail context arg (used by every pi maker launch site in this file)
+
+`ponytail` (lazy-senior-dev, YAGNI-first) must be loaded for every maker, Claude and pi alike, so the
+checker spends its rounds on real bugs instead of walking back scope the maker never needed to add.
+Claude gets this via its own Skill tool (see the Claude maker prompts below); pi has no skill-invocation
+tool, so the only way to load it there is to inject the skill file as context, reusing the exact
+path-based auto-injection pi already does for nested CLAUDE.md/AGENTS.md files above — nothing new on
+pi's side. Resolve the installed skill fresh at every pi launch, same as `nested_ctx_args`, never cached
+or persisted (a plugin update can move it):
+
+```bash
+ponytail_skill=$(find "$HOME/.claude/plugins" -maxdepth 6 -path '*/skills/ponytail/SKILL.md' -print -quit 2>/dev/null)
+ponytail_args=()
+[ -n "$ponytail_skill" ] && ponytail_args=(--append-system-prompt "$ponytail_skill")
+```
+
+Splice `"${ponytail_args[@]+"${ponytail_args[@]}"}"` into the pi argv right alongside
+`"${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"` — same bash-3.2-safe idiom, same reason: an unresolved
+path (ponytail not installed) splices to zero words instead of an unbound-variable error. If
+`$ponytail_skill` comes back empty, skip the flag silently — `/secondmate-doctor` already tracks
+ponytail as a companion to install; this is not the place to install it. Same exemption as
+`nested_ctx_args`: the "Pi herdr maker (still running)" prompt-only site never runs it.
+
 1. **Triage** — classify the task `ship` (produces a diff) vs `scout` (report only; skip the checker and
    the gate), and a rigor tier: `full` (checker + verify-gate + human hold) or `fast` (tests + gate only).
    For a reasoning-heavy question with no tools needed (root-cause, triage, plan review, pre-mortem),
@@ -328,9 +353,9 @@ process starts there, so there is nothing to inject.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
-     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
-     - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
+     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" and "Ponytail context arg" blocks (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" "${ponytail_args[@]+"${ponytail_args[@]}"}"`, then prompt with the same fix plan and checklist.
+     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" and "Ponytail context arg" blocks (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" "${ponytail_args[@]+"${ponytail_args[@]}"}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
+     - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. Operate under ponytail for this task — if it is not already active this session, invoke the ponytail skill via the Skill tool before writing any code. <fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
      **Restart amplio-style hybrid:** When the supervisor restarts a maker mid-round (due to `loop-guard.sh` exit-5 restart signal,
@@ -705,7 +730,7 @@ back to the headless path). Every split uses `--no-focus` so the captain's focus
 - **Maker pane** — start the Claude maker directly on the root_pane from `herdr worktree create` (no split needed since the root_pane's cwd is already the worktree), then drive via `agent prompt`:
   ```bash
   herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto || { echo "herdr agent start failed — abort" >&2; exit 1; }
-  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop. <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<goal>\">" --wait --timeout 600000
+  herdr agent prompt sm-<task-id> "Implement: <goal>. You are the maker — write the code, run tests, commit to this worktree, then reply DONE. Do NOT invoke /loop-task or secondmate; the supervisor owns the checker loop. Operate under ponytail for this task — if it is not already active this session, invoke the ponytail skill via the Skill tool before writing any code. <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<goal>\">" --wait --timeout 600000
   ```
   If Claude shows a one-time folder-trust prompt, accept it once: `herdr agent send-keys sm-<task-id> enter`. The maker's output is
   its file edits — read them with `git -C <worktree> diff`, not from the pane.
