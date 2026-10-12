@@ -122,7 +122,7 @@ This is the spec the maker receives.
   # immediately before this start, run the "Nested context-file args" block (with <wt> = this worktree's
   # path, fresh at every launch); its set -u-safe splice goes into the pi argv below (empty array = zero words)
   herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> \
-    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"
+    -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"
   herdr agent prompt sm-pi-<task-id> "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">" --wait --timeout 600000
   ```
   `<root_pane_id>` comes from `.result.root_pane.pane_id` of the `herdr worktree create` call (step 2), and the
@@ -131,8 +131,14 @@ This is the spec the maker receives.
   `<task-id>` is the same slug used in the worktree branch (e.g. `add-version-flag`). A task-scoped name
   prevents loop-back fix plans from being routed to a stale agent in a different worktree.
   Do NOT use `herdr-pane.sh spawn` here — without --pane, it splits from the caller's current pane (potentially in a different workspace); with --pane, it splits from the supplied pane's workspace.
-  Use `--thinking medium` (not `off`) — GLM's reasoning catches edge cases (null guards, trap safety,
-  portability) that pure token prediction misses. Use `--thinking high` for security-sensitive or complex logic.
+  Use `--thinking max` (not `off`) — GLM's reasoning catches edge cases (null guards, trap safety,
+  portability) that pure token prediction misses. Max is the ceiling for the pi maker — there is no higher
+  tier to escalate to. Why max: multiple real `pi --thinking max`/`medium`/`high` invocations against this
+  exact amazon-bedrock / global.zai.glm-5.3 host empirically confirmed that max never behaves worse than
+  medium or high (no errors, no degenerate output), and per every hosts-catalog entry max is the real
+  reasoning ceiling for the whole GLM-5.3 model family. The tradeoff: max burns roughly 2-5x the reasoning
+  tokens and wall-clock time per maker round vs medium. A supervisor may deliberately pick a lower level
+  for a cost-sensitive bulk task — but for ordinary rounds max is the setting, not a baseline to tune up.
   Pi runs as a lifecycle-tracked herdr agent: if `blocked` (approval/question UI), inspect `herdr agent get/read`
   before deciding what to send — do not advance to Check while the maker is blocked. If `agent_prompt_stalled`
   (agent did not respond to the prompt within 5s), re-inspect agent state before retrying.
@@ -140,9 +146,9 @@ This is the spec the maker receives.
   If `HERDR_ENV` is not 1, fall back to headless (immediately before launching, run the "Nested
   context-file args" block with `<wt>` = this worktree's path, fresh at every launch; its
   set -u-safe splice goes into the pi argv below — an empty array splices to zero words):
-  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
+  `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<plan>\">"`
 
-  **Plan format — intent + constraints, not a recipe.** The maker has `--thinking medium/high`; let it reason.
+  **Plan format — intent + constraints, not a recipe.** The maker has `--thinking max`; let it reason.
   A good plan gives:
   - **What** to achieve (goal + success condition the checker will verify)
   - **Key constraints** (must not break X, must handle Y edge case, must be idempotent)
@@ -322,8 +328,8 @@ process starts there, so there is nothing to inject.
    - **On `fail` — loop back to the maker, never fix inline as supervisor.** The supervisor reads the
      findings, synthesizes a concrete fix plan, then routes it to the task-scoped maker:
      - *Pi herdr maker (still running):* `herdr agent prompt sm-pi-<task-id> "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
-     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"`, then prompt with the same fix plan and checklist.
-     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking medium --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
+     - *Pi herdr maker (exited/done):* immediately before the start, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every restart), then `herdr agent start sm-pi-<task-id> --kind pi --pane <root_pane_id> -- --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}"`, then prompt with the same fix plan and checklist.
+     - *Headless pi maker:* immediately before the launch, run the "Nested context-file args" block (with `<wt>` = this maker's worktree, fresh at every round), then `cd <wt> && run-round.sh --label sm-pi-<task-id> -- pi --provider amazon-bedrock --model global.zai.glm-5.3 --thinking max --extension "${CLAUDE_PLUGIN_ROOT}/bin/scope-guard-extension.ts" "${nested_ctx_args[@]+"${nested_ctx_args[@]}"}" -p "<fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">"`
      - *Claude maker:* `herdr agent prompt sm-<task-id> "You are the maker. Do NOT invoke /loop-task or secondmate. <fix plan> <append the \"Maker prompt closing boilerplate\" block, substituting --task \"<fix plan>\">" --wait --timeout 600000`
      The supervisor NEVER writes project code itself — synthesizing the fix plan is analysis, not implementation.
      Every fix round goes through Check with a refreshed `--live-text` and an incremented unique round marker.
