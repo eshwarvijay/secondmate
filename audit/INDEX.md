@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 56 total)
+## Recent flow (orchestration mechanics) entries (15 of 57 total)
 
-- 2026-09-29 — plan-committee: fix deepseek-r1 tool-use incompatibility + 3 rounds of leak-detection gaps (`audit/flow/2026-09-29--fix-planner-tools.md`)
 - 2026-09-30 — batch-hold-scaling: extend consolidated batch hold to N=10 concurrent sub-supervisors (`audit/flow/2026-09-30--batch-hold-scaling.md`)
 - 2026-09-30 — dedupe-maker-prompt: consolidate 7 duplicate maker-prompt closing boilerplate sites in SKILL.md (`audit/flow/2026-09-30--dedupe-maker-prompt.md`)
 - 2026-09-30 — delegate-default-flip: flip secondmate's default so any triggered task dispatches to a fresh sub-agent-supervisor, ne... (`audit/flow/2026-09-30--delegate-default-flip.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-08 — session-banner-todo-mention: close the deferred follow-up from 2026-10-02 by mentioning task-tracking-checklist seedi... (`audit/flow/2026-10-08--session-banner-todo-mention.md`)
 - 2026-10-08 — wire-budget-aware-sop: SKILL.md checkpoint cost/self-estimate flags + pane-reaper watchdog wiring (`audit/flow/2026-10-08--wire-budget-aware-sop.md`)
 - 2026-10-09 — Wire nested-context-file discovery into 4 pi-maker launch sites in SKILL.md (`audit/flow/2026-10-09--pi-nested-context-files.md`)
+- 2026-10-12 — pi-maker-thinking-max: flip pi maker --thinking medium -> max, empirically verified, 2 human-driven interventions on... (`audit/flow/2026-10-12--pi-maker-thinking-max.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 54 total)
+## Recent decision (choices, findings, escalations) entries (15 of 55 total)
 
-- 2026-09-29 — Data-driven per-slot tools mode; accept round-4 finding as documented residual limitation (`audit/decision/2026-09-29--fix-planner-tools.md`)
 - 2026-09-30 — batch-hold-scaling: structural batch-id binding + verdict.py reuse; human-approved merge (`audit/decision/2026-09-30--batch-hold-scaling.md`)
 - 2026-09-30 — One canonical boilerplate block + 7 pointers; fixed direction wording and byte-fidelity drift on checker fail (`audit/decision/2026-09-30--dedupe-maker-prompt.md`)
 - 2026-09-30 — Fold fan-out into the standard path; fix a real HERDR_ENV-conditional spawn bug the checker caught in round 1 (`audit/decision/2026-09-30--delegate-default-flip.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-08 — Insert a new "0." banner item (not a trailing bullet), closed by two checker-driven precision fixes; three process re... (`audit/decision/2026-10-08--session-banner-todo-mention.md`)
 - 2026-10-08 — wire-budget-aware-sop: substring-collision bug caught+fixed round 1->2; hold answer independently re-verified (`audit/decision/2026-10-08--wire-budget-aware-sop.md`)
 - 2026-10-09 — pi-nested-context-files: set-u-safe splice + -type f fixes; two integration escalations resolved by human/dispatcher (`audit/decision/2026-10-09--pi-nested-context-files.md`)
+- 2026-10-12 — pi-maker-thinking-max: shipped max (not high) per empirical trials; hold answer and merge-permission block both indep... (`audit/decision/2026-10-12--pi-maker-thinking-max.md`)
