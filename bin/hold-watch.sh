@@ -293,13 +293,24 @@ watch() {
 # except the 1s deadline-clamp check, the ~2s zero-padded check, the ~1s slow-poll-shim check,
 # and the signal checks (0.5s each, run in the REAL dispatcher pattern: backgrounded, no job
 # control). No test here answers a hold in the real repo's ledger, writes outside the scratch
-# dir, or acquires any lock.
+# dir, or acquires any lock — and that isolation is ENFORCED, not merely documented:
+# --selfcheck refuses to run with an inherited SM_HOLD_LEDGER (exit 4) and asserts its
+# round-trip ledger lives inside its own throwaway scratch dir (exit 4 otherwise).
 SC_FAILS=0
 bad() { printf 'selfcheck FAIL: %s\n' "$*" >&2; SC_FAILS=$((SC_FAILS + 1)); }
 
 selfcheck() {
   local t fix warnonly orphan want1 want2 ledger corrupt empty vfile entries shim realpy
   local hid bid ofile err out rc now elapsed wpid kpid long ok128
+  # Structural isolation guard (round-8 finding C): --selfcheck may create, answer,
+  # and edit holds ONLY inside its own throwaway scratch dir. An inherited
+  # SM_HOLD_LEDGER pointing anywhere else is refused outright, so the read-only
+  # invariant (never answer holds, never edit ledgers) is ENFORCED for every
+  # ledger outside selfcheck's own scratch dir -- not merely documented above.
+  if [ -n "${SM_HOLD_LEDGER:-}" ]; then
+    printf 'selfcheck FAIL: refusing to run with an inherited SM_HOLD_LEDGER (%s) -- selfcheck exercises its round-trips only inside its own throwaway scratch dir\n' "$SM_HOLD_LEDGER" >&2
+    exit 4
+  fi
   t="$(mktemp -d)"
   ofile="$t/rw.out"
   err="$t/rw.err"
@@ -432,6 +443,12 @@ EOF
   }
 
   ledger="$t/decisions.jsonl"
+  # Structural isolation guard, part 2: the round-trip ledger must live inside
+  # this selfcheck's own throwaway dir; anything else is a hard failure.
+  case "$ledger" in
+    "$t"/*) ;;
+    *) printf 'selfcheck FAIL: scratch ledger escaped its scratch dir: %s\n' "$ledger" >&2; exit 4 ;;
+  esac
   hid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task rt-task --q "rt question?" --sha abc123 2>/dev/null)" \
     || bad "scratch hold creation failed"
 
