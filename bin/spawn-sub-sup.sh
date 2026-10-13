@@ -27,14 +27,17 @@ validate_id() {
   fi
 }
 
-# Refuses to write through a pre-existing symlink at a predictable artifact path (prompt/log/result) --
-# a local attacker who pre-creates one of these otherwise gets whatever it points at silently overwritten.
-refuse_symlink() {
-  local path="$1"
-  if [ -L "$path" ]; then
-    echo "SPAWN-SUB-SUP: refusing to write through pre-existing symlink: $path" >&2
-    exit 2
-  fi
+# Atomically opens fd 9 for writing to a predictable artifact path (prompt/log/result), failing with
+# no fd leaked if ANYTHING already exists there -- regular file or symlink (even dangling), checked by
+# the kernel's own O_EXCL at open() time, never a separate stat-then-write step a concurrent attacker
+# could win a race against by swapping in a symlink between the check and the write.
+exclusive_open() {
+  local path="$1" rc
+  set -C
+  exec 9> "$path"
+  rc=$?
+  set +C
+  return "$rc"
 }
 
 # Substitutes {{TASK_ID}}/{{OWNER}}/{{REPO}}/{{MODE}}/{{BATCH_ID}} into a template file's contents.
@@ -333,31 +336,45 @@ fi
 [ -f "$template_file" ] || { echo "template file not found: $template_file" >&2; exit 2; }
 
 rendered_prompt_path="${log_dir}/sm-${task_id}.prompt"
-refuse_symlink "$rendered_prompt_path"
-render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file" > "$rendered_prompt_path"
+if ! exclusive_open "$rendered_prompt_path"; then
+  echo "SPAWN-SUB-SUP: refusing to write -- a file or symlink already exists at: $rendered_prompt_path" >&2
+  exit 2
+fi
+render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file" >&9
+exec 9>&-
 
 log_file="${log_dir}/sm-${task_id}.log"
 result_file="${log_dir}/sm-${task_id}.result"
-refuse_symlink "$log_file"
+if ! exclusive_open "$log_file"; then
+  echo "SPAWN-SUB-SUP: refusing to write -- a file or symlink already exists at: $log_file" >&2
+  exit 2
+fi
 
 # Capture claude's own exit status in the SAME if/then/else statement set -e would otherwise inspect
 # (and here would also skip past under `set -e` with pipefail if written on a trailing line) --
 # a nonzero/killed exit must be caught here, not lost by falling through to the lines below.
 # `command claude` (not a bare `claude` call) bypasses shell function lookup -- an ambient/exported
 # `claude` function can otherwise shadow the real binary (or, in --selfcheck, the synthetic stub).
-if ( cd "$repo" && command claude -p "$(cat "$rendered_prompt_path")" --dangerously-skip-permissions --output-format stream-json --verbose ) > "$log_file" 2>&1; then
+# Output goes through the fd already opened exclusively above (>&9), never a second path-based open --
+# so a crashed/killed subprocess can never be confused with the exclusive-open check having failed.
+if ( cd "$repo" && command claude -p "$(cat "$rendered_prompt_path")" --dangerously-skip-permissions --output-format stream-json --verbose ) >&9 2>&1; then
   claude_rc=0
 else
   claude_rc=$?
 fi
+exec 9>&-
 
 if [ "$claude_rc" -ne 0 ]; then
   echo "SPAWN-SUB-SUP: CLAUDE SUBPROCESS CRASHED OR WAS KILLED (exit $claude_rc) -- see $log_file. dispatch-report.py was NOT invoked." >&2
   exit 5
 fi
 
-refuse_symlink "$result_file"
-extract_result "$log_file" > "$result_file"
+if ! exclusive_open "$result_file"; then
+  echo "SPAWN-SUB-SUP: refusing to write -- a file or symlink already exists at: $result_file" >&2
+  exit 2
+fi
+extract_result "$log_file" >&9
+exec 9>&-
 
 if dispatch_out="$("$SCRIPT_DIR/dispatch-report.py" "$result_file")"; then
   dispatch_rc=0
