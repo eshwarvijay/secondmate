@@ -153,19 +153,44 @@ valid-looking echoed example), blindly taking either the first or the last can s
 WRONG one — and releasing the claim with a wrong token fails, leaving a successfully merged
 task's claim stuck open forever with no further signal that anything went wrong.
 
-So the dispatcher does not guess between head/tail at all. It extracts **every** `^SM_CLAIM_TOKEN:`
-line from `.final.txt`:
+So the dispatcher does not guess between head/tail at all. It counts the matching lines in
+`.final.txt` FIRST, directly off `grep`'s own line count — never through a value-bearing
+intermediate variable — and only extracts a value once that count is confirmed to be exactly 1:
 ```bash
-tokens=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | cut -d: -f2-)
-n=$(printf '%s\n' "$tokens" | grep -c .)
+n=$(grep -c '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" || true)
+if [ "$n" -eq 1 ]; then
+  token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | cut -d: -f2-)
+fi
 ```
-- **Exactly one match** — use it. This is the well-behaved case.
-- **Zero matches, or more than one** — a protocol violation for this task-id. Do NOT guess which
-  one (if any) is real. Treat it exactly like a stuck task: escalate to the human verbatim (which
-  task-id, and whether zero or N>1 lines were found), the same "don't guess when ambiguous"
-  posture `dispatch-report.py` itself takes for a missing completion tag (its own exit 3,
-  `malformed`). This is the safety net, not the primary mechanism — the primary mechanism is the
-  prompt-contract requirement above: a well-behaved sub-supervisor emitting exactly one
+Two mechanical shell-correctness details, both load-bearing, both live-verified:
+- **The `|| true` on the counting `grep -c` is required**, not decorative. Under a normal strict
+  shell (`set -euo pipefail`, which a real dispatcher script should run under), `grep` exits 1 on
+  zero matches; with `pipefail` that fails the whole assignment and `set -e` then aborts the
+  script *before* it ever reaches the "zero matches → escalate" branch below. Confirmed live: the
+  unguarded form (`n=$(grep -c ... )`, no `|| true`) under `set -euo pipefail` against a file with
+  zero matching lines killed the script outright (exit 1, no further output) — the escalation
+  logic was never reached. With `|| true`, the same zero-match case instead correctly assigns
+  `n=0` and the script continues.
+- **Counting must happen on `grep`'s own match lines, never on a `cut`-derived, `$()`-captured
+  value.** An earlier draft counted `cut -d: -f2-`'s *output* via `printf '%s\n' "$tokens" | grep
+  -c .` — this undercounts whenever one of the matching lines has an EMPTY value after the colon
+  (e.g. a malformed `SM_CLAIM_TOKEN:` with nothing after it): `cut`'s output for that line is an
+  empty string, and command substitution (`$(...)`) strips ALL trailing newlines from its captured
+  value, so a trailing empty line silently vanishes from `$tokens` before it's ever counted.
+  Confirmed live: two real matching lines (`SM_CLAIM_TOKEN:abc123` and a second, empty-valued
+  `SM_CLAIM_TOKEN:`) counted as `n=1` through the old path, not 2 — the multiple-line escalation
+  never triggered, and the (wrong, since ambiguous) sole surviving token got used. Counting
+  `grep -c`'s own matched LINES directly, before any `cut`, has no such information loss and
+  correctly reported `n=2` for the identical input.
+
+Then branch on `n`:
+- **`n` is exactly 1** — use the extracted `token`. This is the well-behaved case.
+- **`n` is 0 or more than 1** — a protocol violation for this task-id. Do NOT guess which one (if
+  any) is real; do not even attempt the extraction. Treat it exactly like a stuck task: escalate
+  to the human verbatim (which task-id, and the actual value of `n`), the same "don't guess when
+  ambiguous" posture `dispatch-report.py` itself takes for a missing completion tag (its own exit
+  3, `malformed`). This is the safety net, not the primary mechanism — the primary mechanism is
+  the prompt-contract requirement above: a well-behaved sub-supervisor emitting exactly one
   `SM_CLAIM_TOKEN:` line never triggers this path in the first place.
 
 The dispatcher needs this token later for `bin/claim-ledger.py release` at merge/teardown time
@@ -233,25 +258,49 @@ exit 127, `pid <N> is not a child of this shell`). So reaping, for every dispatc
 not — is a non-blocking poll on the loop's own cadence (section 4), per task-id, **checking PID
 liveness FIRST, not `.final.txt` presence first:**
 
-1. **Is the `.pid` sidecar's recorded PID still alive?** `.final.txt`'s mere presence does NOT
-   prove the process has finished: per section 1's own step order, `spawn-sub-sup.sh` writes
+1. **Is the `.pid` sidecar's recorded PID still alive — distinguishing a truly running process
+   from a zombie, which a bare `kill -0` cannot do?** `.final.txt`'s mere presence does NOT prove
+   the process has finished: per section 1's own step order, `spawn-sub-sup.sh` writes
    `.final.txt` at step 2, then still has to run `dispatch-report.py` (step 3) and exit with its
    code (step 4) — so `.final.txt` can exist while the tracked PID is still alive and mid-sequence.
-   Checking PID liveness first avoids that race.
-   - `kill -0 <pid>` (non-blocking signal probe, never a blocking `wait`).
-   - **Alive** — still running; poll again next cycle, regardless of whether `.final.txt` already
-     exists.
-   - **Not alive** — go to step 2.
+   Checking liveness first avoids that race — but liveness itself needs more care than a bare
+   `kill -0`: a child that has already exited but was never reaped by its parent becomes a ZOMBIE
+   (defunct), and `kill -0` on a zombie's PID still succeeds — the kernel has not yet recycled that
+   PID slot — so a check built on `kill -0` alone would classify a zombie as "still running" and
+   poll forever, and the batch would never close. Confirmed live: forked a child that exits
+   immediately but was deliberately left unreaped — `ps -o stat=,command= -p <pid>` reported
+   `Z    <defunct>` while `kill -0 <pid>` on that same PID still returned success (exit 0).
 
-   **Accepted limitation, not solved here:** `kill -0` is a best-effort liveness signal — it only
-   proves *some* process currently holds that PID number, not that it is still `spawn-sub-sup.sh`
-   (confirmed live: `kill -0` against an unrelated backgrounded process also returns success/exit
-   0 — any live PID passes it, regardless of what it's actually running). In the rare case the OS
-   reuses that exact PID for an unrelated process in the narrow window between the real process
-   exiting and the next watchdog poll, `kill -0` would false-positive "still alive." This is the
-   same single-operator, local-git trust model the parent skill already accepts elsewhere
-   ("detection only, no automated certainty") — this contract does not try to eliminate that narrow
-   race with a more elaborate corroboration scheme; it accepts it as a known, bounded limitation.
+   So the check is `ps -o stat= -p <pid>` (portable across Linux and macOS/BSD), not `kill -0`
+   alone:
+   ```bash
+   state=$(ps -o stat= -p "$pid" 2>/dev/null)
+   ```
+   - **`$state` is empty** (no such PID at all) — not alive — go to step 2.
+   - **`$state` starts with `Z`** (zombie/defunct) — also not alive for the purpose of this check
+     — go to step 2. If this poll is running inside the SAME dispatcher process that originally
+     forked `spawn-sub-sup.sh` (not a restarted dispatcher — see the restart-safety note just
+     above), additionally run `wait "$pid" 2>/dev/null` here to actually REAP the zombie and free
+     its process-table slot: confirmed live that `waitpid()` on an already-exited child returns
+     immediately (0.000s) when called by its own forking parent — it only blocks for a genuinely
+     still-running child, which is not this branch. A restarted dispatcher cannot `wait` on a PID
+     it never forked and does not need to: once the original parent process is truly gone, the
+     kernel reparents any zombie it left behind to init/launchd, which reaps it on its own — the
+     "not alive" classification above is already correct regardless of who, if anyone, performs
+     the explicit reap.
+   - **`$state` is any other, non-empty, non-`Z` value** (a real running state) — still running;
+     poll again next cycle, regardless of whether `.final.txt` already exists.
+
+   **Accepted limitation, not solved here:** this `ps`-based check is still a best-effort liveness
+   signal — it only proves *some* process currently holds that PID number in a real running state,
+   not that it is still `spawn-sub-sup.sh` (confirmed live: a plain liveness probe against an
+   unrelated backgrounded process also returns "alive" — any live PID passes it, regardless of
+   what it's actually running). In the rare case the OS reuses that exact PID for an unrelated
+   process in the narrow window between the real process exiting and the next watchdog poll, this
+   check would false-positive "still alive." This is the same single-operator, local-git trust
+   model the parent skill already accepts elsewhere ("detection only, no automated certainty") —
+   this contract does not try to eliminate that narrow race with a more elaborate corroboration
+   scheme; it accepts it as a known, bounded limitation.
 2. **Once the PID is confirmed not alive, `.final.txt`'s presence/absence decides the outcome:**
    - **Present** — the process finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
      to get the terminal exit code. Nothing further to poll for this task-id.
