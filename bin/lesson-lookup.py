@@ -596,20 +596,25 @@ _MINT_HELP_BODY = (
 _WORKTREE_GITDIR_MARKER = '/worktrees/'
 
 
-def _find_dotgit_path(start_dir):
-    """Walk upward from `start_dir` (inclusive) to the filesystem root, looking for a `.git` entry
-    (file OR directory) in each directory -- the same upward directory-walk git itself uses to find
-    a repo's toplevel. Returns the resolved `.git` path, or None if none is found before reaching the
-    filesystem root. Purely filesystem-based: no subprocess, no `git` invocation of any kind, so
-    nothing on PATH (including an attacker-placed fake `git` executable) can influence this walk."""
+def _find_dotgit_entries(start_dir):
+    """Walk upward from `start_dir` (inclusive) to the filesystem root, YIELDING the `.git` entry
+    (file OR directory) found at EVERY level that has one -- not just the nearest. A nested `.git`
+    (directory or file) does NOT by itself establish a new repo boundary for this purpose: the real
+    question `_primary_checkout_refusal_reason` needs answered is whether the CWD sits ANYWHERE
+    inside a linked worktree's directory tree, which only a full walk to the filesystem root can
+    answer. Stopping at the nearest `.git` (the previous design) let a nested decoy -- e.g. a plain
+    `.git` DIRECTORY planted a few levels below a real linked worktree's root -- mask the real,
+    further-up worktree-pointer boundary and wrongly allow mint to run. Purely filesystem-based: no
+    subprocess, no `git` invocation of any kind, so nothing on PATH (including an attacker-placed
+    fake `git` executable) can influence this walk."""
     current = pathlib.Path(start_dir).resolve()
     while True:
         candidate = current / '.git'
         if candidate.exists():
-            return candidate
+            yield candidate
         parent = current.parent
         if parent == current:  # reached the filesystem root
-            return None
+            return
         current = parent
 
 
@@ -622,35 +627,68 @@ def _primary_checkout_refusal_reason():
     `git rev-parse --show-toplevel` via subprocess, but that call trusts whatever `git` is first on
     PATH -- a cross-model checker reproduced installing a lesson from inside a real linked worktree
     simply by putting a fake `git` earlier on PATH that printed the primary checkout's path and
-    exited 0, which fools ANY subprocess-based check regardless of env-var scrubbing. Instead this
-    walks upward from the real CWD (`os.getcwd()`, never influenced by PATH or any executable) via
-    `_find_dotgit_path()`, the same way git's own repo-discovery works, then tests whether that
-    `.git` is a real directory (primary checkout) versus a file (the gitdir-pointer git writes for a
-    linked worktree, whose content is a `gitdir: <path>` line pointing under
-    `_WORKTREE_GITDIR_MARKER`) or missing (ambiguous). Fails CLOSED (refuses) on any ambiguity --
-    never fails open."""
-    git_path = _find_dotgit_path(os.getcwd())
-    if git_path is None:
-        return "mint: could not find a .git entry walking up from the CWD -- refusing (fail closed)"
-    if git_path.is_dir():
-        return None
-    if not git_path.is_file():
-        return (f"mint: refusing -- {git_path} exists but is neither a directory nor a regular file "
-                f"-- ambiguous, refusing (fail closed)")
+    exited 0, which fools ANY subprocess-based check regardless of env-var scrubbing.
+
+    Walks the FULL ancestor chain from the real CWD (`os.getcwd()`, never influenced by PATH or any
+    executable) via `_find_dotgit_entries()`, not just the nearest `.git`: if ANY ancestor's `.git`
+    is a file whose `gitdir: <path>` line points under `_WORKTREE_GITDIR_MARKER`
+    (`.git/worktrees/<name>`), the CWD is physically contained within that linked worktree's
+    directory tree and this refuses immediately -- regardless of any nearer, nested `.git`
+    (directory or otherwise) found closer to the CWD, which a maker could create (deliberately or by
+    accident) specifically to defeat a nearest-match-only check. Only once no ancestor is a
+    worktree-pointer does the NEAREST `.git` entry decide the outcome: a real directory is a normal
+    primary checkout (allow); a file pointing somewhere else entirely (not under
+    `_WORKTREE_GITDIR_MARKER`) is still a legitimate primary checkout using an external gitdir (e.g.
+    `git init --separate-git-dir=<external>`) and is also allowed -- only a worktree-shaped pointer
+    is ever refused. Fails CLOSED (refuses) on any ambiguity, including a CWD that no longer exists
+    (`os.getcwd()` itself raising) -- never fails open."""
     try:
-        gitdir_line = git_path.read_text(encoding='utf-8', errors='replace').strip()
+        cwd = os.getcwd()
     except OSError as e:
-        return f"mint: could not read {git_path} ({e}) -- refusing (fail closed)"
-    m = re.match(r'gitdir:\s*(.+)\Z', gitdir_line)
-    gitdir_target = m.group(1).strip() if m else None
-    if gitdir_target and _WORKTREE_GITDIR_MARKER in gitdir_target.replace('\\', '/'):
-        return (f"mint: refusing -- {git_path} is a file pointing to a linked-worktree gitdir "
-                f"({gitdir_target}). mint only runs in the primary checkout, never inside a maker's "
-                f"linked worktree.")
-    pointer_note = f", pointing to {gitdir_target!r}" if gitdir_target else ""
-    return (f"mint: refusing -- {git_path} is a file (not a real directory){pointer_note}. mint only "
-            f"runs in the primary checkout (where .git is a real directory), never inside a maker's "
-            f"linked worktree.")
+        return f"mint: could not determine the current directory ({e}) -- refusing (fail closed)"
+
+    nearest_entry = None
+    nearest_gitdir_target = None
+    nearest_read_error = None
+
+    for git_path in _find_dotgit_entries(cwd):
+        gitdir_target = None
+        read_error = None
+        if git_path.is_file():
+            try:
+                gitdir_line = git_path.read_text(encoding='utf-8', errors='replace').strip()
+                m = re.match(r'gitdir:\s*(.+)\Z', gitdir_line)
+                gitdir_target = m.group(1).strip() if m else None
+            except OSError as e:
+                read_error = e
+
+        if nearest_entry is None:
+            nearest_entry = git_path
+            nearest_gitdir_target = gitdir_target
+            nearest_read_error = read_error
+
+        if gitdir_target and _WORKTREE_GITDIR_MARKER in gitdir_target.replace('\\', '/'):
+            return (f"mint: refusing -- {git_path} is a file pointing to a linked-worktree gitdir "
+                    f"({gitdir_target}), so the CWD is physically contained within a maker's linked "
+                    f"worktree. mint only runs in the primary checkout, never inside a maker's "
+                    f"linked worktree, however deeply nested the CWD is below it.")
+
+    if nearest_entry is None:
+        return "mint: could not find a .git entry walking up from the CWD -- refusing (fail closed)"
+    if nearest_entry.is_dir():
+        return None
+    if not nearest_entry.is_file():
+        return (f"mint: refusing -- {nearest_entry} exists but is neither a directory nor a regular "
+                f"file -- ambiguous, refusing (fail closed)")
+    if nearest_read_error is not None:
+        return f"mint: could not read {nearest_entry} ({nearest_read_error}) -- refusing (fail closed)"
+    if not nearest_gitdir_target:
+        return (f"mint: refusing -- {nearest_entry} is a file but doesn't contain a parseable "
+                f"'gitdir: <path>' line -- ambiguous, refusing (fail closed)")
+    # No ancestor .git anywhere in the chain pointed under _WORKTREE_GITDIR_MARKER (checked in the
+    # loop above), so this nearest file-based .git is a legitimate, supported primary-checkout
+    # layout (e.g. `git init --separate-git-dir=<external>`), not a linked worktree.
+    return None
 
 
 def _discover_categories(lessons_dir):
@@ -766,8 +804,26 @@ def _mint_tags_written_as_list(frontmatter_text):
                     continue
                 return later_stripped.startswith('- ')
             return False  # 'tags:' with nothing at all after it -- not a list
-        return value.startswith('[')  # inline bracketed list form
+        return _is_balanced_inline_list(value)  # inline bracketed list form, must be well-formed
     return False  # no 'tags' key found in the raw frontmatter at all
+
+
+def _is_balanced_inline_list(value):
+    """True if `value` is a well-formed, CLOSED inline YAML flow-sequence: starts with '[', ends
+    with ']', and brackets are balanced throughout -- not merely `startswith('[')`, which let an
+    unterminated `tags: [testing` (no closing bracket at all) sail through as a checker found."""
+    value = value.strip()
+    if not value.startswith('[') or not value.endswith(']'):
+        return False
+    depth = 0
+    for ch in value:
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
 
 
 def cmd_mint(argv):
@@ -2172,6 +2228,132 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-7 Finding 1 regression: a primary checkout created with
+    # `git init --separate-git-dir=<external-dir>` ALSO has a `.git` FILE (pointing to an arbitrary
+    # external gitdir with no `/worktrees/` in the path), not a directory -- but it IS a legitimate
+    # primary checkout, not a linked worktree, and must be allowed.
+    def test_mint_separate_git_dir_primary_allowed():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            external_gitdir = os.path.join(tmp, 'external.git')
+            repo = os.path.join(tmp, 'repo')
+            subprocess.run(
+                ['git', 'init', '-q', '-b', 'main', '--separate-git-dir', external_gitdir, repo],
+                check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.email', 'a@a'], check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.name', 'a'], check=True)
+            with open(os.path.join(repo, 'f'), 'w') as f:
+                f.write('x')
+            subprocess.run(['git', '-C', repo, 'add', '-A'], check=True)
+            subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'init'], check=True)
+
+            # Sanity: confirm the real git layout -- .git is a FILE, not a directory, here.
+            assert (pathlib.Path(repo) / '.git').is_file(), (
+                "git init --separate-git-dir should create a .git FILE, not a directory -- if this "
+                "fails, the fixture itself isn't exercising the layout this test is about")
+
+            lessons_dir = os.path.join(tmp, 'lessons')
+            os.makedirs(os.path.join(lessons_dir, 'testing'))
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a primary checkout using --separate-git-dir (a legitimate layout whose .git is a "
+                f"file pointing elsewhere, not a directory) must still be allowed:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 2 regression: a decoy `.git` DIRECTORY planted a few levels below a real
+    # linked worktree's root (e.g. a maker ran `git init` in a subdirectory) must NOT let mint
+    # bypass the worktree refusal -- the CWD is still physically contained within the worktree, no
+    # matter what's nested closer to it. The walk must reach the TRUE worktree-pointer boundary
+    # further up, not stop at the nearer decoy directory.
+    def test_mint_nested_dotgit_decoy_in_worktree_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-decoy')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'decoy-feat', wt, 'main'], check=True)
+
+            subdir = os.path.join(wt, 'subdir')
+            os.makedirs(subdir)
+            subprocess.run(['git', 'init', '-q', '-b', 'main', subdir], check=True)
+            assert (pathlib.Path(subdir) / '.git').is_dir(), (
+                "the decoy nested repo's .git should be a real directory -- if this fails, the "
+                "fixture isn't exercising the decoy layout this test is about")
+
+            draft = os.path.join(tmp, 'nested.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(subdir), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "mint must still refuse from inside a nested decoy .git directory that itself sits "
+                "inside a real linked maker worktree -- a nearer plain .git dir must not mask the "
+                "real worktree-pointer boundary further up")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'nested.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 3 regression: `_mint_tags_written_as_list`'s inline-list branch previously
+    # only checked `value.startswith('[')`, so an unterminated flow sequence (`tags: [testing`, no
+    # closing bracket at all) passed and installed. Must actually validate the list is closed.
+    def test_mint_unterminated_bracket_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'broken-list.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [testing\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "an unterminated inline tags list (`tags: [testing` with no closing bracket) must "
+                "be rejected, not accepted as a well-formed list")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'broken-list.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 4 regression: `_primary_checkout_refusal_reason()` called `os.getcwd()` with
+    # no error handling -- if the CWD was removed out from under the process, that call raises an
+    # unhandled FileNotFoundError traceback instead of mint's documented fail-closed refusal.
+    def test_mint_removed_cwd_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        doomed = os.path.join(tmp, 'doomed')
+        os.makedirs(doomed)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(doomed)
+            os.rmdir(doomed)  # remove the CWD out from under the process
+            err = io.StringIO()
+            try:
+                with redirect_stderr(err):
+                    rc = cmd_mint(['--file', os.path.join(tmp, 'does-not-matter.md')])
+            except Exception as e:
+                raise AssertionError(
+                    f"a removed CWD must produce a controlled fail-closed refusal, not an unhandled "
+                    f"exception: {type(e).__name__}: {e}")
+            assert rc != 0, "mint with a removed CWD must refuse (fail closed)"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a fail-closed refusal must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+        finally:
+            os.chdir(old_cwd)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_mint_positive_path_roundtrip():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -2240,6 +2422,10 @@ Always do the one thing that must happen.
     test_mint_primary_checkout_only_refusal()
     test_mint_env_and_path_spoof_refused()
     test_mint_primary_checkout_check_is_git_independent()
+    test_mint_separate_git_dir_primary_allowed()
+    test_mint_nested_dotgit_decoy_in_worktree_refused()
+    test_mint_unterminated_bracket_tags_rejected()
+    test_mint_removed_cwd_refused()
     test_mint_positive_path_roundtrip()
 
     # Test 10: All 4 real shipped seed files parse correctly and are evidence:E4
