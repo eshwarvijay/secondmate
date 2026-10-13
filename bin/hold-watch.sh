@@ -24,21 +24,57 @@
 #   - A --task filter matching zero holds while other holds are open is just the ordinary
 #     no-match case: the same timeout/exit-3 path, nothing special.
 #   - Signals during the wait: SIGTERM -> exit 143, SIGINT -> exit 130 (both distinct from
-#     timeout's exit 3).
+#     timeout's exit 3). POSIX force-ignores SIGINT for backgrounded commands when job control
+#     is off, and a signal ignored on shell entry cannot be trapped -- so a dispatcher's
+#     `hold-watch.sh ... &` would silently lose the INT contract (SIGTERM is unaffected: it is
+#     never force-ignored). At startup the script self-probes: a one-shot INT trap plus a
+#     self-delivered SIGINT. If the trap fires, SIGINT is already this script's (foreground and
+#     job-control invocations) and it starts directly; if nothing consumes the signal, SIGINT
+#     was force-ignored on entry, and the script re-execs itself once through python3 to reset
+#     that disposition to default (only a runtime sigaction can undo an inherited SIG_IGN;
+#     bash alone cannot -- `trap -p` does not even expose it). pid/argv/env/fds are preserved
+#     by exec, so the caller and `kill $!` still target the same process. Prefer SIGTERM to
+#     stop a running instance anyway -- it is the one signal that never needs this treatment.
 #   - The deadline is an absolute wall-clock instant (not a decrementing counter), so a slow poll
 #     never steals time from later ticks; sleeps are plain `sleep` (never `read -t`, which races
 #     stdin under cron), clamped to the remaining budget so the script never lingers past the
-#     deadline.
-#   - Exit 2: usage/validation error (bad --task charset, non-numeric --interval/--timeout, ...).
+#     deadline. EACH `hold.py open` invocation is itself bounded by the remaining budget (with a
+#     1s floor so even --timeout 0 gets one real poll; then TERM and, after a 1s grace, KILL), so
+#     a hung/slow single poll can never push the runtime meaningfully past --timeout.
+#   - --interval/--timeout accept zero-padded digit strings ("08" is the value it visually is,
+#     base-10 -- never bash's octal-literal arithmetic, which used to exit 1 undocumented).
+#   - Exit 2: usage/validation error (bad --task charset, non-numeric/out-of-range numerics, ...).
 
 set -u
+
+# SIGINT self-heal (see header). `trap -p` cannot detect the inherited force-ignore (bash does not
+# expose it), so detect it with a self-probe: install a one-shot INT trap and self-deliver
+# SIGINT. If the trap fires, INT was already ours -- no heal, no extra python3 startup. If
+# nothing consumed the signal, INT was force-ignored on entry (a backgrounded, non-job-control
+# invocation) and only a runtime sigaction can undo that: re-exec through python3, which resets
+# the disposition to default before exec'ing us back (pid/argv/env/fds preserved, so the caller
+# and `kill $!` still target this same process). No guard variable is needed: the re-exec'd
+# instance probes SIG_DFL, finds it trappable, and does not heal again. The one-shot probe trap
+# is simply overwritten by the real INT trap installed further below.
+_int_probe="$(mktemp "${TMPDIR:-/tmp}/hold-watch-int-probe.XXXXXX")"
+trap 'rm -f "$_int_probe"' INT
+kill -INT $$
+if [ -e "$_int_probe" ]; then   # nothing consumed the signal: SIGINT was ignored on entry
+  rm -f "$_int_probe"
+  if command -v python3 >/dev/null 2>&1; then
+    exec python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' "$0" "$@"
+  fi
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOLD_PY="$SCRIPT_DIR/hold.py"
 
-SLEEP_PID=""
-on_signal() {  # distinct from timeout's exit 3; also kill the in-flight sleep so nothing lingers
+SLEEP_PID="" POLL_PID="" POLL_KILLER="" POLL_OUT=""
+on_signal() {  # distinct from timeout's exit 3; kill anything in flight so nothing lingers
   [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
+  [ -n "$POLL_PID" ] && kill "$POLL_PID" 2>/dev/null
+  [ -n "$POLL_KILLER" ] && kill "$POLL_KILLER" 2>/dev/null
+  [ -n "$POLL_OUT" ] && rm -f "$POLL_OUT"
   exit "$1"
 }
 trap 'on_signal 143' TERM
@@ -88,22 +124,52 @@ match_block() {
   [ -n "$MATCH_BLOCK" ]
 }
 
+# poll_once <outfile> <budget-secs> -- one `hold.py open`, bounded by the REMAINING time budget
+# (not the full --interval), so a hung/slow hold.py invocation can never push the script
+# meaningfully past its --timeout deadline. The bound is a backgrounded killer subshell: if the
+# poll finishes early, the killer is TERM-killed before its own `kill` can ever run; if the poll
+# hangs, it gets TERM and, after a 1s grace, KILL. Returns hold.py's exit status (143 when the
+# budget killed it). hold.py's stderr is suppressed: its "(no open decisions)" noise stays out of
+# the cron log, and its stdout WARNING lines still reach match_block for stderr forwarding.
+poll_once() {
+  local ofile="$1" budget="$2" rc=0
+  python3 "$HOLD_PY" open >"$ofile" 2>/dev/null &
+  POLL_PID=$!
+  ( sleep "$budget"; kill -TERM "$POLL_PID" 2>/dev/null; sleep 1; kill -KILL "$POLL_PID" 2>/dev/null ) &
+  POLL_KILLER=$!
+  wait "$POLL_PID"; rc=$?
+  POLL_PID=""
+  kill "$POLL_KILLER" 2>/dev/null
+  wait "$POLL_KILLER" 2>/dev/null
+  POLL_KILLER=""
+  return "$rc"
+}
+
 # watch -- the polling loop. Polls immediately (a hold that is already open is found without
-# waiting), then every --interval seconds until the absolute wall-clock deadline elapses.
+# waiting), then every --interval seconds until the absolute wall-clock deadline elapses. Every
+# poll is itself bounded by the remaining budget, and the inter-poll sleep is clamped to the
+# remaining budget too, so the runtime never meaningfully exceeds --timeout.
 watch() {
-  local out="" polls=0 deadline now sleep_for
+  local polls=0 deadline now budget sleep_for pfile
+  pfile="$(mktemp "${TMPDIR:-/tmp}/hold-watch-poll.XXXXXX")"
+  POLL_OUT="$pfile"
   deadline=$(( $(date +%s) + TIMEOUT ))
   while :; do
     polls=$((polls + 1))
-    out="$(python3 "$HOLD_PY" open 2>/dev/null)" \
-      || printf 'hold-watch: hold.py open exited nonzero on poll %d; retrying next tick\n' "$polls" >&2
-    if match_block "$TASK" <<<"$out"; then
+    budget=$(( deadline - $(date +%s) ))
+    [ "$budget" -lt 1 ] && budget=1  # floor: even --timeout 0 gets one real (bounded) poll
+    if ! poll_once "$pfile" "$budget"; then
+      printf 'hold-watch: hold.py open exited nonzero on poll %d; retrying next tick\n' "$polls" >&2
+    fi
+    if match_block "$TASK" <"$pfile"; then
       printf '%s\n' "$MATCH_BLOCK"
+      rm -f "$pfile"
       exit 0
     fi
     now="$(date +%s)"
     if [ "$now" -ge "$deadline" ]; then
       printf 'NO-HOLD: no open hold matching task=%s after %ss (%d polls)\n' "${TASK:-any}" "$TIMEOUT" "$polls"
+      rm -f "$pfile"
       exit 3
     fi
     sleep_for=$(( deadline - now ))
@@ -118,16 +184,18 @@ watch() {
 # ------------------------------------------------------------------ --selfcheck
 # Asserts THIS script's own matching/parsing contract: fixture tests call the real match_block()
 # (the exact function the watch loop calls), round-trips run this script as a real subprocess
-# against the real bin/hold.py over a scratch ledger (SM_HOLD_LEDGER override). No multi-second
-# real wait: every ledger round-trip uses --timeout 0 (one immediate poll, zero sleeps) except
-# the 1s deadline-clamp check and the signal checks (0.5s each). No test here answers a hold in
-# the real repo's ledger, writes outside the scratch dir, or acquires any lock.
+# against the real bin/hold.py over a scratch ledger (SM_HOLD_LEDGER override). Slow by design
+# (but bounded): every ledger round-trip uses --timeout 0 (one immediate poll, zero sleeps)
+# except the 1s deadline-clamp check, the ~2s zero-padded check, the ~1s slow-poll-shim check,
+# and the signal checks (0.5s each, run in the REAL dispatcher pattern: backgrounded, no job
+# control). No test here answers a hold in the real repo's ledger, writes outside the scratch
+# dir, or acquires any lock.
 SC_FAILS=0
 bad() { printf 'selfcheck FAIL: %s\n' "$*" >&2; SC_FAILS=$((SC_FAILS + 1)); }
 
 selfcheck() {
-  local t fix warnonly orphan want1 want2 ledger corrupt empty vfile entries
-  local hid bid ofile err rc now elapsed wpid long ok128
+  local t fix warnonly orphan want1 want2 ledger corrupt empty vfile entries shim realpy
+  local hid bid ofile err rc now elapsed wpid kpid long ok128
   t="$(mktemp -d)"
   ofile="$t/rw.out"
   err="$t/rw.err"
@@ -241,6 +309,23 @@ EOF
   elapsed=$(( $(date +%s) - now ))
   [ "$elapsed" -le 5 ] || bad "--timeout 1 must give up after ~1s even with --interval 30 (took ${elapsed}s)"
 
+  # slow hold.py-open substitute near the deadline (bug-1 class): each poll invocation is itself
+  # bounded by the REMAINING budget, so a 5s-hanging poll under --timeout 1 still ends at ~1s.
+  # The watcher runs foreground here, so its startup self-probe finds SIGINT already trappable
+  # and no self-heal re-exec fires -- the shim intercepts ONLY the poll interpreter. (The
+  # heal's own coverage is the backgrounded SIGINT test below.)
+  shim="$t/shim"; mkdir -p "$shim"
+  realpy="$(command -v python3)"
+  printf '#!/bin/sh\nsleep 5\nexec "%s" "$@"\n' "$realpy" >"$shim/python3"
+  chmod +x "$shim/python3"
+  now="$(date +%s)"
+  SM_HOLD_LEDGER="$empty" PATH="$shim:$PATH" "$0" --interval 1 --timeout 1 >"$ofile" 2>"$err"
+  rc=$?
+  elapsed=$(( $(date +%s) - now ))
+  [ "$rc" -eq 3 ] || bad "slow-poll substitute: rc=$rc (wanted 3)"
+  [ "$elapsed" -le 3 ] || bad "a hung poll must be bounded by the remaining budget: 1s watch took ${elapsed}s"
+  grep -q '^NO-HOLD:' "$ofile" || bad "slow-poll substitute must still end with the NO-HOLD line"
+
   # ---------- argument validation ----------
   rc=0; "$0" --task 'bad task!' --timeout 0 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || bad "invalid --task charset must be rejected early with exit 2, got $rc"
@@ -255,18 +340,29 @@ EOF
   [ "$rc" -eq 2 ] || bad "--interval 0 must be rejected with exit 2, got $rc"
   rc=0; "$0" --timeout abc >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || bad "non-numeric --timeout must be rejected with exit 2, got $rc"
+
+  # zero-padded numerics (bug-2 class): accepted and base-10-normalized -- "09"/"08" are the
+  # values they visually are, never bash octal literals (which used to crash exit 1 mid-watch).
+  # The open batch hold matches on the first poll, so this costs zero real wait.
+  rw "$ledger" 0 --timeout 09 --interval 08
+  now="$(date +%s)"
+  rw "$empty" 3 --interval 01 --timeout 02   # live zero-padded run: 1s ticks, 2s deadline
+  elapsed=$(( $(date +%s) - now ))
+  [ "$elapsed" -le 4 ] || bad "zero-padded live run took ${elapsed}s (budget was 2s)"
+  grep -q "after 2s (" "$ofile" || bad "NO-HOLD line must report the normalized timeout (2s) -- got: $(cat "$ofile")"
+  rw "$empty" 3 --timeout 00                 # "00" = 0: accepted, one immediate poll
   rc=0; "$0" --bogus >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || bad "an unknown argument must be rejected with exit 2, got $rc"
   rc=0; "$0" --help >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 0 ] || bad "--help must exit 0, got $rc"
 
-  # ---------- signals during the wait: distinct from timeout's exit 3 ----------
-  # set -m (job control) so the async child does NOT inherit SIGINT-as-ignored -- without it the
-  # INT round-trip could not exercise the child's own INT trap at all.
-  set -m
+  # ---------- signals during the wait, in the REAL dispatcher pattern: backgrounded, NO job
+  # control. bash force-ignores SIGINT for such children (an entry-ignored signal cannot be
+  # trapped); the startup self-heal re-exec is what restores the documented exit 130. SIGTERM is
+  # never force-ignored, so it is the simplest reliable stop; both are asserted here. ----------
   SM_HOLD_LEDGER="$empty" "$0" --interval 30 --timeout 3600 >"$t/sig.out" 2>/dev/null &
   wpid=$!
-  sleep 0.5  # past the first poll, into the signal-interruptible wait
+  sleep 0.5   # past startup (incl. the one-time self-heal exec) into the signal-interruptible wait
   kill -TERM "$wpid" 2>/dev/null
   wait "$wpid"; rc=$?
   [ "$rc" -eq 143 ] || bad "SIGTERM during the wait must exit 143 (distinct from 3), got $rc"
@@ -274,9 +370,13 @@ EOF
   wpid=$!
   sleep 0.5
   kill -INT "$wpid" 2>/dev/null
+  # bound the wait: if a regression ever re-breaks backgrounded SIGINT, fail fast (the rescue
+  # TERM yields 143 != 130) instead of hanging the selfcheck for the child's full 3600s.
+  ( sleep 5; kill -TERM "$wpid" 2>/dev/null ) &
+  kpid=$!
   wait "$wpid"; rc=$?
+  kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
   [ "$rc" -eq 130 ] || bad "SIGINT during the wait must exit 130 (distinct from 3), got $rc"
-  set +m
 
   rm -rf "$t"
   if [ "$SC_FAILS" -eq 0 ]; then echo ok; exit 0; fi
@@ -296,6 +396,12 @@ ledger, or acquires a lock. WARNING corruption lines go to stderr, never stdout.
 
 Exit codes: 0 hold found; 2 usage/validation error; 3 timeout, no matching open hold;
            130 interrupted (SIGINT); 143 terminated (SIGTERM).
+
+Stopping a running instance: prefer SIGTERM (always honored). SIGINT also works, including for
+a backgrounded `hold-watch.sh ... &` invocation: POSIX forces SIGINT ignored for non-job-
+control background commands (an ignored signal cannot be trapped), so the script detects that
+at startup with a one-shot self-probe and re-execs itself once through python3 to reset the
+disposition. Zero-padded --interval/--timeout digit strings are accepted as base-10.
 EOF
 }
 
@@ -326,10 +432,16 @@ if [ -n "$TASK" ] && ! [[ "$TASK" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
        "the same charset hold.py's own task-ids use)" >&2
   exit 2
 fi
-[[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]] \
-  || { echo "hold-watch: --interval must be an integer >= 1 (seconds), got '$INTERVAL'" >&2; exit 2; }
-[[ "$TIMEOUT" =~ ^[0-9]+$ ]] \
-  || { echo "hold-watch: --timeout must be an integer >= 0 (seconds), got '$TIMEOUT'" >&2; exit 2; }
+# digit strings only, zero-padding allowed ("08" is the value it visually is), length-capped
+# so the normalized value always fits bash's 64-bit arithmetic without silent wraparound
+[[ "$INTERVAL" =~ ^[0-9]{1,18}$ ]] \
+  || { echo "hold-watch: --interval must be 1-18 digits (seconds), got '$INTERVAL'" >&2; exit 2; }
+[[ "$TIMEOUT" =~ ^[0-9]{1,18}$ ]] \
+  || { echo "hold-watch: --timeout must be 1-18 digits (seconds), got '$TIMEOUT'" >&2; exit 2; }
+INTERVAL="$((10#$INTERVAL))"   # base-10 normalize: never bash's octal-literal arithmetic
+TIMEOUT="$((10#$TIMEOUT))"
+[ "$INTERVAL" -ge 1 ] \
+  || { echo "hold-watch: --interval must be >= 1 second, got '$INTERVAL'" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 \
   || { echo "hold-watch: python3 not found in PATH (needed to run bin/hold.py)" >&2; exit 2; }
 [ -f "$HOLD_PY" ] \
