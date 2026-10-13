@@ -2101,6 +2101,17 @@ Always do the one thing that must happen.
                     f"help text must document the leading-'?' explicit-key rule:\n{out.getvalue()}")
                 assert 'flow-structural stop' in help_text, (
                     f"help text must document the whitespace/stop-char/end-of-text condition:\n{out.getvalue()}")
+                # Round-17 Finding 2 regression: the four assertions above pinned the paragraph's
+                # mapping-VALUE/KEY/stop-character wording, but not the "whitespace" or "end of
+                # the text" arms of the same tri-state condition -- a mutation that removed just
+                # those two phrases (keeping 'flow-structural stop' intact) still passed every
+                # assertion above.
+                assert 'followed by whitespace' in help_text, (
+                    f"help text must document the whitespace arm of the mapping-indicator "
+                    f"condition:\n{out.getvalue()}")
+                assert 'end of the text' in help_text, (
+                    f"help text must document the end-of-text arm of the mapping-indicator "
+                    f"condition:\n{out.getvalue()}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3267,6 +3278,22 @@ Always do the one thing that must happen.
                 f"a '?' right before a ',' element separator is the same null-key/null-value "
                 f"explicit-key shorthand and must be rejected too:\n{err4.getvalue()}")
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-stop-comma.md'))
+
+            # Round-17 Finding 1 regression: the three cases above cover `?` followed by
+            # whitespace or a flow-structural stop character, but not `?` followed by nothing at
+            # all -- the dash-item's ENTIRE content is just '?', so the mapping-indicator check
+            # must fire on the end-of-text arm, not the whitespace or stop-char arms.
+            draft_eot = os.path.join(tmp, 'explicit-key-eot.md')
+            with open(draft_eot, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - ?\n'))
+            err5 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err5):
+                rc5 = cmd_mint(['--file', draft_eot])
+            assert rc5 != 0, (
+                f"a dash-item whose entire content is a bare '?' (nothing after it at all) is a "
+                f"null-key/null-value explicit-key mapping too -- the end-of-text arm of the "
+                f"indicator check must reject it:\n{err5.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-eot.md'))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
