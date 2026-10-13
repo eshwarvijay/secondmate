@@ -45,7 +45,10 @@ exclusive_open() {
 render_prompt() {
   local mode="$1" task_id="$2" owner="$3" repo="$4" batch_id="$5" template_file="$6"
   local prompt
-  prompt="$(cat "$template_file")"
+  # Check the ACTUAL read's own exit status, not just an earlier -r check -- the file can pass that
+  # check and still fail to read moments later (deleted, permissions changed, unmounted, etc). On
+  # failure, return nonzero with no stdout, so the caller never gets a silently-empty prompt.
+  prompt="$(cat "$template_file")" || return 1
   prompt="${prompt//\{\{TASK_ID\}\}/$task_id}"
   prompt="${prompt//\{\{OWNER\}\}/$owner}"
   prompt="${prompt//\{\{REPO\}\}/$repo}"
@@ -109,6 +112,15 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo "$out" | grep -q 'task-id:  T2'  || { echo "FAIL: batch template task-id not substituted"; fails=1; }
   echo "$out" | grep -q 'batch-id: B9'  || { echo "FAIL: batch template batch-id not substituted"; fails=1; }
   echo "$out" | grep -qF '{{' && { echo "FAIL: batch template left an unsubstituted placeholder"; fails=1; }
+
+  # render_prompt must detect a failed read of template_file itself (not just rely on an earlier
+  # stat-based -r check elsewhere) and return nonzero with no stdout. A directory is a deterministic,
+  # non-racing way to construct "exists and even passes -r" yet still fails an actual `cat` read.
+  mkdir -p "$t/render_prompt_unreadable_dir"
+  if render_prompt solo T3 sm-T3 /repo/z solo "$t/render_prompt_unreadable_dir" >/dev/null 2>"$t/render_prompt_fail.err"; then
+    echo "FAIL: render_prompt should return nonzero when its template_file's actual read fails, but it succeeded"
+    fails=1
+  fi
 
   # --- stream-json extraction (isolated, no claude process involved) ---
   log1="$t/r1.log"
@@ -229,6 +241,29 @@ FAKE
   [ "$rc" = 2 ] || { echo "FAIL: unreadable --prompt-file should exit 2 (got $rc)"; fails=1; }
   grep -qi 'not readable' "$t/run7b.err" || { echo "FAIL: unreadable --prompt-file refusal message missing"; fails=1; }
   [ -f "$claude_marker" ] && { echo "FAIL: claude was invoked despite an unreadable --prompt-file"; fails=1; }
+
+  # 7c) TOCTOU variant of 7b, end-to-end: the file passes the EARLIER -r check (it's a real,
+  #     genuinely readable file), but the ACTUAL read inside render_prompt still fails (deleted,
+  #     permissions changed, unmounted mid-race, per the checker's exact repro). Rather than a real
+  #     race (unreliable -- the exact lesson learned fixing 8c/8d last round), deterministically
+  #     force the failure by overriding `cat` on PATH to fail unconditionally for this one
+  #     invocation: the earlier -f/-r checks are bash BUILTINS that never call the external `cat`
+  #     binary at all, so they still pass normally against the real file; only render_prompt's own
+  #     `cat "$template_file"` call is intercepted.
+  fakecat="$t/fakecatbin"; mkdir -p "$fakecat"
+  cat > "$fakecat/cat" <<'FAKECAT'
+#!/usr/bin/env bash
+echo "cat: $1: Permission denied (simulated TOCTOU failure for selfcheck)" >&2
+exit 1
+FAKECAT
+  chmod +x "$fakecat/cat"
+  toctou_template="$t/toctou_template.txt"; printf 'real content {{TASK_ID}}\n' > "$toctou_template"
+  claude_marker2="$t/claude_invoked_marker2"; rm -f "$claude_marker2"
+  log_dir="$t/run7c"; mkdir -p "$log_dir"
+  rc=0; out="$(PATH="$fakecat:$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok CLAUDE_INVOKED_MARKER="$claude_marker2" "$0" --task-id toctoutest --mode solo --repo "$repo_dir" --log-dir "$log_dir" --prompt-file "$toctou_template" 2>"$t/run7c.err")" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: TOCTOU-failed template read should exit 2 (got $rc)"; fails=1; }
+  grep -qi 'failed to read' "$t/run7c.err" || { echo "FAIL: TOCTOU-failed template read refusal message missing"; fails=1; }
+  [ -f "$claude_marker2" ] && { echo "FAIL: claude was invoked despite the template read failing after the earlier readability check passed"; fails=1; }
 
   # 8) symlink refusal: a pre-existing symlink at the .prompt/.log/.result path must be refused, not
   #    followed -- a local attacker pre-creating one must never get the victim file overwritten.
@@ -439,7 +474,10 @@ fi
 # Render the prompt into a bash variable (never re-read from disk) -- this is the exact string later
 # fed to `claude -p`, so there is no window after this point where an attacker could swap the on-disk
 # .prompt artifact for a symlink to attacker-controlled content and have it silently re-trusted.
-prompt_content="$(render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file")"
+if ! prompt_content="$(render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file")"; then
+  echo "SPAWN-SUB-SUP: failed to read template file: $template_file (passed the earlier readability check but the actual read still failed -- deleted, permissions changed, or unmounted in between) -- refusing to launch claude with an empty/partial prompt" >&2
+  exit 2
+fi
 
 rendered_prompt_path="${log_dir}/sm-${task_id}.prompt"
 if ! exclusive_open "$rendered_prompt_path"; then
