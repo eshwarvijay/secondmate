@@ -22,7 +22,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo "$out" | grep -q "new-worktree.sh" || { echo "FAIL: missing new-worktree.sh as the non-herdr spawn command"; fails=1; }
   echo "$out" | grep -qi "In herdr (HERDR_ENV=1)" || { echo "FAIL: missing the in-herdr spawn path"; fails=1; }
   echo "$out" | grep -q "herdr worktree create" || { echo "FAIL: missing herdr worktree create as the in-herdr spawn command"; fails=1; }
-  echo "$out" | grep -q "pi+GLM-5.3 --thinking max (simple)" || { echo "FAIL: missing the pi+GLM-5.3 --thinking max simple-maker routing wording"; fails=1; }
+  echo "$out" | grep -qF "pi+GLM-5.3 --thinking max (simple)" || { echo "FAIL: missing the pi+GLM-5.3 --thinking max simple-maker routing wording"; fails=1; }
   echo "$out" | grep -q "pi+Qwen" && { echo "FAIL: stale pi+Qwen maker-routing wording still present"; fails=1; }
   echo "$out" | grep -q -- "--thinking medium" && { echo "FAIL: stale --thinking medium maker-routing wording still present"; fails=1; }
   echo "$out" | grep -qi "never self-answered" || { echo "FAIL: missing the never-self-answered-hold wording"; fails=1; }
