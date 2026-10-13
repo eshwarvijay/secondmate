@@ -4,6 +4,7 @@
 
 Usage: bin/lesson-lookup.py --task "<description>" [--task-id <id>]
        bin/lesson-lookup.py tag --lesson-id <id> --outcome helpful|harmful
+       bin/lesson-lookup.py mint --file <draft.md> [--category <cat>]
        bin/lesson-lookup.py selfcheck
 
 Reads all bin/lessons/**/*.md files, parses frontmatter (stdlib only, no yaml),
@@ -32,6 +33,13 @@ frontmatter fields via a surgical, atomic text edit (never a full YAML
 round-trip) so every other line in the file -- tags, evidence, earned-in,
 the body -- is preserved byte-for-byte. This is supervisor judgment recorded
 after the fact, never an automated correlation against any other history.
+
+`mint` validates and installs a brand-new, complete lesson draft (frontmatter
++ body, authored exactly like any shipped lesson) into bin/lessons/. It never
+constructs a lesson from separate flags, never overwrites an existing lesson
+file, and only ever runs from the primary checkout -- never inside a maker's
+linked worktree, Claude or pi alike. On any validation failure it writes
+nothing and exits nonzero with a stderr message naming the first failure.
 """
 import sys
 import os
@@ -562,6 +570,714 @@ def cmd_tag(argv):
         return 1
 
     print(f"tagged {lesson_id_arg} as {outcome} ({field}={new_val})")
+    return 0
+
+
+_MINT_USAGE = 'Usage: bin/lesson-lookup.py mint --file <draft.md> [--category <cat>]\n'
+
+_MINT_HELP_BODY = (
+    "\n"
+    "Validate a complete, hand-authored lesson draft (frontmatter + body) and install it into\n"
+    "bin/lessons/<category>/<slug>.md. Never overwrites an existing lesson.\n"
+    "\n"
+    "mint is a step-11, PRIMARY-CHECKOUT-ONLY tool: it refuses to run from inside a maker's linked\n"
+    "worktree -- Claude or pi alike -- checked before any other validation, before --file is even\n"
+    "read. Run it only from the primary checkout.\n"
+    "\n"
+    "  --file <draft.md>   path to the complete lesson draft to validate and install (required)\n"
+    "  --category <cat>    destination category under bin/lessons/; falls back to the draft's own\n"
+    "                       `category:` frontmatter field if omitted\n"
+    "\n"
+    "The draft's `tags` field must be a non-empty, flat list of string scalars -- either the\n"
+    "inline `[a, b]` form or the multi-line `- a` / `- b` block form. No nesting (a tag may not\n"
+    "itself be a list or mapping), no comments, and no raw control characters.\n"
+    "\n"
+    "A tag that looks like a YAML mapping indicator is rejected, not swallowed as text: a `:` in\n"
+    "mapping-value position (`name:`) and a leading `?` in explicit-key position (`? name`) each\n"
+    "count as a mapping indicator only when followed by whitespace, a flow-structural stop\n"
+    "character (`]` or `,`), or the end of the text -- e.g. `[name:]`, `[? name]`, and `[?]` are\n"
+    "all one-key mappings, not flat strings, and are rejected the same as a comment or nested list.\n"
+)
+
+
+# Git itself writes a file named `commondir` INSIDE a linked worktree's PRIVATE gitdir (at
+# <main-repo>/.git/worktrees/<name>/commondir, containing a relative path back to the shared/common
+# gitdir) -- and ONLY there. A primary checkout's own gitdir never has this file, whether it's the
+# standard `.git` directory or an external one from `git init --separate-git-dir=<dir>`. This is
+# the real, naming-independent structural signal for "is this gitdir a linked worktree's private
+# gitdir": unlike pattern-matching the gitdir-pointer's path TEXT for a '/worktrees/' substring
+# (fooled in BOTH directions -- dodged by routing the pointer through a symlink/alias whose own
+# path text contains no such substring, or misfired on an unrelated external gitdir that happens to
+# live under a directory literally named "worktrees" for other reasons), this inspects the actual
+# resolved target directory's own contents, which only git itself ever writes and only for a linked
+# worktree's private gitdir. No `git` subprocess call needed -- just a filesystem existence check.
+_WORKTREE_COMMONDIR_FILENAME = 'commondir'
+
+
+def _resolve_gitdir_target(gitdir_target, pointer_path):
+    """Resolve a `gitdir: <path>` pointer's target to an absolute, symlink-RESOLVED real path.
+    `pointer_path` is the `.git` file that contained the pointer -- a relative target is resolved
+    relative to ITS parent directory, the same way git itself resolves gitdir pointers. Following
+    symlinks here (via `.resolve()`) is what makes this immune to a pointer rewritten to go through
+    a symlink/alias: the real worktree-private gitdir underneath is still reached, and the
+    structural `commondir` signal checked against the real resolved directory, not the alias path."""
+    target = pathlib.Path(gitdir_target)
+    if not target.is_absolute():
+        target = pointer_path.parent / target
+    return target.resolve()
+
+
+def _is_worktree_private_gitdir(resolved_target):
+    """True if `resolved_target` (already symlink-resolved) is a linked worktree's PRIVATE gitdir --
+    detected via the structural `commondir` file git itself writes there (see
+    `_WORKTREE_COMMONDIR_FILENAME`'s comment), never present in a primary checkout's own gitdir.
+    Fails CLOSED (returns True, the safer "treat as a worktree, refuse" assumption) if the
+    filesystem check itself can't be made cleanly due to an OS error -- never silently treats an
+    unreadable/ambiguous target as safe to allow."""
+    try:
+        return (resolved_target / _WORKTREE_COMMONDIR_FILENAME).is_file()
+    except OSError:
+        return True
+
+
+def _find_dotgit_entries(start_dir):
+    """Walk upward from `start_dir` (inclusive) to the filesystem root, YIELDING the `.git` entry
+    (file OR directory) found at EVERY level that has one -- not just the nearest. A nested `.git`
+    (directory or file) does NOT by itself establish a new repo boundary for this purpose: the real
+    question `_primary_checkout_refusal_reason` needs answered is whether the CWD sits ANYWHERE
+    inside a linked worktree's directory tree, which only a full walk to the filesystem root can
+    answer. Stopping at the nearest `.git` (the previous design) let a nested decoy -- e.g. a plain
+    `.git` DIRECTORY planted a few levels below a real linked worktree's root -- mask the real,
+    further-up worktree-pointer boundary and wrongly allow mint to run. Purely filesystem-based: no
+    subprocess, no `git` invocation of any kind, so nothing on PATH (including an attacker-placed
+    fake `git` executable) can influence this walk."""
+    current = pathlib.Path(start_dir).resolve()
+    while True:
+        candidate = current / '.git'
+        if candidate.exists():
+            yield candidate
+        parent = current.parent
+        if parent == current:  # reached the filesystem root
+            return
+        current = parent
+
+
+def _primary_checkout_refusal_reason():
+    """Return None if the CWD's repo is the primary checkout, else a stderr-ready refusal message
+    naming the exact predicate checked. Deliberately does NOT reuse scope-guard.py's
+    is_maker_worktree() -- that helper is keyed to a marker file written only for Claude-Code maker
+    sessions, so it would silently fail to refuse inside a pi maker's linked worktree. Also
+    deliberately does NOT shell out to `git` AT ALL for this decision: an earlier version called
+    `git rev-parse --show-toplevel` via subprocess, but that call trusts whatever `git` is first on
+    PATH -- a cross-model checker reproduced installing a lesson from inside a real linked worktree
+    simply by putting a fake `git` earlier on PATH that printed the primary checkout's path and
+    exited 0, which fools ANY subprocess-based check regardless of env-var scrubbing.
+
+    Walks the FULL ancestor chain from the real CWD (`os.getcwd()`, never influenced by PATH or any
+    executable) via `_find_dotgit_entries()`, not just the nearest `.git`: if ANY ancestor's `.git`
+    RESOLVES (following symlinks -- see `_resolve_gitdir_target()` for a gitdir-pointer file's
+    text, and the `.resolve()` call below for the `.git` entry itself, however it presents: a real
+    directory, a pointer file, or a symlink to either) to a linked worktree's PRIVATE gitdir --
+    detected structurally via `_is_worktree_private_gitdir()`'s `commondir`-file check, never by
+    pattern-matching any path's text -- the CWD is physically contained within that linked
+    worktree's directory tree and this refuses immediately. This fires regardless of any nearer,
+    nested `.git` (directory or otherwise) found closer to the CWD, which a maker could create
+    (deliberately or by accident) specifically to defeat a nearest-match-only check, AND regardless
+    of the path to the real private gitdir being routed through a symlink/alias -- whether that
+    symlink sits in a gitdir-pointer file's TEXT or is the `.git` entry itself -- whose own path
+    text contains no worktree-shaped substring. Only once no ancestor resolves to a worktree's
+    private gitdir does the NEAREST `.git` entry decide the outcome: a real (or symlinked-to-real)
+    directory is a normal primary checkout (allow); a file resolving somewhere else entirely (not a
+    worktree's private gitdir) is still a legitimate primary checkout using an external gitdir
+    (e.g. `git init --separate-git-dir=<external>`, even one whose path happens to contain the
+    substring "worktrees" for unrelated reasons) and is also allowed -- only the real structural
+    signal ever triggers a refusal. Fails CLOSED (refuses) on any ambiguity, including a CWD that
+    no longer exists (`os.getcwd()` itself raising) -- never fails open."""
+    try:
+        cwd = os.getcwd()
+    except OSError as e:
+        return f"mint: could not determine the current directory ({e}) -- refusing (fail closed)"
+
+    nearest_entry = None
+    nearest_real_entry = None
+    nearest_gitdir_target = None
+
+    for git_path in _find_dotgit_entries(cwd):
+        gitdir_target = None
+        resolved_target = None
+        try:
+            # Resolve the `.git` entry itself through symlinks BEFORE classifying it -- the same
+            # "resolve before deciding" principle already applied to a gitdir-pointer file's TEXT
+            # below, generalized to the entry itself. Without this, a `.git` entry that's a symlink
+            # straight to a linked worktree's private gitdir directory would be misread: `is_dir()`
+            # on a symlink-to-directory reports True, so it would be treated as an ordinary
+            # primary-checkout `.git` directory and never checked for the `commondir` marker.
+            real_entry = git_path.resolve() if git_path.is_symlink() else git_path
+        except OSError as e:
+            return f"mint: could not resolve {git_path} ({e}) -- refusing (fail closed)"
+
+        if real_entry.is_dir():
+            # Either an ordinary primary-checkout gitdir directory, or -- if `.git` was a symlink --
+            # the resolved target IS itself a worktree's private gitdir directory. Same structural
+            # commondir check decides either way, so no separate code path is needed for the
+            # symlink-to-directory case.
+            if _is_worktree_private_gitdir(real_entry):
+                return (f"mint: refusing -- {git_path} resolves to {real_entry}, a linked "
+                        f"worktree's private gitdir -- identified by the 'commondir' file git "
+                        f"itself writes only there -- so the CWD is physically contained within a "
+                        f"maker's linked worktree. mint only runs in the primary checkout, never "
+                        f"inside a maker's linked worktree, however deeply nested, aliased, or "
+                        f"symlinked the path to it is.")
+        elif real_entry.is_file():
+            try:
+                gitdir_line = real_entry.read_text(encoding='utf-8', errors='replace').strip()
+                m = re.match(r'gitdir:\s*(.+)\Z', gitdir_line)
+                gitdir_target = m.group(1).strip() if m else None
+                if gitdir_target:
+                    resolved_target = _resolve_gitdir_target(gitdir_target, real_entry)
+            except OSError as e:
+                return f"mint: could not resolve/read {real_entry} ({e}) -- refusing (fail closed)"
+
+        if nearest_entry is None:
+            nearest_entry = git_path
+            nearest_real_entry = real_entry
+            nearest_gitdir_target = gitdir_target
+
+        if resolved_target is not None and _is_worktree_private_gitdir(resolved_target):
+            return (f"mint: refusing -- {git_path} points (resolved: {resolved_target}) to a "
+                    f"linked worktree's private gitdir -- identified by the 'commondir' file git "
+                    f"itself writes only there -- so the CWD is physically contained within a "
+                    f"maker's linked worktree. mint only runs in the primary checkout, never inside "
+                    f"a maker's linked worktree, however deeply nested or aliased the path to it is.")
+
+    if nearest_entry is None:
+        return "mint: could not find a .git entry walking up from the CWD -- refusing (fail closed)"
+    if nearest_real_entry.is_dir():
+        return None
+    if not nearest_real_entry.is_file():
+        return (f"mint: refusing -- {nearest_entry} exists but is neither a directory nor a regular "
+                f"file -- ambiguous, refusing (fail closed)")
+    if not nearest_gitdir_target:
+        return (f"mint: refusing -- {nearest_entry} is a file but doesn't contain a parseable "
+                f"'gitdir: <path>' line -- ambiguous, refusing (fail closed)")
+    # No ancestor .git anywhere in the chain resolved to a linked worktree's PRIVATE gitdir (checked
+    # structurally in the loop above), so this nearest file-based .git is a legitimate, supported
+    # primary-checkout layout (e.g. git init --separate-git-dir=<external>), not a linked worktree --
+    # regardless of what its path text happens to contain.
+    return None
+
+
+def _discover_categories(lessons_dir):
+    """Real, existing bin/lessons/ subdirectories, discovered dynamically -- never a hardcoded tuple,
+    since mint must refuse an unknown/novel category rather than ever creating a new top-level dir."""
+    lessons_path = pathlib.Path(lessons_dir)
+    if not lessons_path.is_dir():
+        return []
+    return sorted(p.name for p in lessons_path.iterdir() if p.is_dir())
+
+
+# "always"/"never" are deliberately EXCLUDED from this anywhere-in-sentence marker set, even
+# though they're common in genuine rules -- they're just as common in plain declarative prose
+# ("The build server is always located in the east wing." / "X is never Y."), so matching them
+# bare and mid-sentence is too weak a signal on its own. They still count as legitimate
+# directives when they're the sentence's OPENING word (see _IMPERATIVE_LEAD_VERBS below) -- that
+# position is the actual imperative-mood marker ("Always do X." / "Never do Y."), distinct from
+# the word merely appearing in a descriptive clause.
+_IMPERATIVE_MARKERS = re.compile(
+    r"\b(must|avoid|should|shall|cannot|can't|do not|don't|ensure|stay|verify|confirm|refuse|reject)\b",
+    re.IGNORECASE)
+
+_IMPERATIVE_LEAD_VERBS = {
+    'avoid', 'stay', 'run', 'check', 'verify', 'confirm', 'write', 'keep', 'use', 'do', 'never',
+    'always', 'ensure', 'tag', 'mint', 'reject', 'refuse', 'ask', 'read', 'commit', 'test', 'treat',
+    'add', 'remove', 'delete', 'install', 'validate', 'log', 'record', 'skip',
+}
+
+# These markers are modal auxiliaries: in genuine English grammar they are ALWAYS followed by a
+# bare-infinitive verb ("must call", "should avoid", "cannot skip"), never by a verb inflected for
+# 3rd-person-singular present tense ("must appears", "should happens" are not valid English). A
+# declarative sentence that merely talks ABOUT one of these words as a noun ("The word must appears
+# in this factual sentence.") puts the sentence's REAL verb immediately after the marker instead,
+# and that real verb is reliably -s-inflected -- a checker found exactly this decoy. Checking the
+# next word's shape (not just that something follows) is what tells "must call" apart from
+# "must appears" without a full grammatical parser.
+_MODAL_DIRECTIVE_MARKERS = frozenset({'must', 'should', 'shall', 'cannot', "can't", 'do not', "don't"})
+
+# A marker word appearing INSIDE a quoted span ("must comply", 'should avoid') is being discussed
+# or quoted, not functioning as the sentence's own grammatical modal -- a checker found
+# `The phrase "must comply" is printed in this declarative sentence.` sailing through on exactly
+# this gap. Matches either quote style as a non-greedy span; no body in this grammar's real,
+# shipped lessons uses quotes at all, so this costs nothing on the common path.
+_QUOTED_SPAN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+
+
+def _has_directive_marker(stripped_sentence):
+    """A marker word (must/avoid/should/...) only counts as a directive if at least one occurrence
+    has something follow it in the sentence -- the obligation's own verb phrase. A marker used as a
+    bare noun/object at the very end of the sentence ("This sentence contains the word must.") is a
+    declarative statement ABOUT the word, not an actual directive, and must not pass on the marker's
+    mere presence alone -- a checker found exactly this decoy. For the modal markers (see
+    `_MODAL_DIRECTIVE_MARKERS`), merely having *something* follow isn't enough either: a declarative
+    sentence can use the marker as a noun mid-sentence with the sentence's own verb landing right
+    after it ("The word must appears in this factual sentence.") -- a checker found this second,
+    sneakier decoy too. A genuine modal directive is always followed by a bare-infinitive verb, never
+    one inflected with a 3rd-person-singular "-s", so this additionally rejects a modal match whose
+    very next word looks like that inflected verb. A marker word that only appears INSIDE a quoted
+    span (see `_QUOTED_SPAN_RE`) is excluded too -- `The phrase "must comply" is printed in this
+    declarative sentence.` is talking ABOUT a quoted phrase, not issuing an obligation, a third decoy
+    a checker found. Every real imperative-rule marker use ("must call...", "should avoid...") is
+    followed by a bare verb outside any quotes; only a sentence-final noun-like use, a noun-like use
+    immediately followed by an inflected verb, or a marker trapped inside quotation marks, is
+    excluded here. Still a keyword heuristic, not a grammatical parser: it can't tell "must comply
+    with X" (real directive) from a contrived "must, as in the modal verb," mid-sentence aside -- it
+    only catches the specific decoy shapes a checker actually found."""
+    body_no_terminal_punct = re.sub(r'[.!?]\Z', '', stripped_sentence).rstrip()
+    quoted_spans = [(m.start(), m.end()) for m in _QUOTED_SPAN_RE.finditer(body_no_terminal_punct)]
+    for m in _IMPERATIVE_MARKERS.finditer(body_no_terminal_punct):
+        if any(start <= m.start() < end for start, end in quoted_spans):
+            continue  # the marker only appears inside a quoted span -- not the sentence's own modal
+        remainder = body_no_terminal_punct[m.end():]
+        if not remainder.strip():
+            continue  # nothing follows -- sentence-final noun-like use, not a directive
+        if m.group(0).lower() in _MODAL_DIRECTIVE_MARKERS:
+            next_word = re.match(r"\s*([A-Za-z']+)", remainder)
+            if next_word and next_word.group(1).lower().endswith('s'):
+                continue  # e.g. "must appears" -- a modal is never followed by a 3rd-person
+                          # singular inflected verb, so this is the marker used as a noun with the
+                          # sentence's real verb right after it, not an obligation clause
+        return True
+    return False
+
+
+def _is_single_sentence_body(body_text):
+    """Heuristic for "exactly one imperative-rule sentence": no blank-line paragraph break, the
+    stripped text is non-empty and ends in one of .!?, splitting on sentence-ending punctuation
+    followed by whitespace yields exactly one non-empty segment, AND the sentence reads as a RULE
+    rather than a plain declarative fact -- it either contains an obligation/prohibition marker word
+    (must/avoid/should/...) used as an actual directive (see `_has_directive_marker` -- not merely
+    present anywhere, which a checker showed lets a bare mention like "This sentence contains the
+    word must." through), or opens on a common bare imperative verb (e.g. "Stay within scope.",
+    "Avoid X.", "Always do X.", "Never do Y."). This is a keyword heuristic, not a grammatical mood
+    classifier: a declarative sentence that happens to use a marker word as a real (non-final)
+    directive-shaped mid-sentence word would still pass, and a genuinely imperative sentence using a
+    verb outside the curated lead-verb list with no marker word elsewhere would still be rejected.
+    There's no stdlib primitive for "is this an imperative rule, not a fact" -- this catches the
+    clear declarative-fact cases checkers have found ("The build server is located in the east
+    wing.", "The build server is always located in the east wing." -- see the _IMPERATIVE_MARKERS
+    comment above for why "always"/"never" don't count as anywhere-markers, and "This sentence
+    contains the word must." -- see `_has_directive_marker`), not every edge case."""
+    stripped = body_text.strip()
+    if not stripped or '\n\n' in stripped:
+        return False
+    if not re.search(r'[.!?]\Z', stripped):
+        return False
+    segments = [s for s in re.split(r'(?<=[.!?])\s+', stripped) if s.strip()]
+    if len(segments) != 1:
+        return False
+    if _has_directive_marker(stripped):
+        return True
+    first_word = re.match(r"[A-Za-z']+", stripped)
+    return bool(first_word and first_word.group(0).lower() in _IMPERATIVE_LEAD_VERBS)
+
+
+def _present_zero(fm, field):
+    """True only if `field` is present in fm AND parses to exactly 0 -- a minted lesson must start
+    with helpful_count/harmful_count both explicitly 0, not merely absent (parse_frontmatter's
+    generic fallback stores raw strings, so this parses defensively rather than assuming int)."""
+    if field not in fm:
+        return False
+    try:
+        return int(str(fm[field]).strip()) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _mint_tags_written_as_list(frontmatter_text):
+    """Mint-specific stricter check: did the draft's RAW frontmatter actually write `tags` as a
+    YAML list (the multi-line '- item' dash form, or an inline bracketed '[a, b]' form) -- NOT a
+    bare scalar like `tags: testing`? `parse_frontmatter()` is deliberately lenient for lookup/tag's
+    own purposes: it coerces ANY non-empty scalar value into a one-item list (see its 'tags' branch),
+    which makes mint's "tags must be a non-empty list" check vacuous against the ALREADY-COERCED
+    dict -- a checker found exactly this gap (`tags: testing` sailed through). This inspects the raw
+    frontmatter TEXT directly instead, and does not change parse_frontmatter() or any of lookup/tag's
+    own behavior.
+
+    If `tags:` is declared more than once, only the LAST declaration is checked -- that mirrors
+    `parse_frontmatter()`'s own dict-assignment semantics (each `tags:` line it encounters
+    overwrites `fm['tags']`, so a later duplicate key wins there too). Checking the first
+    declaration instead would let a strict-looking first `tags:` approve a draft whose actually-
+    effective value, from a later duplicate `tags:` line, was never validated at all."""
+    lines = frontmatter_text.splitlines()
+    last_tags_index = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or ':' not in stripped:
+            continue
+        key, _, _value = stripped.partition(':')
+        if key.strip() == 'tags':
+            last_tags_index = i
+    if last_tags_index is None:
+        return False  # no 'tags' key found in the raw frontmatter at all
+
+    _key, _, value = lines[last_tags_index].strip().partition(':')
+    value = value.strip()
+    if not value:
+        # Multi-line form is a real list only if the subsequent non-blank lines are '- item'
+        # dash lines, and each one's OWN content is itself a well-formed scalar -- not merely
+        # shaped like a dash line. Consumes every consecutive dash line (blank lines in between
+        # are tolerated), stopping at the first non-blank line that isn't a dash line (that's
+        # where this key's block ends, e.g. the next frontmatter key) or at a malformed item. A
+        # `#`-prefixed line is rejected outright rather than treated as an unremarkable block
+        # boundary: mint's bounded grammar disallows comments everywhere, including right after
+        # otherwise-valid dash items -- it is not a legitimate "next frontmatter key" the way a
+        # real key line is, so silently stopping here (and accepting the items seen so far) would
+        # wrongly admit a draft whose tags block actually contains an illegal comment line.
+        found_item = False
+        for later in lines[last_tags_index + 1:]:
+            later_stripped = later.strip()
+            if later_stripped == '':
+                continue
+            if later_stripped.startswith('#'):
+                return False  # a comment is never legal in mint's tags grammar
+            if not later_stripped.startswith('- '):
+                break  # end of this key's dash-block
+            if not _is_valid_yaml_scalar_entry(later_stripped[2:]):
+                return False  # a dash line shaped right, but malformed content -- not a list
+            found_item = True
+        return found_item
+    return _is_balanced_inline_list(value)  # inline bracketed list form, must be well-formed
+
+
+# Shared recognizer for mint's tags grammar -- deliberately a BOUNDED SUBSET of YAML, not full
+# YAML: a tag is a single flat string label (plain/single-quoted/double-quoted), never a nested
+# list or mapping, never a comment, never a raw control character. This is the one real parsing
+# primitive both the inline '[a, b]' list form and each multi-line '- item' dash line's own
+# content are validated against, rather than two separate hand-rolled checks drifting out of sync
+# with each other (a checker found exactly that across several rounds: a dash-line check that only
+# looked at the '- ' prefix shape and never validated what followed it; an inline-list check that
+# tracked quotes but accepted ANY backslash escape, or let a nested `[[]]` recurse arbitrarily deep
+# -- ~1500 nested `[` characters crashed mint with an unhandled RecursionError, since there was
+# never a real reason for a tag's own value to itself be a list). Flattening the grammar fixes the
+# crash at its root (there is nothing left to recurse into: an element is now ALWAYS a scalar, so
+# `_parse_yaml_flow_scalar` never calls back into a sequence parser) and the inline-vs-block
+# inconsistency the checker also found (`tags: [[]]` was already rejected inline but
+# `tags:\n  - []` was wrongly accepted in block form -- with nesting disallowed everywhere, both
+# forms now agree). No YAML library dependency, by design -- this repo is stdlib-only (see the
+# top-of-file imports); this is a small, correct recursive-descent parser rather than a
+# byte-counting heuristic, scoped to exactly what a tags value may legally contain.
+_DOUBLE_QUOTE_SIMPLE_ESCAPES = frozenset('0abtnvfre"\\/N_LP ')
+_DOUBLE_QUOTE_HEX_ESCAPE_WIDTHS = {'x': 2, 'u': 4, 'U': 8}
+_HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
+
+
+def _consume_double_quoted_scalar(text, pos):
+    """`text[pos]` is a `"`. Returns the index just past the matching closing `"` if every escape
+    sequence inside is a LEGAL YAML double-quote escape (unterminated, or an illegal escape like
+    `\\q`, returns None), and every literal (non-escaped) character is NOT a raw control byte
+    (ord < 0x20) -- YAML disallows an unescaped control character in a scalar, and a tag is a
+    single-line label with no legitimate reason to contain one; an escaped form like `\\x00` is
+    still a normal, legal escape and is unaffected by this check."""
+    i = pos + 1
+    n = len(text)
+    while True:
+        if i >= n:
+            return None  # unterminated
+        ch = text[i]
+        if ch == '"':
+            return i + 1
+        if ch == '\\':
+            if i + 1 >= n:
+                return None  # trailing backslash, nothing to escape
+            esc = text[i + 1]
+            if esc in _DOUBLE_QUOTE_SIMPLE_ESCAPES:
+                i += 2
+                continue
+            width = _DOUBLE_QUOTE_HEX_ESCAPE_WIDTHS.get(esc)
+            if width is not None:
+                hex_digits = text[i + 2:i + 2 + width]
+                if len(hex_digits) != width or not all(c in _HEX_DIGITS for c in hex_digits):
+                    return None
+                i += 2 + width
+                continue
+            return None  # not a legal YAML double-quote escape
+        if ord(ch) < 0x20:
+            return None  # raw control byte -- not a legal literal scalar character
+        i += 1
+
+
+def _consume_single_quoted_scalar(text, pos):
+    """`text[pos]` is a `'`. YAML single-quoted scalars have no backslash-escaping at all -- a
+    backslash is just ordinary data -- and a doubled `''` is the only way to embed a literal `'`.
+    Returns the index just past the matching closing `'`, or None if unterminated or if a literal
+    raw control byte (ord < 0x20) appears -- same "no control characters in a scalar" rule as the
+    double-quoted form."""
+    i = pos + 1
+    n = len(text)
+    while True:
+        if i >= n:
+            return None  # unterminated
+        if text[i] == "'":
+            if i + 1 < n and text[i + 1] == "'":
+                i += 2  # escaped literal quote
+                continue
+            return i + 1
+        if ord(text[i]) < 0x20:
+            return None  # raw control byte -- not a legal literal scalar character
+        i += 1
+
+
+_YAML_FLOW_STOP_CHARS = ',[]{}"\'#'
+
+# YAML mapping-indicator characters that this grammar must recognize and reject rather than
+# swallow as plain-scalar text: `:` marks a mapping VALUE and is live at any position in the run
+# (`name:` mid-scalar still starts a mapping), while `?` marks a mapping KEY and is only an
+# indicator as the very first character of a node (`what?` is a fine plain scalar; `?name` is a
+# mapping). Both share the same "is this indicator actually acting as one" test: it's acting as an
+# indicator only when followed by whitespace, by one of the same flow-structural stop characters,
+# or by the end of the text -- `name:value`/`?x` with no gap are just ordinary scalar characters.
+_YAML_MAPPING_INDICATOR_CHARS = ':?'
+
+
+def _starts_yaml_mapping_indicator(text, i):
+    """True if `text[i]` is a YAML mapping-indicator character (see `_YAML_MAPPING_INDICATOR_CHARS`)
+    that is actually acting as one here -- i.e. followed by whitespace, a flow-structural stop
+    character, or the end of the text -- rather than being ordinary scalar text."""
+    n = len(text)
+    if text[i] not in _YAML_MAPPING_INDICATOR_CHARS:
+        return False
+    return i + 1 == n or text[i + 1] in ' \t' or text[i + 1] in _YAML_FLOW_STOP_CHARS
+
+
+def _consume_plain_scalar(text, pos):
+    """A plain (unquoted) scalar run: everything up to the next flow-structural character (`,`,
+    `[`, `]`, `{`, `}`), a quote character, a `#` (mint's tags grammar does not support YAML
+    comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), or a
+    live YAML mapping indicator (see `_starts_yaml_mapping_indicator` -- `:` checked at every
+    position since it marks a mapping VALUE anywhere in the run, `?` checked only at `pos` itself
+    since it marks a mapping KEY only as a node's first character), or the end of the string. A tag
+    is a flat scalar, so any of these is simply invalid here, never a mapping to recurse into.
+    Returns the index just past the run, or None if nothing non-whitespace was actually consumed (an
+    empty element, e.g. the gap between two commas in `[testing,,mint]`, a `[`/`{` immediately where
+    a flat scalar was expected -- nesting is not part of this grammar -- or a leading `?` acting as
+    a mapping-key indicator)."""
+    n = len(text)
+    i = pos
+    if i < n and text[i] == '?' and _starts_yaml_mapping_indicator(text, i):
+        return None  # explicit-key indicator as the first character -- not a flat scalar
+    while i < n and text[i] not in _YAML_FLOW_STOP_CHARS:
+        if text[i] == ':' and _starts_yaml_mapping_indicator(text, i):
+            break  # YAML mapping-key indicator -- tags are flat scalars, not mappings
+        i += 1
+    if not text[pos:i].strip():
+        return None  # empty element, or a disallowed structural/comment character right away
+    return i
+
+
+def _parse_yaml_flow_scalar(text, pos):
+    """Parse exactly one FLAT scalar element -- a double-quoted, single-quoted, or plain scalar --
+    starting at `text[pos]`. Deliberately does NOT recurse into a nested flow sequence or mapping:
+    mint's tags grammar has no nesting, so a `[` or `{` encountered here falls through to
+    `_consume_plain_scalar`, which immediately rejects it (an empty, structural-only run). Returns
+    the index just past the consumed value if well-formed, else None."""
+    if pos >= len(text):
+        return None
+    ch = text[pos]
+    if ch == '"':
+        return _consume_double_quoted_scalar(text, pos)
+    if ch == "'":
+        return _consume_single_quoted_scalar(text, pos)
+    return _consume_plain_scalar(text, pos)
+
+
+def _consume_flow_sequence(text, pos):
+    """`text[pos]` is a `[`. Parses the TOP-LEVEL bracketed flow sequence for the inline tags-list
+    form only -- possibly empty (`[]`/`[ ]`), otherwise one or more comma-separated FLAT elements
+    (each a `_parse_yaml_flow_scalar`; since that function never recurses into another `[`, this is
+    never called recursively -- there is exactly one flow sequence per tags value, never nested,
+    which is what keeps this parser's stack depth constant regardless of how many `[` characters a
+    malicious draft piles up), rejecting any empty element (e.g. a double comma), a nested
+    `[`/`{` element, an unquoted `#`, or a missing closing `]`. Returns the index just past the
+    matching `]`, or None."""
+    n = len(text)
+    i = pos + 1
+    while i < n and text[i] in ' \t':
+        i += 1
+    if i < n and text[i] == ']':
+        return i + 1  # '[]' (or '[ ]') -- syntactically valid empty list
+    while True:
+        end = _parse_yaml_flow_scalar(text, i)
+        if end is None:
+            return None
+        i = end
+        while i < n and text[i] in ' \t':
+            i += 1
+        if i >= n:
+            return None  # unterminated -- no closing ']'
+        if text[i] == ',':
+            i += 1
+            while i < n and text[i] in ' \t':
+                i += 1
+            continue
+        if text[i] == ']':
+            return i + 1
+        return None  # unexpected character where ',' or ']' was expected (includes an unquoted '#')
+
+
+def _is_balanced_inline_list(value):
+    """True if `value` is a well-formed, CLOSED inline flow-sequence of FLAT scalars (see
+    `_consume_flow_sequence`): starts with '[', and the ENTIRE stripped value is consumed as one
+    flow sequence -- rejecting a malformed double-comma like `[testing,,mint]`, an unterminated
+    bracket, an illegal backslash escape inside a quoted element like `["a\\q"]` (not a real YAML
+    escape), a nested element like `[[]]` (tags are flat; nesting is not part of this grammar), or
+    an unquoted `#` (no comment support, e.g. `[a # ...]` is simply malformed, not comment-
+    stripped)."""
+    value = value.strip()
+    if not value.startswith('['):
+        return False
+    end = _consume_flow_sequence(value, 0)
+    return end is not None and end == len(value)
+
+
+def _is_valid_yaml_scalar_entry(text):
+    """True if `text` (one multi-line tags dash-item's content, right after '- ') is, on its own,
+    exactly one well-formed FLAT scalar -- a quoted scalar or a plain scalar, never a nested flow
+    sequence/mapping -- with nothing malformed or left over. Shares `_parse_yaml_flow_scalar` with
+    `_is_balanced_inline_list` so a dash-line's content is held to the exact same standard as an
+    inline list element: `- [unterminated` (an unclosed flow sequence) and `- []` (an empty NESTED
+    list -- tags are flat, so this is rejected exactly like `[[]]` is inline) are both rejected
+    here, closing the inline-vs-block inconsistency a checker found."""
+    text = text.strip()
+    if not text:
+        return False
+    end = _parse_yaml_flow_scalar(text, 0)
+    return end is not None and end == len(text)
+
+
+def cmd_mint(argv):
+    """`mint --file <draft.md> [--category <cat>]` -- validate a complete, hand-authored lesson
+    draft and install it into bin/lessons/<category>/<slug>.md. Never overwrites an existing lesson.
+    Primary-checkout-only; see _primary_checkout_refusal_reason(). Writes nothing on any rejection."""
+    # --help/-h is handled before anything else, including the primary-checkout check -- asking for
+    # help should work from anywhere (a maker worktree included) rather than being swallowed by the
+    # "--file is required" rejection, which a checker found it was previously falling into.
+    if '--help' in argv or '-h' in argv:
+        sys.stdout.write(_MINT_USAGE)
+        sys.stdout.write(_MINT_HELP_BODY)
+        return 0
+
+    # Primary-checkout refusal check runs FIRST, before reading --file or any other validation, so a
+    # maker worktree gets refused immediately regardless of what else is wrong with its arguments.
+    refusal = _primary_checkout_refusal_reason()
+    if refusal:
+        sys.stderr.write(_MINT_USAGE)
+        sys.stderr.write(refusal + '\n')
+        return 2
+
+    file_arg = None
+    category_arg = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--file' and i + 1 < len(argv):
+            file_arg = argv[i + 1]; i += 2
+        elif argv[i] == '--category' and i + 1 < len(argv):
+            category_arg = argv[i + 1]; i += 2
+        else:
+            i += 1
+
+    if not file_arg:
+        sys.stderr.write(_MINT_USAGE)
+        sys.stderr.write("mint: --file is required\n")
+        return 2
+
+    draft_path = pathlib.Path(file_arg)
+    if not draft_path.is_file():
+        sys.stderr.write(f"mint: --file {file_arg!r} is not a file\n")
+        return 2
+
+    try:
+        content = draft_path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as e:
+        # OSError covers PermissionError (e.g. a mode-000 file), FileNotFoundError (a TOCTOU unlink
+        # between the is_file() check above and this read), and any other OS-level read failure.
+        # UnicodeDecodeError (a ValueError subclass, NOT an OSError subclass -- caught separately on
+        # purpose) covers a draft containing invalid UTF-8 bytes. Every other invalid --file input
+        # gets a clean "mint: ..." rejection, never a raw traceback -- this must too.
+        sys.stderr.write(f"mint: cannot read --file {file_arg!r} ({e})\n")
+        return 2
+    fm, body = parse_frontmatter(content)
+    if fm is None:
+        sys.stderr.write(f"mint: {file_arg} has no parseable frontmatter\n")
+        return 2
+
+    tags = fm.get('tags', [])
+    if not isinstance(tags, list) or not tags:
+        sys.stderr.write("mint: draft's `tags` must be a non-empty list\n")
+        return 2
+    frontmatter_text, _raw_body = _split_frontmatter(content)
+    if frontmatter_text is None or not _mint_tags_written_as_list(frontmatter_text):
+        sys.stderr.write(
+            "mint: draft's `tags` must be written as an actual YAML list (either a multi-line "
+            "'- item' block or an inline '[a, b]' form), not a bare scalar\n")
+        return 2
+
+    earned_in = fm.get('earned-in')
+    if not earned_in or not _TASK_ID_RE.match(earned_in):
+        sys.stderr.write(f"mint: draft's `earned-in` ({earned_in!r}) must match the task-id shape\n")
+        return 2
+
+    if not _present_zero(fm, 'helpful_count') or not _present_zero(fm, 'harmful_count'):
+        sys.stderr.write(
+            "mint: draft must declare `helpful_count: 0` and `harmful_count: 0` explicitly -- "
+            f"got helpful_count={fm.get('helpful_count')!r}, harmful_count={fm.get('harmful_count')!r}\n")
+        return 2
+
+    if fm.get('evidence') == 'E4':
+        sys.stderr.write("mint: `evidence: E4` is reserved for the 4 foundational seed lessons -- rejected\n")
+        return 2
+
+    if not _is_single_sentence_body(body):
+        sys.stderr.write(
+            "mint: body must be exactly one imperative-rule sentence (no blank-line paragraph "
+            "breaks, no multiple sentences)\n")
+        return 2
+
+    lessons_dir = _lessons_dir()
+    category = category_arg or fm.get('category')
+    if not category:
+        sys.stderr.write("mint: no --category given and draft frontmatter has no `category` field\n")
+        return 2
+    real_categories = _discover_categories(lessons_dir)
+    if category not in real_categories:
+        sys.stderr.write(
+            f"mint: unknown category {category!r} -- must be one of the existing bin/lessons/ "
+            f"subdirectories: {real_categories}\n")
+        return 2
+
+    slug = draft_path.stem
+    if not _LESSON_ID_RE.match(slug):
+        sys.stderr.write(f"mint: derived slug {slug!r} (from --file's filename) is not a valid lesson-id segment\n")
+        return 2
+
+    dest = _resolve_lesson_path(lessons_dir, f'{category}/{slug}')
+    if dest is None:
+        sys.stderr.write(f"mint: resolved destination for {category}/{slug} escapes bin/lessons/ -- rejected\n")
+        return 2
+
+    if dest.exists():
+        sys.stderr.write(f"mint: {dest} already exists -- refusing to overwrite an existing lesson's history\n")
+        return 2
+
+    try:
+        with _ledger_lock(dest):
+            if dest.exists():  # re-check under the lock -- closes the TOCTOU window against a concurrent mint
+                sys.stderr.write(f"mint: {dest} already exists -- refusing to overwrite an existing lesson's history\n")
+                return 2
+            _atomic_write(dest, content)
+    except OSError as e:
+        sys.stderr.write(f"mint: OS error installing {dest} ({e})\n")
+        return 1
+
+    print(f"minted {category}/{slug} -> {dest}")
     return 0
 
 
@@ -1222,6 +1938,1472 @@ race target lesson.
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    # mint's primary-checkout-only refusal check runs real `git rev-parse --show-toplevel` against
+    # the process CWD -- so every mint test below needs a REAL primary-checkout git repo as its CWD,
+    # not just any tempdir, or it would get refused for the wrong reason (this worktree itself is a
+    # linked worktree) before ever reaching the validation it's actually trying to exercise.
+    @contextlib.contextmanager
+    def _in_dir(path):
+        old = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(old)
+
+    def _mint_fixture(tmp):
+        repo = os.path.join(tmp, 'primary-repo')
+        subprocess.run(['git', 'init', '-q', '-b', 'main', repo], check=True)
+        subprocess.run(['git', '-C', repo, 'config', 'user.email', 'a@a'], check=True)
+        subprocess.run(['git', '-C', repo, 'config', 'user.name', 'a'], check=True)
+        with open(os.path.join(repo, 'f'), 'w') as f:
+            f.write('x')
+        subprocess.run(['git', '-C', repo, 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'init'], check=True)
+        lessons_dir = os.path.join(tmp, 'lessons')
+        os.makedirs(os.path.join(lessons_dir, 'testing'))
+        return repo, lessons_dir
+
+    _VALID_DRAFT = """---
+tags:
+  - testing
+  - mint
+earned-in: mint-selftest-task
+helpful_count: 0
+harmful_count: 0
+category: testing
+---
+Always do the one thing that must happen.
+"""
+
+    # Round-4 regression: an unreadable --file (e.g. mode-000) must get mint's documented controlled
+    # rejection ("mint: cannot read --file ...") like every other invalid input, never an unhandled
+    # OSError/PermissionError traceback.
+    def test_mint_unreadable_file_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        draft = os.path.join(tmp, 'unreadable.md')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.chmod(draft, 0o000)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            except Exception as e:
+                raise AssertionError(
+                    f"an unreadable --file must produce a controlled rejection, not an unhandled "
+                    f"exception: {type(e).__name__}: {e}")
+            assert rc != 0, "an unreadable --file must be rejected"
+            assert 'cannot read' in err.getvalue().lower(), f"expected a controlled read-failure error:\n{err.getvalue()}"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a controlled rejection must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'unreadable.md')), (
+                "nothing must be written when --file can't be read")
+        finally:
+            os.chmod(draft, 0o644)  # restore so shutil.rmtree can clean up reliably
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-5 regression: a draft containing invalid UTF-8 bytes (e.g. a raw 0xff byte) must ALSO get
+    # a controlled rejection, same as an unreadable file -- UnicodeDecodeError is a ValueError
+    # subclass, not an OSError subclass, so round 4's `except OSError` alone didn't catch it.
+    def test_mint_invalid_utf8_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'bad-utf8.md')
+            with open(draft, 'wb') as f:
+                f.write(_VALID_DRAFT.encode('utf-8'))
+                f.write(b'\xff')  # invalid standalone UTF-8 byte
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            except Exception as e:
+                raise AssertionError(
+                    f"invalid UTF-8 in --file must produce a controlled rejection, not an unhandled "
+                    f"exception: {type(e).__name__}: {e}")
+            assert rc != 0, "a draft with invalid UTF-8 bytes must be rejected"
+            assert 'cannot read' in err.getvalue().lower(), f"expected a controlled read-failure error:\n{err.getvalue()}"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a controlled rejection must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'bad-utf8.md')), (
+                "nothing must be written when --file isn't valid UTF-8")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-5 regression: `mint` with no --file at all must be rejected -- this path already worked
+    # (exit 2, "mint: --file is required") but had no pinning regression test until now.
+    def test_mint_no_file_arg_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint([])
+            assert rc != 0, "mint with no --file must be rejected"
+            assert '--file is required' in err.getvalue(), f"expected a --file-is-required error:\n{err.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 4 regression: `mint --help`/`-h` must show real help text, not get swallowed
+    # by the "--file is required" rejection -- and that help text must document mint's
+    # primary-checkout-only, linked-worktree-refusing nature. Also proves --help works from
+    # anywhere, including a non-git tempdir, since it's handled before the primary-checkout check.
+    def test_mint_help_flag_shows_usage():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            for flag in ('--help', '-h'):
+                out = io.StringIO()
+                err = io.StringIO()
+                with _in_dir(tmp), redirect_stdout(out), redirect_stderr(err):
+                    rc = cmd_mint([flag])
+                assert rc == 0, f"mint {flag} must exit 0, got {rc}:\n{err.getvalue()}"
+                help_text = out.getvalue().lower()
+                assert '--file is required' not in err.getvalue(), (
+                    f"{flag} must not fall through to the --file-is-required rejection:\n{err.getvalue()}")
+                assert 'primary checkout' in help_text or 'linked' in help_text, (
+                    f"help text must document mint's primary-checkout-only, worktree-refusing nature:\n{out.getvalue()}")
+                assert '--file' in help_text, f"help text must document --file:\n{out.getvalue()}"
+                # Round-14 Finding 2 regression: these four assertions pin the tags-grammar
+                # paragraph added in _MINT_HELP_BODY -- a prior version of this test only checked
+                # for '--file'/'primary checkout', which still passed even with the whole tags-
+                # grammar paragraph removed. Each phrase below is load-bearing text from that
+                # paragraph: removing any one of flat-list-requirement, no-nesting, no-comments, or
+                # no-control-characters must fail this test.
+                assert 'flat list of string scalars' in help_text, (
+                    f"help text must document that `tags` is a flat list of string scalars:\n{out.getvalue()}")
+                assert 'no nesting' in help_text, (
+                    f"help text must document that tags may not be nested:\n{out.getvalue()}")
+                assert 'no comments' in help_text, (
+                    f"help text must document that the tags grammar has no comment support:\n{out.getvalue()}")
+                assert 'no raw control characters' in help_text, (
+                    f"help text must document that raw control characters are disallowed in tags:\n{out.getvalue()}")
+                # Round-16 Finding 1 regression: pins the mapping-indicator paragraph added to
+                # _MINT_HELP_BODY -- a prior version of the help text said tags may not be "a list
+                # or mapping" but never explained HOW a mapping is detected (the `:`/`?` rules and
+                # their whitespace/stop-char/end-of-text condition), leaving a user who hit
+                # `tags: [?]` or `tags: [name:]` with no way to understand the rejection from
+                # --help alone. Each phrase below is load-bearing text from that paragraph.
+                assert 'mapping-value position' in help_text, (
+                    f"help text must document the colon mapping-value rule:\n{out.getvalue()}")
+                assert 'explicit-key position' in help_text, (
+                    f"help text must document the leading-'?' explicit-key rule:\n{out.getvalue()}")
+                assert 'flow-structural stop' in help_text, (
+                    f"help text must document the whitespace/stop-char/end-of-text condition:\n{out.getvalue()}")
+                # Round-17 Finding 2 regression: the four assertions above pinned the paragraph's
+                # mapping-VALUE/KEY/stop-character wording, but not the "whitespace" or "end of
+                # the text" arms of the same tri-state condition -- a mutation that removed just
+                # those two phrases (keeping 'flow-structural stop' intact) still passed every
+                # assertion above.
+                assert 'followed by whitespace' in help_text, (
+                    f"help text must document the whitespace arm of the mapping-indicator "
+                    f"condition:\n{out.getvalue()}")
+                assert 'end of the text' in help_text, (
+                    f"help text must document the end-of-text arm of the mapping-indicator "
+                    f"condition:\n{out.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_mint_empty_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: []\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "empty tags must be rejected"
+            assert 'tags' in err.getvalue().lower(), f"expected a tags error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md')), "nothing must be written on rejection"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 3 regression: `tags: testing` (a bare YAML scalar, not a list) is silently
+    # coerced by parse_frontmatter()'s lenient lookup/tag-oriented logic into a one-item list, which
+    # would make mint's "non-empty list" check vacuous against the ALREADY-COERCED value. Mint must
+    # independently reject a scalar, while still accepting both real list forms (multi-line dash and
+    # inline bracketed) so the stricter check doesn't overcorrect.
+    def test_mint_scalar_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_scalar = os.path.join(tmp, 'scalar-tags.md')
+            with open(draft_scalar, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: testing\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_scalar])
+            assert rc != 0, "a bare scalar `tags: testing` must be rejected, not silently coerced into a list"
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'scalar-tags.md'))
+
+            # must not overcorrect: a real inline bracketed list form is still accepted.
+            draft_bracket = os.path.join(tmp, 'bracket-tags.md')
+            with open(draft_bracket, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [testing, mint]\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_bracket])
+            assert rc2 == 0, f"a real inline bracketed tags list must still be accepted:\n{err2.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_bad_earned_in_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('earned-in: mint-selftest-task', 'earned-in: bad id with spaces'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a malformed earned-in must be rejected"
+            assert 'earned-in' in err.getvalue().lower(), f"expected an earned-in error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_nonzero_counts_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('helpful_count: 0', 'helpful_count: 1'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a nonzero starting helpful_count must be rejected"
+            assert 'helpful_count' in err.getvalue() or 'harmful_count' in err.getvalue(), f"expected a counts error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_evidence_e4_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('category: testing\n', 'category: testing\nevidence: E4\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "evidence: E4 on a minted lesson must be rejected"
+            assert 'e4' in err.getvalue().lower(), f"expected an E4 error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_multi_sentence_body_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Do thing one. Do thing two.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a multi-sentence body must be rejected"
+            assert 'sentence' in err.getvalue().lower(), f"expected a body/sentence error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+
+            # a blank-line paragraph break must also be rejected, even if each paragraph alone reads
+            # as a single sentence.
+            draft2 = os.path.join(tmp, 'draft2.md')
+            with open(draft2, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Always do the first thing.\n\nAlso always do the second thing.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft2])
+            assert rc2 != 0, "a blank-line paragraph break must be rejected"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Finding 2 regression: a single, well-formed, purely declarative FACT sentence (no obligation/
+    # prohibition marker word anywhere, no imperative lead verb) must be rejected -- the sentence-
+    # count/shape check alone (the pre-fix state of _is_single_sentence_body) accepted this.
+    def test_mint_declarative_body_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The build server is located in the east wing.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a purely declarative factual sentence must be rejected as not an imperative rule"
+            assert 'sentence' in err.getvalue().lower() or 'imperative' in err.getvalue().lower(), (
+                f"expected a body/sentence error:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Finding A regression (round 3): a checker's adversarial repro -- "always"/"never" appearing
+    # BARE and MID-SENTENCE in an otherwise-declarative sentence used to be enough, on their own, to
+    # pass the imperative gate ("The build server is always located in the east wing." was wrongly
+    # accepted, since "always" matched _IMPERATIVE_MARKERS). Also asserts the fix doesn't
+    # overcorrect: a genuine directive that opens on "Always"/"Never" as its own imperative verb
+    # (the legitimate, different case) must still pass.
+    def test_mint_weak_marker_mid_sentence_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The build server is always located in the east wing.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "a declarative sentence with 'always' merely appearing mid-sentence must still be "
+                "rejected -- 'always'/'never' bare and mid-sentence is not a strong enough rule signal")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+
+            # the symmetric "never" case must also be rejected.
+            draft_never = os.path.join(tmp, 'draft-never.md')
+            with open(draft_never, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The build server is never located in the east wing.\n'))
+            err_never = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err_never):
+                rc_never = cmd_mint(['--file', draft_never])
+            assert rc_never != 0, "a declarative sentence with 'never' merely appearing mid-sentence must still be rejected"
+
+            # legitimate directives that OPEN on "Always"/"Never" as the imperative verb itself must
+            # still pass -- the fix must not overcorrect into rejecting real rules.
+            draft_always_lead = os.path.join(tmp, 'draft-always-lead.md')
+            with open(draft_always_lead, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Always commit before replying done.\n'))
+            err_lead = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err_lead):
+                rc_lead = cmd_mint(['--file', draft_always_lead])
+            assert rc_lead == 0, f"a genuine 'Always <verb>...' directive must still be accepted:\n{err_lead.getvalue()}"
+
+            draft_never_lead = os.path.join(tmp, 'draft-never-lead.md')
+            with open(draft_never_lead, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Never skip the verification step.\n'))
+            err_never_lead = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err_never_lead):
+                rc_never_lead = cmd_mint(['--file', draft_never_lead])
+            assert rc_never_lead == 0, f"a genuine 'Never <verb>...' directive must still be accepted:\n{err_never_lead.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 2 regression: a bare substring match for "must" anywhere let a purely
+    # declarative sentence ABOUT the word "must" through ("This sentence contains the word must."),
+    # because the marker word itself was present even though nothing follows it as a directive.
+    # Also asserts the fix doesn't overcorrect: a genuine imperative rule in the voice of a real
+    # shipped lesson (mutation-test-your-tests.md's own opening clause, truncated to one sentence)
+    # must still be accepted.
+    def test_mint_declarative_must_decoy_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_decoy = os.path.join(tmp, 'decoy.md')
+            with open(draft_decoy, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'This sentence contains the word must.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_decoy])
+            assert rc != 0, (
+                "a declarative sentence merely MENTIONING the word 'must' (with nothing following "
+                "it as a directive) must be rejected, not accepted on the bare keyword's presence")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'decoy.md'))
+
+            # must not overcorrect: a genuine imperative rule in a real lesson's voice still passes.
+            draft_real_voice = os.path.join(tmp, 'real-voice.md')
+            with open(draft_real_voice, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'A selfcheck/regression test must call the actual function or code path it claims to test.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_real_voice])
+            assert rc2 == 0, (
+                f"a genuine imperative rule matching a real shipped lesson's voice must still be "
+                f"accepted:\n{err2.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-10 Finding 2 regression: `_has_directive_marker()` previously only required that
+    # SOMETHING follow the marker word anywhere later in the sentence, so a declarative sentence
+    # whose own real verb happens to land immediately after a noun-like "must" ("The word must
+    # appears in this factual sentence.") still passed as if it were a genuine obligation clause.
+    # Also re-asserts the earlier round-6 decoy ("This sentence contains the word must.", nothing
+    # at all follows "must") still correctly rejects, and that a real imperative lesson body still
+    # passes -- this round's fix must not regress either.
+    def test_mint_declarative_must_followed_by_verb_decoy_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_decoy = os.path.join(tmp, 'verb-decoy.md')
+            with open(draft_decoy, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The word must appears in this factual sentence.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_decoy])
+            assert rc != 0, (
+                "a declarative sentence where 'must' is used as a noun and the sentence's own verb "
+                "lands right after it ('The word must appears...') must be rejected -- a modal is "
+                "never followed by a 3rd-person-singular inflected verb in a real directive")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'verb-decoy.md'))
+
+            # must not regress the earlier sentence-final decoy.
+            draft_sentence_final = os.path.join(tmp, 'sentence-final-decoy.md')
+            with open(draft_sentence_final, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'This sentence contains the word must.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_sentence_final])
+            assert rc2 != 0, "the earlier sentence-final 'must' decoy must still be rejected"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'sentence-final-decoy.md'))
+
+            # must not overcorrect: a genuine imperative rule still passes.
+            draft_real = os.path.join(tmp, 'real-directive.md')
+            with open(draft_real, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'A selfcheck/regression test must call the actual function or code path it claims to test.\n'))
+            err3 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err3):
+                rc3 = cmd_mint(['--file', draft_real])
+            assert rc3 == 0, (
+                f"a genuine imperative rule ('...must call...') must still be accepted:\n{err3.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 3 regression: a directive marker word appearing only INSIDE a quoted span
+    # is being discussed, not functioning as the sentence's own grammatical modal --
+    # `The phrase "must comply" is printed in this declarative sentence.` must be rejected.
+    # Also re-asserts a genuine directive still passes unaffected.
+    def test_mint_quoted_marker_decoy_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_decoy = os.path.join(tmp, 'quoted-marker-decoy.md')
+            with open(draft_decoy, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The phrase "must comply" is printed in this declarative sentence.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_decoy])
+            assert rc != 0, (
+                "a directive marker word appearing only inside a quoted span ('\"must comply\"') "
+                "must be rejected -- it's the sentence discussing a quoted phrase, not issuing an "
+                "obligation of its own")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'quoted-marker-decoy.md'))
+
+            # must not overcorrect: a genuine imperative rule with no quotes still passes.
+            draft_real = os.path.join(tmp, 'quoted-marker-real.md')
+            with open(draft_real, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'A selfcheck/regression test must call the actual function or code path it claims to test.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_real])
+            assert rc2 == 0, (
+                f"a genuine imperative rule with no quotes must still be accepted:\n{err2.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 5 regression: a draft with valid frontmatter but a missing/empty body must be
+    # rejected -- the real CLI already does this correctly, but no selfcheck test exercised it (the
+    # only prior body-rejection test used multi-sentence content, never an empty body).
+    def test_mint_missing_body_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'empty-body.md')
+            with open(draft, 'w') as f:
+                f.write(
+                    "---\n"
+                    "tags:\n  - testing\n  - mint\n"
+                    "earned-in: mint-selftest-task\n"
+                    "helpful_count: 0\n"
+                    "harmful_count: 0\n"
+                    "category: testing\n"
+                    "---\n")  # nothing at all after the closing delimiter
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a draft with a missing/empty body must be rejected"
+            assert 'sentence' in err.getvalue().lower(), f"expected a body/sentence error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'empty-body.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 6 regression: a draft lacking frontmatter delimiters entirely (no opening/
+    # closing '---' markers) must be rejected -- the real CLI already does this correctly via
+    # parse_frontmatter() returning (None, None), but no mint selfcheck test exercised cmd_mint's own
+    # `fm is None` rejection branch (the existing test_malformed_skip test exercises lookup, not mint).
+    def test_mint_malformed_frontmatter_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'no-delimiters.md')
+            with open(draft, 'w') as f:
+                f.write("tags: [testing]\nearned-in: mint-selftest-task\n\nAlways do the one thing.\n")
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a draft with no frontmatter delimiters at all must be rejected"
+            assert 'frontmatter' in err.getvalue().lower(), f"expected a frontmatter error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'no-delimiters.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_unknown_category_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('category: testing', 'category: nonexistent-category'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "an unknown category must be rejected"
+            assert 'category' in err.getvalue().lower(), f"expected a category error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'nonexistent-category')), (
+                "mint must never create a new top-level category directory")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_destination_collision_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            existing = os.path.join(lessons_dir, 'testing', 'draft.md')
+            with open(existing, 'w') as f:
+                f.write('---\ntags:\n  - old\nhelpful_count: 3\nharmful_count: 1\n---\npre-existing lesson.\n')
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "minting onto an existing destination path must be refused"
+            assert 'exist' in err.getvalue().lower(), f"expected a collision error:\n{err.getvalue()}"
+            # the pre-existing lesson's history must survive untouched.
+            assert 'helpful_count: 3' in pathlib.Path(existing).read_text(), (
+                "a collision refusal must never overwrite the existing lesson's accumulated counts")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_primary_checkout_only_refusal():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'feat', wt, 'main'], check=True)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+
+            # From the linked worktree -> refused specifically for being a linked worktree.
+            err = io.StringIO()
+            with _in_dir(wt), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "mint must refuse inside a linked worktree"
+            assert 'linked worktree' in err.getvalue().lower() or 'primary checkout' in err.getvalue().lower(), (
+                f"expected a primary-checkout refusal message:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md')), "nothing must be written on refusal"
+
+            # From the primary checkout -> must NOT be refused for being a linked worktree (other
+            # validations may still run, but this specific refusal reason must not fire).
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft])
+            assert rc2 == 0, f"mint should succeed from the primary checkout:\n{err2.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 1 regression: reproduces the checker's EXACT repro for the new attack class --
+    # from a REAL linked worktree's CWD, with PATH poisoned so a fake `git` is found first that
+    # PRINTS THE PRIMARY CHECKOUT'S PATH and exits 0 (the simplest possible attacker-controlled-PATH
+    # trick against any subprocess-based check). Also keeps the round-3 GIT_DIR/GIT_WORK_TREE env-var
+    # spoof in the same test, since both are "attacker controls the environment to fool a `git`
+    # subprocess call" attacks -- the fix for this round removes `git` subprocess usage from this
+    # check ENTIRELY, so neither trick has anything left to fool.
+    def test_mint_env_and_path_spoof_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-spoof')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'spoof-feat', wt, 'main'], check=True)
+            draft = os.path.join(tmp, 'spoof.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            os.environ['GIT_DIR'] = os.path.join(repo, '.git')
+            os.environ['GIT_WORK_TREE'] = repo
+
+            fakebin = os.path.join(tmp, 'fakebin-lying-git')
+            os.makedirs(fakebin)
+            fake_git = os.path.join(fakebin, 'git')
+            with open(fake_git, 'w') as f:
+                # Prints the PRIMARY checkout's path and exits 0, exactly like the checker's repro --
+                # a real `git rev-parse --show-toplevel` call fooled by this would wrongly conclude
+                # the CWD is the primary checkout.
+                f.write(f'#!/bin/sh\necho {repo}\nexit 0\n')
+            os.chmod(fake_git, 0o755)
+            old_path = os.environ.get('PATH', '')
+            os.environ['PATH'] = fakebin
+
+            err = io.StringIO()
+            try:
+                with _in_dir(wt), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            finally:
+                del os.environ['GIT_DIR']
+                del os.environ['GIT_WORK_TREE']
+                os.environ['PATH'] = old_path
+            assert rc != 0, (
+                "neither GIT_DIR/GIT_WORK_TREE spoofing nor a lying fake `git` on PATH must bypass "
+                "the primary-checkout refusal from a real linked worktree")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'spoof.md')), (
+                "nothing must be written when the primary-checkout check is spoofed")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 1 regression (positive side): proves the primary-checkout check no longer
+    # depends on `git` being invocable AT ALL -- from the primary checkout, with NO `git` binary
+    # reachable on PATH whatsoever, mint must still correctly ALLOW (no false refusal); from a
+    # linked worktree under the same git-less PATH, mint must still correctly REFUSE. Both outcomes
+    # come from the filesystem-only `.git` walk, with zero subprocess involvement either way.
+    def test_mint_primary_checkout_check_is_git_independent():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-no-git')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'no-git-feat', wt, 'main'], check=True)
+            draft_ok = os.path.join(tmp, 'draft-ok.md')
+            with open(draft_ok, 'w') as f:
+                f.write(_VALID_DRAFT)
+            draft_bad = os.path.join(tmp, 'draft-bad.md')
+            with open(draft_bad, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+
+            empty_bin = os.path.join(tmp, 'empty-bin')  # a PATH dir with no `git` executable at all
+            os.makedirs(empty_bin)
+            old_path = os.environ.get('PATH', '')
+            os.environ['PATH'] = empty_bin
+            try:
+                err_primary = io.StringIO()
+                with _in_dir(repo), redirect_stderr(err_primary):
+                    rc_primary = cmd_mint(['--file', draft_ok])
+                err_wt = io.StringIO()
+                with _in_dir(wt), redirect_stderr(err_wt):
+                    rc_wt = cmd_mint(['--file', draft_bad])
+            finally:
+                os.environ['PATH'] = old_path
+            assert rc_primary == 0, (
+                f"mint from the primary checkout must succeed even with NO `git` binary on PATH at "
+                f"all -- the check must not depend on git being invocable:\n{err_primary.getvalue()}")
+            assert rc_wt != 0, (
+                "mint from a linked worktree must still refuse even with NO `git` binary on PATH -- "
+                "the filesystem-only check doesn't need git to detect the worktree gitdir file")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft-bad.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 1 regression: a primary checkout created with
+    # `git init --separate-git-dir=<external-dir>` ALSO has a `.git` FILE (pointing to an arbitrary
+    # external gitdir with no `/worktrees/` in the path), not a directory -- but it IS a legitimate
+    # primary checkout, not a linked worktree, and must be allowed.
+    def test_mint_separate_git_dir_primary_allowed():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            external_gitdir = os.path.join(tmp, 'external.git')
+            repo = os.path.join(tmp, 'repo')
+            subprocess.run(
+                ['git', 'init', '-q', '-b', 'main', '--separate-git-dir', external_gitdir, repo],
+                check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.email', 'a@a'], check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.name', 'a'], check=True)
+            with open(os.path.join(repo, 'f'), 'w') as f:
+                f.write('x')
+            subprocess.run(['git', '-C', repo, 'add', '-A'], check=True)
+            subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'init'], check=True)
+
+            # Sanity: confirm the real git layout -- .git is a FILE, not a directory, here.
+            assert (pathlib.Path(repo) / '.git').is_file(), (
+                "git init --separate-git-dir should create a .git FILE, not a directory -- if this "
+                "fails, the fixture itself isn't exercising the layout this test is about")
+
+            lessons_dir = os.path.join(tmp, 'lessons')
+            os.makedirs(os.path.join(lessons_dir, 'testing'))
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a primary checkout using --separate-git-dir (a legitimate layout whose .git is a "
+                f"file pointing elsewhere, not a directory) must still be allowed:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 2 regression: a decoy `.git` DIRECTORY planted a few levels below a real
+    # linked worktree's root (e.g. a maker ran `git init` in a subdirectory) must NOT let mint
+    # bypass the worktree refusal -- the CWD is still physically contained within the worktree, no
+    # matter what's nested closer to it. The walk must reach the TRUE worktree-pointer boundary
+    # further up, not stop at the nearer decoy directory.
+    def test_mint_nested_dotgit_decoy_in_worktree_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-decoy')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'decoy-feat', wt, 'main'], check=True)
+
+            subdir = os.path.join(wt, 'subdir')
+            os.makedirs(subdir)
+            subprocess.run(['git', 'init', '-q', '-b', 'main', subdir], check=True)
+            assert (pathlib.Path(subdir) / '.git').is_dir(), (
+                "the decoy nested repo's .git should be a real directory -- if this fails, the "
+                "fixture isn't exercising the decoy layout this test is about")
+
+            draft = os.path.join(tmp, 'nested.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(subdir), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "mint must still refuse from inside a nested decoy .git directory that itself sits "
+                "inside a real linked maker worktree -- a nearer plain .git dir must not mask the "
+                "real worktree-pointer boundary further up")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'nested.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 1 regression: a real linked worktree whose `.git` pointer file is rewritten
+    # to point through a SYMLINK/alias whose own path text contains no '/worktrees/' substring, but
+    # which RESOLVES to the real `<repo>/.git/worktrees/<name>` private gitdir, must still be
+    # refused -- the structural `commondir`-file check (after following the symlink) catches this
+    # where a path-text substring match would not.
+    def test_mint_symlink_aliased_worktree_pointer_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-alias')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'alias-feat', wt, 'main'], check=True)
+
+            real_private_gitdir = pathlib.Path(repo) / '.git' / 'worktrees' / 'wt-alias'
+            assert real_private_gitdir.is_dir(), (
+                "expected git to have created the worktree's private gitdir at the usual location")
+            alias = pathlib.Path(tmp) / 'opaque-alias-no-worktree-substring'
+            alias.symlink_to(real_private_gitdir, target_is_directory=True)
+            assert '/worktrees/' not in str(alias), "the alias path itself must not contain the substring this test is bypassing"
+
+            # Rewrite the worktree's .git pointer to go through the alias instead of the real path.
+            (pathlib.Path(wt) / '.git').write_text(f'gitdir: {alias}\n')
+
+            draft = os.path.join(tmp, 'alias-draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(wt), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "a worktree .git pointer routed through a symlink/alias whose path text contains no "
+                "'/worktrees/' substring must still be refused -- the structural commondir check "
+                "must follow the symlink to the real private gitdir, not trust the alias text")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'alias-draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 2 regression: a genuine `git init --separate-git-dir <dir>` primary checkout
+    # must be ALLOWED even when the chosen external gitdir path happens to contain the literal
+    # substring '/worktrees/' for unrelated naming reasons -- the structural commondir check (which
+    # that external gitdir does NOT have) correctly distinguishes it from an actual linked worktree,
+    # where a path-text substring match would wrongly refuse it.
+    def test_mint_separate_git_dir_named_worktrees_allowed():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            external_gitdir = os.path.join(tmp, 'worktrees', 'external.git')
+            os.makedirs(os.path.join(tmp, 'worktrees'))
+            repo = os.path.join(tmp, 'repo')
+            subprocess.run(
+                ['git', 'init', '-q', '-b', 'main', '--separate-git-dir', external_gitdir, repo],
+                check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.email', 'a@a'], check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.name', 'a'], check=True)
+            with open(os.path.join(repo, 'f'), 'w') as f:
+                f.write('x')
+            subprocess.run(['git', '-C', repo, 'add', '-A'], check=True)
+            subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'init'], check=True)
+
+            assert '/worktrees/' in str(pathlib.Path(external_gitdir)), (
+                "the external gitdir path must contain the substring this test is proving doesn't matter")
+            assert not (pathlib.Path(external_gitdir) / 'commondir').exists(), (
+                "a --separate-git-dir external gitdir should NOT have a commondir file -- if this "
+                "fails, the fixture isn't exercising the layout this test is about")
+
+            lessons_dir = os.path.join(tmp, 'lessons')
+            os.makedirs(os.path.join(lessons_dir, 'testing'))
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a --separate-git-dir primary checkout must be allowed even when its external "
+                f"gitdir path contains '/worktrees/' for unrelated reasons:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-10 Finding 1 regression: a linked worktree whose `.git` ENTRY ITSELF (not a gitdir
+    # pointer file's text, the entry) is replaced with a symlink pointing directly at its own real
+    # private gitdir directory must still be refused. `is_dir()` on a symlink-to-directory reports
+    # True, so without resolving the `.git` entry itself first, this used to be misread as an
+    # ordinary primary-checkout `.git` directory and never checked for the `commondir` marker.
+    def test_mint_symlinked_dotgit_directory_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-dotgit-symlink')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'dotgit-symlink-feat', wt, 'main'], check=True)
+
+            real_private_gitdir = pathlib.Path(repo) / '.git' / 'worktrees' / 'wt-dotgit-symlink'
+            assert real_private_gitdir.is_dir(), (
+                "expected git to have created the worktree's private gitdir at the usual location")
+
+            dotgit = pathlib.Path(wt) / '.git'
+            dotgit.unlink()  # remove the normal gitdir-pointer FILE
+            dotgit.symlink_to(real_private_gitdir, target_is_directory=True)  # replace with a symlink straight at the real private gitdir
+            assert dotgit.is_symlink(), "the fixture's .git entry must actually be a symlink"
+            assert dotgit.is_dir(), (
+                "a symlink to a directory must itself report as a directory -- if this fails, the "
+                "fixture isn't exercising the misclassification this test is about")
+
+            draft = os.path.join(tmp, 'dotgit-symlink-draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(wt), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "a worktree whose .git entry is itself a symlink straight to its real private "
+                "gitdir directory must still be refused -- the commondir check must resolve the "
+                ".git entry itself through symlinks, not just a gitdir-pointer file's text")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'dotgit-symlink-draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 3 regression: `_mint_tags_written_as_list`'s inline-list branch previously
+    # only checked `value.startswith('[')`, so an unterminated flow sequence (`tags: [testing`, no
+    # closing bracket at all) passed and installed. Must actually validate the list is closed.
+    def test_mint_unterminated_bracket_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'broken-list.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [testing\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "an unterminated inline tags list (`tags: [testing` with no closing bracket) must "
+                "be rejected, not accepted as a well-formed list")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'broken-list.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 3 regression: a bare bracket-COUNTING check doesn't understand malformed
+    # elements -- `tags: [testing,,mint]` (an empty element between two commas) is not valid YAML
+    # (no real YAML parser accepts it), but the old counter only cared that brackets balanced.
+    def test_mint_double_comma_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'double-comma.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [testing,,mint]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "an inline tags list with an empty element from a double comma (`[testing,,mint]`) "
+                "must be rejected -- it's not valid YAML")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'double-comma.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 4 regression: a bare bracket-COUNTING check doesn't understand quoting --
+    # `tags: ["a]"]` is valid YAML (a one-item list containing the quoted string `a]`), but the old
+    # counter saw the `]` inside the quotes as a structural closing bracket and miscounted,
+    # wrongly rejecting a legitimate list.
+    def test_mint_quoted_bracket_in_tags_accepted():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'quoted-bracket.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: ["a]"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a valid YAML list containing a quoted string with a bracket character inside the "
+                f"quotes (`[\"a]\"]`) must be accepted, not rejected on a miscounted bracket:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'quoted-bracket.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-10 Finding 3 regression: a backslash-escaped quote inside a double-quoted scalar
+    # (`tags: ["a\"b"]`, standard YAML escape syntax) must NOT be mistaken for the string's closing
+    # quote -- the old quote-aware scanner didn't track escapes, so it treated the escaped `"` as
+    # the real closing quote and misparsed the rest of the line, wrongly rejecting a valid list.
+    def test_mint_escaped_quote_in_tags_accepted():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'escaped-quote.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: ["a\\"b"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a valid YAML list containing a backslash-escaped quote inside a double-quoted "
+                f"scalar (`[\"a\\\"b\"]`) must be accepted, not rejected on a misparsed closing "
+                f"quote:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'escaped-quote.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-11 Finding 1 regression: the quote-aware scanner previously accepted ANY backslash
+    # escape inside a double-quoted scalar without checking it's a LEGAL YAML escape --
+    # `tags: ["a\q"]` (`\q` is not a real escape; legal ones are things like `\"`, `\\`, `\n`)
+    # must be rejected, not accepted.
+    def test_mint_illegal_escape_in_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'illegal-escape.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: ["a\\q"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"an inline tags list with an illegal backslash escape inside a double-quoted "
+                f"scalar (`[\"a\\q\"]` -- `\\q` is not a real YAML escape) must be rejected:\n{err.getvalue()}")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'illegal-escape.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-11 Finding 2 regression: the multi-line '- item' dash-block check previously only
+    # verified a subsequent non-blank line's SHAPE (starts with '- '), never its content --
+    # `tags:\n  - testing\n  - [unterminated` (the second item's own value is an unclosed flow
+    # sequence) must be rejected, not accepted.
+    def test_mint_block_list_item_unterminated_bracket_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'block-item-broken.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags:\n  - testing\n  - [unterminated\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"a multi-line tags block whose second dash-item's own content is an unterminated "
+                f"flow sequence (`- [unterminated`) must be rejected, not accepted just because the "
+                f"line starts with '- ':\n{err.getvalue()}")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'block-item-broken.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 1 regression (the crash): the old recursive-descent parser recursed into a
+    # nested flow sequence for every `[`, so ~1500 nested `[` characters crashed mint with an
+    # unhandled RecursionError instead of a controlled refusal. Tags are now flat scalars only, so
+    # there is nothing left to recurse into -- this must come back as a controlled rejection
+    # (rc != 0, no traceback), not a crash.
+    def test_mint_deeply_nested_brackets_no_crash():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'deep-nest.md')
+            deeply_nested = 'tags: ' + ('[' * 1500) + '\n'
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', deeply_nested))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            except RecursionError:
+                raise AssertionError(
+                    "a draft with ~1500 nested '[' characters in tags must be rejected with a "
+                    "controlled refusal, not crash with an unhandled RecursionError")
+            assert rc != 0, "a deeply (and flatly disallowed) nested tags value must be rejected"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a controlled refusal must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'deep-nest.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 1 regression (the inconsistency): a nested list element -- inline
+    # (`tags: [[a], mint]`) or as a block-list item (`tags:\n  - []`) -- must now BOTH be rejected
+    # -- tags are flat scalars, nesting is not part of this grammar in either form. (The inline
+    # case deliberately uses `[[a], mint]`, not `[[]]`: a bare `[[]]` is ALSO rejected earlier, by
+    # `parse_frontmatter()`'s own unrelated lenient `tags`-list coercion treating it as an empty
+    # list -- that would mask whether THIS round's `_mint_tags_written_as_list` fix is actually
+    # doing the rejecting. `[[a], mint]` parses to a non-empty, 2-element list under that lenient
+    # coercion, so it reaches -- and is rejected by -- the stricter check this round fixed.)
+    # Before this round, inline nesting was already rejected but block `- []` wrongly passed.
+    def test_mint_nested_list_rejected_both_forms():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_inline = os.path.join(tmp, 'nested-inline.md')
+            with open(draft_inline, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [[a], mint]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_inline])
+            assert rc != 0, "an inline tags list containing a nested list element ('[[a], mint]') must be rejected"
+            assert 'yaml list' in err.getvalue().lower(), (
+                f"expected the strict tags-list-shape rejection (not the unrelated non-empty-list "
+                f"check) to be what fires here:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'nested-inline.md'))
+
+            draft_block = os.path.join(tmp, 'nested-block.md')
+            with open(draft_block, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - []\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_block])
+            assert rc2 != 0, (
+                "a multi-line tags block whose dash-item value is a nested empty list ('- []') "
+                "must be rejected too -- it was previously wrongly accepted, inconsistent with the "
+                "inline form rejecting the same shape")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'nested-block.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 2a regression: mint's tags grammar does not support YAML comments at all --
+    # an unquoted '#' is simply illegal, never comment-stripped. `tags: [a # ...]` becomes an
+    # actually-unterminated list once a real YAML comment-stripper would remove everything from
+    # '#' onward (including the literal ']'), and must be rejected.
+    def test_mint_unquoted_hash_in_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'hash-comment.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n',
+                    'tags: [a # closing bracket is commented out]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"an inline tags list with an unquoted '#' must be rejected -- mint's tags grammar "
+                f"has no comment support, so this is simply malformed, not comment-stripped:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'hash-comment.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 2b regression: YAML disallows an unescaped control character inside a
+    # scalar; a raw NUL byte inside a double-quoted tags element must be rejected, not accepted.
+    def test_mint_raw_control_byte_in_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'control-byte.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags: ["a\x00b"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"an inline tags list with a raw NUL byte inside a double-quoted scalar must be "
+                f"rejected -- YAML disallows an unescaped control character in a scalar:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'control-byte.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-13 Finding 1 regression: a tag element written as a YAML MAPPING (`name: value`) must
+    # be rejected just like a nested list already is -- a tag is a flat string scalar, never a
+    # mapping, in either the inline '[a, b]' form or the multi-line '- item' block form.
+    def test_mint_mapping_tag_rejected_both_forms():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_inline = os.path.join(tmp, 'mapping-inline.md')
+            with open(draft_inline, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [name: value]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_inline])
+            assert rc != 0, "an inline tags list containing a mapping element ('[name: value]') must be rejected"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'mapping-inline.md'))
+
+            draft_block = os.path.join(tmp, 'mapping-block.md')
+            with open(draft_block, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - name: value\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_block])
+            assert rc2 != 0, (
+                "a multi-line tags block whose dash-item value is a mapping ('- name: value') "
+                "must be rejected too -- a tag is a flat scalar, not a mapping")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'mapping-block.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-14 Finding 1 regression: a colon immediately followed by a structural character (`]`
+    # or `,`), not whitespace or end-of-text, is ALSO a YAML mapping-key indicator with an implicit
+    # null value (`name:` inside `[name:]` means a one-key mapping `{name: null}`, not the string
+    # "name:") -- round-13's fix only covered colon-followed-by-whitespace-or-end, missing this case.
+    def test_mint_implicit_null_mapping_tag_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_bracket = os.path.join(tmp, 'implicit-null-bracket.md')
+            with open(draft_bracket, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [name:]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_bracket])
+            assert rc != 0, (
+                f"'[name:]' is a one-key mapping with an implicit null value, not a flat string "
+                f"-- a colon right before the closing ']' must be rejected:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'implicit-null-bracket.md'))
+
+            draft_comma = os.path.join(tmp, 'implicit-null-comma.md')
+            with open(draft_comma, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags: [name:, mint]\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_comma])
+            assert rc2 != 0, (
+                f"a colon right before a ',' element separator is the same implicit-null mapping "
+                f"shorthand and must be rejected too:\n{err2.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'implicit-null-comma.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-15 Finding regression: `?` is YAML's EXPLICIT-KEY mapping indicator -- a plain scalar
+    # starting with `?` followed by whitespace constructs a mapping (`{name: null}`), the same as
+    # the colon-based implicit-null form above, just keyed on the other side of the `:`. Both the
+    # inline form (`[? name]`) and the equivalent block form (`- ? name`) must be rejected.
+    #
+    # Round-16 Finding 2 regression: the whitespace-followed case above isn't the only way `?`
+    # acts as the explicit-key indicator -- the same as the colon-based form, it also counts when
+    # followed by a flow-structural stop character (`]`/`,`) or the end of the text, with no space
+    # at all. The code already rejects `[?]` and `[?, mint]` correctly (confirmed by the round-16
+    # checker's own probes); this extends the test so a future narrowing of the check back to
+    # "whitespace only" would be caught here instead of slipping through unnoticed.
+    def test_mint_explicit_key_mapping_tag_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_inline = os.path.join(tmp, 'explicit-key-inline.md')
+            with open(draft_inline, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [? name]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_inline])
+            assert rc != 0, (
+                f"'[? name]' is a one-key mapping via YAML's explicit-key indicator, not a flat "
+                f"string -- a leading '?' followed by whitespace must be rejected:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-inline.md'))
+
+            draft_block = os.path.join(tmp, 'explicit-key-block.md')
+            with open(draft_block, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - ? name\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_block])
+            assert rc2 != 0, (
+                "a multi-line tags block whose dash-item value is an explicit-key mapping "
+                "('- ? name') must be rejected too -- a tag is a flat scalar, not a mapping")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-block.md'))
+
+            draft_stop_bracket = os.path.join(tmp, 'explicit-key-stop-bracket.md')
+            with open(draft_stop_bracket, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [?]\n'))
+            err3 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err3):
+                rc3 = cmd_mint(['--file', draft_stop_bracket])
+            assert rc3 != 0, (
+                f"'[?]' is a one-key mapping with a null key AND a null value, not a flat string "
+                f"-- a '?' right before the closing ']' (no whitespace at all) must be rejected "
+                f"too:\n{err3.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-stop-bracket.md'))
+
+            draft_stop_comma = os.path.join(tmp, 'explicit-key-stop-comma.md')
+            with open(draft_stop_comma, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [?, mint]\n'))
+            err4 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err4):
+                rc4 = cmd_mint(['--file', draft_stop_comma])
+            assert rc4 != 0, (
+                f"a '?' right before a ',' element separator is the same null-key/null-value "
+                f"explicit-key shorthand and must be rejected too:\n{err4.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-stop-comma.md'))
+
+            # Round-17 Finding 1 regression: the three cases above cover `?` followed by
+            # whitespace or a flow-structural stop character, but not `?` followed by nothing at
+            # all -- the dash-item's ENTIRE content is just '?', so the mapping-indicator check
+            # must fire on the end-of-text arm, not the whitespace or stop-char arms.
+            draft_eot = os.path.join(tmp, 'explicit-key-eot.md')
+            with open(draft_eot, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - ?\n'))
+            err5 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err5):
+                rc5 = cmd_mint(['--file', draft_eot])
+            assert rc5 != 0, (
+                f"a dash-item whose entire content is a bare '?' (nothing after it at all) is a "
+                f"null-key/null-value explicit-key mapping too -- the end-of-text arm of the "
+                f"indicator check must reject it:\n{err5.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-eot.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-13 Finding 2 regression: a comment line directly after otherwise-valid block-list
+    # items must be rejected outright, not silently treated as an unremarkable block boundary (the
+    # way a legitimate next frontmatter key would be).
+    def test_mint_comment_after_block_items_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'comment-after-items.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n',
+                    'tags:\n  - testing\n  # comment in the tags block\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"a comment line directly after valid block-list tag items must be rejected -- "
+                f"mint's tags grammar has no comment support:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'comment-after-items.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-13 Finding 3 regression: a duplicate `tags:` key means `parse_frontmatter()`'s own
+    # dict-assignment semantics make the LAST declaration the one actually used downstream -- the
+    # raw-grammar validator must check that same last declaration, not approve a strict-looking
+    # first one while a different, unvalidated value is what actually gets installed.
+    def test_mint_duplicate_tags_key_uses_last_declaration():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'duplicate-tags.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags: [testing]\ntags: scalar\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"a duplicate `tags:` key whose LAST declaration is a bare scalar must be rejected "
+                f"-- that is the declaration parse_frontmatter() actually uses downstream, "
+                f"regardless of how well-formed the first declaration looked:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'duplicate-tags.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-7 Finding 4 regression: `_primary_checkout_refusal_reason()` called `os.getcwd()` with
+    # no error handling -- if the CWD was removed out from under the process, that call raises an
+    # unhandled FileNotFoundError traceback instead of mint's documented fail-closed refusal.
+    def test_mint_removed_cwd_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        doomed = os.path.join(tmp, 'doomed')
+        os.makedirs(doomed)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(doomed)
+            os.rmdir(doomed)  # remove the CWD out from under the process
+            err = io.StringIO()
+            try:
+                with redirect_stderr(err):
+                    rc = cmd_mint(['--file', os.path.join(tmp, 'does-not-matter.md')])
+            except Exception as e:
+                raise AssertionError(
+                    f"a removed CWD must produce a controlled fail-closed refusal, not an unhandled "
+                    f"exception: {type(e).__name__}: {e}")
+            assert rc != 0, "mint with a removed CWD must refuse (fail closed)"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a fail-closed refusal must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+        finally:
+            os.chdir(old_cwd)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_mint_positive_path_roundtrip():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            out = io.StringIO()
+            with _in_dir(repo), redirect_stdout(out):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, f"a valid draft should mint successfully: {out.getvalue()}"
+
+            installed = pathlib.Path(lessons_dir) / 'testing' / 'draft.md'
+            assert installed.is_file(), f"expected the lesson installed at {installed}"
+            fm, body = parse_frontmatter(installed.read_text(encoding='utf-8'))
+            assert fm is not None, "the installed file must parse like any hand-authored seed lesson"
+            assert fm.get('tags') == ['testing', 'mint'], f"tags must round-trip: {fm}"
+            assert fm.get('earned-in') == 'mint-selftest-task', f"earned-in must round-trip: {fm}"
+            assert _counts(fm) == (0, 0), f"counts must round-trip as (0, 0): {fm}"
+            assert body.strip() == 'Always do the one thing that must happen.', f"body must round-trip: {body!r}"
+
+            # Minting the SAME draft a second time must now collide (the destination now exists).
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc2 = cmd_mint(['--file', draft])
+            assert rc2 != 0, "re-minting the same slug must now be refused as a collision"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Run all tests
     import os, io
     from contextlib import redirect_stdout, redirect_stderr
@@ -1239,6 +3421,50 @@ race target lesson.
     test_default_ledger_anchoring()
     test_tag_subcommand()
     test_tag_subcommand_concurrent_race()
+    test_mint_unreadable_file_rejected()
+    test_mint_invalid_utf8_rejected()
+    test_mint_no_file_arg_rejected()
+    test_mint_help_flag_shows_usage()
+    test_mint_empty_tags_rejected()
+    test_mint_scalar_tags_rejected()
+    test_mint_bad_earned_in_rejected()
+    test_mint_nonzero_counts_rejected()
+    test_mint_evidence_e4_rejected()
+    test_mint_multi_sentence_body_rejected()
+    test_mint_declarative_body_rejected()
+    test_mint_weak_marker_mid_sentence_rejected()
+    test_mint_declarative_must_decoy_rejected()
+    test_mint_declarative_must_followed_by_verb_decoy_rejected()
+    test_mint_quoted_marker_decoy_rejected()
+    test_mint_missing_body_rejected()
+    test_mint_malformed_frontmatter_rejected()
+    test_mint_unknown_category_rejected()
+    test_mint_destination_collision_rejected()
+    test_mint_primary_checkout_only_refusal()
+    test_mint_env_and_path_spoof_refused()
+    test_mint_primary_checkout_check_is_git_independent()
+    test_mint_separate_git_dir_primary_allowed()
+    test_mint_nested_dotgit_decoy_in_worktree_refused()
+    test_mint_symlink_aliased_worktree_pointer_refused()
+    test_mint_separate_git_dir_named_worktrees_allowed()
+    test_mint_symlinked_dotgit_directory_refused()
+    test_mint_unterminated_bracket_tags_rejected()
+    test_mint_double_comma_tags_rejected()
+    test_mint_quoted_bracket_in_tags_accepted()
+    test_mint_escaped_quote_in_tags_accepted()
+    test_mint_illegal_escape_in_tags_rejected()
+    test_mint_block_list_item_unterminated_bracket_rejected()
+    test_mint_deeply_nested_brackets_no_crash()
+    test_mint_nested_list_rejected_both_forms()
+    test_mint_unquoted_hash_in_tags_rejected()
+    test_mint_raw_control_byte_in_tags_rejected()
+    test_mint_mapping_tag_rejected_both_forms()
+    test_mint_implicit_null_mapping_tag_rejected()
+    test_mint_explicit_key_mapping_tag_rejected()
+    test_mint_comment_after_block_items_rejected()
+    test_mint_duplicate_tags_key_uses_last_declaration()
+    test_mint_removed_cwd_refused()
+    test_mint_positive_path_roundtrip()
 
     # Test 10: All 4 real shipped seed files parse correctly and are evidence:E4
     def test_real_seed_files():
@@ -1279,5 +3505,7 @@ if __name__ == '__main__':
         selfcheck()
     elif len(sys.argv) > 1 and sys.argv[1] == 'tag':
         sys.exit(cmd_tag(sys.argv[2:]))
+    elif len(sys.argv) > 1 and sys.argv[1] == 'mint':
+        sys.exit(cmd_mint(sys.argv[2:]))
     else:
         sys.exit(main())
