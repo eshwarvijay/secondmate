@@ -65,24 +65,33 @@ bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir .secondm
 shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), and a `--log-dir`.
 
 **Behavior, in order:**
-1. Write a `<task-id>.pid` liveness sidecar into the log dir **before forking** — the OS pid of the
-   process about to be spawned. This is independent of `progress-ledger.py`'s self-reported
-   checkpoints: it gives the watchdog (section 4) a liveness signal even if the sub-supervisor dies
-   before ever recording its first checkpoint.
-2. Fork a **brand-new** `claude -p --output-format stream-json` process for that task-id and
+1. Fork a **brand-new** `claude -p --output-format stream-json` process for that task-id and
    prompt. Never `--continue` or `--resume` — every sub-supervisor must start with zero inherited
    context, the exact same "Agent tool, never fork" discipline `skills/secondmate/SKILL.md` already
    requires for the in-session case, just enforced via process flags instead of a tool-call
-   parameter.
-3. Tee the raw `stream-json` output to `.secondmate/dispatch/<task-id>.jsonl` as it streams.
-4. On process exit, extract the final assistant message's plain-text content out of that
+   parameter. Then — as the very first action the parent takes once the child's PID is available,
+   before anything else — write a `<task-id>.pid` liveness sidecar into the log dir containing that
+   PID and the fork's own timestamp (e.g. `pid=<N> forked_at=<epoch-seconds>`, or a `date`-sourced
+   equivalent). **Not "before forking":** a PID cannot be known before the child exists — in bash,
+   `$!` (the backgrounded child's PID) is empty until after the `&` fork has already happened
+   (confirmed live: a probe script printed `$!` as empty immediately before forking a background
+   `sleep`, and only non-empty immediately after). The sidecar write happens immediately after the
+   fork instead, with a small, unavoidable window between fork and sidecar-write — normal and fine
+   for this idiom, same as any PID-file scheme. The `forked_at` timestamp is written here because
+   section 5's liveness check needs it later to corroborate that whatever process is holding this
+   PID at check time is actually still *this* task's wrapper, not a reused/unrelated PID (see
+   section 5). This sidecar is independent of `progress-ledger.py`'s self-reported checkpoints: it
+   gives the watchdog (section 4) a liveness signal even if the sub-supervisor dies before ever
+   recording its first checkpoint.
+2. Tee the raw `stream-json` output to `.secondmate/dispatch/<task-id>.jsonl` as it streams.
+3. On process exit, extract the final assistant message's plain-text content out of that
    `stream-json` log into `.secondmate/dispatch/<task-id>.final.txt`.
-5. Run `bin/dispatch-report.py` against that `.final.txt` file — **never** the raw `.jsonl`.
+4. Run `bin/dispatch-report.py` against that `.final.txt` file — **never** the raw `.jsonl`.
    `dispatch-report.py`'s own completion-tag regex is anchored at the start of a line; a completion
    tag that happens to appear inside a JSON string value in the raw stream (e.g. quoted inside a
    `"text": "...SM_DONE_MERGED:abc123..."` field) would never match there, so only the extracted
    plain text is a valid target.
-6. Exit with `dispatch-report.py`'s own exit code **verbatim** — never a raw bash `$?` from the
+5. Exit with `dispatch-report.py`'s own exit code **verbatim** — never a raw bash `$?` from the
    `claude -p` process itself (that reflects the CLI's own exit status, not the parsed completion
    tag).
 
@@ -185,17 +194,34 @@ restarted mid-batch (crash, redeploy, manual kill) only has the batch manifest (
 from, and a shell can only `wait` on its own child — waiting on a PID it never forked itself fails
 immediately (confirmed live: `wait <pid>` from a fresh shell that did not fork that PID returns
 exit 127, `pid <N> is not a child of this shell`). So reaping, for every dispatcher — restarted or
-not — is a non-blocking poll on the loop's own cadence (section 4), per task-id:
-1. Does `.secondmate/dispatch/<task-id>.final.txt` already exist? If so, the process already
-   finished — run `bin/dispatch-report.py` against it (section 1) to get the terminal exit code.
-   Nothing further to poll for this task-id.
-2. If not: is the `.pid` sidecar's recorded PID still alive? Check with a non-blocking signal probe
-   (`kill -0 <pid>`), never a blocking `wait`.
-   - **Alive** — still running; poll again next cycle.
-   - **Dead, with no `.final.txt` ever having appeared** — an ANOMALY: the process died before
-     producing any output (crashed, killed externally, etc.). Escalate to the human exactly like a
-     stuck task. Never silently retry it, and never assume success just because the process is
-     gone.
+not — is a non-blocking poll on the loop's own cadence (section 4), per task-id, **checking PID
+liveness FIRST, not `.final.txt` presence first:**
+
+1. **Is the `.pid` sidecar's recorded PID still alive and still plausibly this task's wrapper?**
+   `.final.txt`'s mere presence does NOT prove the wrapper has finished: per section 1's own step
+   order, the wrapper writes `.final.txt` at step 3, then still has to run `dispatch-report.py`
+   (step 4) and exit with its code (step 5) — so `.final.txt` can exist while the wrapper is still
+   alive and mid-sequence. Checking PID liveness first avoids that race. Two sub-checks, both
+   against the `.pid` sidecar (PID + `forked_at` timestamp, section 1):
+   - `kill -0 <pid>` (non-blocking signal probe, never a blocking `wait`). If it fails outright
+     (no such process), the PID is dead — go to step 2.
+   - If `kill -0` succeeds, that alone only proves *some* process currently holds that PID number —
+     not that it's actually this task's wrapper (confirmed live: `kill -0` against an unrelated
+     backgrounded `sleep` process also returns success/exit 0 — any live PID passes it, regardless
+     of what it's actually running). Corroborate with `ps -p <pid> -o lstart=,command=` and check
+     that the reported start time is at/after the sidecar's own `forked_at` timestamp and that the
+     command line plausibly matches a `claude -p` invocation for this task. If `kill -0` succeeded
+     but this corroboration does NOT match, treat it exactly like "not alive" — something else now
+     holds that recycled PID number — and fall through to step 2.
+   - If both the liveness probe and the corroboration check pass: **still running** — poll again
+     next cycle, regardless of whether `.final.txt` already exists.
+2. **Only once the PID is confirmed not alive (or not corroborated as this task's wrapper) does
+   `.final.txt`'s presence/absence matter:**
+   - **Present** — the wrapper finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
+     to get the terminal exit code. Nothing further to poll for this task-id.
+   - **Absent** — an ANOMALY: the process is gone but never produced output (crashed, killed
+     externally, etc.). Escalate to the human exactly like a stuck task. Never silently retry it,
+     and never assume success just because the process is gone.
 
 The batch is closed once every fanned-out task-id's `spawn-sub-sup.sh` process has exited (reaped),
 or the batch TTL expires, whichever comes first. Only AFTER that — for the subset of task-ids whose
