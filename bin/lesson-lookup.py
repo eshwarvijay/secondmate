@@ -587,6 +587,10 @@ _MINT_HELP_BODY = (
     "  --file <draft.md>   path to the complete lesson draft to validate and install (required)\n"
     "  --category <cat>    destination category under bin/lessons/; falls back to the draft's own\n"
     "                       `category:` frontmatter field if omitted\n"
+    "\n"
+    "The draft's `tags` field must be a non-empty, flat list of string scalars -- either the\n"
+    "inline `[a, b]` form or the multi-line `- a` / `- b` block form. No nesting (a tag may not\n"
+    "itself be a list or mapping), no comments, and no raw control characters.\n"
 )
 
 
@@ -890,34 +894,52 @@ def _mint_tags_written_as_list(frontmatter_text):
     which makes mint's "tags must be a non-empty list" check vacuous against the ALREADY-COERCED
     dict -- a checker found exactly this gap (`tags: testing` sailed through). This inspects the raw
     frontmatter TEXT directly instead, and does not change parse_frontmatter() or any of lookup/tag's
-    own behavior."""
-    for i, line in enumerate(frontmatter_text.splitlines()):
+    own behavior.
+
+    If `tags:` is declared more than once, only the LAST declaration is checked -- that mirrors
+    `parse_frontmatter()`'s own dict-assignment semantics (each `tags:` line it encounters
+    overwrites `fm['tags']`, so a later duplicate key wins there too). Checking the first
+    declaration instead would let a strict-looking first `tags:` approve a draft whose actually-
+    effective value, from a later duplicate `tags:` line, was never validated at all."""
+    lines = frontmatter_text.splitlines()
+    last_tags_index = None
+    for i, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or ':' not in stripped:
             continue
-        key, _, value = stripped.partition(':')
-        if key.strip() != 'tags':
-            continue
-        value = value.strip()
-        if not value:
-            # Multi-line form is a real list only if the subsequent non-blank lines are '- item'
-            # dash lines, and each one's OWN content is itself a well-formed scalar -- not merely
-            # shaped like a dash line. Consumes every consecutive dash line (blank lines in between
-            # are tolerated), stopping at the first non-blank line that isn't a dash line (that's
-            # where this key's block ends, e.g. the next frontmatter key) or at a malformed item.
-            found_item = False
-            for later in frontmatter_text.splitlines()[i + 1:]:
-                later_stripped = later.strip()
-                if later_stripped == '':
-                    continue
-                if not later_stripped.startswith('- '):
-                    break  # end of this key's dash-block
-                if not _is_valid_yaml_scalar_entry(later_stripped[2:]):
-                    return False  # a dash line shaped right, but malformed content -- not a list
-                found_item = True
-            return found_item
-        return _is_balanced_inline_list(value)  # inline bracketed list form, must be well-formed
-    return False  # no 'tags' key found in the raw frontmatter at all
+        key, _, _value = stripped.partition(':')
+        if key.strip() == 'tags':
+            last_tags_index = i
+    if last_tags_index is None:
+        return False  # no 'tags' key found in the raw frontmatter at all
+
+    _key, _, value = lines[last_tags_index].strip().partition(':')
+    value = value.strip()
+    if not value:
+        # Multi-line form is a real list only if the subsequent non-blank lines are '- item'
+        # dash lines, and each one's OWN content is itself a well-formed scalar -- not merely
+        # shaped like a dash line. Consumes every consecutive dash line (blank lines in between
+        # are tolerated), stopping at the first non-blank line that isn't a dash line (that's
+        # where this key's block ends, e.g. the next frontmatter key) or at a malformed item. A
+        # `#`-prefixed line is rejected outright rather than treated as an unremarkable block
+        # boundary: mint's bounded grammar disallows comments everywhere, including right after
+        # otherwise-valid dash items -- it is not a legitimate "next frontmatter key" the way a
+        # real key line is, so silently stopping here (and accepting the items seen so far) would
+        # wrongly admit a draft whose tags block actually contains an illegal comment line.
+        found_item = False
+        for later in lines[last_tags_index + 1:]:
+            later_stripped = later.strip()
+            if later_stripped == '':
+                continue
+            if later_stripped.startswith('#'):
+                return False  # a comment is never legal in mint's tags grammar
+            if not later_stripped.startswith('- '):
+                break  # end of this key's dash-block
+            if not _is_valid_yaml_scalar_entry(later_stripped[2:]):
+                return False  # a dash line shaped right, but malformed content -- not a list
+            found_item = True
+        return found_item
+    return _is_balanced_inline_list(value)  # inline bracketed list form, must be well-formed
 
 
 # Shared recognizer for mint's tags grammar -- deliberately a BOUNDED SUBSET of YAML, not full
@@ -1001,15 +1023,20 @@ def _consume_single_quoted_scalar(text, pos):
 def _consume_plain_scalar(text, pos):
     """A plain (unquoted) scalar run: everything up to the next flow-structural character (`,`,
     `[`, `]`, `{`, `}`), a quote character, a `#` (mint's tags grammar does not support YAML
-    comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), or
-    the end of the string. Returns the index just past the run, or None if nothing non-whitespace
-    was actually consumed (an empty element, e.g. the gap between two commas in
-    `[testing,,mint]`, or a `[`/`{` immediately where a flat scalar was expected -- nesting is not
-    part of this grammar, so a structural-open character here is simply invalid, not a sequence to
-    recurse into)."""
+    comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), a
+    `:` that marks a YAML mapping-key (one followed by whitespace or by the end of the text -- real
+    YAML treats `name: value` this way even bare inside a flow sequence, e.g. `[name: value]`
+    parses as a one-key mapping element, not a flat string; a tag is a flat scalar, so this is
+    simply invalid here, not a mapping to recurse into), or the end of the string. Returns the
+    index just past the run, or None if nothing non-whitespace was actually consumed (an empty
+    element, e.g. the gap between two commas in `[testing,,mint]`, or a `[`/`{` immediately where a
+    flat scalar was expected -- nesting is not part of this grammar, so a structural-open character
+    here is simply invalid, not a sequence to recurse into)."""
     n = len(text)
     i = pos
     while i < n and text[i] not in ',[]{}"\'#':
+        if text[i] == ':' and (i + 1 == n or text[i + 1] in ' \t'):
+            break  # YAML mapping-key indicator -- tags are flat scalars, not mappings
         i += 1
     if not text[pos:i].strip():
         return None  # empty element, or a disallowed structural/comment character right away
@@ -3055,6 +3082,87 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-13 Finding 1 regression: a tag element written as a YAML MAPPING (`name: value`) must
+    # be rejected just like a nested list already is -- a tag is a flat string scalar, never a
+    # mapping, in either the inline '[a, b]' form or the multi-line '- item' block form.
+    def test_mint_mapping_tag_rejected_both_forms():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_inline = os.path.join(tmp, 'mapping-inline.md')
+            with open(draft_inline, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [name: value]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_inline])
+            assert rc != 0, "an inline tags list containing a mapping element ('[name: value]') must be rejected"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'mapping-inline.md'))
+
+            draft_block = os.path.join(tmp, 'mapping-block.md')
+            with open(draft_block, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - name: value\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_block])
+            assert rc2 != 0, (
+                "a multi-line tags block whose dash-item value is a mapping ('- name: value') "
+                "must be rejected too -- a tag is a flat scalar, not a mapping")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'mapping-block.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-13 Finding 2 regression: a comment line directly after otherwise-valid block-list
+    # items must be rejected outright, not silently treated as an unremarkable block boundary (the
+    # way a legitimate next frontmatter key would be).
+    def test_mint_comment_after_block_items_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'comment-after-items.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n',
+                    'tags:\n  - testing\n  # comment in the tags block\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"a comment line directly after valid block-list tag items must be rejected -- "
+                f"mint's tags grammar has no comment support:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'comment-after-items.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-13 Finding 3 regression: a duplicate `tags:` key means `parse_frontmatter()`'s own
+    # dict-assignment semantics make the LAST declaration the one actually used downstream -- the
+    # raw-grammar validator must check that same last declaration, not approve a strict-looking
+    # first one while a different, unvalidated value is what actually gets installed.
+    def test_mint_duplicate_tags_key_uses_last_declaration():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'duplicate-tags.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags: [testing]\ntags: scalar\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"a duplicate `tags:` key whose LAST declaration is a bare scalar must be rejected "
+                f"-- that is the declaration parse_frontmatter() actually uses downstream, "
+                f"regardless of how well-formed the first declaration looked:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'duplicate-tags.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-7 Finding 4 regression: `_primary_checkout_refusal_reason()` called `os.getcwd()` with
     # no error handling -- if the CWD was removed out from under the process, that call raises an
     # unhandled FileNotFoundError traceback instead of mint's documented fail-closed refusal.
@@ -3166,6 +3274,9 @@ Always do the one thing that must happen.
     test_mint_nested_list_rejected_both_forms()
     test_mint_unquoted_hash_in_tags_rejected()
     test_mint_raw_control_byte_in_tags_rejected()
+    test_mint_mapping_tag_rejected_both_forms()
+    test_mint_comment_after_block_items_rejected()
+    test_mint_duplicate_tags_key_uses_last_declaration()
     test_mint_removed_cwd_refused()
     test_mint_positive_path_roundtrip()
 
