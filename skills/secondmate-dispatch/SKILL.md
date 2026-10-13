@@ -152,10 +152,27 @@ but that backstop is optional infrastructure around the loop, not a substitute f
 
 ## 5. Batch close and the batch manifest
 
-Batch close is unchanged — still ledger-driven, never from the dispatcher's own in-memory state:
-poll `bin/progress-ledger.py ready --batch-id <batch-id>` until every fanned-out task-id has
-reached a terminal `dispatch-report.py` exit code, or the batch TTL expires, then open the
-consolidated hold (section 6).
+**Primary signal: each task-id's own `spawn-sub-sup.sh` process exiting.** Unlike the in-session
+case (where the dispatcher's own Agent-tool call return is the signal), the external dispatcher
+tracks each task-id's backgrounded `spawn-sub-sup.sh` PID itself and reaps it; that process's own
+exit code — section 1's contract: it relays `dispatch-report.py`'s exit code (0/1/2/3/4) verbatim —
+IS the terminal-outcome signal for that task-id, whatever the code is. This is NOT optional, and
+`bin/progress-ledger.py ready --batch-id <batch-id>` is NOT a substitute for it: `ready`'s own
+implementation only emits a task-id whose *latest recorded phase* equals the terminal
+`verify_gate_pass` phase (confirmed by reading `progress-ledger.py`'s `ready` command directly) — a
+refused or stuck task-id, whose sub-supervisor released its claim and exited without ever reaching
+that phase, never appears in `ready`'s output at all, not even as a non-ready hit. A dispatcher that
+only polled `ready` would wait out the full batch TTL for every refused/stuck task-id instead of
+recognizing them as already terminal the moment their process exited.
+
+The batch is closed once every fanned-out task-id's `spawn-sub-sup.sh` process has exited (reaped),
+or the batch TTL expires, whichever comes first. Only AFTER that — for the subset of task-ids whose
+process exited with code **4** (`SM_READY_UNMERGED`) — does the dispatcher poll
+`bin/progress-ledger.py ready --batch-id <batch-id>` to pull their `checked_sha`/
+`checker_verdict_path`, needed to build the consolidated hold's entries file (section 6). A task-id
+whose process exited 1/2/3 contributes no `ready` row and needs none: its refusal/stuck/parse-failure
+reason is relayed to the human straight from `spawn-sub-sup.sh`'s own exit, not sourced from the
+ledger.
 
 **New requirement for the external case:** before fanning out, the dispatcher writes a batch
 manifest file:
@@ -190,6 +207,15 @@ and must cover every entry in exactly one list:
 ```bash
 bin/hold.py answer <hold-id> --approve "<id>,<id>,..." --reject "<id>,..."
 ```
+
+**Edge case: zero task-ids reached `SM_READY_UNMERGED` (exit 4).** If every task-id in the batch
+ended up refused, stuck, or malformed — none of them reaching ready-unmerged — the entries file
+would be `[]`, and `bin/hold.py hold --entries-file` rejects that outright (confirmed by reading
+its own entries-file validation and by running it live against an empty-list file: it exits nonzero
+with `must contain a non-empty JSON list of entries`, never opening a hold or writing to the
+ledger). Do **not** call `hold.py hold` in that case — there is nothing to merge. Instead, relay
+every refusal/stuck reason to the human verbatim (ordinary dispatcher discipline, unchanged) and
+treat the batch as done: no hold, no merge sequencing, no entries file at all.
 
 ## 7. Merge sequencing — one approved task-id at a time
 
