@@ -15,8 +15,11 @@ lesson-lookup.py's _lesson_ledger_path() uses). A human owns every retire/rewrit
 this tool only proposes signal from recorded evidence; it never edits, deletes, retires, or
 rewrites anything, and never acts on its own verdicts.
 
-Strictly read-only: never writes a single file, and therefore takes no lock at all
-(lesson-lookup.py's flock-based lock guards its `tag` WRITES; this tool has none).
+Read-only on real data: --report (and every path that touches real lesson files or the real
+ledger) never writes, removes, or locks any real file, and takes no lock at all
+(lesson-lookup.py's flock-based lock guards its `tag` WRITES; this tool has none). --selfcheck
+is the one explicit, intentional exception: it builds and tears down its own throwaway fixture
+lessons and ledger in an isolated temp directory purely to test itself.
 
 Reuse, never reimplement: frontmatter parsing (parse_frontmatter), lesson loading (load_lessons),
 count reading (_counts), and ledger-path anchoring (_lesson_ledger_path) all come from the real
@@ -239,8 +242,12 @@ Usage:
 
 A HUMAN OWNS EVERY RETIRE/REWRITE DECISION. This tool only proposes signal from recorded
 evidence; it never edits, deletes, retires, or rewrites any lesson, and it never acts on its
-own verdicts. It is strictly read-only: it writes no file at all and therefore takes no lock
-at all (lesson-lookup.py's flock-based lock guards its `tag` writes -- there are none here).
+own verdicts. --report (and every path that touches real lesson files or the real ledger)
+never writes, removes, or locks any real file: it takes no lock at all (lesson-lookup.py's
+flock-based lock guards its `tag` writes -- there are none here). The one explicit,
+intentional exception is --selfcheck: it creates and cleans up its own throwaway fixture
+lessons and ledger in an isolated temp directory purely to test itself -- it never touches
+the real lesson store or the real ledger.
 
 --report prints a tab-separated table to stdout, one line per *.md file under the lessons
 directory (SM_LESSONS_DIR, default: bin/lessons/), sorted by lesson id, preceded by a header:
@@ -394,6 +401,25 @@ def selfcheck():
                 except SystemExit as e:
                     assert e.code == EXIT_CANNOT_RUN, (
                         f"main({bad_argv!r}) must exit {EXIT_CANNOT_RUN}, got {e.code!r}")
+
+        # --- a nonexistent lessons directory is "cannot run at all": the REAL --report entry
+        #     point must exit with the single documented nonzero code -- pinned here so a
+        #     regression in this exit-status contract fails --selfcheck, not just a manual check.
+        #     Injected via SM_LESSONS_DIR, the same env override lesson-lookup.py itself reads.
+        missing_base = pathlib.Path(tempfile.mkdtemp(prefix='curator-missing-'))
+        tmpdirs.append(missing_base)
+        os.environ['SM_LESSONS_DIR'] = str(missing_base / 'no-such-lessons-dir')
+        os.environ['SM_LESSON_LEDGER'] = str(missing_base / 'no-such-ledger.jsonl')
+        err = io.StringIO()
+        with redirect_stderr(err):
+            try:
+                main(['--report'])
+                assert False, "--report against a nonexistent lessons dir must not succeed"
+            except SystemExit as e:
+                assert e.code == EXIT_CANNOT_RUN, (
+                    f"a nonexistent lessons dir must exit the documented code {EXIT_CANNOT_RUN}, got {e.code!r}")
+        assert 'FATAL' in err.getvalue(), (
+            f"the nonzero exit must come from the documented fatal path:\n{err.getvalue()}")
 
         # --- direct boundary assertions on the REAL verdict function -----------------------
         # retire rule 1: total feedback tags at exactly 3 fires, at 2 does not
