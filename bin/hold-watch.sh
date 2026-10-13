@@ -12,8 +12,10 @@
 #
 # Contract (line-oriented, cron-friendly):
 #   - stdout on match (exit 0): the first matching hold's FULL block -- its `[id] (task) question`
-#     anchor line plus its immediately following indented `    - ` batch sub-entries -- exactly as
-#     `hold.py open` renders it, nothing else.
+#     anchor line, any continuation lines of its own question (hold.py puts --q verbatim into the
+#     ledger, so a multi-line question renders as literal extra lines after its anchor), and its
+#     immediately following indented `    - ` batch sub-entries -- exactly as `hold.py open`
+#     renders it, nothing else.
 #   - stdout on timeout (exit 3): one final cron-friendly `NO-HOLD: ...` status line.
 #   - `--task T`: on match, only a hold whose OWN task field equals T exactly (never substring).
 #     T is validated against the same charset hold.py's own task-ids use (alphanumeric plus -_,
@@ -30,14 +32,16 @@
 #     timeout's exit 3). POSIX force-ignores SIGINT for backgrounded commands when job control
 #     is off, and a signal ignored on shell entry cannot be trapped -- so a dispatcher's
 #     `hold-watch.sh ... &` would silently lose the INT contract (SIGTERM is unaffected: it is
-#     never force-ignored). At startup the script self-probes: a one-shot INT trap plus a
-#     self-delivered SIGINT. If the trap fires, SIGINT is already this script's (foreground and
-#     job-control invocations) and it starts directly; if nothing consumes the signal, SIGINT
-#     was force-ignored on entry, and the script re-execs itself once through python3 to reset
-#     that disposition to default (only a runtime sigaction can undo an inherited SIG_IGN;
-#     bash alone cannot -- `trap -p` does not even expose it). pid/argv/env/fds are preserved
-#     by exec, so the caller and `kill $!` still target the same process. Prefer SIGTERM to
-#     stop a running instance anyway -- it is the one signal that never needs this treatment.
+#     never force-ignored). The INT-trap install at the top is then a silent no-op, which
+#     `trap -p INT` reflects as EMPTY (a successfully installed trap always lists -- verified
+#     live in foreground, backgrounded-no-job-control, and backgrounded-job-control modes). That
+#     empty listing is the self-heal's detection (near the bottom, see "SIGINT self-heal"):
+#     the instance execs a python that resets the disposition to default and execs this script
+#     back -- same pid/argv/env/fds, so the caller's `kill $!` still targets this process and
+#     the documented INT -> 130 then works. The interpreter is resolved FIRST through a
+#     bounded, group-tracked child so the exec never goes through a PATH wrapper script; a
+#     TERM/INT landing anywhere in the heal reaps the whole tree, never orphaning children.
+#     Prefer SIGTERM to stop a running instance anyway -- it needs none of this.
 #   - The deadline is an absolute wall-clock instant (not a decrementing counter), so a slow poll
 #     never steals time from later ticks; sleeps are plain `sleep` (never `read -t`, which races
 #     stdin under cron), clamped to the remaining budget so the script never lingers past the
@@ -49,34 +53,20 @@
 #     capped at 31536000 seconds (one year) so every accepted value is a duration any `sleep`
 #     actually honors -- an absurd value is rejected early with exit 2 instead of reaching the
 #     loop, where it would otherwise fail every poll/sleep forever with no documented exit.
-#   - Exit 2: usage/validation error (bad --task charset, non-numeric/out-of-range numerics, ...).
+#   - Exit 2: usage/validation error (bad --task charset, non-numeric/out-of-range numerics,
+#     unusable TMPDIR, ...).
 
 set -u
 
-# SIGINT self-heal (see header). `trap -p` cannot detect the inherited force-ignore (bash does not
-# expose it), so detect it with a self-probe: install a one-shot INT trap and self-deliver
-# SIGINT. If the trap fires, INT was already ours -- no heal, no extra python3 startup. If
-# nothing consumed the signal, INT was force-ignored on entry (a backgrounded, non-job-control
-# invocation) and only a runtime sigaction can undo that: re-exec through python3, which resets
-# the disposition to default before exec'ing us back (pid/argv/env/fds preserved, so the caller
-# and `kill $!` still target this same process). No guard variable is needed: the re-exec'd
-# instance probes SIG_DFL, finds it trappable, and does not heal again. The one-shot probe trap
-# is simply overwritten by the real INT trap installed further below.
-_int_probe="$(mktemp "${TMPDIR:-/tmp}/hold-watch-int-probe.XXXXXX")"
-trap 'rm -f "$_int_probe"' INT
-kill -INT $$
-if [ -e "$_int_probe" ]; then   # nothing consumed the signal: SIGINT was ignored on entry
-  rm -f "$_int_probe"
-  if command -v python3 >/dev/null 2>&1; then
-    exec python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' "$0" "$@"
-  fi
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOLD_PY="$SCRIPT_DIR/hold.py"
-
-SLEEP_PID="" POLL_PID="" POLL_KILLER="" POLL_OUT=""
+# Anything the script may have in flight, tracked so the TERM/INT traps below can reap ALL of
+# it: the inter-poll sleep, a poll in flight plus its killer, a child's whole process GROUP
+# (set only when a child was spawned under `set -m` -- a PATH interpreter may be a wrapper
+# script with its OWN children, and killing just the wrapper pid would orphan them), and the
+# poll's scratch file. Traps go up HERE, before anything that can spawn a child, so no window
+# exists in which a signal could leak one.
+SLEEP_PID="" POLL_PID="" POLL_KILLER="" POLL_GROUP="" POLL_OUT=""
 on_signal() {  # distinct from timeout's exit 3; kill anything in flight so nothing lingers
+  [ -n "$POLL_GROUP" ] && kill -TERM -- "-$POLL_GROUP" 2>/dev/null
   [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
   [ -n "$POLL_PID" ] && kill "$POLL_PID" 2>/dev/null
   [ -n "$POLL_KILLER" ] && kill "$POLL_KILLER" 2>/dev/null
@@ -84,7 +74,11 @@ on_signal() {  # distinct from timeout's exit 3; kill anything in flight so noth
   exit "$1"
 }
 trap 'on_signal 143' TERM
-trap 'on_signal 130' INT
+trap 'on_signal 130' INT   # in a backgrounded (non-job-control) invocation this install is a
+                           # silent no-op -- detected and healed near the bottom (SIGINT self-heal)
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOLD_PY="$SCRIPT_DIR/hold.py"
 
 # hold.py open's per-hold anchor line: `[id] (task) question...   opts: ...`. The task field is
 # the first `)`-closed group; a task-id containing `)` cannot be created through hold.py's own
@@ -97,10 +91,13 @@ MATCH_BLOCK=""
 # Structural parse of hold.py open's rendering:
 #   - an anchor line is a match candidate; --task is EXACT string equality against the captured
 #     task field, never substring; empty filter = any open hold;
-#   - a matched anchor's immediately following indented `    - ` sub-lines (batch entries) belong
-#     to it; only the FIRST match wins (a later anchor is never appended to the block);
+#   - a matched anchor's immediately following indented `    - ` sub-lines (batch entries) AND
+#     any intermediate non-anchor continuation lines belong to it -- hold.py puts --q verbatim
+#     into the ledger, so a multi-line question renders as literal extra lines after its anchor,
+#     and open's output has no other possible line shape; only the FIRST match wins (a later
+#     anchor is never appended to the block);
 #   - a WARNING line is never a match: forwarded to stderr, scanning/polling continues;
-#   - anything else is ignored (not a match candidate).
+#   - anything else (before the first match) is ignored.
 # Returns 0 with MATCH_BLOCK set to the matched block (no trailing newline), 1 with no match.
 match_block() {
   local filter="$1" line="" in_block=0 matched_once=0 task="" block=""
@@ -114,14 +111,20 @@ match_block() {
         [ "$in_block" -eq 1 ] && block+="$line"$'\n'
         ;;
       *)
-        in_block=0
-        if [ "$matched_once" -eq 0 ] && [[ "$line" =~ $ANCHOR_RE ]]; then
-          task="${BASH_REMATCH[1]}"
-          if [ -z "$filter" ] || [ "$task" = "$filter" ]; then
-            block+="$line"$'\n'
-            in_block=1
-            matched_once=1
+        if [[ "$line" =~ $ANCHOR_RE ]]; then
+          in_block=0
+          if [ "$matched_once" -eq 0 ]; then
+            task="${BASH_REMATCH[1]}"
+            if [ -z "$filter" ] || [ "$task" = "$filter" ]; then
+              block+="$line"$'\n'
+              in_block=1
+              matched_once=1
+            fi
           fi
+        elif [ "$in_block" -eq 1 ]; then
+          # not an anchor, sub-entry, or WARNING: the only remaining line shape is a continuation
+          # of the MATCHED hold's own multi-line question text -- keep it in the block, never end it
+          block+="$line"$'\n'
         fi
         ;;
     esac
@@ -130,22 +133,21 @@ match_block() {
   [ -n "$MATCH_BLOCK" ]
 }
 
-# poll_once <outfile> <budget-secs> -- one `hold.py open`, bounded by the REMAINING time budget
-# (not the full --interval), so a hung/slow hold.py invocation can never push the script
-# meaningfully past its --timeout deadline. The bound is a backgrounded killer subshell: it
-# sleeps the budget, then TERMs the poll (KILL after a 1s grace); if the poll finishes early,
-# the killer is TERM-killed before its own `kill` can ever run. The killer's inner sleep is a
-# TRACKED child the subshell's own EXIT/TERM traps kill, and the subshell's stdout/stderr are
-# /dev/null -- so NOTHING outlives this call: an orphaned `sleep $budget` would otherwise
-# linger (up to --timeout, a year at the cap) holding whatever fds it inherited, wedging a
-# dispatcher that captures this watcher's stdout via a pipe until long after the exit code.
-# Returns hold.py's exit status (143 when the budget killed it). hold.py's stderr is
-# suppressed: its "(no open decisions)" noise stays out of the cron log, and its stdout
-# WARNING lines still reach match_block for stderr forwarding.
-poll_once() {
-  local ofile="$1" budget="$2" rc=0
-  python3 "$HOLD_PY" open >"$ofile" 2>/dev/null &
+# run_bounded <outfile> <budget-secs> <grouped 0|1> <argv...> -- run argv with stdout to
+# <outfile>, bounded by the budget: a killer subshell sleeps the budget, then TERMs the child
+# (KILL after a 1s grace). If <grouped> is 1, the CALLER spawns this under `set -m` so the child
+# becomes its own process-group leader; POLL_GROUP then records it so on_signal reaps the
+# child's ENTIRE tree -- a PATH interpreter may be a wrapper script with its own children, and
+# a bare pid-kill of the wrapper would orphan them. The killer's inner sleep is a tracked
+# child the subshell's own EXIT/TERM traps kill, and the subshell's fds are /dev/null, so
+# nothing outlives this call (round-4's no-linger fix, hoisted here so the SIGINT self-heal
+# can reuse the exact same machinery).
+run_bounded() {
+  local ofile="$1" budget="$2" grouped="$3"; shift 3
+  local rc=0
+  "$@" >"$ofile" 2>/dev/null &
   POLL_PID=$!
+  if [ "$grouped" -eq 1 ]; then POLL_GROUP="$POLL_PID"; else POLL_GROUP=""; fi
   (
     tpid=""
     trap '[ -n "${tpid:-}" ] && kill "$tpid" 2>/dev/null' EXIT
@@ -166,13 +168,23 @@ poll_once() {
   return "$rc"
 }
 
+# poll_once <outfile> <budget-secs> -- one `hold.py open`, bounded by the REMAINING time budget
+# (not the full --interval), so a hung/slow hold.py invocation can never push the script
+# meaningfully past its --timeout deadline. Returns hold.py's exit status (143 when the budget
+# killed it). hold.py's stderr is suppressed: its "(no open decisions)" noise stays out of the
+# cron log, and its stdout WARNING lines still reach match_block for stderr forwarding.
+poll_once() {
+  run_bounded "$1" "$2" 0 python3 "$HOLD_PY" open
+}
+
 # watch -- the polling loop. Polls immediately (a hold that is already open is found without
 # waiting), then every --interval seconds until the absolute wall-clock deadline elapses. Every
 # poll is itself bounded by the remaining budget, and the inter-poll sleep is clamped to the
 # remaining budget too, so the runtime never meaningfully exceeds --timeout.
 watch() {
   local polls=0 deadline now budget sleep_for pfile
-  pfile="$(mktemp "${TMPDIR:-/tmp}/hold-watch-poll.XXXXXX")"
+  pfile="$(mktemp "${TMPDIR:-/tmp}/hold-watch-poll.XXXXXX")" \
+    || { echo "hold-watch: cannot create the poll scratch file (bad TMPDIR=${TMPDIR:-/tmp}?); refusing to watch blind" >&2; exit 2; }
   POLL_OUT="$pfile"
   deadline=$(( $(date +%s) + TIMEOUT ))
   while :; do
@@ -263,6 +275,30 @@ EOF
   match_block "" <"$orphan" 2>/dev/null \
     && bad "an indented sub-line with no anchor is never itself a match candidate"
 
+  # multi-line question (round-5 finding 1): hold.py renders an embedded newline in --q as a
+  # literal continuation line after its own anchor; the matched block must KEEP it (and still
+  # reach its batch sub-entries), never end at the continuation, and a later anchor must stay
+  # excluded -- and a SKIPPED multi-line hold's continuation must not leak into another block
+  fixml="$t/fix.multi"
+  cat >"$fixml" <<'EOF'
+[eee55555] (task-multi) first line
+second line of the question
+    - sub-m (checked_sha=sha-m) sub-m: verdict=pass findings=0 files=0 lenses=none
+[fff66666] (task-next) unrelated
+EOF
+  wantml='[eee55555] (task-multi) first line
+second line of the question
+    - sub-m (checked_sha=sha-m) sub-m: verdict=pass findings=0 files=0 lenses=none'
+  match_block "" <"$fixml" 2>/dev/null || bad "any-filter: a multi-line-question hold must match"
+  [ "$MATCH_BLOCK" = "$wantml" ] \
+    || bad "multi-line question: the continuation line and the batch sub-entries must stay in the block -- got: $MATCH_BLOCK"
+  match_block "task-multi" <"$fixml" 2>/dev/null || bad "--task must match a multi-line-question hold"
+  [ "$MATCH_BLOCK" = "$wantml" ] || bad "multi-line block must be identical under a --task filter"
+  match_block "task-next" <"$fixml" 2>/dev/null \
+    || bad "--task must still match a LATER anchor that follows a multi-line hold"
+  [ "$MATCH_BLOCK" = "[fff66666] (task-next) unrelated" ] \
+    || bad "a skipped multi-line hold's continuation must not leak into another block -- got: $MATCH_BLOCK"
+
   # ---------- real round-trips: THIS script as a real subprocess + the REAL bin/hold.py,
   # against a scratch ledger. --timeout 0 = one immediate poll, no real wait. ----------
   rw() {  # rw <ledger> <expected-rc> <args...> ; captures stdout to $ofile, stderr to $err
@@ -305,6 +341,15 @@ EOF
   grep -qF "    - batch-x (checked_sha=sha-x) batch-x: verdict=pass findings=0 files=0 lenses=none" "$ofile" \
     || bad "batch sub-entry line must be surfaced verbatim"
 
+  # a real multi-line --q round-trip (round-5 finding 1): hold.py puts --q verbatim into the
+  # ledger, so open renders the anchor across lines; the watcher must report the FULL block
+  mlid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task rt-multi --q $'line one\nline two' --sha cc 2>/dev/null)" \
+    || bad "scratch multi-line hold creation failed"
+  rw "$ledger" 0 --task rt-multi --timeout 0
+  want_rt="[$mlid] (rt-multi) line one"$'\n'"line two"
+  [ "$(cat "$ofile")" = "$want_rt" ] \
+    || bad "multi-line question round-trip must print the block with its continuation line -- got: $(cat "$ofile")"
+
   rw "$ledger" 3 --task batch --timeout 0  # substring of the batch task ('batch' vs 'batch-1'): no-match
 
   # WARNING forwarding end-to-end via hold.py's real corruption path: corrupt line + open hold
@@ -332,9 +377,9 @@ EOF
 
   # slow hold.py-open substitute near the deadline (bug-1 class): each poll invocation is itself
   # bounded by the REMAINING budget, so a 5s-hanging poll under --timeout 1 still ends at ~1s.
-  # The watcher runs foreground here, so its startup self-probe finds SIGINT already trappable
-  # and no self-heal re-exec fires -- the shim intercepts ONLY the poll interpreter. (The
-  # heal's own coverage is the backgrounded SIGINT test below.)
+  # The watcher runs foreground here, so its INT trap installs and the SIGINT self-heal (which
+  # keys on `trap -p INT` being empty) does not fire -- the shim intercepts ONLY the poll
+  # interpreter. (The heal's own coverage is the backgrounded SIGINT test below.)
   shim="$t/shim"; mkdir -p "$shim"
   realpy="$(command -v python3)"
   printf '#!/bin/sh\nsleep 5\nexec "%s" "$@"\n' "$realpy" >"$shim/python3"
@@ -440,6 +485,40 @@ EOF
   kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
   [ "$rc" -eq 130 ] || bad "SIGINT during the wait must exit 130 (distinct from 3), got $rc"
 
+  # mid-heal TERM (round-5 finding 2): a slow PATH interpreter wrapper must not leak its own
+  # children when a TERM lands mid-resolution. The heal resolves the interpreter inside a
+  # bounded child in its OWN process group, so on_signal reaps the wrapper's whole tree; the
+  # exec then goes to the resolved interpreter directly, never through the wrapper.
+  shim2="$t/shim2"; mkdir -p "$shim2"
+  printf '#!/bin/sh\nsleep 1.6\nexec "%s" "$@"\n' "$realpy" >"$shim2/python3"
+  chmod +x "$shim2/python3"
+  SM_HOLD_LEDGER="$empty" PATH="$shim2:$PATH" "$0" --interval 30 --timeout 3600 >"$t/heal.out" 2>"$t/heal.err" &
+  wpid=$!
+  sleep 0.7   # mid-resolution: the wrapper is inside its `sleep 1.6` inside OUR tracked child
+  kill -TERM "$wpid" 2>/dev/null
+  wait "$wpid"; rc=$?
+  [ "$rc" -eq 143 ] || bad "a TERM during the SIGINT self-heal must exit 143, got $rc"
+  sleep 0.4   # an un-reaped wrapper child would show up here, orphaned (ppid 1) but still alive
+  if ps -ax -o ppid=,command= 2>/dev/null | awk '$1==1 && $2=="sleep" && $3=="1.6" {f=1} END {exit !f}'; then
+    bad "a TERM during the self-heal orphaned the interpreter wrapper's child"
+  fi
+
+  # broken TMPDIR (round-5 finding 3): the poll scratch file must fail LOUDLY (exit 2), and the
+  # SIGINT self-heal must degrade loudly too -- never silently skip (round 4's mktemp-based
+  # probe silently defeated the heal exactly when TMPDIR was broken)
+  rc=0; TMPDIR="$t/no-such-tmp" "$0" --timeout 0 >"/dev/null" 2>"$t/tmpdir.err" || rc=$?
+  [ "$rc" -eq 2 ] || bad "a broken TMPDIR must fail loudly with exit 2, got $rc"
+  grep -q "cannot create the poll scratch file" "$t/tmpdir.err" \
+    || bad "a broken TMPDIR must print a loud, explicit error"
+  TMPDIR="$t/no-such-tmp" SM_HOLD_LEDGER="$empty" "$0" --interval 30 --timeout 3600 >"$t/healb.out" 2>"$t/healb.err" &
+  wpid=$!
+  sleep 0.5   # enough for the loud fallback heal + the healed instance's own loud pfile exit 2
+  kill -TERM "$wpid" 2>/dev/null
+  wait "$wpid"; rc=$?
+  [ "$rc" -eq 2 ] || bad "a backgrounded broken-TMPDIR watcher must still reach the loud exit 2, got $rc"
+  grep -q "self-heal" "$t/healb.err" \
+    || bad "a broken TMPDIR must not silently skip the SIGINT self-heal (loud note expected)"
+
   rm -rf "$t"
   if [ "$SC_FAILS" -eq 0 ]; then echo ok; exit 0; fi
   printf 'selfcheck: %d failure(s)\n' "$SC_FAILS" >&2
@@ -462,8 +541,9 @@ Exit codes: 0 hold found; 2 usage/validation error; 3 timeout, no matching open 
 Stopping a running instance: prefer SIGTERM (always honored). SIGINT also works, including for
 a backgrounded `hold-watch.sh ... &` invocation: POSIX forces SIGINT ignored for non-job-
 control background commands (an ignored signal cannot be trapped), so the script detects that
-at startup with a one-shot self-probe and re-execs itself once through python3 to reset the
-disposition. Zero-padded --interval/--timeout digit strings are accepted as base-10, capped
+(the INT trap install is a silent no-op, which `trap -p INT` shows as empty), resolves the real
+interpreter through a bounded, group-tracked child, and execs it to reset the disposition.
+Zero-padded --interval/--timeout digit strings are accepted as base-10, capped
 at 31536000 seconds (one year). An explicitly supplied empty --task (`--task=`) is rejected
 with exit 2 -- it is not the same as omitting the flag.
 EOF
@@ -522,5 +602,49 @@ command -v python3 >/dev/null 2>&1 \
   || { echo "hold-watch: python3 not found in PATH (needed to run bin/hold.py)" >&2; exit 2; }
 [ -f "$HOLD_PY" ] \
   || { echo "hold-watch: $HOLD_PY not found (this script must live next to hold.py in bin/)" >&2; exit 2; }
+
+# ------------------------------------------------------------------ SIGINT self-heal
+# POSIX force-ignores SIGINT for backgrounded, non-job-control commands, and a signal ignored
+# on shell entry cannot be trapped: the `trap ... INT` at the top of this script was then a
+# silent no-op, which `trap -p INT` reflects as EMPTY (a successfully installed trap always
+# lists). That empty listing is the detection -- no mktemp, no self-delivered signal, nothing
+# that can silently misreport when TMPDIR is broken (round 4's mktemp probe silently skipped
+# the heal exactly when it was needed). When INT was force-ignored, only a runtime sigaction
+# can undo it, so this instance execs a python that resets the disposition to default and then
+# execs this script back: same pid, argv, environment, and fds, so the caller's `kill $!` still
+# targets THIS process and the documented INT -> 130 works from then on. The re-run instance
+# installs the INT trap successfully (disposition now default), finds `trap -p INT` non-empty,
+# and does not heal again -- no loop.
+#
+# The exec itself must not leak: a PATH `python3` can be a wrapper SCRIPT that spawns its own
+# children (pyenv/conda activation shims, etc.), and a TERM/INT landing mid-resolution used to
+# kill only the wrapper, orphaning those children. So the real interpreter is resolved FIRST:
+# a bounded child in its own process GROUP runs PATH-python3 (wrapper included -- the wrapper's
+# children die with the group) just to print its own sys.executable; a signal during that run
+# reaps the whole tree via POLL_GROUP (on_signal, top of script). Then the exec goes to the
+# RESOLVED interpreter directly, never through the wrapper -- real interpreters spawn no
+# children, so a TERM/INT in the exec window dies cleanly by kernel default (143/130), no
+# orphan possible. Degraded corners are LOUD, never silent: unusable TMPDIR or a hung/broken
+# interpreter each print a stderr note and fall back to the direct PATH exec (round-3
+# behavior), where only a pathological wrapper could leak.
+if [ -z "$(trap -p INT)" ] && command -v python3 >/dev/null 2>&1; then
+  realpy=""
+  pf_file="$(mktemp "${TMPDIR:-/tmp}/hold-watch-heal.XXXXXX" 2>/dev/null)" || pf_file=""
+  if [ -n "$pf_file" ]; then
+    POLL_OUT="$pf_file"
+    set -m   # make the resolution child its own process-group leader so on_signal reaps its tree
+    run_bounded "$pf_file" 30 1 python3 -c 'import sys; print(sys.executable)' || true
+    set +m
+    realpy="$(head -n 1 "$pf_file" 2>/dev/null)"
+    rm -f "$pf_file"
+    POLL_OUT=""
+    [ -n "$realpy" ] && [ -x "$realpy" ] \
+      || printf 'hold-watch: could not resolve the real python3 for the SIGINT self-heal (slow or broken interpreter in PATH?); falling back to a direct PATH exec\n' >&2
+  else
+    printf 'hold-watch: cannot create a scratch file for the SIGINT self-heal (bad TMPDIR=%s?); falling back to a direct interpreter exec\n' "${TMPDIR:-/tmp}" >&2
+  fi
+  [ -n "$realpy" ] && [ -x "$realpy" ] || realpy="python3"
+  exec "$realpy" -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' "$0" "$@"
+fi
 
 watch
