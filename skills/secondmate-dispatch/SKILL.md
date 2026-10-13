@@ -818,9 +818,10 @@ which task-ids belong to the batch in the first place.
 ## 6. One consolidated hold
 
 **Before building the entries file: filter `ready`'s output through THREE things — this batch's
-own persisted task-id list, `claim-ledger.py status`'s currently-OPEN claims, AND this batch's own
-durable hold-history — never trust `ready --batch-id` alone as proof a row belongs to THIS
-dispatcher's own batch, or that it hasn't already been decided.** Three independent reasons a row
+own persisted task-id list, `claim-ledger.py status`'s currently-OPEN claims, AND `hold.py`'s own
+ledger of what this batch already asked a human about — never trust `ready --batch-id` alone as
+proof a row belongs to THIS dispatcher's own batch, or that it hasn't already been decided.**
+Three independent reasons a row
 from `ready --batch-id <batch-id>` must not be taken at face value:
 1. `progress-ledger.py`'s ledger rows are never deleted, so once a batch task-id reaches
    `verify_gate_pass`, `ready --batch-id` reports that SAME row forever, even long after that
@@ -844,44 +845,53 @@ from `ready --batch-id <batch-id>` must not be taken at face value:
    "left completely untouched... claimed, needs rework") — so the first two checks alone cannot
    tell "ready and never yet asked about" apart from "already rejected by a human in a prior hold
    for this exact batch-id."** `hold.py open` only shows currently-OPEN holds; once a hold is
-   answered it simply disappears from that view, so the "search for an existing open hold, open a
-   new one if none is found" logic below (re-)opens a BRAND-NEW hold asking the human to
-   re-adjudicate a task-id they already rejected, every time the dispatcher restarts and nothing
-   has changed. Confirmed live: opened a hold covering `t1`, answered it `--reject t1`, then
-   re-ran the exact "no open hold found → open a new one" logic — it found nothing in `hold.py
-   open`'s output (correctly empty, the hold is closed) and opened a SECOND hold for the identical,
-   unchanged `t1`. The fix needs a durable record of what this batch already asked a human about,
-   independent of `hold.py open`'s open-only view — see "Hold history: the third durable artifact"
-   below.
+   answered it simply disappears from that view. But `hold.py`'s own ledger (`$SM_HOLD_LEDGER`)
+   already durably records EVERY hold ever opened — including a batch hold's full `batch` list of
+   `{task_id, checked_sha, digest}` — and every answer ever given — including a batch answer's
+   structured `approved`/`rejected` lists (confirmed by reading `_recs()`, `open_decisions()`, and
+   the `hold`/`answer` record shapes in `bin/hold.py` directly). There is no need to re-derive or
+   cache this a second time: see "Reuse `hold.py`'s own ledger directly" below.
 
-**Hold history: the third durable artifact.** Alongside `<batch-id>.batch.json` (section 5), this
-dispatcher also durably records every hold-id it has ever opened for this batch-id, at
-`$dispatch_dir/<batch-id>.hold-history.json` — a JSON array of
-`{"hold_id": "...", "entries": [{"task_id": ..., "checked_sha": ..., ...}, ...]}`, one record per
-hold ever opened (not just the currently-open one), written atomically (read, append, temp+`mv`,
-the same idiom as every other durable write in this file) the moment a NEW hold is opened (see the
-updated "open a new one" step below). A hold-id, once answered, is never reopened or reanswered
-(confirmed by reading `hold.py`'s own `_recs()`/`answer` handling directly: an already-answered id
-is rejected outright) — so a REJECTED decision recorded against a specific `checked_sha` is
-permanent for that `checked_sha`, and remains valid evidence across any number of dispatcher
-restarts without needing `hold.py open`'s live, open-only view at all. Reading whether a given
-historical hold-id was answered, and what it decided, means reading `hold.py`'s own ledger
-directly at `${SM_HOLD_LEDGER:-decisions.jsonl}` — the identical path hold.py itself resolves
-(confirmed by reading its own `LEDGER = pathlib.Path(os.environ.get("SM_HOLD_LEDGER",
-"decisions.jsonl"))` directly) — for the `{"ev": "answer", "id": "<hold-id>"}` record hold.py's
-own module docstring documents as its real, stable answer shape, extracting `.rejected[]`. This is
-reading a tool's own documented, stable on-disk contract directly, the same discipline this file
-already applies to `dispatch-report.py`'s regex, `claim-ledger.py`'s `_TOKEN_RE`, and
-`pane-reaper.py`'s exit codes elsewhere — not a second, parallel definition of "rejected."
+**Reuse `hold.py`'s own ledger directly — no new artifact.** Three rounds of fixes previously
+tried to maintain a SEPARATE, hand-rolled cache of this same information
+(`$dispatch_dir/<batch-id>.hold-history.json`, read and written with ad hoc `jq`) and each round
+the checker found a new way that cache could be corrupted and silently fail open — the cache
+itself, not any one `jq`/bash mistake inside it, was the root cause. The fix is to delete that
+cache entirely and read `hold.py`'s own ledger directly instead, reusing `hold.py`'s OWN parsing
+rather than reimplementing it a fourth time. `hold.py` already loads its sibling `bin/verdict.py`
+as a module by file path for exactly this kind of reuse (see `_verdict_module()` in `bin/hold.py`
+directly) — the same technique applies here: load `bin/hold.py` itself as a module and call its
+own `_recs()`, which already tolerates and counts malformed lines rather than crashing or silently
+misclassifying (confirmed by reading `_recs()`'s own docstring and implementation directly) — the
+exact tested, fail-tolerant parsing `hold.py open` itself already relies on everywhere else, not a
+second, looser definition of "rejected." This is independent of `hold.py open`'s open-only view by
+construction — `_recs()` returns EVERY hold and answer record ever written, open or closed, so a
+hold answered in a prior round of this same batch is found exactly the same way a currently-open
+one would be. There is also no new file of our own for a crash or a bad write to corrupt: the real
+ledger is written exclusively by `hold.py`'s own atomic, flock-guarded `_append` (confirmed by
+reading `_ledger_lock`/`_append` directly) — the same ledger every other hold in this entire system
+already depends on, not something this skill invented and now owns alone. If that real, shared
+ledger were ever corrupted, that is already `hold.py`'s own documented, accepted operational
+concern (`hold.py open`'s own `_BAD`-count warning: "ledger may be corrupt; reconcile manually") —
+a system-wide incident, not a new failure mode this skill introduces by reading it.
 
-A rejected decision only disqualifies a task-id for the EXACT `checked_sha` it was rejected at —
-never for a later, genuinely different `checked_sha`. A human-driven rework/resubmission round
-produces a brand-new `verify_gate_pass` row with a new `checked_sha` (ordinary dispatcher
-discipline, unchanged), which is exactly the signal this file already treats as "legitimately
-different" everywhere else (`merge-sequencer.sh`'s own `--checked-sha` anti-reattachment gate,
-`hold.py`'s own `--sha` binding). Comparing on `"<task-id>@<checked_sha>"` pairs, not bare
-task-ids, is what lets a genuine resubmission through while still excluding an unchanged, already-
-rejected one.
+The embedded Python script's own exit code (`$rc_py` below) still needs capturing and classifying,
+same idiom as everywhere else in this file — not because `_recs()` itself can fail on a malformed
+ledger (it can't; malformed lines are tolerated and counted, never raised), but because `python3`
+itself or `bin/hold.py`'s own module-loading could genuinely fail unexpectedly (e.g. `python3`
+missing). On that failure, escalate and stop before building anything downstream — never fall
+through to an empty rejected set, which would silently fail OPEN exactly like the deleted
+`hold-history.json` cache did.
+
+A rejected decision only disqualifies a task-id for the EXACT `checked_sha` recorded in that SAME
+hold's own `batch` entries — never for a later, genuinely different `checked_sha`. A human-driven
+rework/resubmission round produces a brand-new `verify_gate_pass` row with a new `checked_sha`
+(ordinary dispatcher discipline, unchanged), which is exactly the signal this file already treats
+as "legitimately different" everywhere else (`merge-sequencer.sh`'s own `--checked-sha`
+anti-reattachment gate, `hold.py`'s own `--sha` binding). Comparing on `"<task-id>@<checked_sha>"`
+pairs, not bare task-ids, is what lets a genuine resubmission through while still excluding an
+unchanged, already-rejected one — now sourced directly from `hold.py`'s own `batch[].checked_sha`
+field, never a hand-copied value of our own.
 
 Carry all three cross-checks into this skill's own batch-close concretely:
 ```bash
@@ -892,43 +902,45 @@ open_claims_output=$(bin/claim-ledger.py status)
 batch_task_ids=$(jq -r '.task_ids[]' "$dispatch_dir/${batch_id}.batch.json")
 ready_output=$(bin/progress-ledger.py ready --batch-id "$batch_id")
 
-# Build the rejected_unchanged set from this batch's own hold history -- independent of
-# hold.py open's open-only view (that view cannot distinguish "never asked" from "already
-# answered"); an answered hold-id is permanent, so this is safe to trust across any restart.
-history_file="$dispatch_dir/${batch_id}.hold-history.json"
-if [ ! -f "$history_file" ]; then
-  # First-ever initialization uses the SAME atomic temp-file + mv idiom as every other durable
-  # write in this file (batch.json, manifest.json) -- never a direct `echo >`, which an
-  # interruption mid-write could leave half-written, producing exactly the kind of malformed
-  # file the read-side fix below must independently defend against anyway.
-  tmp="$history_file.tmp"
-  echo '[]' > "$tmp"
-  mv "$tmp" "$history_file"
-fi
-rejected_unchanged=()
-rc_hist=0
-history_records=$(jq -c '.[]' "$history_file") || rc_hist=$?
-if [ "$rc_hist" -ne 0 ]; then
-  : # ESCALATE to the human verbatim (batch-id, "$rc_hist") -- hold-history.json itself is
-    # malformed or unreadable. STOP here: do NOT proceed to build entries_task_ids or open any
-    # hold this cycle. Falling through with an empty rejected_unchanged set would silently fail
-    # OPEN -- treating "durable state is corrupted" as "nothing was ever rejected," handing an
-    # already-rejected task-id straight back into a brand-new hold. Retry next cycle once a human
-    # has restored or removed the file.
+# Reuse hold.py's own ledger directly (see above) -- no cache of our own to corrupt.
+rc_py=0
+rejected_lines=$(python3 - "$batch_id" <<'PY'
+import importlib.util, pathlib, sys
+batch_id = sys.argv[1]
+spec = importlib.util.spec_from_file_location(
+    "secondmate_dispatch_hold", pathlib.Path("bin/hold.py").resolve())
+hold = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hold)
+recs = hold._recs()
+hold_by_id = {r["id"]: r for r in recs if r.get("ev") == "hold"}
+answer_by_id = {r["id"]: r for r in recs if r.get("ev") == "answer"}
+for hid, hrec in hold_by_id.items():
+    if hrec.get("task") != batch_id:
+        continue
+    batch = hrec.get("batch")
+    if not isinstance(batch, list):
+        continue
+    arec = answer_by_id.get(hid)
+    if arec is None:
+        continue  # still open -- nothing decided yet, not this check's concern
+    rejected_ids = set(arec.get("rejected") or [])
+    for entry in batch:
+        if entry.get("task_id") in rejected_ids:
+            print(f"{entry['task_id']}@{entry.get('checked_sha')}")
+PY
+) || rc_py=$?
+
+if [ "$rc_py" -ne 0 ]; then
+  : # ESCALATE to the human verbatim (batch-id, "$rc_py") -- reusing hold.py's own ledger failed
+    # unexpectedly (python3 missing, or bin/hold.py itself failing to import). STOP here: do NOT
+    # proceed to build entries_task_ids or open any hold this cycle. Never fall through to an
+    # empty rejected set, which would silently fail OPEN.
 else
-  while IFS= read -r hrec; do
-    [ -z "$hrec" ] && continue
-    hid=$(printf '%s' "$hrec" | jq -r '.hold_id')
-    answer_rec=$(jq -c --arg id "$hid" 'select(.ev == "answer" and .id == $id)' \
-      "${SM_HOLD_LEDGER:-decisions.jsonl}")
-    [ -z "$answer_rec" ] && continue   # not yet answered -- nothing to exclude for this hold-id
-    rej_ids=$(printf '%s' "$answer_rec" | jq -r '.rejected[]? // empty')
-    while IFS= read -r rid; do
-      [ -z "$rid" ] && continue
-      rsha=$(printf '%s' "$hrec" | jq -r --arg t "$rid" '.entries[] | select(.task_id == $t) | .checked_sha')
-      rejected_unchanged+=("${rid}@${rsha}")
-    done <<< "$rej_ids"
-  done <<< "$history_records"
+  rejected_unchanged=()
+  while IFS= read -r pair; do
+    [ -z "$pair" ] && continue
+    rejected_unchanged+=("$pair")
+  done <<< "$rejected_lines"
 
   entries_task_ids=()
   while IFS= read -r line; do
@@ -953,27 +965,39 @@ else
   done <<< "$ready_output"
 fi
 ```
-Confirmed live, four scenarios: (1) a two-task-id batch where `t1` was already merged and its
-claim released in a prior round while `t2` was still pending — `ready --batch-id` kept reporting
-BOTH (ledger rows never deleted), but the claim-status half of the filter correctly dropped `t1`
-and kept only `t2`; (2) the batch-id-collision scenario above — the claim-status check ALONE
-wrongly kept the foreign `foreign1` (`claim_open=1`), but adding the batch-manifest membership
-check (`in_batch=0` for `foreign1`) correctly dropped it while still keeping the genuine `mine1`;
-(3) the rejected-and-unchanged scenario — opened a hold for `t1@aaa111`, rejected it, recorded
-that hold into `hold-history.json`, then re-ran this exact filter on a simulated restart:
-`entries_task_ids` correctly came back empty (the rejection, unchanged, is excluded) — then
-recorded a NEW `verify_gate_pass` row for `t1` at a genuinely different `checked_sha` (a real
-rework resubmission) and re-ran the identical filter again: `t1` correctly reappeared in
-`entries_task_ids`, confirming the exclusion is scoped to the exact rejected `checked_sha`, never
-to the bare task-id; (4) **fail-closed on a corrupted `hold-history.json`** — after the SAME
-rejection as scenario (3), corrupted the file to `{not-json` and re-ran the filter: the earlier,
-unguarded `done < <(jq -c '.[]' "$history_file")` form (reading via process substitution with no
-exit-code capture) silently produced ZERO lines on jq's parse failure, so `rejected_unchanged`
-came back empty and `entries_task_ids` wrongly re-included `t1` — the exact bug this fix closes.
-The current form (`history_records=$(jq -c '.[]' "$history_file") || rc_hist=$?`, then branching
-on `rc_hist`) correctly detected the same parse failure (confirmed live: `rc_hist=5` for this
-malformed input) and escalated instead of proceeding — `entries_task_ids` was never built at all
-for that cycle, and `t1` was correctly NOT re-selected.
+Confirmed live, seven scenarios, run against the real `bin/hold.py`/`bin/claim-ledger.py`/
+`bin/progress-ledger.py` (not simulated): (1) a two-task-id batch where `t1` was already merged
+and its claim released in a prior round while `t2` was still pending — `ready --batch-id` kept
+reporting BOTH (ledger rows never deleted), but the claim-status half of the filter correctly
+dropped `t1` and kept only `t2`; (2) the batch-id-collision scenario above — the claim-status
+check ALONE wrongly kept the foreign `foreign1` (`claim_open=1`), but adding the batch-manifest
+membership check (`in_batch=0` for `foreign1`) correctly dropped it while still keeping the
+genuine `mine1`; (3) **first-ever ready task-id, no prior hold at all** — a fresh batch with no
+hold ever opened correctly surfaced its one ready task-id, confirming the switch away from the
+deleted cache didn't regress the ordinary, no-history case; (4) **reject → restart → excluded** —
+opened a real batch hold for `t1@aaa111`, rejected it via the real `hold.py answer --reject`, then
+re-ran this exact filter on a simulated restart: `entries_task_ids` correctly came back empty;
+(5) **reject → rework (new `checked_sha`) → restart → resurfaced** — recorded a NEW
+`verify_gate_pass` row for `t1` at a genuinely different `checked_sha` and re-ran the identical
+filter: `t1` correctly reappeared, confirming the exclusion is scoped to the exact rejected
+`checked_sha`, never the bare task-id; (6) **a malformed JSON line appended directly to the real
+ledger** after the same rejection — `hold._recs()`'s own tolerant per-line parsing skipped it
+(incrementing its own `_BAD` counter) while still correctly finding the real rejection record;
+`entries_task_ids` stayed correctly empty, no cache of our own to go corrupt; (7) **a
+schema-valid-but-wrong-shape record** (a syntactically valid JSON object with an `"ev": "answer"`
+whose `approved`/`rejected` aren't lists, plus an unrelated valid-JSON object with neither `ev`
+nor `id`) appended to the real ledger — both rejected by `_recs()`'s own existing validation, the
+real rejection still correctly found; (8) **a missing/never-created ledger file** (the very first
+batch-close ever, before any `hold.py` call has run) — `_recs()`'s own `LEDGER.exists()` guard
+returned an empty list, correctly treated as "nothing ever decided," the one ready task-id
+surfaced normally; (9) **an incomplete batch-answer record** (a hand-crafted ledger line with
+`"rejected"` but no `"approved"` key) — `_recs()`'s own validation requires BOTH as lists for a
+batch answer to count, so this incomplete record is itself treated as malformed and skipped; the
+task-id was correctly NOT treated as rejected, exactly matching `hold.py open`'s own independent
+confirmation that this same hold is STILL OPEN (both read the identical `_recs()`, so there is no
+way for the two views to disagree). None of scenarios 6–9 required any new defensive code of our
+own to pass — they pass because the redundant cache (and its entire corruption surface) no longer
+exists, and `hold.py`'s own already-tested parsing is reused as-is.
 
 Then write the JSON entries file, one object per task-id that survived the filter above, to
 `entries_file="$dispatch_dir/${batch_id}.entries.json"` —
@@ -1027,17 +1051,15 @@ hold_output=$(bin/hold.py open) || rc_open=$?
 
 - **A matching open hold is found** (`$existing_id` is non-empty) — reuse its id; do NOT call
   `hold.py hold` again. Just keep waiting for a human to answer that existing hold.
-- **No matching open hold is found** (`$existing_id` is empty) — only then open a new one, and
-  immediately record it into `hold-history.json` above — this is what makes the rejected-and-
-  unchanged exclusion restart-safe: without this write, a dispatcher that restarts between opening
-  this hold and it being answered would have no durable way to ever learn this hold-id existed:
+- **No matching open hold is found** (`$existing_id` is empty) — only then open a new one. No
+  separate bookkeeping write is needed here at all: `hold.py hold` itself already durably appends
+  the new hold's own `task`/`batch` record to `$SM_HOLD_LEDGER` the moment it succeeds (see
+  `_append(rec)` in `bin/hold.py`'s own `hold` command) — the exact record the "Reuse `hold.py`'s
+  own ledger directly" recipe above reads back on a later cycle. There is nothing further for this
+  dispatcher to record on its own:
 ```bash
-new_hold_id=$(bin/hold.py hold --task "$batch_id" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
-  --entries-file "$entries_file")
-tmp="$history_file.tmp"
-jq --arg hid "$new_hold_id" --slurpfile entries "$entries_file" \
-  '. + [{hold_id: $hid, entries: $entries[0]}]' "$history_file" > "$tmp"
-mv "$tmp" "$history_file"
+bin/hold.py hold --task "$batch_id" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
+  --entries-file "$entries_file"
 ```
 Wait for a genuine human answer; never self-answer. The answer is structured, not freeform prose,
 and must cover every entry in exactly one list:
@@ -1183,21 +1205,14 @@ they aren't silently lost:
   `rc_status=0; open_claims_output=$(bin/claim-ledger.py status) || rc_status=$?`, escalate on
   `rc_status != 0`, the identical idiom already applied to `hold.py open` two lines above it in
   this same section.
-- **Section 6's `new_hold_id=$(bin/hold.py hold --task ... --entries-file "$entries_file")` is a
-  bare call under `set -e`, with no `rc=$?` capture.** `hold.py hold` can genuinely fail (e.g. a
-  malformed or missing entries file, or the same kind of ledger I/O error already confirmed live
-  for `hold.py open`/`claim-ledger.py status` elsewhere in this section) and the bare, unguarded
-  call aborts the whole script right there instead of relaying the failure to the human verbatim.
-  Suggested fix: `rc_hold=0; new_hold_id=$(bin/hold.py hold ...) || rc_hold=$?`, escalate on
-  `rc_hold != 0`, the identical idiom already applied throughout this section.
-- **Section 6's `hold-history.json` append (the `jq ... > "$tmp"` write immediately after opening
-  a new hold, plus its `mv`) runs as bare commands under `set -e`, with no `rc=$?` capture on
-  either.** A `jq` failure writing `$tmp` (or an `mv` failure, e.g. the parent directory
-  disappearing mid-run) aborts the script uncommunicatively right there, after the hold has
-  already been opened but before this dispatcher has durably recorded that it did so — leaving a
-  real, open hold with no corresponding `hold-history.json` entry, invisible to a later restart's
-  rejected-and-unchanged check. Suggested fix: capture each command's own `rc=$?` explicitly and
-  escalate on nonzero, the identical idiom already applied throughout this section.
+- **Section 6's `bin/hold.py hold --task "$batch_id" --q ... --entries-file "$entries_file"` (the
+  "open a new one" step) is a bare call under `set -e`, with no `rc=$?` capture.** `hold.py hold`
+  can genuinely fail (e.g. a malformed or missing entries file, or the same kind of ledger I/O
+  error already confirmed live for `hold.py open`/`claim-ledger.py status` elsewhere in this
+  section) and the bare, unguarded call aborts the whole script right there with a raw error
+  instead of relaying the failure to the human verbatim. Suggested fix: `rc_hold=0; bin/hold.py
+  hold ... || rc_hold=$?`, escalate on `rc_hold != 0`, the identical idiom already applied
+  throughout this section.
 
 ## Proposed secondmate SKILL.md amendment (HUMAN-OWNED — apply by hand)
 
