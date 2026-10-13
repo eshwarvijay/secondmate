@@ -167,7 +167,14 @@ def collect_curation(lessons_dir, ledger_path):
     lessons_path = pathlib.Path(lessons_dir)
     if not lessons_path.is_dir():
         raise FileNotFoundError(f"lessons directory not found: {lessons_dir}")
-    md_files = sorted(lessons_path.rglob('*.md'))
+    # Only real FILES are lessons: a filesystem entry that merely matches '*.md' by name -- e.g. a
+    # directory called "not-a-lesson.md" -- must never become a report row (it would read 0/0/0
+    # and, on a ledger with >= 10 rows, flip to a false retire-candidate). The reused
+    # load_lessons() independently skips unreadable entries with its own read-failure warning;
+    # this is_file() filter is the report-side guarantee, at the one place this file discovers
+    # lesson entries (every other path -- the loader, the diagnoser -- only ever sees entries
+    # that came through here or already skip unreadable ones themselves).
+    md_files = sorted(p for p in lessons_path.rglob('*.md') if p.is_file())
 
     # The one parse pass: the real loader. It warns on (and skips) unparseable/unreadable files;
     # the loop below detects those via its own listing and adds this tool's precise warning.
@@ -555,6 +562,21 @@ def selfcheck():
         rows = _rows(out)
         _assert_row(rows, 'fresh/never-looked-up', 'keep', '1', '0', '0')
         assert err == '', f"a missing ledger is the fresh state, not a warning:\n{err}"
+
+        # --- Scenario H: a filesystem entry that is a DIRECTORY whose name ends in ".md" is not a
+        #     lesson -- it must produce NO report row at all (an unfiltered name-match walk would
+        #     read it as 0/0/0 and, with >= 10 ledger rows, flip it to a false retire-candidate).
+        lessons, ledger = _scenario()
+        _lesson(lessons, 'real/lesson', helpful=1, harmful=0)
+        (pathlib.Path(lessons) / 'sneaky' / 'not-a-lesson.md').mkdir(parents=True)  # a DIRECTORY
+        _ledger(ledger, [['real/lesson']])
+        rc, out, err = _run_report()
+        assert rc == 0, f"--report must exit 0 (got {rc}); stderr: {err}"
+        rows = _rows(out)
+        assert 'sneaky/not-a-lesson' not in rows and len(rows) == 1, (
+            f"a directory named like a lesson must produce NO report row "
+            f"(not even a 0/0/0 one): {rows}")
+        _assert_row(rows, 'real/lesson', 'keep', '1', '0', '1')
 
         print("ok")
         return 0
