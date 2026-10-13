@@ -112,10 +112,11 @@ classes (A) and (B) into each other. Capture first, decide second.
   directly).
 - `ps -o stat= -p <pid>` — `{0,1}`: `0` found (state printed), `1` no such process (empty stdout).
   Confirmed live that this exit/output signature is IDENTICAL whether the PID is a genuinely dead
-  (but well-formed) process or the sidecar content is not a PID at all (e.g. `"not-a-pid"`) — `ps`
-  cannot tell these apart, so the PID-sidecar's own content must be validated as `^[0-9]+$` BEFORE
-  ever calling `ps` on it (see section 5). Confirmed live separately: a missing `ps` binary on
-  `PATH` exits `127`, outside `{0,1}` — genuinely unexpected, must escalate.
+  (but well-formed) process or the sidecar content is not a PID at all (e.g. `"not-a-pid"`, or even
+  `"0"` — never a valid spawnable child PID) — `ps` cannot tell these apart, so the PID-sidecar's
+  own content must be validated as `^[1-9][0-9]*$` (a positive integer, not merely digits-only)
+  BEFORE ever calling `ps` on it (see section 5). Confirmed live separately: a missing `ps` binary
+  on `PATH` exits `127`, outside `{0,1}` — genuinely unexpected, must escalate.
 - `grep` (any form used in this file) — `{0,1}` is the normal "match found / no match" contract;
   `2` is a real error (confirmed live: a missing or unreadable target file exits `2` with a message
   on stderr, distinct from the "zero matches" exit `1`). When `grep` reads from a pipe or an
@@ -188,8 +189,8 @@ shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below)
    plain text is a valid target.
 4. Exit with `dispatch-report.py`'s own exit code **verbatim** — never a raw bash `$?` from the
    `claude -p` process itself (that reflects the CLI's own exit status, not the parsed completion
-   tag). This is also the exit code the dispatcher's own `kill -0`/reap sees (section 5), since
-   steps 1–4 all run inside the one PID it is tracking.
+   tag). This is also the exit code the dispatcher's own `ps -o stat=`-based liveness check and
+   `wait`-based reap see (section 5), since steps 1–4 all run inside the one PID it is tracking.
 
 **Outputs:** `.secondmate/dispatch/<task-id>.jsonl` (raw) and `.secondmate/dispatch/<task-id>.final.txt`
 (extracted plain text), both written by `spawn-sub-sup.sh` itself. `.secondmate/dispatch/<task-id>.pid`
@@ -259,26 +260,30 @@ valid-looking echoed example), blindly taking either the first or the last can s
 WRONG one — and releasing the claim with a wrong token fails, leaving a successfully merged
 task's claim stuck open forever with no further signal that anything went wrong.
 
-So the dispatcher does not guess between head/tail at all. It counts the matching lines in
-`.final.txt` FIRST, directly off `grep`'s own line count — never through a value-bearing
-intermediate variable — using the idiom above (`grep` here reads a real FILE, not a pipe or an
+So the dispatcher does not guess between head/tail at all, and does not pipe through a second
+external tool to extract the value either. ONE `grep` call captures the matching lines' raw
+content; both the count and the extraction are then pure bash — no `cut`, no `sed`, no second
+process, and no second exit code to classify (`grep` here reads a real FILE, not a pipe or an
 in-memory string, so its full `{0,1,2}` contract applies and a genuine file-read failure, exit `2`,
 must be told apart from "zero matches," exit `1`):
 ```bash
 rc_g=0
-n=$(grep -c '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt") || rc_g=$?
+matched=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt") || rc_g=$?
 if [ "$rc_g" -ne 0 ] && [ "$rc_g" -ne 1 ]; then
   : # ESCALATE to the human verbatim (task-id, "$rc_g") -- e.g. exit 2, the file vanished or became
     # unreadable; NEVER silently treated as "zero matches"
+elif [ "$rc_g" -eq 1 ]; then
+  n=0  # grep's documented "zero matches" exit -- n legitimately 0, $matched is empty
 else
-  [ "$rc_g" -eq 1 ] && n=0  # grep's documented "zero matches" exit -- n legitimately 0
+  newlines="${matched//[^$'\n']/}"   # strip everything except newline characters
+  n=$(( ${#newlines} + 1 ))          # line count = internal-newline count + 1
   if [ "$n" -eq 1 ]; then
-    token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | cut -d: -f2-)
+    token="${matched#SM_CLAIM_TOKEN:}"   # strip the known prefix -- pure bash, no external tool
   fi
 fi
 ```
-Two mechanical shell-correctness details, both load-bearing, both live-verified:
-- **`grep -c`'s own exit code must be captured and classified, never blanket `|| true`.** Under a
+Three mechanical shell-correctness details, all load-bearing, all live-verified:
+- **`grep`'s own exit code must be captured and classified, never blanket `|| true`.** Under a
   normal strict shell (`set -euo pipefail`, which a real dispatcher script should run under),
   `grep` exits `1` on zero matches; with `pipefail` that fails the whole assignment and `set -e`
   then aborts the script *before* it ever reaches the "zero matches → escalate" branch below if
@@ -288,17 +293,24 @@ Two mechanical shell-correctness details, both load-bearing, both live-verified:
   silently misreporting a real I/O problem as "zero `SM_CLAIM_TOKEN:` lines found." The capture
   above distinguishes `rc_g == 1` (legitimately `n=0`) from any other nonzero (escalate, never
   treated as `n=0`).
-- **Counting must happen on `grep`'s own match lines, never on a `cut`-derived, `$()`-captured
-  value.** An earlier draft counted `cut -d: -f2-`'s *output* via `printf '%s\n' "$tokens" | grep
-  -c .` — this undercounts whenever one of the matching lines has an EMPTY value after the colon
-  (e.g. a malformed `SM_CLAIM_TOKEN:` with nothing after it): `cut`'s output for that line is an
-  empty string, and command substitution (`$(...)`) strips ALL trailing newlines from its captured
-  value, so a trailing empty line silently vanishes from `$tokens` before it's ever counted.
-  Confirmed live: two real matching lines (`SM_CLAIM_TOKEN:abc123` and a second, empty-valued
-  `SM_CLAIM_TOKEN:`) counted as `n=1` through the old path, not 2 — the multiple-line escalation
-  never triggered, and the (wrong, since ambiguous) sole surviving token got used. Counting
-  `grep -c`'s own matched LINES directly, before any `cut`, has no such information loss and
-  correctly reported `n=2` for the identical input.
+- **Counting must happen on `grep`'s own RAW matched lines, never on a `cut`-derived,
+  `$()`-captured value — eliminating `cut` is what makes this safe, not another classification
+  branch for it.** An earlier draft counted `cut -d: -f2-`'s *output* via `printf '%s\n' "$tokens"
+  | grep -c .` — this undercounts whenever one of the matching lines has an EMPTY value after the
+  colon (e.g. a malformed `SM_CLAIM_TOKEN:` with nothing after it): `cut`'s output for that line is
+  an empty string, and command substitution (`$(...)`) strips ALL trailing newlines from its
+  captured value, so a trailing empty line silently vanishes before it's ever counted. The fix
+  here isn't a smarter count of `cut`'s output — it's never running `cut` at all: `$matched` holds
+  `grep`'s own RAW lines (e.g. `SM_CLAIM_TOKEN:abc123` and, for the empty-valued case,
+  `SM_CLAIM_TOKEN:` itself — neither of which is an empty STRING, just a short one), so counting
+  the internal newline characters directly in `$matched` via `${matched//[^$'\n']/}` has no such
+  information loss. Confirmed live: two real matching lines (`SM_CLAIM_TOKEN:abc123` and a second,
+  empty-valued `SM_CLAIM_TOKEN:`) correctly counted as `n=2` through this path.
+- **Extraction is `${matched#SM_CLAIM_TOKEN:}` — bash's own prefix-stripping parameter expansion —
+  never a second `grep | cut` pipeline.** Once `n == 1` is confirmed, `$matched` already holds
+  that single matching line in full; stripping the known, fixed `SM_CLAIM_TOKEN:` prefix is a
+  one-line bash builtin with no process to spawn and no exit code to ever go wrong. Confirmed
+  live: extracted `0dbc8e60868590c9731bf171f37826a7` correctly from a real matching line this way.
 
 Then branch on `n`:
 - **`n` is exactly 1** — **validate the extracted value's shape before using it, do not just
@@ -340,8 +352,11 @@ while true; do
     : # ESCALATE: an exit code outside stale's own documented {0,1} -- e.g. a dispatcher-own usage
       # bug (bad --threshold-seconds). Never treated as "0 hits."
   fi
-  # the .pid sidecar liveness check (section 1/5) is the ALWAYS-available signal, no herdr required —
-  # poll it here too, non-blocking (kill -0), for any task-id whose .final.txt hasn't appeared yet
+  # the .pid sidecar liveness check (section 5's zombie-aware `ps -o stat=` check, NOT a bare
+  # `kill -0` -- kill -0 cannot tell a zombie from a running process, the exact bug rounds 9-10
+  # already fixed in section 5) is the ALWAYS-available signal, no herdr required -- poll it here
+  # too, non-blocking, reusing section 5's check verbatim, for any task-id whose .final.txt hasn't
+  # appeared yet
   if command -v herdr >/dev/null 2>&1; then
     rc_obs=0
     bin/pane-reaper.py observe || rc_obs=$?
@@ -465,24 +480,32 @@ liveness FIRST, not `.final.txt` presence first:**
    immediately but was deliberately left unreaped — `ps -o stat=,command= -p <pid>` reported
    `Z    <defunct>` while `kill -0 <pid>` on that same PID still returned success (exit 0).
 
-   **Before any of that, validate the sidecar's own content is actually a PID — digits only —
-   BEFORE ever calling `ps` on it.** `ps -o stat= -p <pid>` returns the IDENTICAL signature (exit
-   `1`, empty stdout) for "this well-formed PID doesn't exist" and for "this content isn't a PID
-   at all" (confirmed live: `ps -o stat= -p "not-a-pid"` and `ps -o stat= -p 88888` — a genuinely
-   dead, well-formed PID — both gave `rc_ps=1` and empty `$state`, byte-for-byte indistinguishable).
-   A corrupted or truncated `.pid` sidecar (partial write, disk issue, a bug elsewhere writing the
-   wrong thing) must never be silently treated as "the task's process legitimately finished" —
-   that is a DIFFERENT, more serious anomaly than a normal exit:
+   **Before any of that, validate the sidecar's own content is actually a PID — a positive
+   integer, not just digits-only — BEFORE ever calling `ps` on it.** `ps -o stat= -p <pid>` returns
+   the IDENTICAL signature (exit `1`, empty stdout) for "this well-formed PID doesn't exist" and
+   for "this content isn't a PID at all" (confirmed live: `ps -o stat= -p "not-a-pid"` and
+   `ps -o stat= -p 88888` — a genuinely dead, well-formed PID — both gave `rc_ps=1` and empty
+   `$state`, byte-for-byte indistinguishable). A corrupted or truncated `.pid` sidecar (partial
+   write, disk issue, a bug elsewhere writing the wrong thing) must never be silently treated as
+   "the task's process legitimately finished" — that is a DIFFERENT, more serious anomaly than a
+   normal exit. `^[0-9]+$` (digits-only) is not tight enough: it still accepts `"0"`, which is
+   never a valid spawnable child PID (PID 0 has special kernel meaning and is never what `$!`
+   returns for a real forked process) — confirmed live, `"0"` matches `^[0-9]+$` just as readily as
+   a genuine PID does. The real validation is `^[1-9][0-9]*$` — a positive integer, no leading
+   zero, and never literal `0`:
    ```bash
    sidecar_pid=$(cat ".secondmate/dispatch/${task_id}.pid" 2>/dev/null)
-   if ! [[ "$sidecar_pid" =~ ^[0-9]+$ ]]; then
-     : # ESCALATE: corrupted/malformed .pid sidecar — never call ps on this, never treat as "not alive"
+   if ! [[ "$sidecar_pid" =~ ^[1-9][0-9]*$ ]]; then
+     : # ESCALATE: corrupted/malformed .pid sidecar (incl. literal "0") — never call ps on this,
+       # never treat as "not alive"
    else
      pid="$sidecar_pid"
      # proceed to the ps-based liveness check below
    fi
    ```
-   Only once `$pid` is confirmed to be a well-formed positive integer does the check below run.
+   Confirmed live: `"0"`, a leading-zero string (`"007"`), and `"not-a-pid"` are all correctly
+   rejected by `^[1-9][0-9]*$`, while a genuine PID (`"88888"`) is correctly accepted. Only once
+   `$pid` is confirmed to be a well-formed positive integer does the check below run.
 
    So the check is `ps -o stat= -p <pid>` (portable across Linux and macOS/BSD), not `kill -0`
    alone — **and the `ps` call itself must be guarded under strict mode, but a blanket `|| true`
@@ -514,6 +537,11 @@ liveness FIRST, not `.final.txt` presence first:**
      ```bash
      rc=0
      wait "$pid" 2>/dev/null || rc=$?
+     if [ "$rc" -gt 4 ]; then
+       : # ESCALATE independently of whatever .final.txt separately claims. An unexpected reaped
+         # exit code (e.g. 42) is itself evidence something is wrong -- never fall through to
+         # trusting the final-text file's own classification regardless of what $rc actually was.
+     fi
      ```
      This capture is required, not optional: `wait "$pid"` returns the REAPED CHILD's own exit
      status (e.g. `4` for `SM_READY_UNMERGED`), and under `set -e` a bare `wait "$pid"` call with
@@ -521,13 +549,20 @@ liveness FIRST, not `.final.txt` presence first:**
      treating `$rc` as `spawn-sub-sup.sh`'s terminal dispatch-report code and continuing (confirmed
      live: a bare `wait "$pid"` on a child that exited `4` killed the whole script with exit `4`,
      never reaching code after it; capturing via `rc=0; wait "$pid" || rc=$?` instead correctly
-     recorded `rc=4` and let the script continue). `waitpid()` itself still returns immediately
-     (0.000s, confirmed live) for an already-exited child — it only blocks for a genuinely
-     still-running child, which is not this branch. A restarted dispatcher cannot `wait` on a PID
-     it never forked and does not need to: once the original parent process is truly gone, the
-     kernel reparents any zombie it left behind to init/launchd, which reaps it on its own — the
-     "not alive" classification above is already correct regardless of who, if anyone, performs
-     the explicit reap.
+     recorded `rc=4` and let the script continue). But capturing `$rc` is not the same as trusting
+     it blindly: `spawn-sub-sup.sh`'s own documented exit set is `{0,1,2,3,4}` (see "Strict-mode
+     exit-code discipline" above) — a reaped `$rc` outside that set must escalate ON ITS OWN,
+     independent of whatever `.final.txt` separately claims. Without the explicit `-gt 4` check
+     above, an unexpected code (e.g. `42`) would fall through with NO escalation at all, and the
+     dispatcher would go on to trust the final-text file's own classification regardless of what
+     the reaped process actually exited with — even though a child exiting a code its own contract
+     never defines is itself evidence something is wrong, whatever the final text superficially
+     says. `waitpid()` itself still returns immediately (0.000s, confirmed live) for an
+     already-exited child — it only blocks for a genuinely still-running child, which is not this
+     branch. A restarted dispatcher cannot `wait` on a PID it never forked and does not need to:
+     once the original parent process is truly gone, the kernel reparents any zombie it left behind
+     to init/launchd, which reaps it on its own — the "not alive" classification above is already
+     correct regardless of who, if anyone, performs the explicit reap.
    - **`$state` is any other, non-empty, non-`Z` value** (a real running state) — still running;
      poll again next cycle, regardless of whether `.final.txt` already exists.
 
@@ -610,8 +645,41 @@ which task-ids belong to the batch in the first place.
 
 ## 6. One consolidated hold
 
-Same shape as `skills/secondmate/SKILL.md`'s batch dispatch step (g)–(h): write a JSON entries
-file, one object per ready task-id —
+**Before building the entries file: filter `ready`'s output through `claim-ledger.py status`'s
+currently-OPEN claims — a task-id whose claim is already gone must never be re-included.**
+`progress-ledger.py`'s ledger rows are never deleted, so once a batch task-id reaches
+`verify_gate_pass`, `bin/progress-ledger.py ready --batch-id <batch-id>` reports that SAME row
+forever, even long after that task-id was merged, its claim released, and its worktree torn down
+in a prior round of this same batch. If the dispatcher process restarts after that point and
+re-runs its batch-close logic, it would recompute the ready set from the ledger alone and open a
+SECOND consolidated hold entry for an already-merged, already-answered, already-torn-down task-id.
+`skills/secondmate/SKILL.md`'s own batch-dispatch step (e) already documents the fix for exactly
+this: "Cross-check against `bin/claim-ledger.py status`'s own currently-OPEN claims too — anything
+already merged and released from a prior round of this same batch drops out on its own, since its
+claim is gone." Carry that same cross-check into this skill's own batch-close concretely:
+```bash
+open_claims_output=$(bin/claim-ledger.py status)
+# status's own contract is binary like hold.py open: 0 = success, always, even with zero open
+# claims (confirmed live: "(no open claims)" to stderr, exit 0) -- no classification needed here,
+# unlike `ready`, which the parent skill's own fan-out section documents as "always exits 0" too.
+ready_output=$(bin/progress-ledger.py ready --batch-id "$batch_id")
+entries_task_ids=()
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  tid=$(printf '%s' "$line" | jq -r '.task_id')
+  if printf '%s\n' "$open_claims_output" | grep -qF "[$tid] "; then
+    entries_task_ids+=("$tid")  # claim still open -- keep, this task-id genuinely awaits this hold
+  fi
+  # else: claim already gone -- already merged/answered/torn down in a prior round of this same
+  # batch. DROP it. Never re-include a task-id whose claim-ledger entry is already closed.
+done <<< "$ready_output"
+```
+Confirmed live: simulated a two-task-id batch where `t1` was already merged and its claim released
+in a prior round while `t2` was still pending — `ready --batch-id` kept reporting BOTH `t1` and
+`t2` (ledger rows never deleted, exactly the bug surface), but `claim-ledger.py status` reported
+only `t2` as open; the filter above correctly dropped `t1` and kept only `t2`.
+
+Then write the JSON entries file, one object per task-id that survived the filter above —
 ```json
 [{"task_id": "...", "checked_sha": "...", "checker_verdict_path": "..."}, ...]
 ```
@@ -623,14 +691,12 @@ duplicate hold for the same batch (confirmed live: running the identical `hold.p
 --entries-file ...` call twice in a row produced two distinct open hold ids, both still open).
 So, before opening a hold, check whether one already exists for this batch — guarded, since the
 ordinary "no open hold yet" case (the normal first-batch-close path, not an error) still has to
-survive under strict mode. **But `hold.py open`'s own exit code and the downstream `grep`'s own
-exit code must be captured SEPARATELY, never collapsed into one blanket `|| true` on the whole
-pipeline** — `hold.py open` itself can genuinely fail (confirmed live: pointed `SM_HOLD_LEDGER` at
-a directory instead of a file, a real ledger I/O error, and `hold.py open` crashed with an
-unhandled `IsADirectoryError` and exited `1` — the SAME exit code `grep` uses for its own, entirely
-different and legitimate "zero matches" case). A single blanket guard around the whole pipeline
-cannot tell these two `1`s apart, so a genuine `hold.py open` failure would silently look identical
-to "no existing hold" and fall through into opening a brand-new hold on top of an unresolved tool
+survive under strict mode. **But `hold.py open`'s own exit code and the match-search below must be
+captured SEPARATELY, never collapsed into one blanket `|| true`** — `hold.py open` itself can
+genuinely fail (confirmed live: pointed `SM_HOLD_LEDGER` at a directory instead of a file, a real
+ledger I/O error, and `hold.py open` crashed with an unhandled `IsADirectoryError` and exited `1`).
+Collapsing both into one guard would make a genuine `hold.py open` failure look identical to "no
+existing hold" and fall through into opening a brand-new hold on top of an unresolved tool
 failure. Run `hold.py open` on its own line first, capturing its OWN exit code:
 ```bash
 rc_open=0
@@ -641,24 +707,27 @@ hold_output=$(bin/hold.py open) || rc_open=$?
   top of an unresolved failure.
 - **`rc_open` is `0`** — `hold.py open` succeeded (confirmed live: it exits `0` even when it finds
   zero open holds, printing `(no open decisions)` to stderr). Only now is it safe to search its
-  captured output for a match, and now a `grep` no-match really does mean "no existing hold," not
-  a swallowed tool failure:
+  captured output for a match. `hold.py open`'s own output format is `[<id>] (<task>) <question>`
+  per open hold — a known, fixed shape (strip the leading `[`, take everything up to the first
+  `]`), simple enough to extract with pure bash parameter expansion instead of an external-tool
+  pipeline (`grep`/`head`/`sed`), eliminating the whole class of "what if `sed`/`head` itself fails
+  unexpectedly" findings rather than adding another `rc=$?` branch for yet another tool:
   ```bash
-  existing_id=$(printf '%s\n' "$hold_output" | grep -F "(<batch-label>)" | head -1 | sed -E 's/^\[([^]]+)\].*/\1/' || true)
+  existing_id=""
+  while IFS= read -r line; do
+    if [[ "$line" == "["*"] (<batch-label>)"* ]]; then
+      existing_id="${line#\[}"      # strip the leading "["
+      existing_id="${existing_id%%\]*}"  # keep everything before the first "]"
+      break
+    fi
+  done <<< "$hold_output"
   ```
-  The `|| true` here is scoped to exactly one thing: `grep`'s own "zero matches" exit `1` on
-  `hold.py open`'s ALREADY-CONFIRMED-SUCCESSFUL output — never a stand-in for `hold.py open`'s own
-  exit code, which was captured and checked separately above. This is honestly sufficient per the
-  idiom table above: `grep` here reads a `printf`-captured STRING, never a filename, so its real
-  `{0,1,2}` contract collapses to `{0,1}` at this call site — there is no file for it to fail to
-  find. Confirmed live: this two-step split correctly proceeded to "no existing hold" on a genuine
-  zero-open-holds case, and correctly escalated instead of silently proceeding on the simulated
-  ledger-I/O-error case — both exercised against the real `hold.py` binary.
+  No external tool runs in this extraction at all — `[[ ... ]]` and `${...}` are bash builtins, so
+  there is no second exit code to capture or classify here; the only exit code that mattered was
+  `hold.py open`'s own, already handled above. Confirmed live against the real
+  `[dcfa5ec7] (batch-abc123) merge which of: t1?` output shape: correctly extracted `dcfa5ec7` when
+  the batch label matched, and correctly left `existing_id` empty when no line matched.
 
-`hold.py open`'s own output format is `[<id>] (<task>) <question>` per open hold (confirmed by
-reading its `open` command source directly, and by running it live: it printed exactly
-`[dcfa5ec7] (batch-abc123) merge which of: t1?`), so matching on `(<batch-label>)` finds any open
-hold whose `task` field is this batch's own `--task` string.
 - **A matching open hold is found** (`$existing_id` is non-empty) — reuse its id; do NOT call
   `hold.py hold` again. Just keep waiting for a human to answer that existing hold.
 - **No matching open hold is found** (`$existing_id` is empty) — only then open a new one:
