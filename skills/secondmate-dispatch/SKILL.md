@@ -45,6 +45,11 @@ file — it is not reproduced here beyond this pointer summary:
   (batch only) stop at `SM_READY_UNMERGED` instead of self-merging → release claim (solo) or leave
   it open (batch, until the consolidated hold is answered) → emit exactly one completion tag.
   See that section for the exact `claim-ledger.py`/`progress-ledger.py` invocations at each step.
+- **One explicit exception to "unchanged": Spawn.** When this external dispatcher does the
+  spawning, it has already created the worktree and `cd`'d into it before `claude -p` even starts
+  (section 1) — the sub-supervisor's own copy of the parent SOP's Spawn step must not create a
+  second one. See section 1's "Spawn is the one overridden step" below for the exact override to
+  put in the sub-supervisor's prompt.
 
 Everything below is what is genuinely different when the dispatcher is an external OS process.
 
@@ -155,12 +160,33 @@ runs `claude -p` **synchronously**, in its own foreground (e.g. piping its outpu
 and blocking on it), then does extraction and `dispatch-report.py` itself, then exits with that
 code — there is no second, inner process to ever confuse with the one being tracked.
 
+**Every shared dispatch artifact below — the manifest, the `.pid` sidecar, the `stream-json` log,
+the extracted `.final.txt`, and the batch manifest — is addressed by an ABSOLUTE path, never a bare
+`.secondmate/dispatch/<task-id>.foo` that silently changes meaning depending on the caller's current
+working directory.** Two different processes touch these files from two different working
+directories over a single task's lifetime: the dispatcher itself, and the sub-supervisor's own
+`spawn-sub-sup.sh`/`claude -p` process, which — per step 0 below — `cd`s into the task's worktree
+before anything else runs. A relative path resolves against WHICHEVER of those happens to be the
+current process's CWD at that moment — silently wrong, landing inside the worktree instead of the
+primary repo, for anything written after that `cd` (the `.jsonl`/`.final.txt` writes in steps 1–2
+below, and the checker-pane-id patch below). Confirmed live: a throwaway script that `cd`'d into a
+scratch "worktree" directory and then wrote to the bare relative path `.secondmate/dispatch/x.txt`
+created that file INSIDE the scratch directory, invisible to a separate process still watching the
+original directory's `.secondmate/dispatch/x.txt` — the exact failure this fixes. The dispatcher
+resolves one absolute variable, `dispatch_dir`, once, before fanning out anything — e.g.
+`dispatch_dir="$(git -C <repo> rev-parse --show-toplevel)/.secondmate/dispatch"` — and every path
+below that mentions `.secondmate/dispatch/<id>.foo` means `"$dispatch_dir/<id>.foo"`, passed through
+explicitly, never re-derived from an assumed CWD.
+
 **Invocation (by the dispatcher, backgrounding `spawn-sub-sup.sh` itself):**
 ```bash
-bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir .secondmate/dispatch \
+bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir "$dispatch_dir" \
   --worktree "$worktree_path" &
-echo $! > ".secondmate/dispatch/<task-id>.pid"
+echo $! > "$dispatch_dir/<task-id>.pid"
 ```
+`--log-dir` is passed as the already-absolute `$dispatch_dir`, not a relative literal — this is the
+one value `spawn-sub-sup.sh` carries forward into steps 1–2 below (bound there as `$log_dir`),
+unaffected by its own step-0 `cd`.
 PID bookkeeping now lives with the **dispatcher**, not inside the script: the dispatcher
 backgrounds the one process whose whole lifecycle matters and captures `$!` as its very next
 action, immediately after backgrounding it — the same idiom as before, just relocated to the
@@ -211,8 +237,8 @@ jq -n --arg task_id "<task-id>" --arg worktree_path "$worktree_path" \
   '{task_id: $task_id, worktree_path: $worktree_path,
     workspace_id: ($workspace_id | select(. != "") // null),
     root_pane_id: ($root_pane_id | select(. != "") // null),
-    checker_pane_id: null}' > ".secondmate/dispatch/<task-id>.manifest.json.tmp"
-mv ".secondmate/dispatch/<task-id>.manifest.json.tmp" ".secondmate/dispatch/<task-id>.manifest.json"
+    checker_pane_id: null}' > "$dispatch_dir/<task-id>.manifest.json.tmp"
+mv "$dispatch_dir/<task-id>.manifest.json.tmp" "$dispatch_dir/<task-id>.manifest.json"
 ```
 An empty/unset `workspace_id` or `root_pane_id` (the headless path) correctly serializes to JSON
 `null`, not an empty string — confirmed live: `jq -r '.workspace_id'` on a `null` field prints the
@@ -226,14 +252,23 @@ what was written, with no in-memory state involved at all.
 file immediately after the split call — this is the one, concrete step that actually performs the
 update an earlier draft only described in prose without ever showing it.** The split itself is
 `skills/secondmate/SKILL.md`'s own documented call (confirmed by reading its "Checker pane" recipe
-directly): `ck=$(bin/herdr-pane.sh split --pane <root_pane_id> --dir down)`. Right after that line
-returns `$ck`, patch the manifest atomically — same temp-file + `mv` idiom as the original write,
-never a direct in-place edit:
+directly): `ck=$(bin/herdr-pane.sh split --pane <root_pane_id> --dir down)` — run by the
+sub-supervisor's OWN running session, which (per step 0 below) has already `cd`'d into the
+worktree. So this patch must address the manifest by the SAME absolute path the dispatcher wrote
+it to, never a relative one re-derived from this session's own (now worktree-rooted) CWD: right
+after `$ck` is returned, patch the manifest atomically — same temp-file + `mv` idiom as the
+original write, never a direct in-place edit:
 ```bash
 jq --arg checker_pane_id "$ck" '.checker_pane_id = $checker_pane_id' \
-  ".secondmate/dispatch/<task-id>.manifest.json" > ".secondmate/dispatch/<task-id>.manifest.json.tmp"
-mv ".secondmate/dispatch/<task-id>.manifest.json.tmp" ".secondmate/dispatch/<task-id>.manifest.json"
+  "$dispatch_dir/<task-id>.manifest.json" > "$dispatch_dir/<task-id>.manifest.json.tmp"
+mv "$dispatch_dir/<task-id>.manifest.json.tmp" "$dispatch_dir/<task-id>.manifest.json"
 ```
+Since this session has no way to recover `$dispatch_dir` on its own after `cd`-ing into the
+worktree (it is not an env var or flag the parent SOP itself knows about), the dispatcher must bake
+this literal absolute path directly into the `--prompt-file` text it writes for this task-id, as
+part of describing this one patch step — the same way it must bake the Spawn override in (see
+"Spawn is the one overridden step" below).
+
 No other step in this file ever performs this update — if a deployment never splits a checker
 pane (the common headless case), `checker_pane_id` legitimately stays `null` forever, and nothing
 elsewhere should assume otherwise. Section 4's watchdog (below) re-reads this field fresh every
@@ -242,8 +277,9 @@ watchdog on its very next iteration after the split, with no restart required.
 
 **Inputs:** a `--task-id` (validated by the dispatcher before the call — see Discipline below), a
 `--prompt-file` holding the full sub-supervisor prompt (claim → SOP → completion tag, same prompt
-shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), a `--log-dir`,
-and a `--worktree <path>` — the SAME pre-created worktree path the dispatcher just wrote into this
+shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), a `--log-dir`
+(the dispatcher's own absolute `$dispatch_dir`, never a relative path — see above), and a
+`--worktree <path>` — the SAME pre-created worktree path the dispatcher just wrote into this
 task-id's manifest above (`$worktree_path`/`$wt`), passed through explicitly rather than assumed.
 **This input is required, not optional:** without it, nothing in this contract ever tells the
 spawned `claude -p` process to run from the worktree the dispatcher already created for it — as
@@ -253,19 +289,45 @@ recipe here passes paths through explicitly, never relies on an unstated ambient
 `spawn-sub-sup.sh` to `cd` into `--worktree` itself, as the literal first action, before anything
 else — see step 0 below.
 
+**Spawn is the one overridden step.** `skills/secondmate/SKILL.md`'s own Spawn step (step 2 of its
+SOP) ALSO creates a worktree — via `herdr worktree create` or `new-worktree.sh` — because in the
+ordinary in-session case nothing has created one yet when that step runs. Here the opposite is
+true: this dispatcher (above, "Before backgrounding...") already created the worktree, and
+`spawn-sub-sup.sh` has already `cd`'d into it (step 0 below) before `claude -p` even starts. A
+sub-supervisor that ran the parent SOP's Spawn step completely unmodified would try to create a
+SECOND worktree on the same branch/path and fail outright before getting anywhere else. Confirmed
+live: running `new-worktree.sh`'s own underlying `git worktree add -b <branch> <path> <base>` a
+second time against a branch/path pair a prior call had already created failed with `fatal: a
+branch named '<branch>' already exists` and a nonzero exit — the sub-supervisor would die on its
+own Spawn step, never reaching Plan Committee or anything after it.
+
+So every sub-supervisor prompt this dispatcher writes to `--prompt-file` must say, for Spawn
+specifically and ONLY Spawn: do not call `herdr worktree create` or `new-worktree.sh` — this
+process is already running from the correct worktree (its own CWD, per step 0 below); instead,
+read `"$dispatch_dir/<task-id>.manifest.json"` (the dispatcher-written absolute path from above)
+for the `worktree_path`, `root_pane_id`, and `workspace_id` this dispatcher already recorded, and
+treat Spawn as already complete. Every other step of the parent SOP — Plan Committee, Triage,
+Guard, Check, Gate, Hold, Integrate, Teardown — runs completely unchanged, exactly as
+`skills/secondmate/SKILL.md` already documents it. The sub-supervisor's own session cannot recover
+`$dispatch_dir` any other way after this `cd` (it is not an env var or flag the parent SOP itself
+knows about), so this literal absolute path must be baked directly into the generated prompt text,
+not left for the sub-supervisor to re-derive.
+
 **Behavior, in order (inside `spawn-sub-sup.sh` itself, all synchronous):**
 0. `cd` into `--worktree` — the VERY FIRST action, before `claude -p` or anything else runs. Every
    subsequent step, including the `claude -p` invocation itself, runs with this as the working
    directory, so the sub-supervisor's whole claim → SOP → completion-tag run happens inside the
-   worktree the dispatcher already created for it, never the dispatcher's own ambient CWD.
+   worktree the dispatcher already created for it, never the dispatcher's own ambient CWD. This
+   `cd` does NOT affect `$log_dir` (bound from the already-absolute `--log-dir` input) — steps 1–2
+   below address artifacts through that absolute value, never a path relative to this new CWD.
 1. Run `claude -p --output-format stream-json` for that task-id and prompt, in the foreground,
-   piping its output through `tee` to `.secondmate/dispatch/<task-id>.jsonl` as it streams, and
+   piping its output through `tee` to `"$log_dir/<task-id>.jsonl"` as it streams, and
    **block until that invocation exits.** Never `--continue` or `--resume` — every sub-supervisor
    must start with zero inherited context, the exact same "Agent tool, never fork" discipline
    `skills/secondmate/SKILL.md` already requires for the in-session case, just enforced via process
    flags instead of a tool-call parameter.
 2. Once `claude -p` has exited, extract the final assistant message's plain-text content out of
-   the `.jsonl` log into `.secondmate/dispatch/<task-id>.final.txt`.
+   the `.jsonl` log into `"$log_dir/<task-id>.final.txt"`.
 3. Run `bin/dispatch-report.py` against that `.final.txt` file — **never** the raw `.jsonl`.
    `dispatch-report.py`'s own completion-tag regex is anchored at the start of a line; a completion
    tag that happens to appear inside a JSON string value in the raw stream (e.g. quoted inside a
@@ -276,10 +338,10 @@ else — see step 0 below.
    tag). This is also the exit code the dispatcher's own `ps -o stat=`-based liveness check and
    `wait`-based reap see (section 5), since steps 1–4 all run inside the one PID it is tracking.
 
-**Outputs:** `.secondmate/dispatch/<task-id>.jsonl` (raw) and `.secondmate/dispatch/<task-id>.final.txt`
-(extracted plain text), both written by `spawn-sub-sup.sh` itself. `.secondmate/dispatch/<task-id>.pid`
-(liveness sidecar) is written by the **dispatcher**, not by `spawn-sub-sup.sh` — see the invocation
-recipe above.
+**Outputs:** `"$log_dir/<task-id>.jsonl"` (raw) and `"$log_dir/<task-id>.final.txt"`
+(extracted plain text) — both absolute, written by `spawn-sub-sup.sh` itself.
+`"$dispatch_dir/<task-id>.pid"` (liveness sidecar, the same absolute directory as `$log_dir`) is
+written by the **dispatcher**, not by `spawn-sub-sup.sh` — see the invocation recipe above.
 
 **Exit code:** `dispatch-report.py`'s own exit code, relayed unchanged — the full set is
 0/1/2/3/4: `0` = `SM_DONE_MERGED` (integration already done), `1` = `SM_REFUSED` (relay the reason),
@@ -293,7 +355,8 @@ for the full detail.
 
 ## 2. Log convention
 
-Every spawned sub-supervisor leaves exactly four artifacts under `.secondmate/dispatch/`:
+Every spawned sub-supervisor leaves exactly four artifacts under `$dispatch_dir`
+(`.secondmate/dispatch/` under the primary repo's own checkout, as an absolute path — see section 1):
 - `<task-id>.jsonl` — the raw `stream-json` transcript, written by `spawn-sub-sup.sh` itself,
   append-only, useful for a human reading back what actually happened.
 - `<task-id>.final.txt` — the extracted plain-text content of the final assistant message only,
@@ -358,7 +421,7 @@ in-memory string, so its full `{0,1,2}` contract applies and a genuine file-read
 must be told apart from "zero matches," exit `1`):
 ```bash
 rc_g=0
-matched=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt") || rc_g=$?
+matched=$(grep '^SM_CLAIM_TOKEN:' "$dispatch_dir/${task_id}.final.txt") || rc_g=$?
 if [ "$rc_g" -ne 0 ] && [ "$rc_g" -ne 1 ]; then
   : # ESCALATE to the human verbatim (task-id, "$rc_g") -- e.g. exit 2, the file vanished or became
     # unreadable; NEVER silently treated as "zero matches"
@@ -466,7 +529,7 @@ while true; do
       # pane for that identifier at all), never filtering on that literal string itself.
       pane_grep_args=()
       for task_id in "${task_id_flags[@]}"; do
-        manifest=".secondmate/dispatch/${task_id}.manifest.json"
+        manifest="$dispatch_dir/${task_id}.manifest.json"
         root_pane_id=$(jq -r '.root_pane_id' "$manifest")
         checker_pane_id=$(jq -r '.checker_pane_id' "$manifest")
         [ "$root_pane_id" != "null" ] && pane_grep_args+=(-e "\"pane_id\": \"${root_pane_id}\"")
@@ -603,7 +666,7 @@ liveness FIRST, not `.final.txt` presence first:**
    a genuine PID does. The real validation is `^[1-9][0-9]*$` — a positive integer, no leading
    zero, and never literal `0`:
    ```bash
-   sidecar_pid=$(cat ".secondmate/dispatch/${task_id}.pid" 2>/dev/null)
+   sidecar_pid=$(cat "$dispatch_dir/${task_id}.pid" 2>/dev/null)
    if ! [[ "$sidecar_pid" =~ ^[1-9][0-9]*$ ]]; then
      : # ESCALATE: corrupted/malformed .pid sidecar (incl. literal "0") — never call ps on this,
        # never treat as "not alive"
@@ -688,7 +751,7 @@ liveness FIRST, not `.final.txt` presence first:**
 2. **`.final.txt`'s presence/absence decides the outcome, checked with an explicit `[ -f ... ]`
    test — never implied by just attempting the call below:**
    ```bash
-   final_txt=".secondmate/dispatch/${task_id}.final.txt"
+   final_txt="$dispatch_dir/${task_id}.final.txt"
    if [ -f "$final_txt" ]; then
    ```
    - **Present** — the process finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
@@ -737,9 +800,9 @@ reason is relayed to the human straight from `spawn-sub-sup.sh`'s own exit, not 
 ledger.
 
 **New requirement for the external case:** before fanning out, the dispatcher writes a batch
-manifest file:
+manifest file at the same absolute `$dispatch_dir` as every other artifact above:
 ```
-.secondmate/dispatch/<batch-id>.batch.json
+$dispatch_dir/<batch-id>.batch.json
 ```
 containing the batch-id and the full list of task-ids it is about to launch:
 ```json
@@ -783,7 +846,7 @@ open_claims_output=$(bin/claim-ledger.py status)
 # status's own contract is binary like hold.py open: 0 = success, always, even with zero open
 # claims (confirmed live: "(no open claims)" to stderr, exit 0) -- no classification needed here,
 # unlike `ready`, which the parent skill's own fan-out section documents as "always exits 0" too.
-batch_task_ids=$(jq -r '.task_ids[]' ".secondmate/dispatch/${batch_id}.batch.json")
+batch_task_ids=$(jq -r '.task_ids[]' "$dispatch_dir/${batch_id}.batch.json")
 ready_output=$(bin/progress-ledger.py ready --batch-id "$batch_id")
 entries_task_ids=()
 while IFS= read -r line; do
@@ -914,8 +977,8 @@ fi
 (section 1/2), never an in-memory value from whenever the worktree was originally created** — the
 same restart-safety reason section 4's pane filter now reads from the SAME manifest:
 ```bash
-workspace_id=$(jq -r '.workspace_id' ".secondmate/dispatch/<task-id>.manifest.json")
-worktree=$(jq -r '.worktree_path' ".secondmate/dispatch/<task-id>.manifest.json")
+workspace_id=$(jq -r '.workspace_id' "$dispatch_dir/<task-id>.manifest.json")
+worktree=$(jq -r '.worktree_path' "$dispatch_dir/<task-id>.manifest.json")
 ```
 **Only when `rc` is `0`** does the dispatcher run the follow-on cleanup — never unconditionally:
 ```bash
