@@ -24,12 +24,15 @@
 #     (`--task=`, `--task ""` -- e.g. a dispatcher variable that expanded to nothing) is NOT
 #     the same as omitting the flag: it fails the 1-128 charset and is rejected with exit 2,
 #     never silently treated as "match any open hold".
-#   - `hold.py open`'s corruption marker -- a line of its exact shape
-#     `WARNING: N malformed line(s) in ...` (printed once, after ALL holds) -- is never a match:
-#     each is forwarded verbatim to THIS script's own stderr, and polling continues, even inside
-#     a matched block. A line that merely STARTS with WARNING: is a different matter: inside a
+#   - `hold.py open`'s corruption marker -- a line of its EXACT emission shape
+#     `WARNING: N malformed line(s) in <ledger> — ledger may be corrupt; reconcile manually.`
+#     (quoted from hold.py's source; printed once, after ALL holds, always as the LAST line) --
+#     is never a match: it is forwarded verbatim to THIS script's own stderr, and polling
+#     continues. A line that merely STARTS with WARNING: is a different matter: inside a
 #     matched block it is the hold's own human question text (hold.py renders --q verbatim, no
-#     escaping) and stays in the printed block; outside a block it is forwarded to stderr.
+#     escaping) and stays in the printed block; only a byte-complete corruption shape is
+#     position-checked (always-last) before being classified as corruption -- see match_block
+#     for the residual, documented last-line ambiguity.
 #   - A --task filter matching zero holds while other holds are open is just the ordinary
 #     no-match case: the same timeout/exit-3 path, nothing special.
 #   - Signals during the wait: SIGTERM -> exit 143, SIGINT -> exit 130 (both distinct from
@@ -42,16 +45,15 @@
 #     empty listing is the self-heal's detection (near the bottom, see "SIGINT self-heal"):
 #     the script execs a python DRIVER whose first statements install INT->130 / TERM->143
 #     handlers and which then execs this script back -- same pid/argv/env/fds, so the caller's
-#     `kill $!` still targets this process. The driver is exec'd from an ABSOLUTE system
-#     interpreter (/usr/bin/python3, /usr/local/bin/python3 -- each pretested, bounded and
-#     group-tracked) when a healthy one exists, so a slow PATH wrapper never widens the window.
-#     The ONLY remaining sliver, measured live at ~30-100ms with an absolute interpreter: from
-#     this script's first instruction until the exec'd interpreter's first sigaction line runs
-#     -- a signal arriving in that window is still POSIX-discarded (an entry-ignored signal
-#     cannot be observed by ANY image on this pid until something sigactions it). With no
-#     healthy absolute interpreter the fallback execs PATH python3 itself and the sliver grows
-#     by that wrapper's own startup (the dispatcher's environment, documented). Prefer SIGTERM
-#     to stop a running instance anyway -- it needs none of this.
+#     `kill $!` still targets this process. The driver is exec'd with `-E -S` from the first
+#     executable ABSOLUTE interpreter (homebrew paths before the macOS CLT stub; PATH python3
+#     only if no absolute candidate exists), so PYTHONPATH/PYTHONHOME and sitecustomize cannot
+#     delay it -- the checker's instrumentation vector is closed. The ONLY remaining sliver,
+#     live-measured at ~30-50ms: from this script's first instruction until the exec'd bare
+#     interpreter's first sigaction line runs -- a signal arriving in that window is still
+#     POSIX-discarded (an entry-ignored signal cannot be observed by ANY image on this pid
+#     until something sigactions it). Prefer SIGTERM to stop a running instance anyway -- it
+#     needs none of this.
 #   - The deadline is an absolute wall-clock instant (not a decrementing counter), so a slow poll
 #     never steals time from later ticks; sleeps are plain `sleep` (never `read -t`, which races
 #     stdin under cron), clamped to the remaining budget so the script never lingers past the
@@ -95,11 +97,19 @@ HOLD_PY="$SCRIPT_DIR/hold.py"
 # task-id charset, so exact equality against a validated --task can never false-positive on one.
 ANCHOR_RE='^\[[^]]+\] \(([^)]*)\)'
 
-# hold.py's own end-of-output corruption marker, the only WARNING-shaped line it ever prints
-# (open emits it once, after ALL holds). A byte-match of this SHAPE is corruption noise anywhere;
-# a line that merely starts with WARNING: inside a matched block is question text (see
-# match_block).
-CORRUPT_RE='^WARNING: [0-9]+ malformed line\(s\) in '
+# hold.py's own end-of-output corruption marker, quoted verbatim from its source (hold.py's
+# `open` branch, the ONLY place it is printed):
+#   print(f"WARNING: {_BAD} malformed line(s) in {LEDGER} — ledger may be corrupt; reconcile manually.")
+# open emits it once, after ALL holds, always as the LAST line of its output. The shape below
+# matches that exact emission family (count + any ledger-path rendering + the fixed em-dash
+# suffix, end-anchored); human question text only collides by reproducing the COMPLETE line.
+# Round 7 tightened this from round 6's bare `WARNING: N malformed line(s) in ` prefix, which
+# a real hold's own question text could begin while continuing as ordinary text (the round-7
+# checker repro); an in-block full-shape line is additionally position-checked against the
+# corruption marker's always-last emission (match_block's pending logic). The residual,
+# documented ambiguity is a question whose FINAL rendered line byte-equals a plausible
+# corruption line -- same unresolvable-by-text-alone class as the anchor collision below.
+CORRUPT_RE='^WARNING: [0-9]+ malformed line\(s\) in .* — ledger may be corrupt; reconcile manually\.$'
 
 MATCH_BLOCK=""
 # match_block <task-filter|""> -- reads one `hold.py open` output from stdin (file redirect or
@@ -127,15 +137,32 @@ MATCH_BLOCK=""
 # alternative would swallow REAL next anchors.
 # Returns 0 with MATCH_BLOCK set to the matched block (no trailing newline), 1 with no match.
 match_block() {
-  local filter="$1" line="" in_block=0 matched_once=0 task="" block=""
+  local filter="$1" line="" in_block=0 matched_once=0 task="" block="" pending=""
   MATCH_BLOCK=""
   while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$in_block" -eq 1 ] && [[ "$line" =~ $CORRUPT_RE ]]; then
+      # hold.py's corruption line is ALWAYS the last line of open's output (it prints after
+      # every hold), so a full-shape line inside the matched block can only be CONFIRMED as
+      # corruption at EOF; until then it may still be this hold's own question text (round-7
+      # finding A: hold.py renders --q verbatim, so human text can reproduce the whole shape)
+      # -- hold it and decide when the next line (or EOF) proves which it is
+      if [ -n "$pending" ]; then
+        block+="$pending"$'\n'   # a successor line already proved the earlier one was text
+      fi
+      pending="$line"
+      continue
+    fi
+    if [ -n "$pending" ]; then
+      block+="$pending"$'\n'     # anything following it proves it was question text, in order
+      pending=""
+    fi
     case "$line" in
       "WARNING:"*)
-        if [ "$in_block" -eq 1 ] && ! [[ "$line" =~ $CORRUPT_RE ]]; then
-          # a continuation of the matched hold's own question that merely starts with WARNING:
-          # human text, not corruption noise -- hold.py's real corruption line always matches
-          # $CORRUPT_RE and is handled by the else below even inside a block
+        if [ "$in_block" -eq 1 ]; then
+          # WARNING-prefixed but NOT the full corruption shape (that was handled above): the
+          # hold's own human question text -- hold.py renders --q verbatim, so text CAN start
+          # with WARNING:, and even begin a byte-plausible corruption prefix (round-7 checker
+          # repro) as long as the fixed em-dash suffix or the end-anchor is absent
           block+="$line"$'\n'
         else
           printf '%s\n' "$line" >&2
@@ -163,6 +190,14 @@ match_block() {
         ;;
     esac
   done
+  if [ -n "$pending" ]; then
+    # full shape AND the stream's very last line: exactly hold.py's corruption-marker position
+    # -- treated as corruption noise (RESIDUAL DOCUMENTED AMBIGUITY, same class as the anchor
+    # collision: a question whose final rendered line byte-equals a plausible corruption line is
+    # indistinguishable; only changing hold.py's rendering could split them)
+    printf '%s\n' "$pending" >&2
+    pending=""
+  fi
   MATCH_BLOCK="${block%$'\n'}"
   [ -n "$MATCH_BLOCK" ]
 }
@@ -335,25 +370,34 @@ second line of the question
   [ "$MATCH_BLOCK" = "[fff66666] (task-next) unrelated" ] \
     || bad "a skipped multi-line hold's continuation must not leak into another block -- got: $MATCH_BLOCK"
 
-  # WARNING-shaped question continuation (round-6 finding 1): inside a matched block a line that
-  # merely starts with WARNING: is the hold's own human question text; only hold.py's actual
-  # corruption SHAPE (printed once, after all holds) is corruption noise, even inside a block
+  # WARNING-shaped question continuation (round-6 finding 1 + round-7 finding A): inside a
+  # matched block a line that merely starts with WARNING: -- including the round-7 checker's
+  # byte-plausible corruption PREFIX continued as ordinary text -- is the hold's own question
+  # text; only hold.py's EXACT emission shape (fixed em-dash suffix, end-anchored) is a
+  # corruption candidate, and an in-block full-shape line is position-checked (the real marker
+  # is always open's LAST line): full-shape + NOT last = provably question text; full-shape +
+  # last = corruption (the residual documented ambiguity). Fixture ordered like real open
+  # output: corruption marker last.
   fixw="$t/fix.warnq"
   cat >"$fixw" <<'EOF'
 [aaa11111] (task-w) question start
 WARNING: this line is my own question text, not corruption
+WARNING: 42 malformed line(s) in this is human question text
     - sub-w (checked_sha=sha-w) sub-w: verdict=pass findings=0 files=0 lenses=none
-WARNING: 7 malformed line(s) in /x/decisions.jsonl — ledger may be corrupt; reconcile manually.
+WARNING: 9 malformed line(s) in /y/decisions.jsonl — ledger may be corrupt; reconcile manually.
 [bbb22222] (task-next) next
+WARNING: 7 malformed line(s) in /x/decisions.jsonl — ledger may be corrupt; reconcile manually.
 EOF
   wantw='[aaa11111] (task-w) question start
 WARNING: this line is my own question text, not corruption
-    - sub-w (checked_sha=sha-w) sub-w: verdict=pass findings=0 files=0 lenses=none'
+WARNING: 42 malformed line(s) in this is human question text
+    - sub-w (checked_sha=sha-w) sub-w: verdict=pass findings=0 files=0 lenses=none
+WARNING: 9 malformed line(s) in /y/decisions.jsonl — ledger may be corrupt; reconcile manually.'
   match_block "" <"$fixw" 2>"$err" || bad "any-filter: a WARNING-continuation hold must match"
   [ "$MATCH_BLOCK" = "$wantw" ] \
-    || bad "a WARNING-shaped question continuation must stay in the block (only the corruption SHAPE is noise) -- got: $MATCH_BLOCK"
-  grep -qF "WARNING: 7 malformed line(s)" "$err" \
-    || bad "the corruption-shaped WARNING must still be forwarded to stderr even inside a block"
+    || bad "plausible-prefix and NOT-last full-shape lines must stay in the block (only shape+LAST is corruption) -- got: $MATCH_BLOCK"
+  grep -qF "WARNING: 7 malformed line(s) in /x/" "$err" \
+    || bad "the last-line corruption marker must still be forwarded to stderr"
   match_block "task-next" <"$fixw" 2>/dev/null \
     || bad "--task must match a later anchor after a WARNING-continuation hold"
   [ "$MATCH_BLOCK" = "[bbb22222] (task-next) next" ] \
@@ -448,6 +492,39 @@ EOF
   rw "$ledger" 0 --task anchorq --timeout 0
   [ "$(cat "$ofile")" = "[$aqid] (anchorq) before the fake" ] \
     || bad "anchor-shaped continuation round-trip: documented truncation behavior -- got: $(cat "$ofile")"
+
+  # round-7 finding A, the checker's exact repro: question text that begins a byte-plausible
+  # corruption PREFIX but continues as ordinary text must stay in the printed block (round 6's
+  # loose prefix shape misrouted it; only the full emission shape incl. the fixed em-dash
+  # suffix, end-anchored, is a corruption candidate)
+  wsid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task warning-shape --q $'question begins\nWARNING: 42 malformed line(s) in this is human question text' --sha ff 2>/dev/null)" \
+    || bad "scratch warning-shape hold creation failed"
+  rw "$ledger" 0 --task warning-shape --timeout 0
+  want_ws="[$wsid] (warning-shape) question begins"$'\n'"WARNING: 42 malformed line(s) in this is human question text"
+  [ "$(cat "$ofile")" = "$want_ws" ] \
+    || bad "warning-shape round-trip: the plausible-prefix question line must stay in the block -- got: $(cat "$ofile")"
+  grep -q "this is human question text" "$err" \
+    && bad "the plausible-prefix question line must NOT be routed to stderr as fake corruption"
+
+  # round-7 position rule: a FULL-shape line that is NOT open's last line is provably question
+  # text (hold.py's corruption marker is always the LAST line)
+  fsid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task fullshape --q $'before\nWARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.\nafter' --sha gg 2>/dev/null)" \
+    || bad "scratch fullshape hold creation failed"
+  rw "$ledger" 0 --task fullshape --timeout 0
+  want_fs="[$fsid] (fullshape) before"$'\n'"WARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually."$'\n'"after"
+  [ "$(cat "$ofile")" = "$want_fs" ] \
+    || bad "full-shape + NOT-last: position proves question text -- got: $(cat "$ofile")"
+
+  # round-7 RESIDUAL DOCUMENTED AMBIGUITY (same class as the anchor collision): full shape AND
+  # the very last line of the output -- byte- and position-identical to a real corruption
+  # marker; documented behavior: corruption classification wins (stderr, truncated block)
+  lsid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task lastline --q $'before\nWARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.' --sha hh 2>/dev/null)" \
+    || bad "scratch lastline hold creation failed"
+  rw "$ledger" 0 --task lastline --timeout 0
+  [ "$(cat "$ofile")" = "[$lsid] (lastline) before" ] \
+    || bad "lastline ambiguity: documented corruption-wins truncation -- got: $(cat "$ofile")"
+  grep -q "ledger may be corrupt" "$err" \
+    || bad "lastline ambiguity: the byte-identical line must be forwarded as corruption"
 
   rw "$ledger" 3 --task batch --timeout 0  # substring of the batch task ('batch' vs 'batch-1'): no-match
 
@@ -608,10 +685,10 @@ EOF
 
   # INT through the ENTIRE self-heal window (round-6 finding 2, the checker's exact repro): with
   # a slow PATH wrapper the round-5 design stayed INT-deaf for the wrapper's whole resolution;
-  # the heal now execs a pretested ABSOLUTE interpreter (bypassing the wrapper) whose first
-  # statements arm INT->130, so kill -INT $! lands on a healed, INT-trapped watcher almost
-  # immediately -- and reaps the wrapper's tree as it goes
-  if [ -x /usr/bin/python3 ] || [ -x /usr/local/bin/python3 ]; then
+  # the heal now execs an ABSOLUTE interpreter (bypassing the wrapper) whose first statements
+  # arm INT->130, so kill -INT $! lands on a healed, INT-trapped watcher almost immediately
+  # -- and reaps the wrapper's tree as it goes
+  if [ -x /usr/local/bin/python3 ] || [ -x /opt/homebrew/bin/python3 ] || [ -x /usr/bin/python3 ]; then
     shim3="$t/shim3"; mkdir -p "$shim3"
     printf '#!/bin/sh\nsleep 2\nexec "%s" "$@"\n' "$realpy" >"$shim3/python3"
     chmod +x "$shim3/python3"
@@ -632,6 +709,50 @@ EOF
     echo "  (skipped: no absolute python3 for the fast-heal path -- documented PATH-fallback sliver)"
   fi
 
+  # round-7 finding B, the checker's exact repro vector: an instrumented interpreter
+  # (PYTHONPATH + a sleeping sitecustomize) used to delay the heal's PRETEST child for the
+  # whole sleep, leaving the preflight INT-deaf. The pretest is gone and the driver is exec'd
+  # with -E -S (no PYTHONPATH, no site machinery), so the instrumentation cannot widen the
+  # deaf window: INT mid-heal still lands on the armed driver / healed watcher
+  if [ -x /usr/local/bin/python3 ] || [ -x /opt/homebrew/bin/python3 ] || [ -x /usr/bin/python3 ]; then
+    sited="$t/pysite"; mkdir -p "$sited"
+    printf 'import time\ntime.sleep(2)\n' >"$sited/sitecustomize.py"
+    PYTHONPATH="$sited" SM_HOLD_LEDGER="$empty" "$0" --interval 30 --timeout 3600 >"$t/pyint.out" 2>/dev/null &
+    wpid=$!
+    sleep 0.6   # round 6's design sat in the instrumented-pretest INT-deaf window here
+    kill -INT "$wpid" 2>/dev/null
+    ( sleep 5; kill -TERM "$wpid" 2>/dev/null ) &
+    kpid=$!
+    wait "$wpid"; rc=$?
+    kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+    [ "$rc" -eq 130 ] || bad "an instrumented interpreter (sitecustomize) must not delay the INT heal (got $rc)"
+  fi
+
+  # heal-argv survival (round-7 bug found by my own mutation harness): the heal's exec used
+  # the post-parse "$@" (empty), so every backgrounded -- i.e. INT-ignored, the REAL
+  # dispatcher pattern -- invocation healed into a bare watcher: --task lost (match-any)
+  # and --timeout lost (default 1800s). These runs background the watcher (the heal fires)
+  # and assert the args SURVIVE it; a lost --timeout would hang into the rescue TERM.
+  SM_HOLD_LEDGER="$ledger" "$0" --task lastline --timeout 30 >"$t/argv.out" 2>"$t/argv.err" &
+  wpid=$!
+  ( sleep 10; kill -TERM "$wpid" 2>/dev/null ) &
+  kpid=$!
+  wait "$wpid"; rc=$?
+  kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+  [ "$rc" -eq 0 ] || bad "heal-argv survival: --task lastline must still match after the heal (rc=$rc)"
+  grep -qF "(lastline) before" "$t/argv.out" \
+    || bad "heal-argv survival: --task was lost across the heal -- got: $(cat "$t/argv.out")"
+  grep -q "(batch-1) merge batch?" "$t/argv.out" \
+    && bad "heal-argv survival: the watcher matched the FIRST open hold (match-any: args lost)"
+  SM_HOLD_LEDGER="$empty" "$0" --timeout 2 >"$t/argv2.out" 2>/dev/null &
+  wpid=$!
+  ( sleep 10; kill -TERM "$wpid" 2>/dev/null ) &
+  kpid=$!
+  wait "$wpid"; rc=$?
+  kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+  [ "$rc" -eq 3 ] || bad "heal-argv survival: --timeout 2 must survive the heal (rc=$rc; lost => 1800s default => rescue)"
+  grep -q '^NO-HOLD:' "$t/argv2.out" || bad "heal-argv survival: expected a NO-HOLD timeout line"
+
   # broken TMPDIR (round-5 finding 3): the poll scratch file must fail LOUDLY (exit 2), and the
   # SIGINT self-heal must degrade loudly too -- never silently skip (round 4's mktemp-based
   # probe silently defeated the heal exactly when TMPDIR was broken)
@@ -641,12 +762,12 @@ EOF
     || bad "a broken TMPDIR must print a loud, explicit error"
   TMPDIR="$t/no-such-tmp" SM_HOLD_LEDGER="$empty" "$0" --interval 30 --timeout 3600 >"$t/healb.out" 2>"$t/healb.err" &
   wpid=$!
-  sleep 0.5   # enough for the loud fallback heal + the healed instance's own loud pfile exit 2
+  sleep 0.5   # the heal itself is TMPDIR-free now; the healed instance dies loudly at watch start
   kill -TERM "$wpid" 2>/dev/null
   wait "$wpid"; rc=$?
   [ "$rc" -eq 2 ] || bad "a backgrounded broken-TMPDIR watcher must still reach the loud exit 2, got $rc"
-  grep -q "self-heal" "$t/healb.err" \
-    || bad "a broken TMPDIR must not silently skip the SIGINT self-heal (loud note expected)"
+  grep -q "cannot create the poll scratch file" "$t/healb.err" \
+    || bad "the healed watcher's loud poll-scratch failure must reach stderr (the heal itself is now TMPDIR-free, so the loud path IS the pfile error)"
 
   rm -rf "$t"
   if [ "$SC_FAILS" -eq 0 ]; then echo ok; exit 0; fi
@@ -679,6 +800,14 @@ EOF
 }
 
 # ------------------------------------------------------------------ arg parsing
+# ORIG_ARGS snapshots argv BEFORE the parse loop below consumes it with `shift`: the SIGINT
+# self-heal's exec at the bottom re-runs this script and must pass the ORIGINAL argv through
+# (round-7 bug, found by my own mutation harness running the selfcheck as an async child:
+# the heal used the post-parse "$@" -- empty -- so every INT-ignored (real dispatcher
+# pattern) invocation healed into a BARE watcher: --task lost (match-any false positives) and
+# --timeout lost (default 1800s hangs). The guard expansion keeps empty-arg runs safe under
+# set -u on older bashes.)
+ORIG_ARGS=("$@")
 TASK="" TASK_GIVEN=0 INTERVAL=30 TIMEOUT=1800 SELFCHECK=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -736,42 +865,31 @@ command -v python3 >/dev/null 2>&1 \
 # POSIX force-ignores SIGINT for backgrounded, non-job-control commands, and a signal ignored
 # on shell entry cannot be trapped: the `trap ... INT` at the top of this script was then a
 # silent no-op, which `trap -p INT` reflects as EMPTY (a successfully installed trap always
-# lists). That empty listing is the detection -- no mktemp, no self-delivered signal, nothing
-# that can silently misreport. When INT was force-ignored, only a runtime sigaction on THIS pid
-# can undo it, so this instance execs a python DRIVER whose FIRST statements install
-# INT->130 / TERM->143 handlers and which then execs this script back: same pid/argv/env/fds,
-# and from the driver's first line on, the caller's `kill -INT $!` -> 130 holds THROUGH THE
-# ENTIRE heal, including while any interpreter child is slow -- round 5's design instead stayed
-# INT-deaf for the whole wrapper-dependent resolution window, which round 6's checker live-
-# reproduced. The re-run script instance installs the INT trap successfully (disposition now
+# lists). That empty listing is the detection. When INT was force-ignored, only a runtime
+# sigaction on THIS pid can undo it, so this instance execs a python DRIVER whose FIRST
+# statements install INT->130 / TERM->143 handlers and which then execs this script back:
+# same pid/argv/env/fds, and from the driver's first line on, the caller's `kill -INT $!` ->
+# 130 holds. The re-run script instance installs the INT trap successfully (disposition now
 # default), finds `trap -p INT` non-empty, and does not heal again -- no loop.
 #
-# The driver is exec'd from an ABSOLUTE system interpreter when a healthy one exists
-# (/usr/bin/python3, /usr/local/bin/python3 -- each pretested through run_bounded so a broken
-# system interpreter, e.g. macOS without CLT, cannot kill the watcher, and so a slow PATH
-# wrapper never widens the deaf window: the wrapper only ever runs as a grouped poll child
-# here). Degraded corners are loud, never silent: an unusable TMPDIR (no scratch file for the
-# pretest) prints an explicit note and falls back to the direct PATH exec, whose deaf window
-# then includes that interpreter's own startup -- the documented sliver.
+# Round 7 removed the round-6 preflight PRETEST entirely: the pretest child (a full
+# `python -c pass` startup, before the driver's handlers existed) was itself INT-deaf for its
+# whole wall-clock, and a dispatcher-environment instrumented interpreter (PYTHONPATH + a
+# sleeping sitecustomize -- the checker's repro) made that window multi-second. Now the exec
+# IS the health test: the driver runs `-E -S`, so PYTHONPATH/PYTHONHOME and the site machinery
+# (sitecustomize) are skipped -- the deaf window is exactly ONE bare interpreter startup to
+# its first sigaction line, immune to the instrumentation vector. The first EXECUTABLE
+# candidate is used blind (homebrew paths before the macOS CLT stub); if a candidate's image
+# loads but is broken (e.g. /usr/bin/python3 without Command Line Tools), the watcher dies
+# with that interpreter's own loud stderr error and exit code -- the documented trade-off
+# against reintroducing an unbounded deaf pretest. With no absolute candidate at all, PATH
+# python3 is exec'd and the deaf window then includes that interpreter's own startup.
 if [ -z "$(trap -p INT)" ] && command -v python3 >/dev/null 2>&1; then
   driver='import os,signal,sys; signal.signal(signal.SIGINT, lambda *a: sys.exit(130)); signal.signal(signal.SIGTERM, lambda *a: sys.exit(143)); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)'
-  cand_ok=""
-  pf_file="$(mktemp "${TMPDIR:-/tmp}/hold-watch-heal.XXXXXX" 2>/dev/null)" || pf_file=""
-  if [ -n "$pf_file" ]; then
-    POLL_OUT="$pf_file"
-    for cand in /usr/bin/python3 /usr/local/bin/python3; do
-      [ -x "$cand" ] || continue
-      if run_bounded "$pf_file" 5 "$cand" -c 'pass'; then cand_ok="$cand"; break; fi
-    done
-    rm -f "$pf_file"
-    POLL_OUT=""
-  else
-    printf 'hold-watch: cannot create a scratch file for the SIGINT self-heal interpreter probe (bad TMPDIR=%s?); falling back to a direct PATH exec\n' "${TMPDIR:-/tmp}" >&2
-  fi
-  if [ -n "$cand_ok" ]; then
-    exec "$cand_ok" -c "$driver" "$0" "$@"
-  fi
-  exec python3 -c "$driver" "$0" "$@"
+  for cand in /usr/local/bin/python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+    [ -x "$cand" ] && exec "$cand" -E -S -c "$driver" "$0" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
+  done
+  exec python3 -E -S -c "$driver" "$0" "${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}"
 fi
 
 watch
