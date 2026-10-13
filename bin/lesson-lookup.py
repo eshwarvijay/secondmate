@@ -4,6 +4,7 @@
 
 Usage: bin/lesson-lookup.py --task "<description>" [--task-id <id>]
        bin/lesson-lookup.py tag --lesson-id <id> --outcome helpful|harmful
+       bin/lesson-lookup.py mint --file <draft.md> [--category <cat>]
        bin/lesson-lookup.py selfcheck
 
 Reads all bin/lessons/**/*.md files, parses frontmatter (stdlib only, no yaml),
@@ -32,6 +33,13 @@ frontmatter fields via a surgical, atomic text edit (never a full YAML
 round-trip) so every other line in the file -- tags, evidence, earned-in,
 the body -- is preserved byte-for-byte. This is supervisor judgment recorded
 after the fact, never an automated correlation against any other history.
+
+`mint` validates and installs a brand-new, complete lesson draft (frontmatter
++ body, authored exactly like any shipped lesson) into bin/lessons/. It never
+constructs a lesson from separate flags, never overwrites an existing lesson
+file, and only ever runs from the primary checkout -- never inside a maker's
+linked worktree, Claude or pi alike. On any validation failure it writes
+nothing and exits nonzero with a stderr message naming the first failure.
 """
 import sys
 import os
@@ -562,6 +570,174 @@ def cmd_tag(argv):
         return 1
 
     print(f"tagged {lesson_id_arg} as {outcome} ({field}={new_val})")
+    return 0
+
+
+_MINT_USAGE = 'Usage: bin/lesson-lookup.py mint --file <draft.md> [--category <cat>]\n'
+
+
+def _primary_checkout_refusal_reason():
+    """Return None if the CWD's repo is the primary checkout, else a stderr-ready refusal message
+    naming the exact predicate checked. Deliberately does NOT reuse scope-guard.py's
+    is_maker_worktree() -- that helper is keyed to a marker file written only for Claude-Code maker
+    sessions, so it would silently fail to refuse inside a pi maker's linked worktree. Instead this
+    resolves `git rev-parse --show-toplevel` and tests whether <toplevel>/.git is a real directory
+    (primary checkout) versus a file (the gitdir-pointer git writes for a linked worktree) or
+    missing/unresolvable (ambiguous) -- the same primary-vs-linked signal mark-maker.sh already uses
+    (git-dir vs git-common-dir equality), reimplemented here without depending on scope-guard.py.
+    Fails CLOSED (refuses) on any ambiguity or git error -- never fails open."""
+    try:
+        out = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+    except OSError as e:
+        return f"mint: could not run `git rev-parse --show-toplevel` ({e}) -- refusing (fail closed)"
+    if out.returncode != 0 or not out.stdout.strip():
+        return "mint: not inside a git repository (`git rev-parse --show-toplevel` failed) -- refusing (fail closed)"
+    git_path = pathlib.Path(out.stdout.strip()) / '.git'
+    if git_path.is_dir():
+        return None
+    found = "a file (a linked-worktree gitdir pointer)" if git_path.is_file() else "nothing"
+    return (f"mint: refusing -- checked whether {git_path} is a real directory and found {found}. "
+            f"mint only runs in the primary checkout (where .git is a real directory), never inside a "
+            f"maker's linked worktree.")
+
+
+def _discover_categories(lessons_dir):
+    """Real, existing bin/lessons/ subdirectories, discovered dynamically -- never a hardcoded tuple,
+    since mint must refuse an unknown/novel category rather than ever creating a new top-level dir."""
+    lessons_path = pathlib.Path(lessons_dir)
+    if not lessons_path.is_dir():
+        return []
+    return sorted(p.name for p in lessons_path.iterdir() if p.is_dir())
+
+
+def _is_single_sentence_body(body_text):
+    """Heuristic for "exactly one imperative-rule sentence": no blank-line paragraph break, the
+    stripped text is non-empty and ends in one of .!?, and splitting on sentence-ending punctuation
+    followed by whitespace yields exactly one non-empty segment. There's no stdlib primitive for
+    "one sentence" -- this is a deliberately simple heuristic, not an NLP sentence splitter."""
+    stripped = body_text.strip()
+    if not stripped or '\n\n' in stripped:
+        return False
+    if not re.search(r'[.!?]\Z', stripped):
+        return False
+    segments = [s for s in re.split(r'(?<=[.!?])\s+', stripped) if s.strip()]
+    return len(segments) == 1
+
+
+def _present_zero(fm, field):
+    """True only if `field` is present in fm AND parses to exactly 0 -- a minted lesson must start
+    with helpful_count/harmful_count both explicitly 0, not merely absent (parse_frontmatter's
+    generic fallback stores raw strings, so this parses defensively rather than assuming int)."""
+    if field not in fm:
+        return False
+    try:
+        return int(str(fm[field]).strip()) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def cmd_mint(argv):
+    """`mint --file <draft.md> [--category <cat>]` -- validate a complete, hand-authored lesson
+    draft and install it into bin/lessons/<category>/<slug>.md. Never overwrites an existing lesson.
+    Primary-checkout-only; see _primary_checkout_refusal_reason(). Writes nothing on any rejection."""
+    # Primary-checkout refusal check runs FIRST, before reading --file or any other validation, so a
+    # maker worktree gets refused immediately regardless of what else is wrong with its arguments.
+    refusal = _primary_checkout_refusal_reason()
+    if refusal:
+        sys.stderr.write(_MINT_USAGE)
+        sys.stderr.write(refusal + '\n')
+        return 2
+
+    file_arg = None
+    category_arg = None
+    i = 0
+    while i < len(argv):
+        if argv[i] == '--file' and i + 1 < len(argv):
+            file_arg = argv[i + 1]; i += 2
+        elif argv[i] == '--category' and i + 1 < len(argv):
+            category_arg = argv[i + 1]; i += 2
+        else:
+            i += 1
+
+    if not file_arg:
+        sys.stderr.write(_MINT_USAGE)
+        sys.stderr.write("mint: --file is required\n")
+        return 2
+
+    draft_path = pathlib.Path(file_arg)
+    if not draft_path.is_file():
+        sys.stderr.write(f"mint: --file {file_arg!r} is not a file\n")
+        return 2
+
+    content = draft_path.read_text(encoding='utf-8')
+    fm, body = parse_frontmatter(content)
+    if fm is None:
+        sys.stderr.write(f"mint: {file_arg} has no parseable frontmatter\n")
+        return 2
+
+    tags = fm.get('tags', [])
+    if not isinstance(tags, list) or not tags:
+        sys.stderr.write("mint: draft's `tags` must be a non-empty list\n")
+        return 2
+
+    earned_in = fm.get('earned-in')
+    if not earned_in or not _TASK_ID_RE.match(earned_in):
+        sys.stderr.write(f"mint: draft's `earned-in` ({earned_in!r}) must match the task-id shape\n")
+        return 2
+
+    if not _present_zero(fm, 'helpful_count') or not _present_zero(fm, 'harmful_count'):
+        sys.stderr.write(
+            "mint: draft must declare `helpful_count: 0` and `harmful_count: 0` explicitly -- "
+            f"got helpful_count={fm.get('helpful_count')!r}, harmful_count={fm.get('harmful_count')!r}\n")
+        return 2
+
+    if fm.get('evidence') == 'E4':
+        sys.stderr.write("mint: `evidence: E4` is reserved for the 4 foundational seed lessons -- rejected\n")
+        return 2
+
+    if not _is_single_sentence_body(body):
+        sys.stderr.write(
+            "mint: body must be exactly one imperative-rule sentence (no blank-line paragraph "
+            "breaks, no multiple sentences)\n")
+        return 2
+
+    lessons_dir = _lessons_dir()
+    category = category_arg or fm.get('category')
+    if not category:
+        sys.stderr.write("mint: no --category given and draft frontmatter has no `category` field\n")
+        return 2
+    real_categories = _discover_categories(lessons_dir)
+    if category not in real_categories:
+        sys.stderr.write(
+            f"mint: unknown category {category!r} -- must be one of the existing bin/lessons/ "
+            f"subdirectories: {real_categories}\n")
+        return 2
+
+    slug = draft_path.stem
+    if not _LESSON_ID_RE.match(slug):
+        sys.stderr.write(f"mint: derived slug {slug!r} (from --file's filename) is not a valid lesson-id segment\n")
+        return 2
+
+    dest = _resolve_lesson_path(lessons_dir, f'{category}/{slug}')
+    if dest is None:
+        sys.stderr.write(f"mint: resolved destination for {category}/{slug} escapes bin/lessons/ -- rejected\n")
+        return 2
+
+    if dest.exists():
+        sys.stderr.write(f"mint: {dest} already exists -- refusing to overwrite an existing lesson's history\n")
+        return 2
+
+    try:
+        with _ledger_lock(dest):
+            if dest.exists():  # re-check under the lock -- closes the TOCTOU window against a concurrent mint
+                sys.stderr.write(f"mint: {dest} already exists -- refusing to overwrite an existing lesson's history\n")
+                return 2
+            _atomic_write(dest, content)
+    except OSError as e:
+        sys.stderr.write(f"mint: OS error installing {dest} ({e})\n")
+        return 1
+
+    print(f"minted {category}/{slug} -> {dest}")
     return 0
 
 
@@ -1222,6 +1398,251 @@ race target lesson.
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    # mint's primary-checkout-only refusal check runs real `git rev-parse --show-toplevel` against
+    # the process CWD -- so every mint test below needs a REAL primary-checkout git repo as its CWD,
+    # not just any tempdir, or it would get refused for the wrong reason (this worktree itself is a
+    # linked worktree) before ever reaching the validation it's actually trying to exercise.
+    @contextlib.contextmanager
+    def _in_dir(path):
+        old = os.getcwd()
+        os.chdir(path)
+        try:
+            yield
+        finally:
+            os.chdir(old)
+
+    def _mint_fixture(tmp):
+        repo = os.path.join(tmp, 'primary-repo')
+        subprocess.run(['git', 'init', '-q', '-b', 'main', repo], check=True)
+        subprocess.run(['git', '-C', repo, 'config', 'user.email', 'a@a'], check=True)
+        subprocess.run(['git', '-C', repo, 'config', 'user.name', 'a'], check=True)
+        with open(os.path.join(repo, 'f'), 'w') as f:
+            f.write('x')
+        subprocess.run(['git', '-C', repo, 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'init'], check=True)
+        lessons_dir = os.path.join(tmp, 'lessons')
+        os.makedirs(os.path.join(lessons_dir, 'testing'))
+        return repo, lessons_dir
+
+    _VALID_DRAFT = """---
+tags:
+  - testing
+  - mint
+earned-in: mint-selftest-task
+helpful_count: 0
+harmful_count: 0
+category: testing
+---
+Always do the one thing that must happen.
+"""
+
+    def test_mint_empty_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: []\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "empty tags must be rejected"
+            assert 'tags' in err.getvalue().lower(), f"expected a tags error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md')), "nothing must be written on rejection"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_bad_earned_in_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('earned-in: mint-selftest-task', 'earned-in: bad id with spaces'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a malformed earned-in must be rejected"
+            assert 'earned-in' in err.getvalue().lower(), f"expected an earned-in error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_nonzero_counts_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('helpful_count: 0', 'helpful_count: 1'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a nonzero starting helpful_count must be rejected"
+            assert 'helpful_count' in err.getvalue() or 'harmful_count' in err.getvalue(), f"expected a counts error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_evidence_e4_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('category: testing\n', 'category: testing\nevidence: E4\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "evidence: E4 on a minted lesson must be rejected"
+            assert 'e4' in err.getvalue().lower(), f"expected an E4 error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_multi_sentence_body_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Do thing one. Do thing two.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a multi-sentence body must be rejected"
+            assert 'sentence' in err.getvalue().lower(), f"expected a body/sentence error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+
+            # a blank-line paragraph break must also be rejected, even if each paragraph alone reads
+            # as a single sentence.
+            draft2 = os.path.join(tmp, 'draft2.md')
+            with open(draft2, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Always do the first thing.\n\nAlso always do the second thing.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft2])
+            assert rc2 != 0, "a blank-line paragraph break must be rejected"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_unknown_category_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('category: testing', 'category: nonexistent-category'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "an unknown category must be rejected"
+            assert 'category' in err.getvalue().lower(), f"expected a category error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'nonexistent-category')), (
+                "mint must never create a new top-level category directory")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_destination_collision_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            existing = os.path.join(lessons_dir, 'testing', 'draft.md')
+            with open(existing, 'w') as f:
+                f.write('---\ntags:\n  - old\nhelpful_count: 3\nharmful_count: 1\n---\npre-existing lesson.\n')
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "minting onto an existing destination path must be refused"
+            assert 'exist' in err.getvalue().lower(), f"expected a collision error:\n{err.getvalue()}"
+            # the pre-existing lesson's history must survive untouched.
+            assert 'helpful_count: 3' in pathlib.Path(existing).read_text(), (
+                "a collision refusal must never overwrite the existing lesson's accumulated counts")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_primary_checkout_only_refusal():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'feat', wt, 'main'], check=True)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+
+            # From the linked worktree -> refused specifically for being a linked worktree.
+            err = io.StringIO()
+            with _in_dir(wt), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "mint must refuse inside a linked worktree"
+            assert 'linked worktree' in err.getvalue().lower() or 'primary checkout' in err.getvalue().lower(), (
+                f"expected a primary-checkout refusal message:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md')), "nothing must be written on refusal"
+
+            # From the primary checkout -> must NOT be refused for being a linked worktree (other
+            # validations may still run, but this specific refusal reason must not fire).
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft])
+            assert rc2 == 0, f"mint should succeed from the primary checkout:\n{err2.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    def test_mint_positive_path_roundtrip():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            out = io.StringIO()
+            with _in_dir(repo), redirect_stdout(out):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, f"a valid draft should mint successfully: {out.getvalue()}"
+
+            installed = pathlib.Path(lessons_dir) / 'testing' / 'draft.md'
+            assert installed.is_file(), f"expected the lesson installed at {installed}"
+            fm, body = parse_frontmatter(installed.read_text(encoding='utf-8'))
+            assert fm is not None, "the installed file must parse like any hand-authored seed lesson"
+            assert fm.get('tags') == ['testing', 'mint'], f"tags must round-trip: {fm}"
+            assert fm.get('earned-in') == 'mint-selftest-task', f"earned-in must round-trip: {fm}"
+            assert _counts(fm) == (0, 0), f"counts must round-trip as (0, 0): {fm}"
+            assert body.strip() == 'Always do the one thing that must happen.', f"body must round-trip: {body!r}"
+
+            # Minting the SAME draft a second time must now collide (the destination now exists).
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc2 = cmd_mint(['--file', draft])
+            assert rc2 != 0, "re-minting the same slug must now be refused as a collision"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Run all tests
     import os, io
     from contextlib import redirect_stdout, redirect_stderr
@@ -1239,6 +1660,15 @@ race target lesson.
     test_default_ledger_anchoring()
     test_tag_subcommand()
     test_tag_subcommand_concurrent_race()
+    test_mint_empty_tags_rejected()
+    test_mint_bad_earned_in_rejected()
+    test_mint_nonzero_counts_rejected()
+    test_mint_evidence_e4_rejected()
+    test_mint_multi_sentence_body_rejected()
+    test_mint_unknown_category_rejected()
+    test_mint_destination_collision_rejected()
+    test_mint_primary_checkout_only_refusal()
+    test_mint_positive_path_roundtrip()
 
     # Test 10: All 4 real shipped seed files parse correctly and are evidence:E4
     def test_real_seed_files():
@@ -1279,5 +1709,7 @@ if __name__ == '__main__':
         selfcheck()
     elif len(sys.argv) > 1 and sys.argv[1] == 'tag':
         sys.exit(cmd_tag(sys.argv[2:]))
+    elif len(sys.argv) > 1 and sys.argv[1] == 'mint':
+        sys.exit(cmd_mint(sys.argv[2:]))
     else:
         sys.exit(main())
