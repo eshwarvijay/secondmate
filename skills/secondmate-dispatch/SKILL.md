@@ -89,8 +89,15 @@ shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below)
 **Outputs:** `.secondmate/dispatch/<task-id>.jsonl` (raw), `.secondmate/dispatch/<task-id>.final.txt`
 (extracted plain text), `.secondmate/dispatch/<task-id>.pid` (liveness sidecar).
 
-**Exit code:** `dispatch-report.py`'s own exit code (0/1/2/3 — see that script's contract in
-`skills/secondmate/SKILL.md`), relayed unchanged.
+**Exit code:** `dispatch-report.py`'s own exit code, relayed unchanged — the full set is
+0/1/2/3/4: `0` = `SM_DONE_MERGED` (integration already done), `1` = `SM_REFUSED` (relay the reason),
+`2` = `SM_STUCK_NEED_HUMAN` (relay the reason verbatim), `3` = no completion tag found at all
+(malformed — treat as an escalation-worthy parse failure), `4` = `SM_READY_UNMERGED` (batch dispatch
+only — reached verify-gate PASS, awaiting the batch's consolidated hold, NOT yet merged). `0` and `4`
+must never be conflated: a batch sub-supervisor that only reached verify-gate PASS has not merged
+anything, and `spawn-sub-sup.sh` must propagate exit `4` unchanged rather than collapsing it toward
+`0`/success. See `bin/dispatch-report.py` and `skills/secondmate/SKILL.md`'s own exit-code contract
+for the full detail.
 
 ## 2. Log convention
 
@@ -221,7 +228,10 @@ or auto-`--steal`. Two additions apply specifically to the external case:
    `SM_CLAIM_LEDGER` / `SM_PROGRESS_LEDGER` to the real, absolute path before any `hold.py` /
    `claim-ledger.py` / `progress-ledger.py` call.
 2. **Validate before any shell-out, and never hand-assemble a shell string.** A task-id must match
-   `^[a-zA-Z0-9_-]{1,64}$` and a batch-id must be a UUIDv4 — validate both before using them in any
+   `[A-Za-z0-9_-]{1,128}` — the same convention `claim-ledger.py`, `hold.py`, `progress-ledger.py`,
+   `lesson-lookup.py`, and `teardown-check.sh` already enforce themselves (`claim-ledger.py`'s own
+   selfcheck asserts `not _valid_task_id("a" * 129)`, confirming 128 is the real, intentional
+   boundary) — and a batch-id must be a UUIDv4. Validate both before using them in any
    path, branch name, or command. Every invocation of `claude`, `git`, or a `bin/` script must be
    called with an argv array (e.g. `subprocess.run([...])`, bash `"${arr[@]}"`), never a string
    handed to a shell `-c` — the same hygiene `claim-ledger.py` and `merge-sequencer.sh` already hold
