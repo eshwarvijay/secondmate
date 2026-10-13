@@ -132,11 +132,29 @@ Every spawned sub-supervisor leaves exactly three artifacts under `.secondmate/d
 
 ## 3. Extracting the claim token
 
-The sub-supervisor claims its task-id inside its own fresh process (`bin/claim-ledger.py claim
---task-id <id> --owner sm-<id>`), which prints `token=<hex>` to that process's own stdout — but the
-external dispatcher never sees that process's live stdout, only the extracted `.final.txt`. So
-every sub-supervisor's prompt must require it to emit **exactly one** dedicated line in its final
-output:
+**This procedure applies only to a task-id whose `dispatch-report.py` exit code turns out to be
+`4` (`SM_READY_UNMERGED`) — check the exit code FIRST, before doing anything in this section.**
+Per `skills/secondmate/SKILL.md`'s own batch protocol, a sub-supervisor releases its OWN claim
+internally before emitting `SM_REFUSED` or `SM_STUCK_NEED_HUMAN` if it had successfully claimed,
+and `SM_REFUSED:claim-failed` specifically means the claim never succeeded in the first place
+(confirmed by reading that file directly: step (a) aborts with `SM_REFUSED:claim-failed` on a
+failed claim, before any token could exist; step (d) says a refusal/stuck path "behave[s] exactly
+as solo dispatch does: release the claim and emit `SM_REFUSED:<reason>` or
+`SM_STUCK_NEED_HUMAN:<reason>`" — i.e. it self-releases). Only on exit `4` does the sub-supervisor
+deliberately leave its claim open for the external dispatcher to release later (section 7) — every
+other exit code (`0`/`1`/`2`/`3`) means there is either nothing to release or it was already
+released internally, and this section's token requirement never applies to it. Treating a
+legitimate `SM_REFUSED:claim-failed` as if it needed a token — the earlier draft of this
+section did, since it ran this whole procedure unconditionally — would misroute an ordinary,
+expected refusal into "stuck, needs a token," contradicting the parent SOP it's supposed to
+mirror. For exit codes other than `4`, skip this section entirely: relay the refusal/stuck/done
+outcome exactly as sections 5 and 8 already document, with no claim-token involvement at all.
+
+For a task-id that DID exit `4`: the sub-supervisor claims its task-id inside its own fresh
+process (`bin/claim-ledger.py claim --task-id <id> --owner sm-<id>`), which prints `token=<hex>` to
+that process's own stdout — but the external dispatcher never sees that process's live stdout,
+only the extracted `.final.txt`. So every sub-supervisor's prompt must require it to emit
+**exactly one** dedicated line in its final output:
 ```
 SM_CLAIM_TOKEN:<the hex token claim-ledger.py printed>
 ```
@@ -184,10 +202,21 @@ Two mechanical shell-correctness details, both load-bearing, both live-verified:
   correctly reported `n=2` for the identical input.
 
 Then branch on `n`:
-- **`n` is exactly 1** — use the extracted `token`. This is the well-behaved case.
-- **`n` is 0 or more than 1** — a protocol violation for this task-id. Do NOT guess which one (if
-  any) is real; do not even attempt the extraction. Treat it exactly like a stuck task: escalate
-  to the human verbatim (which task-id, and the actual value of `n`), the same "don't guess when
+- **`n` is exactly 1** — **validate the extracted value's shape before using it, do not just
+  trust `n == 1`.** A single matching line can still have an EMPTY value after the colon (e.g. a
+  malformed or truncated final text) — `n == 1` alone does not mean the extracted string is a real
+  token. Confirmed live: a `.final.txt` with exactly one `SM_CLAIM_TOKEN:` line and nothing after
+  the colon counts as `n=1`, and the old recipe would proceed straight to using that empty string
+  as if it were real. Real tokens are always `secrets.token_hex(16)` — a 32-character lowercase
+  hex string (confirmed by reading `claim-ledger.py`'s own `_TOKEN_RE = re.compile(r"\A[0-9a-f]
+  {32}\Z")` directly). So validate: `[[ "$token" =~ ^[0-9a-f]{32}$ ]]`. If it matches, use it —
+  this is the well-behaved case. If it does NOT match (confirmed live against the empty-value
+  case above), treat it exactly like the "zero or more than one" case below — never call
+  `bin/claim-ledger.py release` with a value that was never confirmed to be a real token.
+- **`n` is 0 or more than 1 — or `n` is 1 but the extracted value fails shape validation** — a
+  protocol violation for this task-id. Do NOT guess which one (if any) is real; do not even
+  attempt to use it. Treat it exactly like a stuck task: escalate to the human verbatim (which
+  task-id, and the actual value of `n` or the malformed token string), the same "don't guess when
   ambiguous" posture `dispatch-report.py` itself takes for a missing completion tag (its own exit
   3, `malformed`). This is the safety net, not the primary mechanism — the primary mechanism is
   the prompt-contract requirement above: a well-behaved sub-supervisor emitting exactly one
@@ -206,18 +235,32 @@ auto-`--steal`):
 
 ```bash
 while true; do
-  bin/progress-ledger.py stale --threshold-seconds "$N" "${task_id_flags[@]}"
+  bin/progress-ledger.py stale --threshold-seconds "$N" "${task_id_flags[@]}" || true
   # the .pid sidecar liveness check (section 1/5) is the ALWAYS-available signal, no herdr required —
   # poll it here too, non-blocking (kill -0), for any task-id whose .final.txt hasn't appeared yet
   if command -v herdr >/dev/null 2>&1; then
-    bin/pane-reaper.py observe
-    bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" ...
+    bin/pane-reaper.py observe || true
+    bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" ... || true
   fi
   # relay any hit from either call to the human verbatim, exactly as the in-session watchdog does —
   # never restart, never steal, never treat a hit as a confirmed crash
   sleep "$N"
 done
 ```
+
+**Both `|| true` guards are required under `set -e`, not decorative — a strict-mode loop must
+survive its own documented "normal" outcomes, not just its errors.** `bin/progress-ledger.py
+stale` exits `1` precisely when it finds a real stale/no-progress hit (confirmed by reading its
+own `stale` command directly: `sys.exit(1 if hits else 0)`) — that nonzero exit is the exact
+signal this watchdog exists to catch, not an error condition. Confirmed live: the unguarded call,
+under `set -euo pipefail`, aborted the loop body the moment it found a genuine stale hit — the
+watchdog would die on its own success case and never loop again. The `pane-reaper.py quiet | grep`
+line has the identical problem from the opposite direction: `grep` exits 1 whenever nothing
+currently matches the filter (the common, expected "nothing quiet right now" case), and under
+`pipefail` that kills the loop too — confirmed live against a filter with zero matches. Both `||
+true` guards let the loop survive either outcome and continue relaying whatever each call printed
+to stdout before `sleep`-ing and polling again; live-ran the fixed loop body across 3 iterations
+with a real recurring stale hit each time — it completed all 3 without aborting.
 
 **`pane-reaper.py` requires herdr; guard it.** This dispatcher's own Scope section above only
 requires "terminal access + a scheduler" — herdr is optional infrastructure, not a hard dependency.
@@ -272,17 +315,32 @@ liveness FIRST, not `.final.txt` presence first:**
    `Z    <defunct>` while `kill -0 <pid>` on that same PID still returned success (exit 0).
 
    So the check is `ps -o stat= -p <pid>` (portable across Linux and macOS/BSD), not `kill -0`
-   alone:
+   alone — **and the `ps` call itself must be guarded under strict mode**: `ps -o stat= -p <pid>`
+   on a dead PID exits nonzero (confirmed live: exit 1 against a PID that no longer exists), and
+   under `set -e` the bare assignment `state=$(ps ...)` would abort the whole poll before it ever
+   reaches the "`$state` is empty → not alive" branch below — the exact routine, expected case
+   this check exists to classify. So:
    ```bash
-   state=$(ps -o stat= -p "$pid" 2>/dev/null)
+   state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
    ```
    - **`$state` is empty** (no such PID at all) — not alive — go to step 2.
    - **`$state` starts with `Z`** (zombie/defunct) — also not alive for the purpose of this check
      — go to step 2. If this poll is running inside the SAME dispatcher process that originally
      forked `spawn-sub-sup.sh` (not a restarted dispatcher — see the restart-safety note just
-     above), additionally run `wait "$pid" 2>/dev/null` here to actually REAP the zombie and free
-     its process-table slot: confirmed live that `waitpid()` on an already-exited child returns
-     immediately (0.000s) when called by its own forking parent — it only blocks for a genuinely
+     above), additionally reap the zombie and free its process-table slot — but capture `wait`'s
+     own return value rather than letting it propagate as a command failure:
+     ```bash
+     rc=0
+     wait "$pid" 2>/dev/null || rc=$?
+     ```
+     This capture is required, not optional: `wait "$pid"` returns the REAPED CHILD's own exit
+     status (e.g. `4` for `SM_READY_UNMERGED`), and under `set -e` a bare `wait "$pid"` call with
+     no `||` treats that nonzero status as `wait` itself failing — aborting the poll instead of
+     treating `$rc` as `spawn-sub-sup.sh`'s terminal dispatch-report code and continuing (confirmed
+     live: a bare `wait "$pid"` on a child that exited `4` killed the whole script with exit `4`,
+     never reaching code after it; capturing via `rc=0; wait "$pid" || rc=$?` instead correctly
+     recorded `rc=4` and let the script continue). `waitpid()` itself still returns immediately
+     (0.000s, confirmed live) for an already-exited child — it only blocks for a genuinely
      still-running child, which is not this branch. A restarted dispatcher cannot `wait` on a PID
      it never forked and does not need to: once the original parent process is truly gone, the
      kernel reparents any zombie it left behind to init/launchd, which reaps it on its own — the
@@ -346,17 +404,27 @@ crashes after opening this batch's hold but before a human answers it, a naively
 dispatcher that just re-ran the recipe below would call `hold.py hold` again and open a SECOND,
 duplicate hold for the same batch (confirmed live: running the identical `hold.py hold
 --entries-file ...` call twice in a row produced two distinct open hold ids, both still open).
-So, before opening a hold, check whether one already exists for this batch:
+So, before opening a hold, check whether one already exists for this batch — guarded, since the
+ordinary "no open hold yet" case (the normal first-batch-close path, not an error) still has to
+survive under strict mode:
 ```bash
-existing_id=$(bin/hold.py open | grep -F "(<batch-label>)" | head -1 | sed -E 's/^\[([^]]+)\].*/\1/')
+existing_id=$(bin/hold.py open | grep -F "(<batch-label>)" | head -1 | sed -E 's/^\[([^]]+)\].*/\1/' || true)
 ```
+The `|| true` is required, not decorative: when there is genuinely no open hold at all (the
+ordinary case right after a batch's first close), `grep` finds no match and exits 1, and under
+`set -o pipefail` that failure propagates through the whole pipeline even though `hold.py open`
+itself exits 0 for "no open decisions" — confirmed live: the unguarded pipeline, under
+`set -euo pipefail` with zero open holds, aborted the script (exit 1) before the dispatcher ever
+reached "open a new hold." With `|| true`, the identical zero-match case instead correctly leaves
+`existing_id` empty and the script continues to the branch below.
+
 `hold.py open`'s own output format is `[<id>] (<task>) <question>` per open hold (confirmed by
 reading its `open` command source directly, and by running it live: it printed exactly
 `[dcfa5ec7] (batch-abc123) merge which of: t1?`), so matching on `(<batch-label>)` finds any open
 hold whose `task` field is this batch's own `--task` string.
-- **A matching open hold is found** — reuse its id (`$existing_id`); do NOT call `hold.py hold`
-  again. Just keep waiting for a human to answer that existing hold.
-- **No matching open hold is found** — only then open a new one:
+- **A matching open hold is found** (`$existing_id` is non-empty) — reuse its id; do NOT call
+  `hold.py hold` again. Just keep waiting for a human to answer that existing hold.
+- **No matching open hold is found** (`$existing_id` is empty) — only then open a new one:
 ```bash
 bin/hold.py hold --task "<batch-label>" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
   --entries-file <that JSON file>
