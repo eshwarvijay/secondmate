@@ -157,7 +157,8 @@ code — there is no second, inner process to ever confuse with the one being tr
 
 **Invocation (by the dispatcher, backgrounding `spawn-sub-sup.sh` itself):**
 ```bash
-bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir .secondmate/dispatch &
+bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir .secondmate/dispatch \
+  --worktree "$worktree_path" &
 echo $! > ".secondmate/dispatch/<task-id>.pid"
 ```
 PID bookkeeping now lives with the **dispatcher**, not inside the script: the dispatcher
@@ -178,18 +179,29 @@ after the sub-supervisor process exits or the dispatcher itself restarts, so the
 to disk at the moment they're first known, the same discipline the batch manifest (section 5)
 already applies at the batch level:
 - **Headless / no herdr:** `read wt branch < <(bin/new-worktree.sh --repo <repo> --task <task-id>)`
-  — the same primitive `skills/secondmate/SKILL.md`'s own headless path uses. No workspace/pane
-  identifiers exist in this path.
+  — the same primitive `skills/secondmate/SKILL.md`'s own headless path uses — then
+  `worktree_path="$wt"`. **This assignment is required, not cosmetic:** `new-worktree.sh`'s own
+  output goes into `$wt`/`$branch`, never a variable literally named `worktree_path` — the manifest
+  write below references `$worktree_path` specifically, and under `set -u` (part of this file's own
+  `set -euo pipefail` discipline) referencing it while only `$wt` was ever assigned is an unbound-
+  variable crash, confirmed live: the unfixed form died with `worktree_path: unbound variable`
+  before the manifest was ever written, meaning the dispatch never got off the ground on the normal
+  no-herdr path. No workspace/pane identifiers exist in this path.
 - **herdr in use:** `result=$(herdr worktree create --cwd <repo> --branch sm/<task-id> --base HEAD
   --label sm-<task-id> --no-focus)`, then `worktree_path=$(printf '%s' "$result" | jq -r
-  '.result.worktree.path')` and `root_pane_id=$(printf '%s' "$result" | jq -r
-  '.result.root_pane.pane_id')` — the identical two JSON paths `skills/secondmate/SKILL.md`'s own
-  `herdr worktree create` call already relies on (confirmed by reading that file's Spawn step 2
-  directly). That same file passes a workspace id to `herdr worktree remove --workspace
-  <workspace-id>` too, but — like this skill, before this fix — never pins down which exact field
-  of `$result` that value comes from; extract it the same way as the two fields above, from
-  whichever field `herdr worktree create`'s own JSON result actually exposes it under, rather than
-  guessing a path neither file has verified.
+  '.result.worktree.path')`, `root_pane_id=$(printf '%s' "$result" | jq -r
+  '.result.root_pane.pane_id')`, and `workspace_id=$(printf '%s' "$result" | jq -r
+  '.result.workspace.workspace_id')` — the first two are the identical JSON paths
+  `skills/secondmate/SKILL.md`'s own `herdr worktree create` call already relies on (confirmed by
+  reading that file's Spawn step 2 directly); the third, `workspace_id`, is confirmed live against
+  a real `herdr worktree create` response (e.g. `"w76"`). **This extraction is required, not
+  optional:** an earlier draft of this contract left `workspace_id` unassigned here and the
+  manifest write below silently fell back to its own `${workspace_id:-}` default (an empty string,
+  serializing to JSON `null`) EVERY time, herdr or not — confirmed live, the unfixed form produced
+  `"workspace_id": null` even against a real herdr response that actually carried `"w76"`. Section
+  7's merge-cleanup branches on this exact field to choose `herdr worktree remove --workspace <id>`
+  over the git fallback; without this line, it always fell through to the git fallback, herdr or
+  not.
 
 Either way, write a durable per-task manifest IMMEDIATELY, atomically (temp file + `mv`, the same
 idiom this skill already requires for round-state files elsewhere):
@@ -208,15 +220,44 @@ literal string `null`, so every later reader must check `[ "$ws" = "null" ]`, no
 `[ -z "$ws" ]`. Confirmed live end-to-end: wrote this manifest for a headless (no-herdr) task-id,
 then re-read it from a **separate** process invocation simulating a dispatcher restart — the
 `worktree_path` and the correctly-`null` `workspace_id`/`root_pane_id` both came back identical to
-what was written, with no in-memory state involved at all. If a checker pane is later split off
-(the visible-orchestration case), update this SAME manifest file (read, patch `checker_pane_id`,
-atomic rewrite) rather than tracking it anywhere else.
+what was written, with no in-memory state involved at all.
+
+**If a checker pane is later split off (the visible-orchestration case), patch THIS SAME manifest
+file immediately after the split call — this is the one, concrete step that actually performs the
+update an earlier draft only described in prose without ever showing it.** The split itself is
+`skills/secondmate/SKILL.md`'s own documented call (confirmed by reading its "Checker pane" recipe
+directly): `ck=$(bin/herdr-pane.sh split --pane <root_pane_id> --dir down)`. Right after that line
+returns `$ck`, patch the manifest atomically — same temp-file + `mv` idiom as the original write,
+never a direct in-place edit:
+```bash
+jq --arg checker_pane_id "$ck" '.checker_pane_id = $checker_pane_id' \
+  ".secondmate/dispatch/<task-id>.manifest.json" > ".secondmate/dispatch/<task-id>.manifest.json.tmp"
+mv ".secondmate/dispatch/<task-id>.manifest.json.tmp" ".secondmate/dispatch/<task-id>.manifest.json"
+```
+No other step in this file ever performs this update — if a deployment never splits a checker
+pane (the common headless case), `checker_pane_id` legitimately stays `null` forever, and nothing
+elsewhere should assume otherwise. Section 4's watchdog (below) re-reads this field fresh every
+poll cycle rather than caching a stale value from spawn time, so this patch becomes visible to the
+watchdog on its very next iteration after the split, with no restart required.
 
 **Inputs:** a `--task-id` (validated by the dispatcher before the call — see Discipline below), a
 `--prompt-file` holding the full sub-supervisor prompt (claim → SOP → completion tag, same prompt
-shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), and a `--log-dir`.
+shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), a `--log-dir`,
+and a `--worktree <path>` — the SAME pre-created worktree path the dispatcher just wrote into this
+task-id's manifest above (`$worktree_path`/`$wt`), passed through explicitly rather than assumed.
+**This input is required, not optional:** without it, nothing in this contract ever tells the
+spawned `claude -p` process to run from the worktree the dispatcher already created for it — as
+documented, the fresh sub-supervisor could end up running its whole SOP from the dispatcher's own
+CWD instead. The simplest, most consistent fix with this file's existing conventions (every other
+recipe here passes paths through explicitly, never relies on an unstated ambient CWD) is for
+`spawn-sub-sup.sh` to `cd` into `--worktree` itself, as the literal first action, before anything
+else — see step 0 below.
 
 **Behavior, in order (inside `spawn-sub-sup.sh` itself, all synchronous):**
+0. `cd` into `--worktree` — the VERY FIRST action, before `claude -p` or anything else runs. Every
+   subsequent step, including the `claude -p` invocation itself, runs with this as the working
+   directory, so the sub-supervisor's whole claim → SOP → completion-tag run happens inside the
+   worktree the dispatcher already created for it, never the dispatcher's own ambient CWD.
 1. Run `claude -p --output-format stream-json` for that task-id and prompt, in the foreground,
    piping its output through `tee` to `.secondmate/dispatch/<task-id>.jsonl` as it streams, and
    **block until that invocation exits.** Never `--continue` or `--resume` — every sub-supervisor
@@ -418,10 +459,28 @@ while true; do
     if [ "$rc_quiet" -ne 0 ] && [ "$rc_quiet" -ne 1 ]; then
       : # ESCALATE: outside quiet's own documented {0,1}
     else
-      printf '%s\n' "$quiet_output" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" || true
-      # the `|| true` here is honestly sufficient (no fix needed): this grep reads a captured
-      # STRING via printf, never a filename argument, so its real {0,1,2} contract collapses to
-      # {0,1} at this call site -- a "file not found" exit 2 is structurally impossible here.
+      # Re-read EVERY watched task-id's own manifest FRESH, this cycle — never cached from spawn
+      # time or a prior iteration, so a checker-pane patch (section 1) becomes visible on the very
+      # next loop iteration after it happens, with no restart required. Build the pane-id filter
+      # dynamically, skipping any field a manifest reports as the literal string "null" (no herdr
+      # pane for that identifier at all), never filtering on that literal string itself.
+      pane_grep_args=()
+      for task_id in "${task_id_flags[@]}"; do
+        manifest=".secondmate/dispatch/${task_id}.manifest.json"
+        root_pane_id=$(jq -r '.root_pane_id' "$manifest")
+        checker_pane_id=$(jq -r '.checker_pane_id' "$manifest")
+        [ "$root_pane_id" != "null" ] && pane_grep_args+=(-e "\"pane_id\": \"${root_pane_id}\"")
+        [ "$checker_pane_id" != "null" ] && pane_grep_args+=(-e "\"pane_id\": \"${checker_pane_id}\"")
+      done
+      if [ "${#pane_grep_args[@]}" -gt 0 ]; then
+        printf '%s\n' "$quiet_output" | grep -F "${pane_grep_args[@]}" || true
+        # the `|| true` here is honestly sufficient (no fix needed): this grep reads a captured
+        # STRING via printf, never a filename argument, so its real {0,1,2} contract collapses to
+        # {0,1} at this call site -- a "file not found" exit 2 is structurally impossible here.
+      fi
+      # if pane_grep_args is empty (every watched task-id is headless, no herdr pane at all),
+      # skip the grep call entirely -- calling `grep -F` with zero -e flags is a usage error, not
+      # "match nothing," so this guard is required, not decorative.
     fi
   fi
   # relay any hit/escalation from any of the three calls above to the human verbatim, exactly as
@@ -430,39 +489,30 @@ while true; do
 done
 ```
 
-**`root_pane_id` (and `checker_pane_id` below) are read from each watched task-id's own
-`<task-id>.manifest.json` (section 1/2) — never an in-memory value the watchdog loop is assumed to
-still hold.** For every task-id in `${task_id_flags[@]}`, read its own manifest
-(`root_pane_id=$(jq -r '.root_pane_id' ".secondmate/dispatch/${task_id}.manifest.json")`, same for
-`checker_pane_id`) and build the pane-id set to filter on from THOSE values, skipping any task-id
-whose manifest reports `"null"` (no herdr pane for that task-id at all) rather than filtering on a
-literal `"null"` string. This is what makes the pane filter restart-safe: a dispatcher that
-crashes and comes back has no conversation context left, but the manifest files on disk are
-exactly what it already needed to re-derive before it could even resume watching these task-ids.
+**This re-reads EVERY watched task-id's own `<task-id>.manifest.json` (section 1/2) fresh, every
+single poll cycle — never an in-memory value, and never a value cached from an earlier iteration
+of this SAME loop.** This is what makes the pane filter restart-safe AND checker-pane-aware: a
+dispatcher that crashes and comes back has no conversation context left, but the manifest files on
+disk are exactly what it already needed to re-derive before it could even resume watching these
+task-ids; and a checker pane split off mid-task (section 1's patch step) is picked up on the very
+next cycle, since the loop never trusts a value it read in a prior iteration. Confirmed live:
+built the pane-id filter for two task-ids (one with a real `root_pane_id`, one fully headless with
+both fields `null`) and confirmed the filter correctly included only the real pane id; separately
+confirmed the all-headless edge case (every watched task-id's manifest reports `null` for both
+fields) correctly skips the `grep` call entirely rather than invoking it with zero `-e` flags.
 
 **Every example invocation here must be a complete, directly-runnable command — no literal "..."
-left sitting where a real argument belongs.** A trailing `...` after the `grep -F -e PATTERN` call
-above is not a harmless placeholder: `grep` reads it as an actual extra argv token, and
-`grep -F -e PATTERN <extra-arg>` interprets that extra token as a FILENAME to read instead of
-stdin — so a real quiet-pane hit arriving on stdin never gets matched, `grep` fails on the missing
-file, and the trailing `|| true` silently swallows a hit that should have been relayed to the
-human. Confirmed live: piping a real `pane-reaper.py quiet`-shaped JSON line (built from reading
+left sitting where a real argument belongs.** A trailing `...` after a `grep -F -e PATTERN` call is
+not a harmless placeholder: `grep` reads it as an actual extra argv token, and `grep -F -e PATTERN
+<extra-arg>` interprets that extra token as a FILENAME to read instead of stdin — so a real
+quiet-pane hit arriving on stdin never gets matched, `grep` fails on the missing file, and a
+trailing `|| true` would silently swallow a hit that should have been relayed to the human.
+Confirmed live: piping a real `pane-reaper.py quiet`-shaped JSON line (built from reading
 `find_quiet`'s own hit-dict construction directly:
-`{"pane_id": pane_id, "status": "quiet", ...}`) into the literal `grep -F -e "..." ...` form
-produced `grep: ...: No such file or directory` and exit 2 — the hit was never seen. Removing the
-trailing `...` (shown fixed above) against the identical sample line matches correctly (exit 0,
-the JSON line printed through).
-
-**If watching more than one pane id, repeat `-e` with the real second pattern, never a
-placeholder** — against the SAME already-captured `$quiet_output` from the loop above, never a
-second direct re-invocation of `pane-reaper.py quiet`:
-```bash
-printf '%s\n' "$quiet_output" \
-  | grep -F -e "\"pane_id\": \"${root_pane_id}\"" -e "\"pane_id\": \"${checker_pane_id}\"" || true
-```
-Confirmed live against three sample lines (`root_pane_id`, `checker_pane_id`, and an unrelated
-third pane id): this two-`-e` form matched both the root and checker pane lines and correctly
-excluded the unrelated one.
+`{"pane_id": pane_id, "status": "quiet", ...}`) into a literal `grep -F -e "..." ...` form produced
+`grep: ...: No such file or directory` and exit 2 — the hit was never seen. The dynamically-built
+`${pane_grep_args[@]}` array above never contains a literal `...` — every `-e` entry it adds is a
+real, concrete pane-id pattern read straight from a manifest.
 
 **All three calls in the loop body apply the capture-and-classify idiom from "Strict-mode
 exit-code discipline" above, not a blanket `|| true`.** `bin/progress-ledger.py stale` exits `1`
@@ -704,39 +754,59 @@ which task-ids belong to the batch in the first place.
 
 ## 6. One consolidated hold
 
-**Before building the entries file: filter `ready`'s output through `claim-ledger.py status`'s
-currently-OPEN claims — a task-id whose claim is already gone must never be re-included.**
-`progress-ledger.py`'s ledger rows are never deleted, so once a batch task-id reaches
-`verify_gate_pass`, `bin/progress-ledger.py ready --batch-id <batch-id>` reports that SAME row
-forever, even long after that task-id was merged, its claim released, and its worktree torn down
-in a prior round of this same batch. If the dispatcher process restarts after that point and
-re-runs its batch-close logic, it would recompute the ready set from the ledger alone and open a
-SECOND consolidated hold entry for an already-merged, already-answered, already-torn-down task-id.
-`skills/secondmate/SKILL.md`'s own batch-dispatch step (e) already documents the fix for exactly
-this: "Cross-check against `bin/claim-ledger.py status`'s own currently-OPEN claims too — anything
-already merged and released from a prior round of this same batch drops out on its own, since its
-claim is gone." Carry that same cross-check into this skill's own batch-close concretely:
+**Before building the entries file: filter `ready`'s output through BOTH this batch's own
+persisted task-id list AND `claim-ledger.py status`'s currently-OPEN claims — never trust
+`ready --batch-id` alone as proof a row belongs to THIS dispatcher's own batch.** Two independent
+reasons a row from `ready --batch-id <batch-id>` must not be taken at face value:
+1. `progress-ledger.py`'s ledger rows are never deleted, so once a batch task-id reaches
+   `verify_gate_pass`, `ready --batch-id` reports that SAME row forever, even long after that
+   task-id was merged, its claim released, and its worktree torn down in a prior round of this
+   same batch. `skills/secondmate/SKILL.md`'s own batch-dispatch step (e) already documents the
+   fix: "Cross-check against `bin/claim-ledger.py status`'s own currently-OPEN claims too —
+   anything already merged and released from a prior round of this same batch drops out on its
+   own, since its claim is gone."
+2. **`<batch-id>` collision across independent dispatcher runs is a known, documented limit
+   elsewhere in this file (section 5's batch manifest discussion)** — `ready --batch-id` has no way
+   to tell "a task-id THIS dispatcher's own batch actually spawned" apart from "a wholly unrelated
+   task-id from a different dispatcher run that happens to carry the identical `<batch-id>` value."
+   Confirmed live: simulated a batch whose own persisted task-id list was `["mine1", "mine2"]`, but
+   recorded a THIRD, unrelated task-id (`foreign1`) at `verify_gate_pass` under the SAME
+   `<batch-id>` — `ready --batch-id` returned BOTH `mine1` and `foreign1`, and `claim-ledger.py
+   status` reported BOTH as open (`foreign1`'s claim is real, just not this batch's), so the
+   claim-status filter alone could not tell them apart and wrongly kept `foreign1`. Only cross-
+   checking against this batch's own `<batch-id>.batch.json` (section 5) — which lists EXACTLY the
+   task-ids this dispatcher's own fan-out actually spawned — correctly excludes it.
+
+Carry both cross-checks into this skill's own batch-close concretely:
 ```bash
 open_claims_output=$(bin/claim-ledger.py status)
 # status's own contract is binary like hold.py open: 0 = success, always, even with zero open
 # claims (confirmed live: "(no open claims)" to stderr, exit 0) -- no classification needed here,
 # unlike `ready`, which the parent skill's own fan-out section documents as "always exits 0" too.
+batch_task_ids=$(jq -r '.task_ids[]' ".secondmate/dispatch/${batch_id}.batch.json")
 ready_output=$(bin/progress-ledger.py ready --batch-id "$batch_id")
 entries_task_ids=()
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   tid=$(printf '%s' "$line" | jq -r '.task_id')
-  if printf '%s\n' "$open_claims_output" | grep -qF "[$tid] "; then
-    entries_task_ids+=("$tid")  # claim still open -- keep, this task-id genuinely awaits this hold
+  claim_open=0
+  printf '%s\n' "$open_claims_output" | grep -qF "[$tid] " && claim_open=1
+  in_batch=0
+  printf '%s\n' "$batch_task_ids" | grep -qxF "$tid" && in_batch=1
+  if [ "$claim_open" -eq 1 ] && [ "$in_batch" -eq 1 ]; then
+    entries_task_ids+=("$tid")  # claim open AND genuinely ours -- keep
   fi
-  # else: claim already gone -- already merged/answered/torn down in a prior round of this same
-  # batch. DROP it. Never re-include a task-id whose claim-ledger entry is already closed.
+  # else: either the claim is already gone (merged/torn down in a prior round of THIS batch), or
+  # this row never belonged to this batch at all (a batch-id collision with a foreign task-id).
+  # DROP it either way. Never re-include a task-id that fails either check.
 done <<< "$ready_output"
 ```
-Confirmed live: simulated a two-task-id batch where `t1` was already merged and its claim released
-in a prior round while `t2` was still pending — `ready --batch-id` kept reporting BOTH `t1` and
-`t2` (ledger rows never deleted, exactly the bug surface), but `claim-ledger.py status` reported
-only `t2` as open; the filter above correctly dropped `t1` and kept only `t2`.
+Confirmed live, both scenarios: (1) a two-task-id batch where `t1` was already merged and its claim
+released in a prior round while `t2` was still pending — `ready --batch-id` kept reporting BOTH
+(ledger rows never deleted), but the claim-status half of the filter correctly dropped `t1` and
+kept only `t2`; (2) the batch-id-collision scenario above — the claim-status check ALONE wrongly
+kept the foreign `foreign1` (`claim_open=1`), but adding the batch-manifest membership check
+(`in_batch=0` for `foreign1`) correctly dropped it while still keeping the genuine `mine1`.
 
 Then write the JSON entries file, one object per task-id that survived the filter above —
 ```json
