@@ -5,8 +5,12 @@ role from an external agent — something that is not itself a Claude Code sessi
 produced this doc used "Hermes" as a concrete example; nothing here is specific to that product, and
 the pattern works from any agent that can run shell commands against this repo and talk to an LLM).
 
-Everything below is checked against this repo's actual scripts and SOP as they exist today. It does
-not reference any script or skill file that doesn't exist yet.
+Everything below is checked against this repo's actual scripts and SOP as they exist today. Every
+piece either exists on `main` already, or — three pieces (`bin/spawn-sub-sup.sh`,
+`bin/hold-watch.sh`, `skills/secondmate-dispatch/SKILL.md`) — exists finished and committed on a
+sibling task's own branch within this same batch, pending merge; those three are called out
+explicitly, with their branch name, wherever they're documented below, and are described against
+their real, current, committed shape, never a guess at what they might contain.
 
 ## 1. What this pattern is, and why
 
@@ -40,10 +44,10 @@ Claude Code `Agent` tool call.
 
 - **secondmate plugin installed** in this repo (if you're reading this file from inside the repo,
   it already is).
-- **herdr**, if you want the pane-visible launch path described in §3 below (an external dispatcher
-  that only needs headless sub-supervisors, with no visible pane, can skip herdr and launch Claude
-  Code sessions by whatever means its own runtime supports instead — that path is outside this doc's
-  scope).
+- **herdr**, if you want the pane-visible launch path described in §3 below. An external dispatcher
+  that only needs headless sub-supervisors, with no visible pane, can skip herdr entirely and use
+  `bin/spawn-sub-sup.sh` instead (§3's "Headless launch" subsection) — real, committed, pending
+  merge from a sibling task (`sm/add-spawn-sub-sup-script`), not a hypothetical.
 - **A dispatcher agent with real terminal/shell access** — it needs to run the commands in §3 and
   §4 directly, not just converse about them.
 - **A scheduler** (cron, a sleep loop, your agent runtime's own timer) for the watchdog cadence in
@@ -66,17 +70,35 @@ loop itself (claiming, routing, checker rounds, verify-gate, hold, merge, teardo
 `skills/secondmate/SKILL.md`'s **"Dispatch mechanics — solo and batch"** section. What follows is only
 what an external, non-Claude-Code dispatcher needs on top of that SOP.
 
-### Launching a sub-agent-supervisor (no dedicated script — use the herdr CLI directly)
+There is now a second canonical SOP, specific to this external-process case:
+`skills/secondmate-dispatch/SKILL.md` (committed on sibling branch `sm/add-dispatch-skill`, pending
+merge). It covers exactly the parts that are genuinely different for an OS-process dispatcher —
+`bin/spawn-sub-sup.sh`'s own contract, claim-token extraction, PID-based reaping (never a blocking
+`wait` from a dispatcher that might restart), the batch manifest file, and the restart-safe
+consolidated-hold check — in far more operational depth than this guide reproduces. Treat this
+guide's §3/§4/§5 as the colleague-facing overview and `skills/secondmate-dispatch/SKILL.md` as the
+detailed reference once it merges.
 
-There is no `bin/spawn-*.sh` wrapper for this. The dispatcher starts a fresh Claude Code
-sub-agent-supervisor as its own OS-level process the same way `skills/secondmate/SKILL.md` already
-starts a **maker** inside a sub-supervisor's own loop (see SKILL.md's "Maker pane" recipe) — one level
-up:
+### Pane-visible launch — use the herdr CLI directly (no wrapper script for this specific path)
+
+For the pane-visible path (a human can watch the sub-supervisor work), there's no dedicated
+wrapper — not to be confused with `bin/spawn-sub-sup.sh` below, which is a *different*, headless
+launch mechanism. The dispatcher starts a fresh Claude Code sub-agent-supervisor as its own
+OS-level process the same way `skills/secondmate/SKILL.md` already starts a **maker** inside a
+sub-supervisor's own loop (see SKILL.md's "Maker pane" recipe) — one level up:
 
 ```bash
-# root_pane_id comes from .result.root_pane.pane_id of a prior `herdr worktree create` call,
-# exactly as SKILL.md's own maker-launch recipe uses it.
-herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto
+# The dispatcher's own pane for the sub-supervisor is a PLAIN pane -- `herdr pane split`, never
+# `herdr worktree create` -- and its cwd can be any ordinary checkout, NOT the sm/<task-id>
+# worktree. The sub-supervisor's own required Spawn step (SKILL.md step 2) creates THAT exact
+# worktree/branch itself, once it's running (`herdr worktree create --branch sm/<task-id>`) -- if
+# the dispatcher created it first, the sub-supervisor's own Spawn call collides: confirmed live,
+# `git worktree add -b sm/<task-id>` on a branch that already exists exits 255 ("fatal: a branch
+# named 'sm/<task-id>' already exists"), which is exactly what `herdr worktree create` would hit
+# internally.
+pane_id=$(herdr pane split --dir right --cwd <any-existing-checkout> --no-focus \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+herdr agent start sm-<task-id> --kind claude --pane "$pane_id" -- --permission-mode auto
 
 # Submit, then harvest output with a SEPARATE call -- this repo's own established pattern
 # (bin/herdr-pane.sh's `delegate` subcommand) discards `agent prompt`'s own stdout and reads the
@@ -97,6 +119,40 @@ real output," never as proof that the prompt you just sent is what produced it.
 **Proof it worked:** `herdr agent get sm-<task-id>` returns successfully (exit 0) once the agent
 exists; `herdr agent read sm-<task-id> --source recent-unwrapped --lines 400` (not `agent prompt`'s
 own stdout) is what actually carries the sub-supervisor's output.
+
+### Headless launch (`bin/spawn-sub-sup.sh`) — no herdr pane at all
+
+**Committed on sibling branch `sm/add-spawn-sub-sup-script`, pending merge** — read directly off
+that branch's real, current source, not a plan. Where the launch above needs herdr for a visible
+pane, this is the no-pane alternative: one foreground `claude -p` process per sub-supervisor,
+started and reaped as an ordinary OS process. It never forks an inner child to track separately —
+`spawn-sub-sup.sh` itself runs `claude -p` synchronously, extracts the final result, runs
+`bin/dispatch-report.py`, and exits with that exact code, so there is exactly one PID whose
+lifetime is the task's own liveness signal.
+
+```bash
+spawn-sub-sup.sh --task-id <task-id> --mode solo|batch [--batch-id <batch-id>] [--repo <dir>] \
+  [--log-dir <dir>] [--prompt-file <file>]
+spawn-sub-sup.sh --selfcheck
+```
+
+Backgrounded by the dispatcher, which captures `$!` as its very next line (PID bookkeeping lives
+with the caller, not inside the script):
+
+```bash
+bin/spawn-sub-sup.sh --task-id <task-id> --mode solo --repo <repo> --log-dir .secondmate/dispatch &
+echo $! > ".secondmate/dispatch/<task-id>.pid"
+```
+
+Exit codes are `dispatch-report.py`'s own, relayed verbatim, plus one the script adds itself:
+`0` `SM_DONE_MERGED`, `1` `SM_REFUSED`, `2` `SM_STUCK_NEED_HUMAN` (also: a `--mode batch` run whose
+final tag was `SM_DONE_MERGED` instead of `SM_READY_UNMERGED` — a self-merge contract violation,
+logged with distinct `SELF-MERGE` wording on stderr), `3` no completion tag found, `4`
+`SM_READY_UNMERGED`, `5` the `claude` subprocess itself crashed or was killed — on this one path
+`dispatch-report.py` is never even invoked, and no `.result` artifact is written. `--mode batch`
+requires `--batch-id`; `--mode solo` rejects it outright.
+
+**Proof it worked:** `bin/spawn-sub-sup.sh --selfcheck` prints `ok`.
 
 ### Claiming (`bin/claim-ledger.py`)
 
@@ -168,6 +224,29 @@ sub-supervisor — that opens the one consolidated hold instead, via `--entries-
 collecting every ready task-id (see SKILL.md's "Batch dispatch" step (g)); `bin/hold.py open` still
 prints it, just shaped as one question covering every task-id in the batch rather than one `--sha`.
 
+### Hold watchdog (`bin/hold-watch.sh`)
+
+**Committed on sibling branch `sm/add-hold-watch-script`, pending merge.** A detection-only,
+cron-friendly wrapper around polling `bin/hold.py open` yourself (§3's "Human gates" above) — never
+answers a hold, never writes to the ledger, just blocks until a match or a timeout.
+
+```bash
+bin/hold-watch.sh [--task <task-id>] [--interval <seconds>] [--timeout <seconds>]
+bin/hold-watch.sh --selfcheck
+```
+
+Polls immediately, then every `--interval` seconds (default `30`, must be `1`–`31536000`) until
+`--timeout` seconds elapse (default `1800`, `0`–`31536000` — `0` is valid and gets exactly one
+poll, no wait). `--task` restricts the match to a hold
+whose own task field is EXACTLY that value (never a substring) — an explicitly empty `--task=`
+(e.g. an unset dispatcher variable) is rejected outright with exit `2`, never silently treated as
+"match anything." On a match: exit `0`, stdout is that hold's full block exactly as `hold.py open`
+rendered it. On timeout: exit `3`, stdout is one line, `NO-HOLD: no open hold matching task=<task>
+after <N>s (<polls> polls)`. `SIGTERM` exits `143`, `SIGINT` exits `130` — both distinct from the
+timeout path.
+
+**Proof it worked:** `bin/hold-watch.sh --selfcheck` prints `ok`.
+
 ### Merging (`bin/merge-sequencer.sh`)
 
 Serializes concurrent merges to `main`/base across multiple sub-supervisors finishing around the same
@@ -203,10 +282,18 @@ printed `TEARDOWN: clean` and exited 0. A checker pane is the supervisor's own r
 close directly — SKILL.md's own teardown step runs `herdr pane close "$ck"` **before** worktree
 removal, precisely because this script will never catch a leaked one.
 
-**Proof it worked:** prints `TEARDOWN: clean` and exits 0 — but treat that as "worktree, branch,
-maker agent, and claim are clean," never as "every herdr resource for this task-id is gone." Confirm
-a checker pane was closed separately, by your own `herdr pane close` call (or `herdr pane list`
-showing it gone), not by this script's report.
+**Proof it worked:** exit `0` alone is NOT proof the maker agent is confirmed gone. Live-checked:
+with `HERDR_ENV` unset (the ordinary state for a headless external dispatcher with no herdr pane at
+all), `teardown-check.sh` still exits `0`, but prints `[herdr] unknown: HERDR_ENV is not 1
+(headless run -- cannot check)` and the summary line itself qualifies: `TEARDOWN: clean, but some
+state(s) could not be verified (see above) -- advisory only`. Only when the report's own `[herdr]`
+field literally reads `clean` (which requires `HERDR_ENV=1` and a reachable `herdr`) has the maker
+agent actually been confirmed absent — an `unknown` field, even under an overall exit `0`, means
+that signal was never verified at all, not that it passed. Read all four bracketed fields
+(`[worktree]`, `[branch]`, `[herdr]`, `[claim]`) individually; don't infer any one of them from the
+overall exit code or the one-line summary. The same caveat applies to the checker pane above:
+confirm it was closed separately, by your own `herdr pane close` call (or `herdr pane list` showing
+it gone), never from this script's report.
 
 ### Parsing completion (`bin/dispatch-report.py`)
 
@@ -249,10 +336,11 @@ Per `audit/flow/2026-10-13--fix-banner-thinking-wording.md` and
    agent-name limit).
 3. **Round 1** — the maker changed the banner line and added 3 selfcheck assertions, mutation-testing
    its own new assertions before replying DONE.
-4. **Checker round 1 — FAIL** — the cross-model checker found a real defect: the new assert-present
-   check used `grep -q` with an unescaped `.` in "5.3" (a regex metacharacter), so a corrupted banner
-   like `pi+GLM-5X3` would still pass. The checker reproduced this directly: mutated the banner text,
-   ran the real selfcheck, showed it wrongly printed `ok`.
+4. **Checker round 1 — FAIL** — the checker (model `global.openai.gpt-5.6-terra`, per
+   `skills/secondmate/SKILL.md:170`'s "Checker model" line) found a real defect: the new
+   assert-present check used `grep -q` with an unescaped `.` in "5.3" (a regex metacharacter), so a
+   corrupted banner like `pi+GLM-5X3` would still pass. The checker reproduced this directly:
+   mutated the banner text, ran the real selfcheck, showed it wrongly printed `ok`.
 5. **Round 2** — the supervisor synthesized a one-line fix plan (`grep -q` → `grep -qF` on that one
    assertion) and routed it back to the same task-scoped maker, never fixing inline. The maker
    re-ran its own mutation test to prove the gap closed, and re-verified round 1's regression tests
