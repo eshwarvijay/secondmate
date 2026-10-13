@@ -129,6 +129,14 @@ if [ "${1:-}" = "--selfcheck" ]; then
   cat > "$fakebin/claude" <<'FAKE'
 #!/usr/bin/env bash
 [ -n "${CLAUDE_INVOKED_MARKER:-}" ] && : > "$CLAUDE_INVOKED_MARKER"
+if [ -n "${CLAUDE_RECEIVED_PROMPT_FILE:-}" ]; then
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-p" ]; then
+      printf '%s' "$2" > "$CLAUDE_RECEIVED_PROMPT_FILE"
+    fi
+    shift
+  done
+fi
 case "${FAKE_CLAUDE_BEHAVIOR:-ok}" in
   crash)
     echo '{"type":"system"}'
@@ -140,24 +148,36 @@ case "${FAKE_CLAUDE_BEHAVIOR:-ok}" in
     ;;
   batch_violation)
     echo '{"type":"system"}'
-    printf '%s\n' '{"type":"result","result":"work done\nSM_DONE_MERGED:deadbeef"}'
+    printf '%s\n' '{"type":"result","result":"work done\nSM_DONE_MERGED:deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}'
     ;;
   claim_token)
     echo '{"type":"system"}'
-    printf '%s\n' '{"type":"result","result":"SM_CLAIM_TOKEN:tok-xyz\nSM_READY_UNMERGED:cafef00d"}'
+    printf '%s\n' '{"type":"result","result":"SM_CLAIM_TOKEN:tok-xyz\nSM_READY_UNMERGED:cafef00dcafef00dcafef00dcafef00dcafef00d"}'
     ;;
   slow)
     sleep 1
     echo '{"type":"system"}'
-    echo '{"type":"result","result":"SM_DONE_MERGED:slowsha"}'
+    echo '{"type":"result","result":"SM_DONE_MERGED:5a0105ca5a0105ca5a0105ca5a0105ca5a0105ca"}'
     ;;
   non_string_result)
     echo '{"type":"system"}'
     echo '{"type":"result","result":{"unexpected":"object"}}'
     ;;
-  *)
+  short_sha_done)
     echo '{"type":"system"}'
     echo '{"type":"result","result":"SM_DONE_MERGED:cafef00d"}'
+    ;;
+  short_sha_ready)
+    echo '{"type":"system"}'
+    echo '{"type":"result","result":"SM_READY_UNMERGED:deadbeef"}'
+    ;;
+  known_sha_real)
+    echo '{"type":"system"}'
+    echo '{"type":"result","result":"SM_DONE_MERGED:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+    ;;
+  *)
+    echo '{"type":"system"}'
+    echo '{"type":"result","result":"SM_DONE_MERGED:cafef00dcafef00dcafef00dcafef00dcafef00d"}'
     ;;
 esac
 FAKE
@@ -168,7 +188,7 @@ FAKE
   log_dir="$t/run1"; mkdir -p "$log_dir"
   rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id ok1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" 2>"$t/run1.err")" || rc=$?
   [ "$rc" = 0 ] || { echo "FAIL: ordinary solo success exit ($rc)"; fails=1; }
-  echo "$out" | grep -q 'SM_DONE_MERGED:cafef00d' || { echo "FAIL: ordinary solo success did not relay dispatch-report.py output"; fails=1; }
+  echo "$out" | grep -q 'SM_DONE_MERGED:cafef00dcafef00dcafef00dcafef00dcafef00d' || { echo "FAIL: ordinary solo success did not relay dispatch-report.py output"; fails=1; }
 
   # 2) crash disambiguation: claude killed/nonzero -> exit 5, stderr banner, dispatch-report.py NEVER run
   #    (no .result file is ever written on this path).
@@ -282,6 +302,51 @@ FAKE
   [ "$race_corrupted" = 0 ] || { echo "FAIL: exclusive_open race test -- victim corrupted after $race_iterations iterations (TOCTOU reopened)"; fails=1; }
   [ "$race_iterations" -gt 20 ] || { echo "FAIL: exclusive_open race test ran suspiciously few iterations ($race_iterations) -- not a meaningful stress test"; fails=1; }
 
+  # 8c) PRODUCTION call-site regression guard: tests 8-8b above only pin exclusive_open's own
+  #     primitive. This pins the production `claude -p "$prompt_content"` call site itself -- if it
+  #     ever regressed back to re-reading rendered_prompt_path by name (`claude -p "$(cat ...)"`), a
+  #     background toggler continuously swapping that path for a symlink to poisoned content for the
+  #     ENTIRE invocation would get the poisoned text relayed to claude's -p argument instead of the
+  #     real rendered prompt.
+  poison_prompt="$t/poison_prompt.txt"; printf 'POISONED_PROMPT_CONTENT_SHOULD_NEVER_REACH_CLAUDE' > "$poison_prompt"
+  received_prompt="$t/received_prompt.txt"; rm -f "$received_prompt"
+  log_dir="$t/run8c"; mkdir -p "$log_dir"
+  prompt_target="$log_dir/sm-promptregress.prompt"
+  (
+    while [ ! -e "$prompt_target" ]; do :; done
+    while true; do
+      rm -f "$prompt_target" 2>/dev/null
+      ln -sf "$poison_prompt" "$prompt_target" 2>/dev/null
+    done
+  ) &
+  toggler8c=$!
+  PATH="$fakebin:$PATH" CLAUDE_RECEIVED_PROMPT_FILE="$received_prompt" "$0" --task-id promptregress --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run8c.err"
+  kill "$toggler8c" 2>/dev/null; wait "$toggler8c" 2>/dev/null
+  [ -f "$received_prompt" ] || { echo "FAIL: production prompt regression guard -- claude was never invoked, test is inconclusive"; fails=1; }
+  grep -q 'POISONED_PROMPT_CONTENT_SHOULD_NEVER_REACH_CLAUDE' "$received_prompt" 2>/dev/null && { echo "FAIL: production claude -p call site relayed poisoned on-disk content instead of the in-memory rendered prompt"; fails=1; }
+
+  # 8d) PRODUCTION call-site regression guard: pins the production
+  #     `extracted="$(printf '%s' "$claude_output" | extract_result)"` call site -- if it ever
+  #     regressed back to re-reading log_file by name, a background toggler continuously swapping
+  #     that path for a symlink to a poisoned (but still full-sha-shaped) NDJSON log for the ENTIRE
+  #     invocation would get the poisoned tag relayed instead of the real captured claude output.
+  poison_log="$t/poison_log.ndjson"
+  printf '%s\n' '{"type":"result","result":"SM_DONE_MERGED:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' > "$poison_log"
+  log_dir="$t/run8d"; mkdir -p "$log_dir"
+  log_target="$log_dir/sm-logregress.log"
+  (
+    while [ ! -e "$log_target" ]; do :; done
+    while true; do
+      rm -f "$log_target" 2>/dev/null
+      ln -sf "$poison_log" "$log_target" 2>/dev/null
+    done
+  ) &
+  toggler8d=$!
+  rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=known_sha_real "$0" --task-id logregress --mode solo --repo "$repo_dir" --log-dir "$log_dir" 2>"$t/run8d.err")" || rc=$?
+  kill "$toggler8d" 2>/dev/null; wait "$toggler8d" 2>/dev/null
+  echo "$out" | grep -q 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' && { echo "FAIL: production extraction call site relayed the poisoned on-disk log tag instead of the real captured claude output"; fails=1; }
+  echo "$out" | grep -q 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || { echo "FAIL: production extraction call site did not relay the real tag either (rc=$rc): $(cat "$t/run8d.err")"; fails=1; }
+
   # 9) cross-invocation lock: two concurrent runs for the SAME task-id/log-dir must not cross-
   #    contaminate -- the second one fails fast instead of racing or reading the first one's artifacts.
   log_dir="$t/run11"; mkdir -p "$log_dir"
@@ -303,7 +368,7 @@ FAKE
   rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id hijack1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" 2>"$t/run12.err")" || rc=$?
   unset -f claude
   [ "$rc" = 0 ] || { echo "FAIL: exported claude function hijacked the real invocation (exit $rc)"; fails=1; }
-  echo "$out" | grep -q 'SM_DONE_MERGED:cafef00d' || { echo "FAIL: exported claude function hijacked the real invocation's output"; fails=1; }
+  echo "$out" | grep -q 'SM_DONE_MERGED:cafef00dcafef00dcafef00dcafef00dcafef00d' || { echo "FAIL: exported claude function hijacked the real invocation's output"; fails=1; }
 
   # 11) non-string .result must not crash extraction (isolated) -- treated as no usable result text.
   log3="$t/r3.log"
@@ -318,6 +383,19 @@ FAKE
   rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=non_string_result "$0" --task-id nsr1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run14.err" || rc=$?
   [ "$rc" = 3 ] || { echo "FAIL: non-string .result end-to-end should exit 3 (no usable tag), got $rc: $(cat "$t/run14.err")"; fails=1; }
   grep -q 'Traceback' "$t/run14.err" && { echo "FAIL: non-string .result leaked a Python traceback (extraction crashed, exit 3 was coincidental, not graceful)"; fails=1; }
+
+  # 13) full-sha discipline: a SM_DONE_MERGED/SM_READY_UNMERGED tag whose value is NOT a full 40-hex
+  #     git SHA (the checker's own repro used an 8-char "cafef00d") must be treated the same as a
+  #     malformed/no-usable-tag result -- exit 3, never relayed as a successful completion.
+  log_dir="$t/run_shortsha1"; mkdir -p "$log_dir"
+  rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=short_sha_done "$0" --task-id shortsha1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" 2>"$t/run_shortsha1.err")" || rc=$?
+  [ "$rc" = 3 ] || { echo "FAIL: non-full-sha SM_DONE_MERGED should be treated as malformed, exit 3 (got $rc)"; fails=1; }
+  echo "$out" | grep -q '^malformed$' || { echo "FAIL: non-full-sha SM_DONE_MERGED not reported as malformed, got: $out"; fails=1; }
+
+  log_dir="$t/run_shortsha2"; mkdir -p "$log_dir"
+  rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=short_sha_ready "$0" --task-id shortsha2 --mode solo --repo "$repo_dir" --log-dir "$log_dir" 2>"$t/run_shortsha2.err")" || rc=$?
+  [ "$rc" = 3 ] || { echo "FAIL: non-full-sha SM_READY_UNMERGED should be treated as malformed, exit 3 (got $rc)"; fails=1; }
+  echo "$out" | grep -q '^malformed$' || { echo "FAIL: non-full-sha SM_READY_UNMERGED not reported as malformed, got: $out"; fails=1; }
 
   # --- drift tripwire: SKILL.md's own numbered/lettered step counts must still match the templates ---
   skill="$SCRIPT_DIR/../skills/secondmate/SKILL.md"
@@ -442,20 +520,35 @@ fi
 printf '%s' "$extracted" >&9
 exec 9>&-
 
-if dispatch_out="$("$SCRIPT_DIR/dispatch-report.py" "$result_file")"; then
+# Feed dispatch-report.py the in-memory extracted text directly (it already documents stdin support
+# for this exact case), never a re-open of result_file by path -- the same re-read-by-path shape
+# findings 1 and 2 (last round) closed for the prompt and the log applies identically here: a
+# concurrent attacker could otherwise swap result_file for a symlink to attacker-controlled NDJSON
+# between the exclusive_open write above and this read, turning a real SM_REFUSED into a relayed
+# SM_DONE_MERGED.
+if dispatch_out="$(printf '%s' "$extracted" | "$SCRIPT_DIR/dispatch-report.py")"; then
   dispatch_rc=0
 else
   dispatch_rc=$?
 fi
 
+# Full-sha discipline: a SM_DONE_MERGED/SM_READY_UNMERGED tag whose value is NOT a full, standard
+# git SHA (40 hex chars) is not a genuine completion signal -- treat it exactly like
+# dispatch-report.py's own malformed/no-tag case ("malformed", exit 3), never relay it as success.
+if [[ "$dispatch_out" == SM_DONE_MERGED:* || "$dispatch_out" == SM_READY_UNMERGED:* ]] \
+   && [[ ! "$dispatch_out" =~ ^(SM_DONE_MERGED|SM_READY_UNMERGED):[0-9a-fA-F]{40}$ ]]; then
+  dispatch_out="malformed"
+  dispatch_rc=3
+fi
+
 echo "$dispatch_out"
 
-claim_line="$(grep -m1 '^SM_CLAIM_TOKEN:' "$result_file" || true)"
+claim_line="$(printf '%s' "$extracted" | grep -m1 '^SM_CLAIM_TOKEN:' || true)"
 [ -n "$claim_line" ] && echo "$claim_line"
 
 final_rc="$dispatch_rc"
 if [ "$mode" = "batch" ] && [[ "$dispatch_out" == SM_DONE_MERGED:* ]]; then
-  violation_line="$(grep -m1 '^SM_DONE_MERGED:' "$result_file" || true)"
+  violation_line="$(printf '%s' "$extracted" | grep -m1 '^SM_DONE_MERGED:' || true)"
   echo "SPAWN-SUB-SUP: BATCH SELF-MERGE CONTRACT VIOLATION -- a --mode batch sub-supervisor must stop at verify_gate_pass and emit SM_READY_UNMERGED, never merge/hold itself. Raw tag: ${violation_line:-$dispatch_out}" >&2
   final_rc=2
 fi
