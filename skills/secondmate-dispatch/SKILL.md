@@ -893,6 +893,35 @@ pairs, not bare task-ids, is what lets a genuine resubmission through while stil
 unchanged, already-rejected one — now sourced directly from `hold.py`'s own `batch[].checked_sha`
 field, never a hand-copied value of our own.
 
+**A hold's own shape and its answer's shape must agree — `hold.py`'s own `_recs()` does not
+cross-check this, so this recipe must.** `_recs()` accepts an answer record as valid if it has
+EITHER the single-task shape (`"a"` present) OR the batch shape (`"approved"`/`"rejected"` both
+present as lists) — it never checks that the accepted shape actually matches whether the HOLD
+record being answered itself has a `batch` key (confirmed by reading `_recs()`'s own validation
+directly: `has_single = "a" in o`, `has_batch = isinstance(o.get("approved"), list) and
+isinstance(o.get("rejected"), list)`, accepted if EITHER holds, with no cross-reference to the
+corresponding hold record at all). A single-task-shaped answer (`{"a": "reject"}`) attached to a
+hold that was actually opened as a BATCH hold is therefore accepted by `_recs()` without
+complaint — and a recipe that only ever reads that answer's `.rejected` list would find nothing,
+silently concluding "not rejected" and re-opening a brand-new hold for an already-decided
+task-id — the exact fail-open pattern this round's own architectural fix just eliminated for the
+deleted cache, reappearing one layer up. Since `bin/hold.py` stays unmodified, this recipe
+notices the inconsistency itself: for any hold record matching this batch whose answer shape does
+NOT match the hold's own shape (batch hold answered single-task-style, or the reverse), that is a
+data anomaly — the embedded script exits nonzero rather than silently treating it as "no
+rejection found," which the surrounding escalate-and-stop branch below already relays to the
+human exactly like any other unexpected failure.
+
+**The module loader must resolve `bin/hold.py` by an ABSOLUTE path, never a bare relative one.**
+A bare `"bin/hold.py"` only resolves correctly when the external dispatcher's own CWD happens to
+be the repo root — this file already documents elsewhere (section 8's discipline #1) that an
+external process's CWD is never guaranteed to be that. Reuse the SAME absolute `$dispatch_dir`
+this whole file already establishes once (section 1: `dispatch_dir="$(git -C <repo>
+rev-parse --show-toplevel)/.secondmate/dispatch"`) rather than inventing a second absolute-path
+variable: stripping its own known `/.secondmate/dispatch` suffix recovers the repo root in one
+bash parameter expansion, `${dispatch_dir%/.secondmate/dispatch}`, with no new variable and no
+external `dirname` process.
+
 Carry all three cross-checks into this skill's own batch-close concretely:
 ```bash
 open_claims_output=$(bin/claim-ledger.py status)
@@ -902,13 +931,16 @@ open_claims_output=$(bin/claim-ledger.py status)
 batch_task_ids=$(jq -r '.task_ids[]' "$dispatch_dir/${batch_id}.batch.json")
 ready_output=$(bin/progress-ledger.py ready --batch-id "$batch_id")
 
-# Reuse hold.py's own ledger directly (see above) -- no cache of our own to corrupt.
+# Reuse hold.py's own ledger directly (see above) -- no cache of our own to corrupt. Resolve
+# bin/hold.py by the SAME absolute $dispatch_dir this file already establishes (section 1), never
+# a bare relative path -- the external dispatcher's own CWD is never guaranteed to be the repo root.
+hold_py_path="${dispatch_dir%/.secondmate/dispatch}/bin/hold.py"
 rc_py=0
-rejected_lines=$(python3 - "$batch_id" <<'PY'
+rejected_lines=$(python3 - "$batch_id" "$hold_py_path" <<'PY'
 import importlib.util, pathlib, sys
 batch_id = sys.argv[1]
 spec = importlib.util.spec_from_file_location(
-    "secondmate_dispatch_hold", pathlib.Path("bin/hold.py").resolve())
+    "secondmate_dispatch_hold", pathlib.Path(sys.argv[2]).resolve())
 hold = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hold)
 recs = hold._recs()
@@ -917,14 +949,21 @@ answer_by_id = {r["id"]: r for r in recs if r.get("ev") == "answer"}
 for hid, hrec in hold_by_id.items():
     if hrec.get("task") != batch_id:
         continue
-    batch = hrec.get("batch")
-    if not isinstance(batch, list):
-        continue
+    is_batch_hold = isinstance(hrec.get("batch"), list)
     arec = answer_by_id.get(hid)
     if arec is None:
         continue  # still open -- nothing decided yet, not this check's concern
+    is_batch_answer = isinstance(arec.get("approved"), list) and isinstance(arec.get("rejected"), list)
+    if is_batch_hold != is_batch_answer:
+        # ANOMALY: hold.py's own _recs() accepts either answer shape unconditionally and never
+        # cross-checks it against the hold's own shape -- never guess which one is "real" here.
+        print(f"shape mismatch: hold {hid!r} is_batch_hold={is_batch_hold} "
+              f"but its answer is_batch_answer={is_batch_answer}", file=sys.stderr)
+        sys.exit(3)
+    if not is_batch_hold:
+        continue  # a genuinely single-task hold sharing this batch's task label -- not our concern
     rejected_ids = set(arec.get("rejected") or [])
-    for entry in batch:
+    for entry in hrec["batch"]:
         if entry.get("task_id") in rejected_ids:
             print(f"{entry['task_id']}@{entry.get('checked_sha')}")
 PY
@@ -932,9 +971,10 @@ PY
 
 if [ "$rc_py" -ne 0 ]; then
   : # ESCALATE to the human verbatim (batch-id, "$rc_py") -- reusing hold.py's own ledger failed
-    # unexpectedly (python3 missing, or bin/hold.py itself failing to import). STOP here: do NOT
-    # proceed to build entries_task_ids or open any hold this cycle. Never fall through to an
-    # empty rejected set, which would silently fail OPEN.
+    # unexpectedly (python3 missing, bin/hold.py itself failing to import, exit 3 = a hold/answer
+    # shape mismatch per the anomaly check above). STOP here: do NOT proceed to build
+    # entries_task_ids or open any hold this cycle. Never fall through to an empty rejected set,
+    # which would silently fail OPEN.
 else
   rejected_unchanged=()
   while IFS= read -r pair; do
