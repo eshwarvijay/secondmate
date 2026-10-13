@@ -240,13 +240,36 @@ while true; do
   # poll it here too, non-blocking (kill -0), for any task-id whose .final.txt hasn't appeared yet
   if command -v herdr >/dev/null 2>&1; then
     bin/pane-reaper.py observe || true
-    bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" ... || true
+    bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" || true
   fi
   # relay any hit from either call to the human verbatim, exactly as the in-session watchdog does —
   # never restart, never steal, never treat a hit as a confirmed crash
   sleep "$N"
 done
 ```
+
+**Every example invocation here must be a complete, directly-runnable command — no literal "..."
+left sitting where a real argument belongs.** A trailing `...` after the `grep -F -e PATTERN` call
+above is not a harmless placeholder: `grep` reads it as an actual extra argv token, and
+`grep -F -e PATTERN <extra-arg>` interprets that extra token as a FILENAME to read instead of
+stdin — so a real quiet-pane hit arriving on stdin never gets matched, `grep` fails on the missing
+file, and the trailing `|| true` silently swallows a hit that should have been relayed to the
+human. Confirmed live: piping a real `pane-reaper.py quiet`-shaped JSON line (built from reading
+`find_quiet`'s own hit-dict construction directly:
+`{"pane_id": pane_id, "status": "quiet", ...}`) into the literal `grep -F -e "..." ...` form
+produced `grep: ...: No such file or directory` and exit 2 — the hit was never seen. Removing the
+trailing `...` (shown fixed above) against the identical sample line matches correctly (exit 0,
+the JSON line printed through).
+
+**If watching more than one pane id, repeat `-e` with the real second pattern, never a
+placeholder:**
+```bash
+bin/pane-reaper.py quiet --threshold-seconds "$N" \
+  | grep -F -e "\"pane_id\": \"${root_pane_id}\"" -e "\"pane_id\": \"${checker_pane_id}\"" || true
+```
+Confirmed live against three sample lines (`root_pane_id`, `checker_pane_id`, and an unrelated
+third pane id): this two-`-e` form matched both the root and checker pane lines and correctly
+excluded the unrelated one.
 
 **Both `|| true` guards are required under `set -e`, not decorative — a strict-mode loop must
 survive its own documented "normal" outcomes, not just its errors.** `bin/progress-ledger.py
@@ -315,15 +338,26 @@ liveness FIRST, not `.final.txt` presence first:**
    `Z    <defunct>` while `kill -0 <pid>` on that same PID still returned success (exit 0).
 
    So the check is `ps -o stat= -p <pid>` (portable across Linux and macOS/BSD), not `kill -0`
-   alone — **and the `ps` call itself must be guarded under strict mode**: `ps -o stat= -p <pid>`
-   on a dead PID exits nonzero (confirmed live: exit 1 against a PID that no longer exists), and
-   under `set -e` the bare assignment `state=$(ps ...)` would abort the whole poll before it ever
-   reaches the "`$state` is empty → not alive" branch below — the exact routine, expected case
-   this check exists to classify. So:
+   alone — **and the `ps` call itself must be guarded under strict mode, but a blanket `|| true`
+   is itself a bug**: a blanket guard reclassifies ANY `ps` failure — a dead PID, but also a
+   genuinely unexpected one (a missing `ps` binary, a permissions problem, any other system
+   error) — as the identical "not alive" outcome, so a still-possibly-running sub-supervisor could
+   get silently treated as done just because `ps` itself malfunctioned. The fix captures `ps`'s
+   own exit code explicitly and only treats its ONE documented "no such process" signature as
+   not-alive:
    ```bash
-   state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
+   rc_ps=0
+   state=$(ps -o stat= -p "$pid" 2>/dev/null) || rc_ps=$?
    ```
-   - **`$state` is empty** (no such PID at all) — not alive — go to step 2.
+   - **`rc_ps` is 0 or 1** (confirmed live: `ps` exits exactly `1` with empty stdout when the PID
+     does not exist — the one documented absence signature; `0` is the normal "found it" case) —
+     proceed to classify by `$state` below.
+   - **`rc_ps` is anything else** (confirmed live: a missing `ps` binary on `PATH` exits `127`, a
+     distinctly different code from the documented `1`) — an UNEXPECTED `ps` failure, not the
+     documented absence case. Escalate to the human exactly like a stuck task; never silently
+     reclassify this as "not alive" just because some exit code was nonzero.
+   - **`$state` is empty** (`rc_ps` was 0 or 1, and nothing was printed — the documented "no such
+     PID" case) — not alive — go to step 2.
    - **`$state` starts with `Z`** (zombie/defunct) — also not alive for the purpose of this check
      — go to step 2. If this poll is running inside the SAME dispatcher process that originally
      forked `spawn-sub-sup.sh` (not a restarted dispatcher — see the restart-safety note just
@@ -361,7 +395,21 @@ liveness FIRST, not `.final.txt` presence first:**
    scheme; it accepts it as a known, bounded limitation.
 2. **Once the PID is confirmed not alive, `.final.txt`'s presence/absence decides the outcome:**
    - **Present** — the process finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
-     to get the terminal exit code. Nothing further to poll for this task-id.
+     to get the terminal exit code — using the SAME capture discipline as the zombie reap in step
+     1, not a bare call:
+     ```bash
+     rc=0
+     bin/dispatch-report.py ".secondmate/dispatch/${task_id}.final.txt" || rc=$?
+     ```
+     This capture is required for the identical reason as `wait`'s above: `dispatch-report.py`'s
+     exit code (`0`–`4`) IS the whole point of the call — not an error signal — and under `set -e`
+     a bare, unguarded invocation treats ANY nonzero code (including `4` for `SM_READY_UNMERGED`,
+     the single most common terminal outcome) as the command itself failing, aborting the strict
+     dispatcher before it ever acts on the parsed result. Confirmed live: a bare, unguarded call
+     against a real `.final.txt` containing `SM_READY_UNMERGED:deadbeef` killed the whole script
+     with exit `4`, never reaching anything after it; capturing via `rc=0; bin/dispatch-report.py
+     ... || rc=$?` instead correctly recorded `rc=4` and let the script continue to act on it.
+     Nothing further to poll for this task-id once `$rc` is captured.
    - **Absent** — an ANOMALY: the process is gone but never produced output (crashed, killed
      externally, etc.). Escalate to the human exactly like a stuck task. Never silently retry it,
      and never assume success just because the process is gone.
@@ -406,17 +454,35 @@ duplicate hold for the same batch (confirmed live: running the identical `hold.p
 --entries-file ...` call twice in a row produced two distinct open hold ids, both still open).
 So, before opening a hold, check whether one already exists for this batch — guarded, since the
 ordinary "no open hold yet" case (the normal first-batch-close path, not an error) still has to
-survive under strict mode:
+survive under strict mode. **But `hold.py open`'s own exit code and the downstream `grep`'s own
+exit code must be captured SEPARATELY, never collapsed into one blanket `|| true` on the whole
+pipeline** — `hold.py open` itself can genuinely fail (confirmed live: pointed `SM_HOLD_LEDGER` at
+a directory instead of a file, a real ledger I/O error, and `hold.py open` crashed with an
+unhandled `IsADirectoryError` and exited `1` — the SAME exit code `grep` uses for its own, entirely
+different and legitimate "zero matches" case). A single blanket guard around the whole pipeline
+cannot tell these two `1`s apart, so a genuine `hold.py open` failure would silently look identical
+to "no existing hold" and fall through into opening a brand-new hold on top of an unresolved tool
+failure. Run `hold.py open` on its own line first, capturing its OWN exit code:
 ```bash
-existing_id=$(bin/hold.py open | grep -F "(<batch-label>)" | head -1 | sed -E 's/^\[([^]]+)\].*/\1/' || true)
+rc_open=0
+hold_output=$(bin/hold.py open) || rc_open=$?
 ```
-The `|| true` is required, not decorative: when there is genuinely no open hold at all (the
-ordinary case right after a batch's first close), `grep` finds no match and exits 1, and under
-`set -o pipefail` that failure propagates through the whole pipeline even though `hold.py open`
-itself exits 0 for "no open decisions" — confirmed live: the unguarded pipeline, under
-`set -euo pipefail` with zero open holds, aborted the script (exit 1) before the dispatcher ever
-reached "open a new hold." With `|| true`, the identical zero-match case instead correctly leaves
-`existing_id` empty and the script continues to the branch below.
+- **`rc_open` is nonzero** — `hold.py open` itself failed; this is NOT the "no open holds" case.
+  Escalate to the human verbatim exactly like a stuck task; do not proceed to open a new hold on
+  top of an unresolved failure.
+- **`rc_open` is `0`** — `hold.py open` succeeded (confirmed live: it exits `0` even when it finds
+  zero open holds, printing `(no open decisions)` to stderr). Only now is it safe to search its
+  captured output for a match, and now a `grep` no-match really does mean "no existing hold," not
+  a swallowed tool failure:
+  ```bash
+  existing_id=$(printf '%s\n' "$hold_output" | grep -F "(<batch-label>)" | head -1 | sed -E 's/^\[([^]]+)\].*/\1/' || true)
+  ```
+  The `|| true` here is scoped to exactly one thing: `grep`'s own "zero matches" exit `1` on
+  `hold.py open`'s ALREADY-CONFIRMED-SUCCESSFUL output — never a stand-in for `hold.py open`'s own
+  exit code, which was captured and checked separately above. Confirmed live: this two-step split
+  correctly proceeded to "no existing hold" on a genuine zero-open-holds case, and correctly
+  escalated instead of silently proceeding on the simulated ledger-I/O-error case — both exercised
+  against the real `hold.py` binary.
 
 `hold.py open`'s own output format is `[<id>] (<task>) <question>` per open hold (confirmed by
 reading its `open` command source directly, and by running it live: it printed exactly
