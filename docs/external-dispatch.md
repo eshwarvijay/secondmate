@@ -255,8 +255,10 @@ Per `audit/flow/2026-10-13--fix-banner-thinking-wording.md` and
    (Eshwar) via the dispatcher chat roughly 5 minutes later. Never self-answered.
 9. **Merge** — `sm/fix-banner-thinking-wording` → `main` via the merge-sequencer, landing as
    `1d3a72748dcd72f7d899506b8cdd91c203fc8bc2`, pushed to origin.
-10. **Teardown** — worktree, branch, herdr pane/agent, and claim-ledger entry all released, confirmed
-    clean via `bin/teardown-check.sh`.
+10. **Teardown** — worktree, branch, maker agent, and claim-ledger entry confirmed clean via
+    `bin/teardown-check.sh`. Per §3's Teardown section, that script's own scope stops at the
+    worktree, the branch, the maker agent, and the claim-ledger entry — it never queries the
+    checker pane, so closing that one is a separate step, not something this check confirms.
 11. **Audit** — both the flow and decision entries above were written as this task's permanent audit
     record.
 
