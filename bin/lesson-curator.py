@@ -98,19 +98,29 @@ def _curator_lesson_id(filepath, lessons_dir):
 def _read_ledger_rows(ledger_path):
     """Read the injection ledger (the caller resolves the path with the same _lesson_ledger_path()
     anchoring lesson-lookup.py writes through). Returns one list-of-strings per WELL-FORMED row
-    (in file order). A missing file is the normal fresh state -> zero rows, no warning. A corrupt
-    row (unparseable JSON, not an object, or a non-list lesson_ids) is excluded from ALL counts
-    with a stderr warning -- a corrupt row must never drive a verdict in either direction.
-    Ledger content is only ever compared as strings against real lesson ids; no filesystem path
-    is ever constructed from it."""
+    (in file order). A missing file is the normal fresh state -> zero rows, no warning. A path
+    that EXISTS but cannot be read as the expected file (a directory, a permission error, ...)
+    RE-RAISES the OSError: the caller maps it to the single documented fatal exit code -- an
+    unreadable ledger must never silently masquerade as an empty one. A corrupt row (unparseable
+    JSON, not an object, or a non-list lesson_ids) is excluded from ALL counts with a stderr
+    warning -- a corrupt row must never drive a verdict in either direction. Ledger content is
+    only ever compared as strings against real lesson ids; no filesystem path is ever constructed
+    from it."""
     p = pathlib.Path(ledger_path)
     try:
-        if not p.exists():
-            return []
         text = p.read_text(encoding='utf-8', errors='replace')
-    except OSError as e:
-        _warn(f"could not read injection ledger {p} ({e}) -- treating it as empty; injection counts below are incomplete")
+    except FileNotFoundError:
+        # The ledger simply isn't there yet (never logged, or vanished between listing and read):
+        # the normal fresh state -- zero rows, no warning, exit 0.
         return []
+    except OSError:
+        # The path EXISTS but cannot be read as the expected file (a directory, a permission
+        # error, ...): a genuine inability to produce a trustworthy report, NOT a fresh state.
+        # Silently treating it as empty would make EVERY lesson read zero injections at once and
+        # could cascade false retire-candidates across the whole report with no exit-status
+        # signal. Re-raise: the caller's OSError handler maps it to the single documented fatal
+        # nonzero exit code -- the same one as the missing-lessons-dir case.
+        raise
     rows = []
     for lineno, line in enumerate(text.splitlines(), 1):
         if not line.strip():
@@ -163,7 +173,8 @@ def collect_curation(lessons_dir, ledger_path):
     test. Returns a list of entries (sorted by lesson id), one per *.md file under lessons_dir --
     including files whose frontmatter is unparseable (counted 0/0, with a stderr warning).
     Emits stderr warnings for unparseable frontmatter and orphaned ledger references. Raises
-    OSError if the lessons directory can't be listed (callers map that to EXIT_CANNOT_RUN)."""
+    OSError if the lessons directory can't be listed or the ledger path exists but can't be read
+    as a file (callers map both to EXIT_CANNOT_RUN)."""
     lessons_path = pathlib.Path(lessons_dir)
     if not lessons_path.is_dir():
         raise FileNotFoundError(f"lessons directory not found: {lessons_dir}")
@@ -294,8 +305,10 @@ ledger rows (see above). stdout carries only the report.
 
 Exit status: 0 for every successful run of --report / --selfcheck / --help, whatever verdicts
 were computed. {EXIT_CANNOT_RUN} is the single documented nonzero exit code, used strictly for
-"could not run at all": unrecognized arguments, bin/lesson-lookup.py cannot be imported, or
-the lessons directory does not exist / cannot be listed.
+"could not run at all": unrecognized arguments, bin/lesson-lookup.py cannot be imported, the
+lessons directory does not exist / cannot be listed, or the ledger path exists but cannot be
+read as a file (a directory, a permission error, ...) -- a simply-MISSING ledger is the normal
+fresh state and stays exit 0, per above.
 """
 
 
@@ -577,6 +590,30 @@ def selfcheck():
             f"a directory named like a lesson must produce NO report row "
             f"(not even a 0/0/0 one): {rows}")
         _assert_row(rows, 'real/lesson', 'keep', '1', '0', '1')
+
+        # --- Scenario I: a ledger path that EXISTS but cannot be read as a file (here: a
+        #     directory) is a genuine inability to produce a trustworthy report -- NOT the
+        #     normal fresh state (Scenario G's simply-missing ledger must stay exit 0). The
+        #     REAL --report entry point must take the single documented fatal exit code: a
+        #     silent empty-ledger fallback would read as zero injections for EVERY lesson at
+        #     once and could cascade false retire-candidates across the whole report.
+        lessons, ledger = _scenario()
+        _lesson(lessons, 'real/lesson', helpful=1, harmful=0)
+        ledger_as_dir = pathlib.Path(lessons) / 'ledger-is-a-directory'
+        ledger_as_dir.mkdir()  # exists, but is NOT a file
+        os.environ['SM_LESSON_LEDGER'] = str(ledger_as_dir)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                main(['--report'])
+                assert False, "--report with an existing-but-unreadable (directory) ledger path must not succeed"
+            except SystemExit as e:
+                assert e.code == EXIT_CANNOT_RUN, (
+                    f"an existing-but-unreadable ledger must exit the documented code "
+                    f"{EXIT_CANNOT_RUN}, got {e.code!r}")
+        assert 'FATAL' in err.getvalue(), (
+            f"the nonzero exit must come from the documented fatal path:\n{err.getvalue()}")
+        assert out.getvalue() == '', "no report may print when the ledger is unreadable"
 
         print("ok")
         return 0
