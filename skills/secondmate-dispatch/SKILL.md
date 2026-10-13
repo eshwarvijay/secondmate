@@ -137,13 +137,27 @@ auto-`--steal`):
 ```bash
 while true; do
   bin/progress-ledger.py stale --threshold-seconds "$N" "${task_id_flags[@]}"
-  bin/pane-reaper.py observe
-  bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" ...
+  # the .pid sidecar liveness check (section 1/5) is the ALWAYS-available signal, no herdr required —
+  # poll it here too, non-blocking (kill -0), for any task-id whose .final.txt hasn't appeared yet
+  if command -v herdr >/dev/null 2>&1; then
+    bin/pane-reaper.py observe
+    bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" ...
+  fi
   # relay any hit from either call to the human verbatim, exactly as the in-session watchdog does —
   # never restart, never steal, never treat a hit as a confirmed crash
   sleep "$N"
 done
 ```
+
+**`pane-reaper.py` requires herdr; guard it.** This dispatcher's own Scope section above only
+requires "terminal access + a scheduler" — herdr is optional infrastructure, not a hard dependency.
+`pane-reaper.py observe` shells out to `herdr pane list` internally and has no fallback: run it on a
+`PATH` with no `herdr` binary and it exits 2 with `could not run \`herdr pane list\`: [Errno 2] No
+such file or directory: 'herdr'` (confirmed live). Guard both `pane-reaper.py` calls behind
+`command -v herdr >/dev/null 2>&1`, exactly as shown above, so a herdr-less deployment of this
+dispatcher doesn't fail its watchdog loop outright. The liveness signal that works with **no**
+herdr dependency at all is the `.pid` sidecar check described in section 5 below — the watchdog
+should always rely on that regardless of whether herdr happens to be present.
 
 The loop itself — not any cron/launchd/systemd entry — is the portable unit; it can run under a
 plain `nohup`/`tmux` session anywhere. A scheduler entry may optionally backstop it (e.g. checking
@@ -154,16 +168,34 @@ but that backstop is optional infrastructure around the loop, not a substitute f
 
 **Primary signal: each task-id's own `spawn-sub-sup.sh` process exiting.** Unlike the in-session
 case (where the dispatcher's own Agent-tool call return is the signal), the external dispatcher
-tracks each task-id's backgrounded `spawn-sub-sup.sh` PID itself and reaps it; that process's own
-exit code — section 1's contract: it relays `dispatch-report.py`'s exit code (0/1/2/3/4) verbatim —
-IS the terminal-outcome signal for that task-id, whatever the code is. This is NOT optional, and
-`bin/progress-ledger.py ready --batch-id <batch-id>` is NOT a substitute for it: `ready`'s own
-implementation only emits a task-id whose *latest recorded phase* equals the terminal
-`verify_gate_pass` phase (confirmed by reading `progress-ledger.py`'s `ready` command directly) — a
-refused or stuck task-id, whose sub-supervisor released its claim and exited without ever reaching
-that phase, never appears in `ready`'s output at all, not even as a non-ready hit. A dispatcher that
-only polled `ready` would wait out the full batch TTL for every refused/stuck task-id instead of
-recognizing them as already terminal the moment their process exited.
+tracks each task-id's terminal outcome via its process's exit — section 1's contract: it relays
+`dispatch-report.py`'s exit code (0/1/2/3/4) verbatim — which IS the terminal-outcome signal for
+that task-id, whatever the code is. This is NOT optional, and `bin/progress-ledger.py ready
+--batch-id <batch-id>` is NOT a substitute for it: `ready`'s own implementation only emits a
+task-id whose *latest recorded phase* equals the terminal `verify_gate_pass` phase (confirmed by
+reading `progress-ledger.py`'s `ready` command directly) — a refused or stuck task-id, whose
+sub-supervisor released its claim and exited without ever reaching that phase, never appears in
+`ready`'s output at all, not even as a non-ready hit. A dispatcher that only polled `ready` would
+wait out the full batch TTL for every refused/stuck task-id instead of recognizing them as already
+terminal the moment their process exited.
+
+**Reaping that exit is restart-safe — never a blocking `wait <pid>`.** The dispatcher process that
+originally forked a task-id's `spawn-sub-sup.sh` could `wait` on it directly, but a dispatcher that
+restarted mid-batch (crash, redeploy, manual kill) only has the batch manifest (below) to work
+from, and a shell can only `wait` on its own child — waiting on a PID it never forked itself fails
+immediately (confirmed live: `wait <pid>` from a fresh shell that did not fork that PID returns
+exit 127, `pid <N> is not a child of this shell`). So reaping, for every dispatcher — restarted or
+not — is a non-blocking poll on the loop's own cadence (section 4), per task-id:
+1. Does `.secondmate/dispatch/<task-id>.final.txt` already exist? If so, the process already
+   finished — run `bin/dispatch-report.py` against it (section 1) to get the terminal exit code.
+   Nothing further to poll for this task-id.
+2. If not: is the `.pid` sidecar's recorded PID still alive? Check with a non-blocking signal probe
+   (`kill -0 <pid>`), never a blocking `wait`.
+   - **Alive** — still running; poll again next cycle.
+   - **Dead, with no `.final.txt` ever having appeared** — an ANOMALY: the process died before
+     producing any output (crashed, killed externally, etc.). Escalate to the human exactly like a
+     stuck task. Never silently retry it, and never assume success just because the process is
+     gone.
 
 The batch is closed once every fanned-out task-id's `spawn-sub-sup.sh` process has exited (reaped),
 or the batch TTL expires, whichever comes first. Only AFTER that — for the subset of task-ids whose
@@ -219,17 +251,35 @@ treat the batch as done: no hold, no merge sequencing, no entries file at all.
 
 ## 7. Merge sequencing — one approved task-id at a time
 
-For every APPROVED task-id, in sequence (never in parallel — `merge-sequencer.sh` already
-singleton-locks per `--repo`, so sequencing here is about correctness of the follow-on steps, not
-just lock contention):
+For every APPROVED task-id, in sequence (never in parallel — `merge-sequencer.sh`'s lock is a
+mkdir-based singleton at `${SM_LOOP_STATE:-<repo>/.secondmate}/merge-sequencer.lock`, so sequencing
+here is about correctness of the follow-on steps, not just lock contention). **This lock only
+truly serializes two concurrent dispatchers against the same repo if they agree on the same
+`SM_LOOP_STATE` value** (confirmed by reading `merge-sequencer.sh`'s own lock-path resolution
+directly) — or both leave it unset, which resolves consistently to `<repo>/.secondmate` for both.
+Two dispatcher processes with *different* `SM_LOOP_STATE` values targeting the identical repo get
+two separate lock directories and can merge concurrently, defeating the singleton entirely. This is
+the same underlying principle as section 8's shared-ledger-path discipline below (a shared
+lock/ledger path requires every dispatcher invocation against a given repo to agree on the same
+env var) — apply it here too, for `SM_LOOP_STATE` specifically.
+
 ```bash
 bin/merge-sequencer.sh --repo <repo> --worktree <worktree> --branch "sm/<task-id>" --base main \
   --checked-sha <that entry's checked_sha>
+```
+**Only on exit 0** does the dispatcher run the follow-on cleanup — never unconditionally:
+```bash
 herdr worktree remove --workspace <workspace-id>
 git branch -d "sm/<task-id>"
 bin/claim-ledger.py release --task-id <task-id> --owner "sm-<task-id>" --token <token from section 3>
 bin/teardown-check.sh --task-id <task-id>
 ```
+On any **nonzero** `merge-sequencer.sh` exit (e.g. it refuses a stale `--checked-sha`), the
+dispatcher leaves the worktree, branch, and claim exactly as they are — do not remove the worktree,
+delete the branch, or release the claim — and relays the failure to the human, the same discipline
+as a stuck/refused task. Running the cleanup unconditionally discards an unmerged, still-good
+task's work and frees its task-id for someone else to claim out from under it.
+
 A **rejected** task-id is left completely untouched: claim still open, worktree and branch still in
 place, nothing released. It stays `claimed, needs rework` until a human-driven rework round or an
 explicit `--steal` resolves it — never silently released just because the batch moved on.
