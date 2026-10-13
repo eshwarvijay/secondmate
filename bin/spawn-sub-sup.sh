@@ -27,6 +27,16 @@ validate_id() {
   fi
 }
 
+# Refuses to write through a pre-existing symlink at a predictable artifact path (prompt/log/result) --
+# a local attacker who pre-creates one of these otherwise gets whatever it points at silently overwritten.
+refuse_symlink() {
+  local path="$1"
+  if [ -L "$path" ]; then
+    echo "SPAWN-SUB-SUP: refusing to write through pre-existing symlink: $path" >&2
+    exit 2
+  fi
+}
+
 # Substitutes {{TASK_ID}}/{{OWNER}}/{{REPO}}/{{MODE}}/{{BATCH_ID}} into a template file's contents.
 # batch_id may be "" (solo mode never has one). Prints the rendered prompt to stdout.
 render_prompt() {
@@ -59,7 +69,7 @@ with open(sys.argv[1]) as f:
             obj = json.loads(line)
         except ValueError:
             continue
-        if isinstance(obj, dict) and obj.get("type") == "result" and "result" in obj:
+        if isinstance(obj, dict) and obj.get("type") == "result" and isinstance(obj.get("result"), str):
             last = obj["result"]
 if last is not None:
     sys.stdout.write(last)
@@ -67,6 +77,10 @@ if last is not None:
 }
 
 if [ "${1:-}" = "--selfcheck" ]; then
+  # Defense in depth: an ambient exported `claude` shell function must never shadow the synthetic
+  # stub below (the real fix is `command claude` at the launch site; this just closes the gap for
+  # any child "$0" invocation forked from this selfcheck process too).
+  unset -f claude 2>/dev/null || true
   fails=0
   t="$(mktemp -d)"
 
@@ -125,6 +139,15 @@ case "${FAKE_CLAUDE_BEHAVIOR:-ok}" in
     echo '{"type":"system"}'
     printf '%s\n' '{"type":"result","result":"SM_CLAIM_TOKEN:tok-xyz\nSM_READY_UNMERGED:cafef00d"}'
     ;;
+  slow)
+    sleep 1
+    echo '{"type":"system"}'
+    echo '{"type":"result","result":"SM_DONE_MERGED:slowsha"}'
+    ;;
+  non_string_result)
+    echo '{"type":"system"}'
+    echo '{"type":"result","result":{"unexpected":"object"}}'
+    ;;
   *)
     echo '{"type":"system"}'
     echo '{"type":"result","result":"SM_DONE_MERGED:cafef00d"}'
@@ -181,6 +204,69 @@ FAKE
   [ "$rc" = 0 ] || { echo "FAIL: --prompt-file run exit ($rc)"; fails=1; }
   grep -q 'CUSTOM TEMPLATE task=pf1 owner=sm-pf1' "$log_dir/sm-pf1.prompt" || { echo "FAIL: --prompt-file override not rendered with substituted placeholders"; fails=1; }
 
+  # 8) symlink refusal: a pre-existing symlink at the .prompt/.log/.result path must be refused, not
+  #    followed -- a local attacker pre-creating one must never get the victim file overwritten.
+  log_dir="$t/run8"; mkdir -p "$log_dir"
+  victim="$t/victim-prompt"; echo SENTINEL > "$victim"
+  ln -s "$victim" "$log_dir/sm-symprompt.prompt"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id symprompt --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run8.err" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: pre-existing symlink at .prompt path should be refused with exit 2 ($rc)"; fails=1; }
+  grep -qi 'symlink' "$t/run8.err" || { echo "FAIL: .prompt symlink refusal message missing"; fails=1; }
+  [ "$(cat "$victim")" = "SENTINEL" ] || { echo "FAIL: victim file for .prompt symlink was overwritten"; fails=1; }
+
+  log_dir="$t/run9"; mkdir -p "$log_dir"
+  victim2="$t/victim-log"; echo SENTINEL2 > "$victim2"
+  ln -s "$victim2" "$log_dir/sm-symlog.log"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id symlog --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run9.err" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: pre-existing symlink at .log path should be refused with exit 2 ($rc)"; fails=1; }
+  grep -qi 'symlink' "$t/run9.err" || { echo "FAIL: .log symlink refusal message missing"; fails=1; }
+  [ "$(cat "$victim2")" = "SENTINEL2" ] || { echo "FAIL: victim file for .log symlink was overwritten"; fails=1; }
+
+  log_dir="$t/run10"; mkdir -p "$log_dir"
+  victim3="$t/victim-result"; echo SENTINEL3 > "$victim3"
+  ln -s "$victim3" "$log_dir/sm-symresult.result"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id symresult --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run10.err" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: pre-existing symlink at .result path should be refused with exit 2 ($rc)"; fails=1; }
+  grep -qi 'symlink' "$t/run10.err" || { echo "FAIL: .result symlink refusal message missing"; fails=1; }
+  [ "$(cat "$victim3")" = "SENTINEL3" ] || { echo "FAIL: victim file for .result symlink was overwritten"; fails=1; }
+
+  # 9) cross-invocation lock: two concurrent runs for the SAME task-id/log-dir must not cross-
+  #    contaminate -- the second one fails fast instead of racing or reading the first one's artifacts.
+  log_dir="$t/run11"; mkdir -p "$log_dir"
+  ( PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=slow "$0" --task-id lockrace --mode solo --repo "$repo_dir" --log-dir "$log_dir" >"$t/run11a.out" 2>"$t/run11a.err"; echo $? > "$t/run11a.rc" ) &
+  bgpid=$!
+  sleep 0.3
+  rc=0; PATH="$fakebin:$PATH" "$0" --task-id lockrace --mode solo --repo "$repo_dir" --log-dir "$log_dir" >"$t/run11b.out" 2>"$t/run11b.err" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: concurrent second invocation should be refused with exit 2 (got $rc)"; fails=1; }
+  grep -qi 'in flight' "$t/run11b.err" || { echo "FAIL: concurrent-run refusal message missing"; fails=1; }
+  wait "$bgpid"
+  [ "$(cat "$t/run11a.rc")" = "0" ] || { echo "FAIL: first (in-flight) invocation should have succeeded ($(cat "$t/run11a.rc"))"; fails=1; }
+
+  # 10) command claude: an ambient exported `claude` shell function must never shadow the real/stub
+  #     binary (this is the checker's own repro: export -f claude, then run; it must have no effect).
+  # shellcheck disable=SC2329 # invoked indirectly, by name, inside the child "$0" process below
+  claude() { echo HIJACKED; exit 99; }
+  export -f claude
+  log_dir="$t/run12"; mkdir -p "$log_dir"
+  rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id hijack1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" 2>"$t/run12.err")" || rc=$?
+  unset -f claude
+  [ "$rc" = 0 ] || { echo "FAIL: exported claude function hijacked the real invocation (exit $rc)"; fails=1; }
+  echo "$out" | grep -q 'SM_DONE_MERGED:cafef00d' || { echo "FAIL: exported claude function hijacked the real invocation's output"; fails=1; }
+
+  # 11) non-string .result must not crash extraction (isolated) -- treated as no usable result text.
+  log3="$t/r3.log"
+  printf '%s\n' '{"type":"system"}' '{"type":"result","result":{"nested":"object"}}' > "$log3"
+  out3="$(extract_result "$log3" 2>"$t/r3.err")"; rc3=$?
+  [ "$rc3" = 0 ] || { echo "FAIL: extract_result crashed on non-string .result (exit $rc3): $(cat "$t/r3.err")"; fails=1; }
+  [ -z "$out3" ] || { echo "FAIL: extract_result should yield no text for a non-string .result, got: $out3"; fails=1; }
+
+  # 12) same, end-to-end: a non-string .result in the real NDJSON stream must relay as "no usable
+  #     tag" (exit 3), never crash the script with an uncaught Python traceback.
+  log_dir="$t/run14"; mkdir -p "$log_dir"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=non_string_result "$0" --task-id nsr1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run14.err" || rc=$?
+  [ "$rc" = 3 ] || { echo "FAIL: non-string .result end-to-end should exit 3 (no usable tag), got $rc: $(cat "$t/run14.err")"; fails=1; }
+  grep -q 'Traceback' "$t/run14.err" && { echo "FAIL: non-string .result leaked a Python traceback (extraction crashed, exit 3 was coincidental, not graceful)"; fails=1; }
+
   # --- drift tripwire: SKILL.md's own numbered/lettered step counts must still match the templates ---
   skill="$SCRIPT_DIR/../skills/secondmate/SKILL.md"
   solo_skill_n="$(sed -n '/^### Solo dispatch/,/^### Batch dispatch/p' "$skill" | grep -cE '^[0-9]+\. ')"
@@ -229,6 +315,16 @@ repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "no such --repo directory" >&2
 mkdir -p "$log_dir"
 owner="sm-${task_id}"
 
+# Cross-invocation guard: two concurrent runs for the SAME task-id/log-dir would otherwise share the
+# exact same prompt/log/result paths, letting one read and relay the OTHER's claude output. Fail fast
+# instead of racing. Released on every exit path via the trap below (success, crash, violation, etc).
+lock_dir="${log_dir}/.sm-${task_id}.lock"
+if ! mkdir "$lock_dir" 2>/dev/null; then
+  echo "SPAWN-SUB-SUP: another spawn-sub-sup.sh invocation for task-id '$task_id' in --log-dir '$log_dir' appears to be in flight (lock dir exists: $lock_dir) -- refusing to risk cross-invocation artifact collision" >&2
+  exit 2
+fi
+trap 'rmdir "$lock_dir" 2>/dev/null' EXIT
+
 if [ -n "$prompt_file_override" ]; then
   template_file="$prompt_file_override"
 else
@@ -237,15 +333,19 @@ fi
 [ -f "$template_file" ] || { echo "template file not found: $template_file" >&2; exit 2; }
 
 rendered_prompt_path="${log_dir}/sm-${task_id}.prompt"
+refuse_symlink "$rendered_prompt_path"
 render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file" > "$rendered_prompt_path"
 
 log_file="${log_dir}/sm-${task_id}.log"
 result_file="${log_dir}/sm-${task_id}.result"
+refuse_symlink "$log_file"
 
 # Capture claude's own exit status in the SAME if/then/else statement set -e would otherwise inspect
 # (and here would also skip past under `set -e` with pipefail if written on a trailing line) --
 # a nonzero/killed exit must be caught here, not lost by falling through to the lines below.
-if ( cd "$repo" && claude -p "$(cat "$rendered_prompt_path")" --dangerously-skip-permissions --output-format stream-json --verbose ) > "$log_file" 2>&1; then
+# `command claude` (not a bare `claude` call) bypasses shell function lookup -- an ambient/exported
+# `claude` function can otherwise shadow the real binary (or, in --selfcheck, the synthetic stub).
+if ( cd "$repo" && command claude -p "$(cat "$rendered_prompt_path")" --dangerously-skip-permissions --output-format stream-json --verbose ) > "$log_file" 2>&1; then
   claude_rc=0
 else
   claude_rc=$?
@@ -256,6 +356,7 @@ if [ "$claude_rc" -ne 0 ]; then
   exit 5
 fi
 
+refuse_symlink "$result_file"
 extract_result "$log_file" > "$result_file"
 
 if dispatch_out="$("$SCRIPT_DIR/dispatch-report.py" "$result_file")"; then
