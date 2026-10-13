@@ -575,46 +575,82 @@ def cmd_tag(argv):
 
 _MINT_USAGE = 'Usage: bin/lesson-lookup.py mint --file <draft.md> [--category <cat>]\n'
 
-
-# Git env vars that override its normal repo-discovery (relative to the real process CWD) entirely.
-# A caller sitting in a real linked worktree can set GIT_DIR to a primary checkout's .git and
-# GIT_WORK_TREE to that checkout's root and make `git rev-parse --show-toplevel` falsely report the
-# primary checkout -- reproduced directly (a cross-model checker got `mint` to install a lesson file
-# from inside a linked worktree this way). Scrubbed from the subprocess env below so the check always
-# reflects the real CWD, never an attacker-controlled override.
-_GIT_DISCOVERY_ENV_VARS = (
-    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
-    'GIT_COMMON_DIR',
+_MINT_HELP_BODY = (
+    "\n"
+    "Validate a complete, hand-authored lesson draft (frontmatter + body) and install it into\n"
+    "bin/lessons/<category>/<slug>.md. Never overwrites an existing lesson.\n"
+    "\n"
+    "mint is a step-11, PRIMARY-CHECKOUT-ONLY tool: it refuses to run from inside a maker's linked\n"
+    "worktree -- Claude or pi alike -- checked before any other validation, before --file is even\n"
+    "read. Run it only from the primary checkout.\n"
+    "\n"
+    "  --file <draft.md>   path to the complete lesson draft to validate and install (required)\n"
+    "  --category <cat>    destination category under bin/lessons/; falls back to the draft's own\n"
+    "                       `category:` frontmatter field if omitted\n"
 )
+
+
+# A linked worktree's gitdir-pointer file always points at a path containing this component (git
+# creates it at <repo>/.git/worktrees/<name>) -- the filesystem-only signal checked below, no `git`
+# subprocess call needed at all.
+_WORKTREE_GITDIR_MARKER = '/worktrees/'
+
+
+def _find_dotgit_path(start_dir):
+    """Walk upward from `start_dir` (inclusive) to the filesystem root, looking for a `.git` entry
+    (file OR directory) in each directory -- the same upward directory-walk git itself uses to find
+    a repo's toplevel. Returns the resolved `.git` path, or None if none is found before reaching the
+    filesystem root. Purely filesystem-based: no subprocess, no `git` invocation of any kind, so
+    nothing on PATH (including an attacker-placed fake `git` executable) can influence this walk."""
+    current = pathlib.Path(start_dir).resolve()
+    while True:
+        candidate = current / '.git'
+        if candidate.exists():
+            return candidate
+        parent = current.parent
+        if parent == current:  # reached the filesystem root
+            return None
+        current = parent
 
 
 def _primary_checkout_refusal_reason():
     """Return None if the CWD's repo is the primary checkout, else a stderr-ready refusal message
     naming the exact predicate checked. Deliberately does NOT reuse scope-guard.py's
     is_maker_worktree() -- that helper is keyed to a marker file written only for Claude-Code maker
-    sessions, so it would silently fail to refuse inside a pi maker's linked worktree. Instead this
-    resolves `git rev-parse --show-toplevel` and tests whether <toplevel>/.git is a real directory
-    (primary checkout) versus a file (the gitdir-pointer git writes for a linked worktree) or
-    missing/unresolvable (ambiguous) -- the same primary-vs-linked signal mark-maker.sh already uses
-    (git-dir vs git-common-dir equality), reimplemented here without depending on scope-guard.py.
-    Fails CLOSED (refuses) on any ambiguity or git error -- never fails open. Runs git with
-    _GIT_DISCOVERY_ENV_VARS scrubbed from its environment (see that constant's comment) so
-    GIT_DIR/GIT_WORK_TREE spoofing from a linked worktree can't make this falsely resolve to some
-    other (e.g. primary) checkout."""
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_DISCOVERY_ENV_VARS}
-    try:
-        out = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True, env=env)
-    except OSError as e:
-        return f"mint: could not run `git rev-parse --show-toplevel` ({e}) -- refusing (fail closed)"
-    if out.returncode != 0 or not out.stdout.strip():
-        return "mint: not inside a git repository (`git rev-parse --show-toplevel` failed) -- refusing (fail closed)"
-    git_path = pathlib.Path(out.stdout.strip()) / '.git'
+    sessions, so it would silently fail to refuse inside a pi maker's linked worktree. Also
+    deliberately does NOT shell out to `git` AT ALL for this decision: an earlier version called
+    `git rev-parse --show-toplevel` via subprocess, but that call trusts whatever `git` is first on
+    PATH -- a cross-model checker reproduced installing a lesson from inside a real linked worktree
+    simply by putting a fake `git` earlier on PATH that printed the primary checkout's path and
+    exited 0, which fools ANY subprocess-based check regardless of env-var scrubbing. Instead this
+    walks upward from the real CWD (`os.getcwd()`, never influenced by PATH or any executable) via
+    `_find_dotgit_path()`, the same way git's own repo-discovery works, then tests whether that
+    `.git` is a real directory (primary checkout) versus a file (the gitdir-pointer git writes for a
+    linked worktree, whose content is a `gitdir: <path>` line pointing under
+    `_WORKTREE_GITDIR_MARKER`) or missing (ambiguous). Fails CLOSED (refuses) on any ambiguity --
+    never fails open."""
+    git_path = _find_dotgit_path(os.getcwd())
+    if git_path is None:
+        return "mint: could not find a .git entry walking up from the CWD -- refusing (fail closed)"
     if git_path.is_dir():
         return None
-    found = "a file (a linked-worktree gitdir pointer)" if git_path.is_file() else "nothing"
-    return (f"mint: refusing -- checked whether {git_path} is a real directory and found {found}. "
-            f"mint only runs in the primary checkout (where .git is a real directory), never inside a "
-            f"maker's linked worktree.")
+    if not git_path.is_file():
+        return (f"mint: refusing -- {git_path} exists but is neither a directory nor a regular file "
+                f"-- ambiguous, refusing (fail closed)")
+    try:
+        gitdir_line = git_path.read_text(encoding='utf-8', errors='replace').strip()
+    except OSError as e:
+        return f"mint: could not read {git_path} ({e}) -- refusing (fail closed)"
+    m = re.match(r'gitdir:\s*(.+)\Z', gitdir_line)
+    gitdir_target = m.group(1).strip() if m else None
+    if gitdir_target and _WORKTREE_GITDIR_MARKER in gitdir_target.replace('\\', '/'):
+        return (f"mint: refusing -- {git_path} is a file pointing to a linked-worktree gitdir "
+                f"({gitdir_target}). mint only runs in the primary checkout, never inside a maker's "
+                f"linked worktree.")
+    pointer_note = f", pointing to {gitdir_target!r}" if gitdir_target else ""
+    return (f"mint: refusing -- {git_path} is a file (not a real directory){pointer_note}. mint only "
+            f"runs in the primary checkout (where .git is a real directory), never inside a maker's "
+            f"linked worktree.")
 
 
 def _discover_categories(lessons_dir):
@@ -644,21 +680,41 @@ _IMPERATIVE_LEAD_VERBS = {
 }
 
 
+def _has_directive_marker(stripped_sentence):
+    """A marker word (must/avoid/should/...) only counts as a directive if at least one occurrence
+    has something follow it in the sentence -- the obligation's own verb phrase. A marker used as a
+    bare noun/object at the very end of the sentence ("This sentence contains the word must.") is a
+    declarative statement ABOUT the word, not an actual directive, and must not pass on the marker's
+    mere presence alone -- a checker found exactly this decoy. Every real imperative-rule marker use
+    ("must call...", "should avoid...") is followed by more words describing what to do; only a
+    sentence-final, noun-like use of the marker word itself is excluded here. Still a keyword
+    heuristic, not a grammatical parser: it can't tell "must comply with X" (real directive) from a
+    contrived "must, as in the modal verb," mid-sentence aside -- it only catches the specific
+    sentence-final-noun decoy shape."""
+    body_no_terminal_punct = re.sub(r'[.!?]\Z', '', stripped_sentence).rstrip()
+    for m in _IMPERATIVE_MARKERS.finditer(body_no_terminal_punct):
+        if m.end() < len(body_no_terminal_punct):
+            return True
+    return False
+
+
 def _is_single_sentence_body(body_text):
     """Heuristic for "exactly one imperative-rule sentence": no blank-line paragraph break, the
     stripped text is non-empty and ends in one of .!?, splitting on sentence-ending punctuation
     followed by whitespace yields exactly one non-empty segment, AND the sentence reads as a RULE
     rather than a plain declarative fact -- it either contains an obligation/prohibition marker word
-    (must/avoid/should/...) anywhere, or opens on a common bare imperative verb (e.g. "Stay within
-    scope.", "Avoid X.", "Always do X.", "Never do Y."). This is a keyword heuristic, not a
-    grammatical mood classifier: a declarative sentence that happens to use a marker word in an
-    unrelated sense would still pass, and a genuinely imperative sentence using a verb outside the
-    curated lead-verb list with no marker word elsewhere would still be rejected. There's no stdlib
-    primitive for "is this an imperative rule, not a fact" -- this catches the clear declarative-fact
-    case a checker found ("The build server is located in the east wing." and the harder adversarial
-    variant "The build server is always located in the east wing." -- see the
-    _IMPERATIVE_MARKERS comment above for why "always"/"never" don't count as anywhere-markers),
-    not every edge case."""
+    (must/avoid/should/...) used as an actual directive (see `_has_directive_marker` -- not merely
+    present anywhere, which a checker showed lets a bare mention like "This sentence contains the
+    word must." through), or opens on a common bare imperative verb (e.g. "Stay within scope.",
+    "Avoid X.", "Always do X.", "Never do Y."). This is a keyword heuristic, not a grammatical mood
+    classifier: a declarative sentence that happens to use a marker word as a real (non-final)
+    directive-shaped mid-sentence word would still pass, and a genuinely imperative sentence using a
+    verb outside the curated lead-verb list with no marker word elsewhere would still be rejected.
+    There's no stdlib primitive for "is this an imperative rule, not a fact" -- this catches the
+    clear declarative-fact cases checkers have found ("The build server is located in the east
+    wing.", "The build server is always located in the east wing." -- see the _IMPERATIVE_MARKERS
+    comment above for why "always"/"never" don't count as anywhere-markers, and "This sentence
+    contains the word must." -- see `_has_directive_marker`), not every edge case."""
     stripped = body_text.strip()
     if not stripped or '\n\n' in stripped:
         return False
@@ -667,7 +723,7 @@ def _is_single_sentence_body(body_text):
     segments = [s for s in re.split(r'(?<=[.!?])\s+', stripped) if s.strip()]
     if len(segments) != 1:
         return False
-    if _IMPERATIVE_MARKERS.search(stripped):
+    if _has_directive_marker(stripped):
         return True
     first_word = re.match(r"[A-Za-z']+", stripped)
     return bool(first_word and first_word.group(0).lower() in _IMPERATIVE_LEAD_VERBS)
@@ -685,10 +741,47 @@ def _present_zero(fm, field):
         return False
 
 
+def _mint_tags_written_as_list(frontmatter_text):
+    """Mint-specific stricter check: did the draft's RAW frontmatter actually write `tags` as a
+    YAML list (the multi-line '- item' dash form, or an inline bracketed '[a, b]' form) -- NOT a
+    bare scalar like `tags: testing`? `parse_frontmatter()` is deliberately lenient for lookup/tag's
+    own purposes: it coerces ANY non-empty scalar value into a one-item list (see its 'tags' branch),
+    which makes mint's "tags must be a non-empty list" check vacuous against the ALREADY-COERCED
+    dict -- a checker found exactly this gap (`tags: testing` sailed through). This inspects the raw
+    frontmatter TEXT directly instead, and does not change parse_frontmatter() or any of lookup/tag's
+    own behavior."""
+    for i, line in enumerate(frontmatter_text.splitlines()):
+        stripped = line.strip()
+        if not stripped or ':' not in stripped:
+            continue
+        key, _, value = stripped.partition(':')
+        if key.strip() != 'tags':
+            continue
+        value = value.strip()
+        if not value:
+            # Multi-line form is a real list only if the next non-blank line is a '- item' dash line.
+            for later in frontmatter_text.splitlines()[i + 1:]:
+                later_stripped = later.strip()
+                if later_stripped == '':
+                    continue
+                return later_stripped.startswith('- ')
+            return False  # 'tags:' with nothing at all after it -- not a list
+        return value.startswith('[')  # inline bracketed list form
+    return False  # no 'tags' key found in the raw frontmatter at all
+
+
 def cmd_mint(argv):
     """`mint --file <draft.md> [--category <cat>]` -- validate a complete, hand-authored lesson
     draft and install it into bin/lessons/<category>/<slug>.md. Never overwrites an existing lesson.
     Primary-checkout-only; see _primary_checkout_refusal_reason(). Writes nothing on any rejection."""
+    # --help/-h is handled before anything else, including the primary-checkout check -- asking for
+    # help should work from anywhere (a maker worktree included) rather than being swallowed by the
+    # "--file is required" rejection, which a checker found it was previously falling into.
+    if '--help' in argv or '-h' in argv:
+        sys.stdout.write(_MINT_USAGE)
+        sys.stdout.write(_MINT_HELP_BODY)
+        return 0
+
     # Primary-checkout refusal check runs FIRST, before reading --file or any other validation, so a
     # maker worktree gets refused immediately regardless of what else is wrong with its arguments.
     refusal = _primary_checkout_refusal_reason()
@@ -736,6 +829,12 @@ def cmd_mint(argv):
     tags = fm.get('tags', [])
     if not isinstance(tags, list) or not tags:
         sys.stderr.write("mint: draft's `tags` must be a non-empty list\n")
+        return 2
+    frontmatter_text, _raw_body = _split_frontmatter(content)
+    if frontmatter_text is None or not _mint_tags_written_as_list(frontmatter_text):
+        sys.stderr.write(
+            "mint: draft's `tags` must be written as an actual YAML list (either a multi-line "
+            "'- item' block or an inline '[a, b]' form), not a bare scalar\n")
         return 2
 
     earned_in = fm.get('earned-in')
@@ -1574,6 +1673,28 @@ Always do the one thing that must happen.
             if 'SM_LESSONS_DIR' in os.environ:
                 del os.environ['SM_LESSONS_DIR']
 
+    # Round-6 Finding 4 regression: `mint --help`/`-h` must show real help text, not get swallowed
+    # by the "--file is required" rejection -- and that help text must document mint's
+    # primary-checkout-only, linked-worktree-refusing nature. Also proves --help works from
+    # anywhere, including a non-git tempdir, since it's handled before the primary-checkout check.
+    def test_mint_help_flag_shows_usage():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            for flag in ('--help', '-h'):
+                out = io.StringIO()
+                err = io.StringIO()
+                with _in_dir(tmp), redirect_stdout(out), redirect_stderr(err):
+                    rc = cmd_mint([flag])
+                assert rc == 0, f"mint {flag} must exit 0, got {rc}:\n{err.getvalue()}"
+                help_text = out.getvalue().lower()
+                assert '--file is required' not in err.getvalue(), (
+                    f"{flag} must not fall through to the --file-is-required rejection:\n{err.getvalue()}")
+                assert 'primary checkout' in help_text or 'linked' in help_text, (
+                    f"help text must document mint's primary-checkout-only, worktree-refusing nature:\n{out.getvalue()}")
+                assert '--file' in help_text, f"help text must document --file:\n{out.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_mint_empty_tags_rejected():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -1588,6 +1709,39 @@ Always do the one thing that must happen.
             assert rc != 0, "empty tags must be rejected"
             assert 'tags' in err.getvalue().lower(), f"expected a tags error:\n{err.getvalue()}"
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md')), "nothing must be written on rejection"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 3 regression: `tags: testing` (a bare YAML scalar, not a list) is silently
+    # coerced by parse_frontmatter()'s lenient lookup/tag-oriented logic into a one-item list, which
+    # would make mint's "non-empty list" check vacuous against the ALREADY-COERCED value. Mint must
+    # independently reject a scalar, while still accepting both real list forms (multi-line dash and
+    # inline bracketed) so the stricter check doesn't overcorrect.
+    def test_mint_scalar_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_scalar = os.path.join(tmp, 'scalar-tags.md')
+            with open(draft_scalar, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: testing\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_scalar])
+            assert rc != 0, "a bare scalar `tags: testing` must be rejected, not silently coerced into a list"
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'scalar-tags.md'))
+
+            # must not overcorrect: a real inline bracketed list form is still accepted.
+            draft_bracket = os.path.join(tmp, 'bracket-tags.md')
+            with open(draft_bracket, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [testing, mint]\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_bracket])
+            assert rc2 == 0, f"a real inline bracketed tags list must still be accepted:\n{err2.getvalue()}"
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
@@ -1763,6 +1917,97 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-6 Finding 2 regression: a bare substring match for "must" anywhere let a purely
+    # declarative sentence ABOUT the word "must" through ("This sentence contains the word must."),
+    # because the marker word itself was present even though nothing follows it as a directive.
+    # Also asserts the fix doesn't overcorrect: a genuine imperative rule in the voice of a real
+    # shipped lesson (mutation-test-your-tests.md's own opening clause, truncated to one sentence)
+    # must still be accepted.
+    def test_mint_declarative_must_decoy_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_decoy = os.path.join(tmp, 'decoy.md')
+            with open(draft_decoy, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'This sentence contains the word must.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_decoy])
+            assert rc != 0, (
+                "a declarative sentence merely MENTIONING the word 'must' (with nothing following "
+                "it as a directive) must be rejected, not accepted on the bare keyword's presence")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'decoy.md'))
+
+            # must not overcorrect: a genuine imperative rule in a real lesson's voice still passes.
+            draft_real_voice = os.path.join(tmp, 'real-voice.md')
+            with open(draft_real_voice, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'A selfcheck/regression test must call the actual function or code path it claims to test.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_real_voice])
+            assert rc2 == 0, (
+                f"a genuine imperative rule matching a real shipped lesson's voice must still be "
+                f"accepted:\n{err2.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 5 regression: a draft with valid frontmatter but a missing/empty body must be
+    # rejected -- the real CLI already does this correctly, but no selfcheck test exercised it (the
+    # only prior body-rejection test used multi-sentence content, never an empty body).
+    def test_mint_missing_body_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'empty-body.md')
+            with open(draft, 'w') as f:
+                f.write(
+                    "---\n"
+                    "tags:\n  - testing\n  - mint\n"
+                    "earned-in: mint-selftest-task\n"
+                    "helpful_count: 0\n"
+                    "harmful_count: 0\n"
+                    "category: testing\n"
+                    "---\n")  # nothing at all after the closing delimiter
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a draft with a missing/empty body must be rejected"
+            assert 'sentence' in err.getvalue().lower(), f"expected a body/sentence error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'empty-body.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-6 Finding 6 regression: a draft lacking frontmatter delimiters entirely (no opening/
+    # closing '---' markers) must be rejected -- the real CLI already does this correctly via
+    # parse_frontmatter() returning (None, None), but no mint selfcheck test exercised cmd_mint's own
+    # `fm is None` rejection branch (the existing test_malformed_skip test exercises lookup, not mint).
+    def test_mint_malformed_frontmatter_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'no-delimiters.md')
+            with open(draft, 'w') as f:
+                f.write("tags: [testing]\nearned-in: mint-selftest-task\n\nAlways do the one thing.\n")
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a draft with no frontmatter delimiters at all must be rejected"
+            assert 'frontmatter' in err.getvalue().lower(), f"expected a frontmatter error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'no-delimiters.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     def test_mint_unknown_category_rejected():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -1835,12 +2080,14 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
-    # Finding 1 regression: reproduces a cross-model checker's exact repro -- from a REAL linked
-    # worktree's CWD, with GIT_DIR pointed at the primary checkout's .git and GIT_WORK_TREE pointed
-    # at the primary checkout's root (the two env vars that override git's normal CWD-based repo
-    # discovery entirely), `git rev-parse --show-toplevel` would -- without the env-scrubbing fix --
-    # falsely report the primary checkout. Must still refuse.
-    def test_mint_git_dir_spoof_refused():
+    # Round-6 Finding 1 regression: reproduces the checker's EXACT repro for the new attack class --
+    # from a REAL linked worktree's CWD, with PATH poisoned so a fake `git` is found first that
+    # PRINTS THE PRIMARY CHECKOUT'S PATH and exits 0 (the simplest possible attacker-controlled-PATH
+    # trick against any subprocess-based check). Also keeps the round-3 GIT_DIR/GIT_WORK_TREE env-var
+    # spoof in the same test, since both are "attacker controls the environment to fool a `git`
+    # subprocess call" attacks -- the fix for this round removes `git` subprocess usage from this
+    # check ENTIRELY, so neither trick has anything left to fool.
+    def test_mint_env_and_path_spoof_refused():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
             repo, lessons_dir = _mint_fixture(tmp)
@@ -1852,6 +2099,19 @@ Always do the one thing that must happen.
             os.environ['SM_LESSONS_DIR'] = lessons_dir
             os.environ['GIT_DIR'] = os.path.join(repo, '.git')
             os.environ['GIT_WORK_TREE'] = repo
+
+            fakebin = os.path.join(tmp, 'fakebin-lying-git')
+            os.makedirs(fakebin)
+            fake_git = os.path.join(fakebin, 'git')
+            with open(fake_git, 'w') as f:
+                # Prints the PRIMARY checkout's path and exits 0, exactly like the checker's repro --
+                # a real `git rev-parse --show-toplevel` call fooled by this would wrongly conclude
+                # the CWD is the primary checkout.
+                f.write(f'#!/bin/sh\necho {repo}\nexit 0\n')
+            os.chmod(fake_git, 0o755)
+            old_path = os.environ.get('PATH', '')
+            os.environ['PATH'] = fakebin
+
             err = io.StringIO()
             try:
                 with _in_dir(wt), redirect_stderr(err):
@@ -1859,67 +2119,55 @@ Always do the one thing that must happen.
             finally:
                 del os.environ['GIT_DIR']
                 del os.environ['GIT_WORK_TREE']
-            assert rc != 0, "GIT_DIR/GIT_WORK_TREE spoofing from a linked worktree must not bypass the primary-checkout refusal"
+                os.environ['PATH'] = old_path
+            assert rc != 0, (
+                "neither GIT_DIR/GIT_WORK_TREE spoofing nor a lying fake `git` on PATH must bypass "
+                "the primary-checkout refusal from a real linked worktree")
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'spoof.md')), (
                 "nothing must be written when the primary-checkout check is spoofed")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
-    # Finding 3 regression: when `git rev-parse --show-toplevel` itself fails (nonzero exit / no
-    # output), the check must fail CLOSED (refuse), never open. A fake `git` on PATH that always
-    # exits nonzero exercises this exact branch -- distinct from the OSError branch (git not found
-    # at all) and from the normal not-a-real-directory branch (git succeeds, reports a toplevel, but
-    # that toplevel's .git isn't a real directory).
-    def test_mint_git_rev_parse_failure_refused():
+    # Round-6 Finding 1 regression (positive side): proves the primary-checkout check no longer
+    # depends on `git` being invocable AT ALL -- from the primary checkout, with NO `git` binary
+    # reachable on PATH whatsoever, mint must still correctly ALLOW (no false refusal); from a
+    # linked worktree under the same git-less PATH, mint must still correctly REFUSE. Both outcomes
+    # come from the filesystem-only `.git` walk, with zero subprocess involvement either way.
+    def test_mint_primary_checkout_check_is_git_independent():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
             repo, lessons_dir = _mint_fixture(tmp)
-            draft = os.path.join(tmp, 'draft.md')
-            with open(draft, 'w') as f:
+            wt = os.path.join(tmp, 'wt-no-git')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'no-git-feat', wt, 'main'], check=True)
+            draft_ok = os.path.join(tmp, 'draft-ok.md')
+            with open(draft_ok, 'w') as f:
+                f.write(_VALID_DRAFT)
+            draft_bad = os.path.join(tmp, 'draft-bad.md')
+            with open(draft_bad, 'w') as f:
                 f.write(_VALID_DRAFT)
             os.environ['SM_LESSONS_DIR'] = lessons_dir
 
-            fakebin = os.path.join(tmp, 'fakebin')
-            os.makedirs(fakebin)
-            fake_git = os.path.join(fakebin, 'git')
-            with open(fake_git, 'w') as f:
-                f.write('#!/bin/sh\nexit 1\n')
-            os.chmod(fake_git, 0o755)
-
+            empty_bin = os.path.join(tmp, 'empty-bin')  # a PATH dir with no `git` executable at all
+            os.makedirs(empty_bin)
             old_path = os.environ.get('PATH', '')
-            os.environ['PATH'] = fakebin
-            err = io.StringIO()
+            os.environ['PATH'] = empty_bin
             try:
-                with _in_dir(repo), redirect_stderr(err):
-                    rc = cmd_mint(['--file', draft])
+                err_primary = io.StringIO()
+                with _in_dir(repo), redirect_stderr(err_primary):
+                    rc_primary = cmd_mint(['--file', draft_ok])
+                err_wt = io.StringIO()
+                with _in_dir(wt), redirect_stderr(err_wt):
+                    rc_wt = cmd_mint(['--file', draft_bad])
             finally:
                 os.environ['PATH'] = old_path
-            assert rc != 0, "a failing `git rev-parse --show-toplevel` must refuse (fail closed), never fail open"
-            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
-
-            # Second sub-case: `git` exits 0 (success) but prints EMPTY stdout -- the OTHER half of
-            # the compound condition `out.returncode != 0 or not out.stdout.strip()`. A mutation that
-            # drops just this half (leaving only the returncode check) would still pass the sub-case
-            # above (nonzero exit) but silently fail OPEN here, since returncode == 0.
-            fakebin_empty = os.path.join(tmp, 'fakebin-empty-stdout')
-            os.makedirs(fakebin_empty)
-            fake_git_empty = os.path.join(fakebin_empty, 'git')
-            with open(fake_git_empty, 'w') as f:
-                f.write('#!/bin/sh\nexit 0\n')
-            os.chmod(fake_git_empty, 0o755)
-
-            os.environ['PATH'] = fakebin_empty
-            err2 = io.StringIO()
-            try:
-                with _in_dir(repo), redirect_stderr(err2):
-                    rc2 = cmd_mint(['--file', draft])
-            finally:
-                os.environ['PATH'] = old_path
-            assert rc2 != 0, (
-                "a `git rev-parse --show-toplevel` that exits 0 with EMPTY stdout must also refuse "
-                "(fail closed), not fail open just because the exit code was 0")
-            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+            assert rc_primary == 0, (
+                f"mint from the primary checkout must succeed even with NO `git` binary on PATH at "
+                f"all -- the check must not depend on git being invocable:\n{err_primary.getvalue()}")
+            assert rc_wt != 0, (
+                "mint from a linked worktree must still refuse even with NO `git` binary on PATH -- "
+                "the filesystem-only check doesn't need git to detect the worktree gitdir file")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft-bad.md'))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
@@ -1975,18 +2223,23 @@ Always do the one thing that must happen.
     test_mint_unreadable_file_rejected()
     test_mint_invalid_utf8_rejected()
     test_mint_no_file_arg_rejected()
+    test_mint_help_flag_shows_usage()
     test_mint_empty_tags_rejected()
+    test_mint_scalar_tags_rejected()
     test_mint_bad_earned_in_rejected()
     test_mint_nonzero_counts_rejected()
     test_mint_evidence_e4_rejected()
     test_mint_multi_sentence_body_rejected()
     test_mint_declarative_body_rejected()
     test_mint_weak_marker_mid_sentence_rejected()
+    test_mint_declarative_must_decoy_rejected()
+    test_mint_missing_body_rejected()
+    test_mint_malformed_frontmatter_rejected()
     test_mint_unknown_category_rejected()
     test_mint_destination_collision_rejected()
     test_mint_primary_checkout_only_refusal()
-    test_mint_git_dir_spoof_refused()
-    test_mint_git_rev_parse_failure_refused()
+    test_mint_env_and_path_spoof_refused()
+    test_mint_primary_checkout_check_is_git_independent()
     test_mint_positive_path_roundtrip()
 
     # Test 10: All 4 real shipped seed files parse correctly and are evidence:E4
