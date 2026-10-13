@@ -665,44 +665,72 @@ def _primary_checkout_refusal_reason():
 
     Walks the FULL ancestor chain from the real CWD (`os.getcwd()`, never influenced by PATH or any
     executable) via `_find_dotgit_entries()`, not just the nearest `.git`: if ANY ancestor's `.git`
-    is a file whose `gitdir: <path>` line RESOLVES (following symlinks, see
-    `_resolve_gitdir_target()`) to a linked worktree's PRIVATE gitdir -- detected structurally via
-    `_is_worktree_private_gitdir()`'s `commondir`-file check, not by pattern-matching the pointer's
-    path text -- the CWD is physically contained within that linked worktree's directory tree and
-    this refuses immediately. This fires regardless of any nearer, nested `.git` (directory or
-    otherwise) found closer to the CWD, which a maker could create (deliberately or by accident)
-    specifically to defeat a nearest-match-only check, AND regardless of the pointer being routed
-    through a symlink/alias whose own path text contains no worktree-shaped substring. Only once no
-    ancestor resolves to a worktree's private gitdir does the NEAREST `.git` entry decide the
-    outcome: a real directory is a normal primary checkout (allow); a file resolving somewhere else
-    entirely (not a worktree's private gitdir) is still a legitimate primary checkout using an
-    external gitdir (e.g. `git init --separate-git-dir=<external>`, even one whose path happens to
-    contain the substring "worktrees" for unrelated reasons) and is also allowed -- only the real
-    structural signal ever triggers a refusal. Fails CLOSED (refuses) on any ambiguity, including a
-    CWD that no longer exists (`os.getcwd()` itself raising) -- never fails open."""
+    RESOLVES (following symlinks -- see `_resolve_gitdir_target()` for a gitdir-pointer file's
+    text, and the `.resolve()` call below for the `.git` entry itself, however it presents: a real
+    directory, a pointer file, or a symlink to either) to a linked worktree's PRIVATE gitdir --
+    detected structurally via `_is_worktree_private_gitdir()`'s `commondir`-file check, never by
+    pattern-matching any path's text -- the CWD is physically contained within that linked
+    worktree's directory tree and this refuses immediately. This fires regardless of any nearer,
+    nested `.git` (directory or otherwise) found closer to the CWD, which a maker could create
+    (deliberately or by accident) specifically to defeat a nearest-match-only check, AND regardless
+    of the path to the real private gitdir being routed through a symlink/alias -- whether that
+    symlink sits in a gitdir-pointer file's TEXT or is the `.git` entry itself -- whose own path
+    text contains no worktree-shaped substring. Only once no ancestor resolves to a worktree's
+    private gitdir does the NEAREST `.git` entry decide the outcome: a real (or symlinked-to-real)
+    directory is a normal primary checkout (allow); a file resolving somewhere else entirely (not a
+    worktree's private gitdir) is still a legitimate primary checkout using an external gitdir
+    (e.g. `git init --separate-git-dir=<external>`, even one whose path happens to contain the
+    substring "worktrees" for unrelated reasons) and is also allowed -- only the real structural
+    signal ever triggers a refusal. Fails CLOSED (refuses) on any ambiguity, including a CWD that
+    no longer exists (`os.getcwd()` itself raising) -- never fails open."""
     try:
         cwd = os.getcwd()
     except OSError as e:
         return f"mint: could not determine the current directory ({e}) -- refusing (fail closed)"
 
     nearest_entry = None
+    nearest_real_entry = None
     nearest_gitdir_target = None
 
     for git_path in _find_dotgit_entries(cwd):
         gitdir_target = None
         resolved_target = None
-        if git_path.is_file():
+        try:
+            # Resolve the `.git` entry itself through symlinks BEFORE classifying it -- the same
+            # "resolve before deciding" principle already applied to a gitdir-pointer file's TEXT
+            # below, generalized to the entry itself. Without this, a `.git` entry that's a symlink
+            # straight to a linked worktree's private gitdir directory would be misread: `is_dir()`
+            # on a symlink-to-directory reports True, so it would be treated as an ordinary
+            # primary-checkout `.git` directory and never checked for the `commondir` marker.
+            real_entry = git_path.resolve() if git_path.is_symlink() else git_path
+        except OSError as e:
+            return f"mint: could not resolve {git_path} ({e}) -- refusing (fail closed)"
+
+        if real_entry.is_dir():
+            # Either an ordinary primary-checkout gitdir directory, or -- if `.git` was a symlink --
+            # the resolved target IS itself a worktree's private gitdir directory. Same structural
+            # commondir check decides either way, so no separate code path is needed for the
+            # symlink-to-directory case.
+            if _is_worktree_private_gitdir(real_entry):
+                return (f"mint: refusing -- {git_path} resolves to {real_entry}, a linked "
+                        f"worktree's private gitdir -- identified by the 'commondir' file git "
+                        f"itself writes only there -- so the CWD is physically contained within a "
+                        f"maker's linked worktree. mint only runs in the primary checkout, never "
+                        f"inside a maker's linked worktree, however deeply nested, aliased, or "
+                        f"symlinked the path to it is.")
+        elif real_entry.is_file():
             try:
-                gitdir_line = git_path.read_text(encoding='utf-8', errors='replace').strip()
+                gitdir_line = real_entry.read_text(encoding='utf-8', errors='replace').strip()
                 m = re.match(r'gitdir:\s*(.+)\Z', gitdir_line)
                 gitdir_target = m.group(1).strip() if m else None
                 if gitdir_target:
-                    resolved_target = _resolve_gitdir_target(gitdir_target, git_path)
+                    resolved_target = _resolve_gitdir_target(gitdir_target, real_entry)
             except OSError as e:
-                return f"mint: could not resolve/read {git_path} ({e}) -- refusing (fail closed)"
+                return f"mint: could not resolve/read {real_entry} ({e}) -- refusing (fail closed)"
 
         if nearest_entry is None:
             nearest_entry = git_path
+            nearest_real_entry = real_entry
             nearest_gitdir_target = gitdir_target
 
         if resolved_target is not None and _is_worktree_private_gitdir(resolved_target):
@@ -714,9 +742,9 @@ def _primary_checkout_refusal_reason():
 
     if nearest_entry is None:
         return "mint: could not find a .git entry walking up from the CWD -- refusing (fail closed)"
-    if nearest_entry.is_dir():
+    if nearest_real_entry.is_dir():
         return None
-    if not nearest_entry.is_file():
+    if not nearest_real_entry.is_file():
         return (f"mint: refusing -- {nearest_entry} exists but is neither a directory nor a regular "
                 f"file -- ambiguous, refusing (fail closed)")
     if not nearest_gitdir_target:
@@ -755,22 +783,46 @@ _IMPERATIVE_LEAD_VERBS = {
     'add', 'remove', 'delete', 'install', 'validate', 'log', 'record', 'skip',
 }
 
+# These markers are modal auxiliaries: in genuine English grammar they are ALWAYS followed by a
+# bare-infinitive verb ("must call", "should avoid", "cannot skip"), never by a verb inflected for
+# 3rd-person-singular present tense ("must appears", "should happens" are not valid English). A
+# declarative sentence that merely talks ABOUT one of these words as a noun ("The word must appears
+# in this factual sentence.") puts the sentence's REAL verb immediately after the marker instead,
+# and that real verb is reliably -s-inflected -- a checker found exactly this decoy. Checking the
+# next word's shape (not just that something follows) is what tells "must call" apart from
+# "must appears" without a full grammatical parser.
+_MODAL_DIRECTIVE_MARKERS = frozenset({'must', 'should', 'shall', 'cannot', "can't", 'do not', "don't"})
+
 
 def _has_directive_marker(stripped_sentence):
     """A marker word (must/avoid/should/...) only counts as a directive if at least one occurrence
     has something follow it in the sentence -- the obligation's own verb phrase. A marker used as a
     bare noun/object at the very end of the sentence ("This sentence contains the word must.") is a
     declarative statement ABOUT the word, not an actual directive, and must not pass on the marker's
-    mere presence alone -- a checker found exactly this decoy. Every real imperative-rule marker use
-    ("must call...", "should avoid...") is followed by more words describing what to do; only a
-    sentence-final, noun-like use of the marker word itself is excluded here. Still a keyword
+    mere presence alone -- a checker found exactly this decoy. For the modal markers (see
+    `_MODAL_DIRECTIVE_MARKERS`), merely having *something* follow isn't enough either: a declarative
+    sentence can use the marker as a noun mid-sentence with the sentence's own verb landing right
+    after it ("The word must appears in this factual sentence.") -- a checker found this second,
+    sneakier decoy too. A genuine modal directive is always followed by a bare-infinitive verb, never
+    one inflected with a 3rd-person-singular "-s", so this additionally rejects a modal match whose
+    very next word looks like that inflected verb. Every real imperative-rule marker use ("must
+    call...", "should avoid...") is followed by a bare verb; only a sentence-final noun-like use, or
+    a noun-like use immediately followed by an inflected verb, is excluded here. Still a keyword
     heuristic, not a grammatical parser: it can't tell "must comply with X" (real directive) from a
-    contrived "must, as in the modal verb," mid-sentence aside -- it only catches the specific
-    sentence-final-noun decoy shape."""
+    contrived "must, as in the modal verb," mid-sentence aside -- it only catches the specific decoy
+    shapes a checker actually found."""
     body_no_terminal_punct = re.sub(r'[.!?]\Z', '', stripped_sentence).rstrip()
     for m in _IMPERATIVE_MARKERS.finditer(body_no_terminal_punct):
-        if m.end() < len(body_no_terminal_punct):
-            return True
+        remainder = body_no_terminal_punct[m.end():]
+        if not remainder.strip():
+            continue  # nothing follows -- sentence-final noun-like use, not a directive
+        if m.group(0).lower() in _MODAL_DIRECTIVE_MARKERS:
+            next_word = re.match(r"\s*([A-Za-z']+)", remainder)
+            if next_word and next_word.group(1).lower().endswith('s'):
+                continue  # e.g. "must appears" -- a modal is never followed by a 3rd-person
+                          # singular inflected verb, so this is the marker used as a noun with the
+                          # sentence's real verb right after it, not an obligation clause
+        return True
     return False
 
 
@@ -853,9 +905,14 @@ def _is_balanced_inline_list(value):
     YAML parser accepts -- and quoting is tracked so a bracket character INSIDE a quoted scalar
     (e.g. `["a]"]`, a valid one-item list containing the string `a]`) is treated as data, not
     structure, rather than miscounted as a real closing bracket (the previous bare bracket-counter
-    did exactly that and wrongly rejected it). No YAML library dependency, by design -- this repo is
-    stdlib-only (see the top-of-file imports); hand-rolled the same lightweight way
-    parse_frontmatter() already parses for lookup/tag's purposes, but strict rather than lenient."""
+    did exactly that and wrongly rejected it). Inside a double-quoted scalar, a backslash-escaped
+    quote (`"a\"b"`, standard YAML escape syntax) does not end the string either -- a bare "are we
+    in a quote" tracker would see that escaped `"` as the closing quote and misparse everything
+    after it, wrongly rejecting a valid list; a single-quoted scalar has no backslash-escaping in
+    YAML, so a backslash there stays an ordinary data character. No YAML library dependency, by
+    design -- this repo is stdlib-only (see the top-of-file imports); hand-rolled the same
+    lightweight way parse_frontmatter() already parses for lookup/tag's purposes, but strict rather
+    than lenient."""
     value = value.strip()
     if not value.startswith('[') or not value.endswith(']'):
         return False
@@ -863,12 +920,17 @@ def _is_balanced_inline_list(value):
 
     depth = 0
     quote_char = None
+    escape_next = False
     current = []
     elements = []
     for ch in inner:
         if quote_char:
             current.append(ch)
-            if ch == quote_char:
+            if escape_next:
+                escape_next = False
+            elif quote_char == '"' and ch == '\\':
+                escape_next = True
+            elif ch == quote_char:
                 quote_char = None
             continue
         if ch in ('"', "'"):
@@ -2090,6 +2152,60 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-10 Finding 2 regression: `_has_directive_marker()` previously only required that
+    # SOMETHING follow the marker word anywhere later in the sentence, so a declarative sentence
+    # whose own real verb happens to land immediately after a noun-like "must" ("The word must
+    # appears in this factual sentence.") still passed as if it were a genuine obligation clause.
+    # Also re-asserts the earlier round-6 decoy ("This sentence contains the word must.", nothing
+    # at all follows "must") still correctly rejects, and that a real imperative lesson body still
+    # passes -- this round's fix must not regress either.
+    def test_mint_declarative_must_followed_by_verb_decoy_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_decoy = os.path.join(tmp, 'verb-decoy.md')
+            with open(draft_decoy, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The word must appears in this factual sentence.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_decoy])
+            assert rc != 0, (
+                "a declarative sentence where 'must' is used as a noun and the sentence's own verb "
+                "lands right after it ('The word must appears...') must be rejected -- a modal is "
+                "never followed by a 3rd-person-singular inflected verb in a real directive")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'verb-decoy.md'))
+
+            # must not regress the earlier sentence-final decoy.
+            draft_sentence_final = os.path.join(tmp, 'sentence-final-decoy.md')
+            with open(draft_sentence_final, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'This sentence contains the word must.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_sentence_final])
+            assert rc2 != 0, "the earlier sentence-final 'must' decoy must still be rejected"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'sentence-final-decoy.md'))
+
+            # must not overcorrect: a genuine imperative rule still passes.
+            draft_real = os.path.join(tmp, 'real-directive.md')
+            with open(draft_real, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'A selfcheck/regression test must call the actual function or code path it claims to test.\n'))
+            err3 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err3):
+                rc3 = cmd_mint(['--file', draft_real])
+            assert rc3 == 0, (
+                f"a genuine imperative rule ('...must call...') must still be accepted:\n{err3.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-6 Finding 5 regression: a draft with valid frontmatter but a missing/empty body must be
     # rejected -- the real CLI already does this correctly, but no selfcheck test exercised it (the
     # only prior body-rejection test used multi-sentence content, never an empty body).
@@ -2465,6 +2581,47 @@ Always do the one thing that must happen.
             if 'SM_LESSONS_DIR' in os.environ:
                 del os.environ['SM_LESSONS_DIR']
 
+    # Round-10 Finding 1 regression: a linked worktree whose `.git` ENTRY ITSELF (not a gitdir
+    # pointer file's text, the entry) is replaced with a symlink pointing directly at its own real
+    # private gitdir directory must still be refused. `is_dir()` on a symlink-to-directory reports
+    # True, so without resolving the `.git` entry itself first, this used to be misread as an
+    # ordinary primary-checkout `.git` directory and never checked for the `commondir` marker.
+    def test_mint_symlinked_dotgit_directory_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-dotgit-symlink')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'dotgit-symlink-feat', wt, 'main'], check=True)
+
+            real_private_gitdir = pathlib.Path(repo) / '.git' / 'worktrees' / 'wt-dotgit-symlink'
+            assert real_private_gitdir.is_dir(), (
+                "expected git to have created the worktree's private gitdir at the usual location")
+
+            dotgit = pathlib.Path(wt) / '.git'
+            dotgit.unlink()  # remove the normal gitdir-pointer FILE
+            dotgit.symlink_to(real_private_gitdir, target_is_directory=True)  # replace with a symlink straight at the real private gitdir
+            assert dotgit.is_symlink(), "the fixture's .git entry must actually be a symlink"
+            assert dotgit.is_dir(), (
+                "a symlink to a directory must itself report as a directory -- if this fails, the "
+                "fixture isn't exercising the misclassification this test is about")
+
+            draft = os.path.join(tmp, 'dotgit-symlink-draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(wt), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "a worktree whose .git entry is itself a symlink straight to its real private "
+                "gitdir directory must still be refused -- the commondir check must resolve the "
+                ".git entry itself through symlinks, not just a gitdir-pointer file's text")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'dotgit-symlink-draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
     # Round-7 Finding 3 regression: `_mint_tags_written_as_list`'s inline-list branch previously
     # only checked `value.startswith('[')`, so an unterminated flow sequence (`tags: [testing`, no
     # closing bracket at all) passed and installed. Must actually validate the list is closed.
@@ -2530,6 +2687,30 @@ Always do the one thing that must happen.
                 f"a valid YAML list containing a quoted string with a bracket character inside the "
                 f"quotes (`[\"a]\"]`) must be accepted, not rejected on a miscounted bracket:\n{err.getvalue()}")
             assert os.path.exists(os.path.join(lessons_dir, 'testing', 'quoted-bracket.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-10 Finding 3 regression: a backslash-escaped quote inside a double-quoted scalar
+    # (`tags: ["a\"b"]`, standard YAML escape syntax) must NOT be mistaken for the string's closing
+    # quote -- the old quote-aware scanner didn't track escapes, so it treated the escaped `"` as
+    # the real closing quote and misparsed the rest of the line, wrongly rejecting a valid list.
+    def test_mint_escaped_quote_in_tags_accepted():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'escaped-quote.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: ["a\\"b"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a valid YAML list containing a backslash-escaped quote inside a double-quoted "
+                f"scalar (`[\"a\\\"b\"]`) must be accepted, not rejected on a misparsed closing "
+                f"quote:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'escaped-quote.md'))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
@@ -2621,6 +2802,7 @@ Always do the one thing that must happen.
     test_mint_declarative_body_rejected()
     test_mint_weak_marker_mid_sentence_rejected()
     test_mint_declarative_must_decoy_rejected()
+    test_mint_declarative_must_followed_by_verb_decoy_rejected()
     test_mint_missing_body_rejected()
     test_mint_malformed_frontmatter_rejected()
     test_mint_unknown_category_rejected()
@@ -2632,9 +2814,11 @@ Always do the one thing that must happen.
     test_mint_nested_dotgit_decoy_in_worktree_refused()
     test_mint_symlink_aliased_worktree_pointer_refused()
     test_mint_separate_git_dir_named_worktrees_allowed()
+    test_mint_symlinked_dotgit_directory_refused()
     test_mint_unterminated_bracket_tags_rejected()
     test_mint_double_comma_tags_rejected()
     test_mint_quoted_bracket_in_tags_accepted()
+    test_mint_escaped_quote_in_tags_accepted()
     test_mint_removed_cwd_refused()
     test_mint_positive_path_roundtrip()
 
