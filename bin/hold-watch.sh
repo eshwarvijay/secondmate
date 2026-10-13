@@ -132,16 +132,31 @@ match_block() {
 
 # poll_once <outfile> <budget-secs> -- one `hold.py open`, bounded by the REMAINING time budget
 # (not the full --interval), so a hung/slow hold.py invocation can never push the script
-# meaningfully past its --timeout deadline. The bound is a backgrounded killer subshell: if the
-# poll finishes early, the killer is TERM-killed before its own `kill` can ever run; if the poll
-# hangs, it gets TERM and, after a 1s grace, KILL. Returns hold.py's exit status (143 when the
-# budget killed it). hold.py's stderr is suppressed: its "(no open decisions)" noise stays out of
-# the cron log, and its stdout WARNING lines still reach match_block for stderr forwarding.
+# meaningfully past its --timeout deadline. The bound is a backgrounded killer subshell: it
+# sleeps the budget, then TERMs the poll (KILL after a 1s grace); if the poll finishes early,
+# the killer is TERM-killed before its own `kill` can ever run. The killer's inner sleep is a
+# TRACKED child the subshell's own EXIT/TERM traps kill, and the subshell's stdout/stderr are
+# /dev/null -- so NOTHING outlives this call: an orphaned `sleep $budget` would otherwise
+# linger (up to --timeout, a year at the cap) holding whatever fds it inherited, wedging a
+# dispatcher that captures this watcher's stdout via a pipe until long after the exit code.
+# Returns hold.py's exit status (143 when the budget killed it). hold.py's stderr is
+# suppressed: its "(no open decisions)" noise stays out of the cron log, and its stdout
+# WARNING lines still reach match_block for stderr forwarding.
 poll_once() {
   local ofile="$1" budget="$2" rc=0
   python3 "$HOLD_PY" open >"$ofile" 2>/dev/null &
   POLL_PID=$!
-  ( sleep "$budget"; kill -TERM "$POLL_PID" 2>/dev/null; sleep 1; kill -KILL "$POLL_PID" 2>/dev/null ) &
+  (
+    tpid=""
+    trap '[ -n "${tpid:-}" ] && kill "$tpid" 2>/dev/null' EXIT
+    trap '[ -n "${tpid:-}" ] && kill "$tpid" 2>/dev/null; exit' TERM
+    sleep "$budget" &
+    tpid=$!
+    wait "$tpid"
+    kill -TERM "$POLL_PID" 2>/dev/null
+    sleep 1
+    kill -KILL "$POLL_PID" 2>/dev/null
+  ) >/dev/null 2>&1 &
   POLL_KILLER=$!
   wait "$POLL_PID"; rc=$?
   POLL_PID=""
@@ -375,6 +390,27 @@ EOF
   rc=0; "$0" --timeout 999999999999999999 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || bad "an absurd --timeout must be rejected with exit 2 (no unbounded failing loop), got $rc"
   rw "$ledger" 0 --interval 31536000 --timeout 0   # exactly the cap: accepted, instant first-poll match
+  rw "$ledger" 0 --timeout 31536000   # the cap as a TIMEOUT must be ACCEPTED too (the batch hold
+  # matches on poll 1, so this costs zero wait) -- guards against a future off-by-one that wrongly
+  # rejects the documented maximum timeout
+
+  # stdout captured through a PIPE (round-4 regression): the poll-killer's inner sleep must
+  # never linger holding the caller's pipe -- a piping dispatcher must see EOF as soon as the
+  # watcher exits (an orphaned `sleep $budget` used to wedge $(...) for up to --timeout)
+  now="$(date +%s)"
+  out="$(SM_HOLD_LEDGER="$ledger" "$0" --timeout 30 --interval 1 2>/dev/null)" \
+    || bad "pipe-capture run should exit 0 on the first-poll match"
+  elapsed=$(( $(date +%s) - now ))
+  [ "$elapsed" -le 10 ] || bad "a piping dispatcher must not wait on lingering killer sleeps, took ${elapsed}s"
+  grep -qF "[$bid] (batch-1) merge batch?" <<<"$out" || bad "pipe-capture run must print the matched block"
+  sleep 0.3   # nothing of this invocation may remain: the killer cleans up after itself
+  # deliberately ps(1), not pgrep: POSIX ps is guaranteed on the minimal systems pgrep is not,
+  # and a missing pgrep would silently weaken this assertion
+  # shellcheck disable=SC2009
+  if ps -ax -o command= 2>/dev/null | grep -F -- "hold-watch.sh --timeout 30 --interval 1" | grep -qv grep; then
+    bad "the poll-killer (or its inner sleep) must not outlive the watcher run"
+  fi
+
   rc=0; "$0" --timeout 31536001 >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || bad "--timeout one second above the 1-year cap must exit 2, got $rc"
   rc=0; "$0" --bogus >/dev/null 2>&1 || rc=$?
