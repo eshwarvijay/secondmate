@@ -576,6 +576,18 @@ def cmd_tag(argv):
 _MINT_USAGE = 'Usage: bin/lesson-lookup.py mint --file <draft.md> [--category <cat>]\n'
 
 
+# Git env vars that override its normal repo-discovery (relative to the real process CWD) entirely.
+# A caller sitting in a real linked worktree can set GIT_DIR to a primary checkout's .git and
+# GIT_WORK_TREE to that checkout's root and make `git rev-parse --show-toplevel` falsely report the
+# primary checkout -- reproduced directly (a cross-model checker got `mint` to install a lesson file
+# from inside a linked worktree this way). Scrubbed from the subprocess env below so the check always
+# reflects the real CWD, never an attacker-controlled override.
+_GIT_DISCOVERY_ENV_VARS = (
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+    'GIT_COMMON_DIR',
+)
+
+
 def _primary_checkout_refusal_reason():
     """Return None if the CWD's repo is the primary checkout, else a stderr-ready refusal message
     naming the exact predicate checked. Deliberately does NOT reuse scope-guard.py's
@@ -585,9 +597,13 @@ def _primary_checkout_refusal_reason():
     (primary checkout) versus a file (the gitdir-pointer git writes for a linked worktree) or
     missing/unresolvable (ambiguous) -- the same primary-vs-linked signal mark-maker.sh already uses
     (git-dir vs git-common-dir equality), reimplemented here without depending on scope-guard.py.
-    Fails CLOSED (refuses) on any ambiguity or git error -- never fails open."""
+    Fails CLOSED (refuses) on any ambiguity or git error -- never fails open. Runs git with
+    _GIT_DISCOVERY_ENV_VARS scrubbed from its environment (see that constant's comment) so
+    GIT_DIR/GIT_WORK_TREE spoofing from a linked worktree can't make this falsely resolve to some
+    other (e.g. primary) checkout."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_DISCOVERY_ENV_VARS}
     try:
-        out = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+        out = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True, env=env)
     except OSError as e:
         return f"mint: could not run `git rev-parse --show-toplevel` ({e}) -- refusing (fail closed)"
     if out.returncode != 0 or not out.stdout.strip():
@@ -610,18 +626,41 @@ def _discover_categories(lessons_dir):
     return sorted(p.name for p in lessons_path.iterdir() if p.is_dir())
 
 
+_IMPERATIVE_MARKERS = re.compile(
+    r"\b(must|never|always|avoid|should|shall|cannot|can't|do not|don't|ensure|stay|verify|confirm|refuse|reject)\b",
+    re.IGNORECASE)
+
+_IMPERATIVE_LEAD_VERBS = {
+    'avoid', 'stay', 'run', 'check', 'verify', 'confirm', 'write', 'keep', 'use', 'do', 'never',
+    'always', 'ensure', 'tag', 'mint', 'reject', 'refuse', 'ask', 'read', 'commit', 'test', 'treat',
+    'add', 'remove', 'delete', 'install', 'validate', 'log', 'record', 'skip',
+}
+
+
 def _is_single_sentence_body(body_text):
     """Heuristic for "exactly one imperative-rule sentence": no blank-line paragraph break, the
-    stripped text is non-empty and ends in one of .!?, and splitting on sentence-ending punctuation
-    followed by whitespace yields exactly one non-empty segment. There's no stdlib primitive for
-    "one sentence" -- this is a deliberately simple heuristic, not an NLP sentence splitter."""
+    stripped text is non-empty and ends in one of .!?, splitting on sentence-ending punctuation
+    followed by whitespace yields exactly one non-empty segment, AND the sentence reads as a RULE
+    rather than a plain declarative fact -- it either contains an obligation/prohibition marker word
+    (must/never/always/avoid/should/...) anywhere, or opens on a common bare imperative verb (e.g.
+    "Stay within scope.", "Avoid X."). This is a keyword heuristic, not a grammatical mood
+    classifier: a declarative sentence that happens to use a marker word in an unrelated sense would
+    still pass, and a genuinely imperative sentence using a verb outside the curated lead-verb list
+    with no marker word elsewhere would still be rejected. There's no stdlib primitive for "is this
+    an imperative rule, not a fact" -- this catches the clear declarative-fact case a checker found
+    ("The build server is located in the east wing."), not every edge case."""
     stripped = body_text.strip()
     if not stripped or '\n\n' in stripped:
         return False
     if not re.search(r'[.!?]\Z', stripped):
         return False
     segments = [s for s in re.split(r'(?<=[.!?])\s+', stripped) if s.strip()]
-    return len(segments) == 1
+    if len(segments) != 1:
+        return False
+    if _IMPERATIVE_MARKERS.search(stripped):
+        return True
+    first_word = re.match(r"[A-Za-z']+", stripped)
+    return bool(first_word and first_word.group(0).lower() in _IMPERATIVE_LEAD_VERBS)
 
 
 def _present_zero(fm, field):
@@ -1540,6 +1579,30 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Finding 2 regression: a single, well-formed, purely declarative FACT sentence (no obligation/
+    # prohibition marker word anywhere, no imperative lead verb) must be rejected -- the sentence-
+    # count/shape check alone (the pre-fix state of _is_single_sentence_body) accepted this.
+    def test_mint_declarative_body_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The build server is located in the east wing.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, "a purely declarative factual sentence must be rejected as not an imperative rule"
+            assert 'sentence' in err.getvalue().lower() or 'imperative' in err.getvalue().lower(), (
+                f"expected a body/sentence error:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     def test_mint_unknown_category_rejected():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -1612,6 +1675,72 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Finding 1 regression: reproduces a cross-model checker's exact repro -- from a REAL linked
+    # worktree's CWD, with GIT_DIR pointed at the primary checkout's .git and GIT_WORK_TREE pointed
+    # at the primary checkout's root (the two env vars that override git's normal CWD-based repo
+    # discovery entirely), `git rev-parse --show-toplevel` would -- without the env-scrubbing fix --
+    # falsely report the primary checkout. Must still refuse.
+    def test_mint_git_dir_spoof_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-spoof')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'spoof-feat', wt, 'main'], check=True)
+            draft = os.path.join(tmp, 'spoof.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            os.environ['GIT_DIR'] = os.path.join(repo, '.git')
+            os.environ['GIT_WORK_TREE'] = repo
+            err = io.StringIO()
+            try:
+                with _in_dir(wt), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            finally:
+                del os.environ['GIT_DIR']
+                del os.environ['GIT_WORK_TREE']
+            assert rc != 0, "GIT_DIR/GIT_WORK_TREE spoofing from a linked worktree must not bypass the primary-checkout refusal"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'spoof.md')), (
+                "nothing must be written when the primary-checkout check is spoofed")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Finding 3 regression: when `git rev-parse --show-toplevel` itself fails (nonzero exit / no
+    # output), the check must fail CLOSED (refuse), never open. A fake `git` on PATH that always
+    # exits nonzero exercises this exact branch -- distinct from the OSError branch (git not found
+    # at all) and from the normal not-a-real-directory branch (git succeeds, reports a toplevel, but
+    # that toplevel's .git isn't a real directory).
+    def test_mint_git_rev_parse_failure_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+
+            fakebin = os.path.join(tmp, 'fakebin')
+            os.makedirs(fakebin)
+            fake_git = os.path.join(fakebin, 'git')
+            with open(fake_git, 'w') as f:
+                f.write('#!/bin/sh\nexit 1\n')
+            os.chmod(fake_git, 0o755)
+
+            old_path = os.environ.get('PATH', '')
+            os.environ['PATH'] = fakebin
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            finally:
+                os.environ['PATH'] = old_path
+            assert rc != 0, "a failing `git rev-parse --show-toplevel` must refuse (fail closed), never fail open"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     def test_mint_positive_path_roundtrip():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -1665,9 +1794,12 @@ Always do the one thing that must happen.
     test_mint_nonzero_counts_rejected()
     test_mint_evidence_e4_rejected()
     test_mint_multi_sentence_body_rejected()
+    test_mint_declarative_body_rejected()
     test_mint_unknown_category_rejected()
     test_mint_destination_collision_rejected()
     test_mint_primary_checkout_only_refusal()
+    test_mint_git_dir_spoof_refused()
+    test_mint_git_rev_parse_failure_refused()
     test_mint_positive_path_roundtrip()
 
     # Test 10: All 4 real shipped seed files parse correctly and are evidence:E4
