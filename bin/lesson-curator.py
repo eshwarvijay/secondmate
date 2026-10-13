@@ -390,6 +390,14 @@ def selfcheck():
             "--help must state that a human owns every retire/rewrite decision"
         assert FEEDBACK_TAGS_MEANING in help_text, "--help must state the pinned 'tags' interpretation"
         assert str(EXIT_CANNOT_RUN) in help_text, "--help must document the single nonzero exit code"
+        # The scoped zero-write guarantee must be in the PRINTED --help text, and the old blanket
+        # wording must not come back: a future edit that silently reverts HELP_TEXT to the
+        # unqualified "writes no file at all" claim must fail --selfcheck, not just a manual read.
+        assert 'never writes, removes, or locks any real file' in help_text \
+            and 'intentional exception is --selfcheck' in help_text, \
+            "--help must scope its zero-write guarantee to real data and name --selfcheck's fixture exception"
+        assert 'writes no file at all' not in help_text, \
+            "--help must not carry the old unqualified zero-write claim"
 
         # --- unrecognized arguments: the one documented nonzero exit code -------------------
         for bad_argv in ([], ['--bogus'], ['--report', '--selfcheck']):
