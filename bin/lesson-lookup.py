@@ -793,6 +793,13 @@ _IMPERATIVE_LEAD_VERBS = {
 # "must appears" without a full grammatical parser.
 _MODAL_DIRECTIVE_MARKERS = frozenset({'must', 'should', 'shall', 'cannot', "can't", 'do not', "don't"})
 
+# A marker word appearing INSIDE a quoted span ("must comply", 'should avoid') is being discussed
+# or quoted, not functioning as the sentence's own grammatical modal -- a checker found
+# `The phrase "must comply" is printed in this declarative sentence.` sailing through on exactly
+# this gap. Matches either quote style as a non-greedy span; no body in this grammar's real,
+# shipped lessons uses quotes at all, so this costs nothing on the common path.
+_QUOTED_SPAN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+
 
 def _has_directive_marker(stripped_sentence):
     """A marker word (must/avoid/should/...) only counts as a directive if at least one occurrence
@@ -805,14 +812,20 @@ def _has_directive_marker(stripped_sentence):
     after it ("The word must appears in this factual sentence.") -- a checker found this second,
     sneakier decoy too. A genuine modal directive is always followed by a bare-infinitive verb, never
     one inflected with a 3rd-person-singular "-s", so this additionally rejects a modal match whose
-    very next word looks like that inflected verb. Every real imperative-rule marker use ("must
-    call...", "should avoid...") is followed by a bare verb; only a sentence-final noun-like use, or
-    a noun-like use immediately followed by an inflected verb, is excluded here. Still a keyword
-    heuristic, not a grammatical parser: it can't tell "must comply with X" (real directive) from a
-    contrived "must, as in the modal verb," mid-sentence aside -- it only catches the specific decoy
-    shapes a checker actually found."""
+    very next word looks like that inflected verb. A marker word that only appears INSIDE a quoted
+    span (see `_QUOTED_SPAN_RE`) is excluded too -- `The phrase "must comply" is printed in this
+    declarative sentence.` is talking ABOUT a quoted phrase, not issuing an obligation, a third decoy
+    a checker found. Every real imperative-rule marker use ("must call...", "should avoid...") is
+    followed by a bare verb outside any quotes; only a sentence-final noun-like use, a noun-like use
+    immediately followed by an inflected verb, or a marker trapped inside quotation marks, is
+    excluded here. Still a keyword heuristic, not a grammatical parser: it can't tell "must comply
+    with X" (real directive) from a contrived "must, as in the modal verb," mid-sentence aside -- it
+    only catches the specific decoy shapes a checker actually found."""
     body_no_terminal_punct = re.sub(r'[.!?]\Z', '', stripped_sentence).rstrip()
+    quoted_spans = [(m.start(), m.end()) for m in _QUOTED_SPAN_RE.finditer(body_no_terminal_punct)]
     for m in _IMPERATIVE_MARKERS.finditer(body_no_terminal_punct):
+        if any(start <= m.start() < end for start, end in quoted_spans):
+            continue  # the marker only appears inside a quoted span -- not the sentence's own modal
         remainder = body_no_terminal_punct[m.end():]
         if not remainder.strip():
             continue  # nothing follows -- sentence-final noun-like use, not a directive
@@ -907,16 +920,23 @@ def _mint_tags_written_as_list(frontmatter_text):
     return False  # no 'tags' key found in the raw frontmatter at all
 
 
-# Shared recursive-descent recognizer for a single YAML flow-style value (a quoted scalar, a
-# bracketed flow sequence, or a plain scalar run) -- the one real parsing primitive both the
-# inline '[a, b]' list form and each multi-line '- item' dash line's own content are validated
-# against, rather than two separate hand-rolled checks drifting out of sync with each other (a
-# checker found exactly that: the dash-line check only looked at the '- ' prefix shape and never
-# validated what followed it, so `- [unterminated` sailed through; the inline-list check tracked
-# quotes but accepted ANY backslash escape inside a double-quoted scalar, so `"a\q"` -- not a real
-# YAML escape -- also sailed through). No YAML library dependency, by design -- this repo is
-# stdlib-only (see the top-of-file imports); this is a small, correct recursive-descent parser
-# rather than a byte-counting heuristic, scoped to exactly what a tags value can legally contain.
+# Shared recognizer for mint's tags grammar -- deliberately a BOUNDED SUBSET of YAML, not full
+# YAML: a tag is a single flat string label (plain/single-quoted/double-quoted), never a nested
+# list or mapping, never a comment, never a raw control character. This is the one real parsing
+# primitive both the inline '[a, b]' list form and each multi-line '- item' dash line's own
+# content are validated against, rather than two separate hand-rolled checks drifting out of sync
+# with each other (a checker found exactly that across several rounds: a dash-line check that only
+# looked at the '- ' prefix shape and never validated what followed it; an inline-list check that
+# tracked quotes but accepted ANY backslash escape, or let a nested `[[]]` recurse arbitrarily deep
+# -- ~1500 nested `[` characters crashed mint with an unhandled RecursionError, since there was
+# never a real reason for a tag's own value to itself be a list). Flattening the grammar fixes the
+# crash at its root (there is nothing left to recurse into: an element is now ALWAYS a scalar, so
+# `_parse_yaml_flow_scalar` never calls back into a sequence parser) and the inline-vs-block
+# inconsistency the checker also found (`tags: [[]]` was already rejected inline but
+# `tags:\n  - []` was wrongly accepted in block form -- with nesting disallowed everywhere, both
+# forms now agree). No YAML library dependency, by design -- this repo is stdlib-only (see the
+# top-of-file imports); this is a small, correct recursive-descent parser rather than a
+# byte-counting heuristic, scoped to exactly what a tags value may legally contain.
 _DOUBLE_QUOTE_SIMPLE_ESCAPES = frozenset('0abtnvfre"\\/N_LP ')
 _DOUBLE_QUOTE_HEX_ESCAPE_WIDTHS = {'x': 2, 'u': 4, 'U': 8}
 _HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
@@ -924,8 +944,11 @@ _HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
 
 def _consume_double_quoted_scalar(text, pos):
     """`text[pos]` is a `"`. Returns the index just past the matching closing `"` if every escape
-    sequence inside is a LEGAL YAML double-quote escape, else None (unterminated, or an illegal
-    escape like `\\q`)."""
+    sequence inside is a LEGAL YAML double-quote escape (unterminated, or an illegal escape like
+    `\\q`, returns None), and every literal (non-escaped) character is NOT a raw control byte
+    (ord < 0x20) -- YAML disallows an unescaped control character in a scalar, and a tag is a
+    single-line label with no legitimate reason to contain one; an escaped form like `\\x00` is
+    still a normal, legal escape and is unaffected by this check."""
     i = pos + 1
     n = len(text)
     while True:
@@ -949,13 +972,17 @@ def _consume_double_quoted_scalar(text, pos):
                 i += 2 + width
                 continue
             return None  # not a legal YAML double-quote escape
+        if ord(ch) < 0x20:
+            return None  # raw control byte -- not a legal literal scalar character
         i += 1
 
 
 def _consume_single_quoted_scalar(text, pos):
     """`text[pos]` is a `'`. YAML single-quoted scalars have no backslash-escaping at all -- a
     backslash is just ordinary data -- and a doubled `''` is the only way to embed a literal `'`.
-    Returns the index just past the matching closing `'`, or None if unterminated."""
+    Returns the index just past the matching closing `'`, or None if unterminated or if a literal
+    raw control byte (ord < 0x20) appears -- same "no control characters in a scalar" rule as the
+    double-quoted form."""
     i = pos + 1
     n = len(text)
     while True:
@@ -966,28 +993,35 @@ def _consume_single_quoted_scalar(text, pos):
                 i += 2  # escaped literal quote
                 continue
             return i + 1
+        if ord(text[i]) < 0x20:
+            return None  # raw control byte -- not a legal literal scalar character
         i += 1
 
 
 def _consume_plain_scalar(text, pos):
     """A plain (unquoted) scalar run: everything up to the next flow-structural character (`,`,
-    `[`, `]`, `{`, `}`) or a quote character, or the end of the string. Returns the index just past
-    the run, or None if nothing non-whitespace was actually consumed (an empty element, e.g. the
-    gap between two commas in `[testing,,mint]`)."""
+    `[`, `]`, `{`, `}`), a quote character, a `#` (mint's tags grammar does not support YAML
+    comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), or
+    the end of the string. Returns the index just past the run, or None if nothing non-whitespace
+    was actually consumed (an empty element, e.g. the gap between two commas in
+    `[testing,,mint]`, or a `[`/`{` immediately where a flat scalar was expected -- nesting is not
+    part of this grammar, so a structural-open character here is simply invalid, not a sequence to
+    recurse into)."""
     n = len(text)
     i = pos
-    while i < n and text[i] not in ',[]{}"\'':
+    while i < n and text[i] not in ',[]{}"\'#':
         i += 1
     if not text[pos:i].strip():
-        return None  # empty element
+        return None  # empty element, or a disallowed structural/comment character right away
     return i
 
 
 def _parse_yaml_flow_scalar(text, pos):
-    """Parse exactly one YAML flow-style value -- a double/single-quoted scalar, a bracketed flow
-    sequence (recursing into this same function for each of ITS elements), or a plain scalar run --
-    starting at `text[pos]`. Returns the index just past the consumed value if well-formed, else
-    None."""
+    """Parse exactly one FLAT scalar element -- a double-quoted, single-quoted, or plain scalar --
+    starting at `text[pos]`. Deliberately does NOT recurse into a nested flow sequence or mapping:
+    mint's tags grammar has no nesting, so a `[` or `{` encountered here falls through to
+    `_consume_plain_scalar`, which immediately rejects it (an empty, structural-only run). Returns
+    the index just past the consumed value if well-formed, else None."""
     if pos >= len(text):
         return None
     ch = text[pos]
@@ -995,16 +1029,18 @@ def _parse_yaml_flow_scalar(text, pos):
         return _consume_double_quoted_scalar(text, pos)
     if ch == "'":
         return _consume_single_quoted_scalar(text, pos)
-    if ch == '[':
-        return _consume_flow_sequence(text, pos)
     return _consume_plain_scalar(text, pos)
 
 
 def _consume_flow_sequence(text, pos):
-    """`text[pos]` is a `[`. Parses a full bracketed flow sequence -- possibly empty (`[]`/`[ ]`),
-    otherwise one or more comma-separated elements (each itself a `_parse_yaml_flow_scalar`, so
-    nested brackets/quotes are handled correctly), rejecting any empty element (e.g. a double
-    comma) or a missing closing `]`. Returns the index just past the matching `]`, or None."""
+    """`text[pos]` is a `[`. Parses the TOP-LEVEL bracketed flow sequence for the inline tags-list
+    form only -- possibly empty (`[]`/`[ ]`), otherwise one or more comma-separated FLAT elements
+    (each a `_parse_yaml_flow_scalar`; since that function never recurses into another `[`, this is
+    never called recursively -- there is exactly one flow sequence per tags value, never nested,
+    which is what keeps this parser's stack depth constant regardless of how many `[` characters a
+    malicious draft piles up), rejecting any empty element (e.g. a double comma), a nested
+    `[`/`{` element, an unquoted `#`, or a missing closing `]`. Returns the index just past the
+    matching `]`, or None."""
     n = len(text)
     i = pos + 1
     while i < n and text[i] in ' \t':
@@ -1027,15 +1063,17 @@ def _consume_flow_sequence(text, pos):
             continue
         if text[i] == ']':
             return i + 1
-        return None  # unexpected character where ',' or ']' was expected
+        return None  # unexpected character where ',' or ']' was expected (includes an unquoted '#')
 
 
 def _is_balanced_inline_list(value):
-    """True if `value` is a well-formed, CLOSED inline YAML flow-sequence of scalars (see
+    """True if `value` is a well-formed, CLOSED inline flow-sequence of FLAT scalars (see
     `_consume_flow_sequence`): starts with '[', and the ENTIRE stripped value is consumed as one
     flow sequence -- rejecting a malformed double-comma like `[testing,,mint]`, an unterminated
-    bracket, or an illegal backslash escape inside a quoted element like `["a\\q"]` (not a real
-    YAML escape)."""
+    bracket, an illegal backslash escape inside a quoted element like `["a\\q"]` (not a real YAML
+    escape), a nested element like `[[]]` (tags are flat; nesting is not part of this grammar), or
+    an unquoted `#` (no comment support, e.g. `[a # ...]` is simply malformed, not comment-
+    stripped)."""
     value = value.strip()
     if not value.startswith('['):
         return False
@@ -1045,11 +1083,12 @@ def _is_balanced_inline_list(value):
 
 def _is_valid_yaml_scalar_entry(text):
     """True if `text` (one multi-line tags dash-item's content, right after '- ') is, on its own,
-    exactly one well-formed YAML flow-style value -- a quoted scalar, a bracketed flow sequence, or
-    a plain scalar -- with nothing malformed or left over. Shares `_parse_yaml_flow_scalar` with
-    `_is_balanced_inline_list` so a dash-line's content is held to the same standard as an inline
-    list element, e.g. `- [unterminated` (an unclosed flow sequence as a dash-item's own value) is
-    rejected here exactly like it would be inside `[...]`."""
+    exactly one well-formed FLAT scalar -- a quoted scalar or a plain scalar, never a nested flow
+    sequence/mapping -- with nothing malformed or left over. Shares `_parse_yaml_flow_scalar` with
+    `_is_balanced_inline_list` so a dash-line's content is held to the exact same standard as an
+    inline list element: `- [unterminated` (an unclosed flow sequence) and `- []` (an empty NESTED
+    list -- tags are flat, so this is rejected exactly like `[[]]` is inline) are both rejected
+    here, closing the inline-vs-block inconsistency a checker found."""
     text = text.strip()
     if not text:
         return False
@@ -2299,6 +2338,45 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-12 Finding 3 regression: a directive marker word appearing only INSIDE a quoted span
+    # is being discussed, not functioning as the sentence's own grammatical modal --
+    # `The phrase "must comply" is printed in this declarative sentence.` must be rejected.
+    # Also re-asserts a genuine directive still passes unaffected.
+    def test_mint_quoted_marker_decoy_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_decoy = os.path.join(tmp, 'quoted-marker-decoy.md')
+            with open(draft_decoy, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The phrase "must comply" is printed in this declarative sentence.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_decoy])
+            assert rc != 0, (
+                "a directive marker word appearing only inside a quoted span ('\"must comply\"') "
+                "must be rejected -- it's the sentence discussing a quoted phrase, not issuing an "
+                "obligation of its own")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'quoted-marker-decoy.md'))
+
+            # must not overcorrect: a genuine imperative rule with no quotes still passes.
+            draft_real = os.path.join(tmp, 'quoted-marker-real.md')
+            with open(draft_real, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'A selfcheck/regression test must call the actual function or code path it claims to test.\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_real])
+            assert rc2 == 0, (
+                f"a genuine imperative rule with no quotes must still be accepted:\n{err2.getvalue()}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-6 Finding 5 regression: a draft with valid frontmatter but a missing/empty body must be
     # rejected -- the real CLI already does this correctly, but no selfcheck test exercised it (the
     # only prior body-rejection test used multi-sentence content, never an empty body).
@@ -2858,6 +2936,125 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-12 Finding 1 regression (the crash): the old recursive-descent parser recursed into a
+    # nested flow sequence for every `[`, so ~1500 nested `[` characters crashed mint with an
+    # unhandled RecursionError instead of a controlled refusal. Tags are now flat scalars only, so
+    # there is nothing left to recurse into -- this must come back as a controlled rejection
+    # (rc != 0, no traceback), not a crash.
+    def test_mint_deeply_nested_brackets_no_crash():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'deep-nest.md')
+            deeply_nested = 'tags: ' + ('[' * 1500) + '\n'
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', deeply_nested))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            except RecursionError:
+                raise AssertionError(
+                    "a draft with ~1500 nested '[' characters in tags must be rejected with a "
+                    "controlled refusal, not crash with an unhandled RecursionError")
+            assert rc != 0, "a deeply (and flatly disallowed) nested tags value must be rejected"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a controlled refusal must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'deep-nest.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 1 regression (the inconsistency): a nested list element -- inline
+    # (`tags: [[a], mint]`) or as a block-list item (`tags:\n  - []`) -- must now BOTH be rejected
+    # -- tags are flat scalars, nesting is not part of this grammar in either form. (The inline
+    # case deliberately uses `[[a], mint]`, not `[[]]`: a bare `[[]]` is ALSO rejected earlier, by
+    # `parse_frontmatter()`'s own unrelated lenient `tags`-list coercion treating it as an empty
+    # list -- that would mask whether THIS round's `_mint_tags_written_as_list` fix is actually
+    # doing the rejecting. `[[a], mint]` parses to a non-empty, 2-element list under that lenient
+    # coercion, so it reaches -- and is rejected by -- the stricter check this round fixed.)
+    # Before this round, inline nesting was already rejected but block `- []` wrongly passed.
+    def test_mint_nested_list_rejected_both_forms():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_inline = os.path.join(tmp, 'nested-inline.md')
+            with open(draft_inline, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [[a], mint]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_inline])
+            assert rc != 0, "an inline tags list containing a nested list element ('[[a], mint]') must be rejected"
+            assert 'yaml list' in err.getvalue().lower(), (
+                f"expected the strict tags-list-shape rejection (not the unrelated non-empty-list "
+                f"check) to be what fires here:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'nested-inline.md'))
+
+            draft_block = os.path.join(tmp, 'nested-block.md')
+            with open(draft_block, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - []\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_block])
+            assert rc2 != 0, (
+                "a multi-line tags block whose dash-item value is a nested empty list ('- []') "
+                "must be rejected too -- it was previously wrongly accepted, inconsistent with the "
+                "inline form rejecting the same shape")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'nested-block.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 2a regression: mint's tags grammar does not support YAML comments at all --
+    # an unquoted '#' is simply illegal, never comment-stripped. `tags: [a # ...]` becomes an
+    # actually-unterminated list once a real YAML comment-stripper would remove everything from
+    # '#' onward (including the literal ']'), and must be rejected.
+    def test_mint_unquoted_hash_in_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'hash-comment.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n',
+                    'tags: [a # closing bracket is commented out]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"an inline tags list with an unquoted '#' must be rejected -- mint's tags grammar "
+                f"has no comment support, so this is simply malformed, not comment-stripped:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'hash-comment.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-12 Finding 2b regression: YAML disallows an unescaped control character inside a
+    # scalar; a raw NUL byte inside a double-quoted tags element must be rejected, not accepted.
+    def test_mint_raw_control_byte_in_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'control-byte.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags: ["a\x00b"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"an inline tags list with a raw NUL byte inside a double-quoted scalar must be "
+                f"rejected -- YAML disallows an unescaped control character in a scalar:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'control-byte.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-7 Finding 4 regression: `_primary_checkout_refusal_reason()` called `os.getcwd()` with
     # no error handling -- if the CWD was removed out from under the process, that call raises an
     # unhandled FileNotFoundError traceback instead of mint's documented fail-closed refusal.
@@ -2946,6 +3143,7 @@ Always do the one thing that must happen.
     test_mint_weak_marker_mid_sentence_rejected()
     test_mint_declarative_must_decoy_rejected()
     test_mint_declarative_must_followed_by_verb_decoy_rejected()
+    test_mint_quoted_marker_decoy_rejected()
     test_mint_missing_body_rejected()
     test_mint_malformed_frontmatter_rejected()
     test_mint_unknown_category_rejected()
@@ -2964,6 +3162,10 @@ Always do the one thing that must happen.
     test_mint_escaped_quote_in_tags_accepted()
     test_mint_illegal_escape_in_tags_rejected()
     test_mint_block_list_item_unterminated_bracket_rejected()
+    test_mint_deeply_nested_brackets_no_crash()
+    test_mint_nested_list_rejected_both_forms()
+    test_mint_unquoted_hash_in_tags_rejected()
+    test_mint_raw_control_byte_in_tags_rejected()
     test_mint_removed_cwd_refused()
     test_mint_positive_path_roundtrip()
 
