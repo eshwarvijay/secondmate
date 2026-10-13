@@ -77,16 +77,26 @@ up:
 # root_pane_id comes from .result.root_pane.pane_id of a prior `herdr worktree create` call,
 # exactly as SKILL.md's own maker-launch recipe uses it.
 herdr agent start sm-<task-id> --kind claude --pane <root_pane_id> -- --permission-mode auto
-herdr agent prompt sm-<task-id> "<the sub-supervisor's dispatch instructions>" --wait --timeout 600000
+
+# Submit, then harvest output with a SEPARATE call -- this repo's own established pattern
+# (bin/herdr-pane.sh's `delegate` subcommand) discards `agent prompt`'s own stdout and reads the
+# actual output back with `agent read` instead of trusting what `agent prompt` printed:
+herdr agent prompt sm-<task-id> "<the sub-supervisor's dispatch instructions>" --wait --timeout 600000 \
+  >/dev/null 2>&1 || { echo "prompt to sm-<task-id> failed or timed out" >&2; exit 1; }
+herdr agent read sm-<task-id> --source recent-unwrapped --lines 400
 ```
 
 `herdr agent start` returns a real process-level success/failure the dispatcher can check with its
-own exit code; `herdr agent prompt --wait` blocks until that sub-supervisor's turn finishes, so an
-external dispatcher gets a real synchronous call it can wrap in its own retry/timeout logic — the
-exact thing an in-session `Agent` tool call cannot offer.
+own exit code. `herdr agent prompt --wait` gives a real exit code too, but it is **not** a reliable
+"this exact turn finished" signal: `herdr agent prompt --help` says explicitly that `--wait`
+"does not track turns: if the agent is already working, that active turn's completion may match" —
+so a `--wait` that returns can mean a *different*, already-in-flight turn settled, not necessarily
+the one this prompt just submitted. Treat `--wait`'s exit code as "something settled, go read the
+real output," never as proof that the prompt you just sent is what produced it.
 
 **Proof it worked:** `herdr agent get sm-<task-id>` returns successfully (exit 0) once the agent
-exists.
+exists; `herdr agent read sm-<task-id> --source recent-unwrapped --lines 400` (not `agent prompt`'s
+own stdout) is what actually carries the sub-supervisor's output.
 
 ### Claiming (`bin/claim-ledger.py`)
 
@@ -128,8 +138,13 @@ bin/pane-reaper.py observe                              # one observation row pe
 bin/pane-reaper.py quiet --threshold-seconds <N> | grep -F "\"pane_id\": \"<root_pane_id>\""
 ```
 
-**Proof it worked:** after at least two `observe` calls spanning real wall-clock time, `quiet` exits 1
-and prints a `{"pane_id": ..., "status": "quiet", ...}` line for a pane whose signature hasn't moved.
+**Proof it worked:** `quiet` only reports a hit once the *elapsed time since the first unchanged
+observation* is `>= --threshold-seconds` — two `observe` calls 1 second apart checked against
+`--threshold-seconds 3600` correctly exits 0 (no hit; 1s hasn't met the hour-long threshold yet).
+To see a real hit, either pick a threshold shorter than the gap between your two observations (e.g.
+two `observe` calls ~1s apart, then `quiet --threshold-seconds 1`), or wait out whatever threshold
+you chose before polling `quiet` again. Only then does it exit 1 and print a
+`{"pane_id": ..., "status": "quiet", ...}` line for a pane whose signature hasn't moved.
 
 ### Human gates (`bin/hold.py`)
 
@@ -162,14 +177,26 @@ pre-merge SHA.
 
 ### Teardown (`bin/teardown-check.sh`)
 
-Advisory scan for leftover per-task state (worktree, branch, herdr pane/agent, open claim) after a
-sub-supervisor believes teardown is complete.
+Advisory scan for leftover per-task state: a git worktree, a git branch, a maker **agent**
+(`sm-<task-id>` / `sm-pi-<task-id>`), and an open `claim-ledger.py` entry.
 
 ```bash
 bin/teardown-check.sh --task-id <task-id> --repo <repo>
 ```
 
-**Proof it worked:** prints `TEARDOWN: clean` and exits 0.
+**This script does NOT cover a checker pane.** Its own header documents this as an accepted,
+not-chased limitation: `_check_herdr` only ever queries agent names, never a bare visible pane with
+no agent attached — which is exactly what a checker pane (opened via `herdr-pane.sh split`, per
+SKILL.md's "Checker pane" recipe) is. Confirmed live: with a leaked checker-pane scenario (no maker
+agent present under either name, no worktree/branch/claim left either), `teardown-check.sh` still
+printed `TEARDOWN: clean` and exited 0. A checker pane is the supervisor's own responsibility to
+close directly — SKILL.md's own teardown step runs `herdr pane close "$ck"` **before** worktree
+removal, precisely because this script will never catch a leaked one.
+
+**Proof it worked:** prints `TEARDOWN: clean` and exits 0 — but treat that as "worktree, branch,
+maker agent, and claim are clean," never as "every herdr resource for this task-id is gone." Confirm
+a checker pane was closed separately, by your own `herdr pane close` call (or `herdr pane list`
+showing it gone), not by this script's report.
 
 ### Parsing completion (`bin/dispatch-report.py`)
 
@@ -177,7 +204,11 @@ The exit-code contract an external dispatcher's own shell script can branch on d
 re-reading a sub-supervisor's prose to make its own judgment call:
 
 ```bash
-herdr agent prompt sm-<task-id> "..." --wait --timeout 600000 > /tmp/sm-<task-id>.out
+# Same submit-then-harvest split as §3's launch example -- never pipe `agent prompt`'s own stdout
+# straight into dispatch-report.py.
+herdr agent prompt sm-<task-id> "..." --wait --timeout 600000 \
+  >/dev/null 2>&1 || { echo "prompt to sm-<task-id> failed or timed out" >&2; exit 1; }
+herdr agent read sm-<task-id> --source recent-unwrapped --lines 400 > /tmp/sm-<task-id>.out
 bin/dispatch-report.py /tmp/sm-<task-id>.out
 echo "exit code: $?"
 ```
