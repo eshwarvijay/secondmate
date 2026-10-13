@@ -55,48 +55,58 @@ running concurrently with this one owns building it. The contract below is what 
 implement and what this skill's recipes call; it is not invented here, and the dispatcher must not
 assume a different shape than this.
 
-**Invocation:**
+**One process, start to finish — not a wrapper forking a separate child.** An earlier draft of
+this contract had `spawn-sub-sup.sh` fork an inner `claude -p` child and sidecar THAT child's PID,
+then had the watchdog (section 5) check that same PID to decide whether the *task* was done. That
+confuses two different lifetimes: the inner `claude -p` child can exit while `spawn-sub-sup.sh`
+itself is still alive doing extraction, running `dispatch-report.py`, and exiting — so watching the
+child's PID tells you nothing about whether the task is actually finished. The fix is to collapse
+this to one process whose entire lifetime, start to finish, IS the task's liveness: `spawn-sub-sup.sh`
+runs `claude -p` **synchronously**, in its own foreground (e.g. piping its output through `tee`
+and blocking on it), then does extraction and `dispatch-report.py` itself, then exits with that
+code — there is no second, inner process to ever confuse with the one being tracked.
+
+**Invocation (by the dispatcher, backgrounding `spawn-sub-sup.sh` itself):**
+```bash
+bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir .secondmate/dispatch &
+echo $! > ".secondmate/dispatch/<task-id>.pid"
 ```
-bin/spawn-sub-sup.sh --task-id <task-id> --prompt-file <path> --log-dir .secondmate/dispatch
-```
+PID bookkeeping now lives with the **dispatcher**, not inside the script: the dispatcher
+backgrounds the one process whose whole lifecycle matters and captures `$!` as its very next
+action, immediately after backgrounding it — the same idiom as before, just relocated to the
+caller, where it is trivially correct (no "before/after fork" ambiguity, because there is exactly
+one thing being forked and exactly one thing being tracked). `$!` is still only available *after*
+the `&` backgrounding has actually happened (confirmed live: a probe script printed `$!` as empty
+immediately before backgrounding a process, and only non-empty immediately after) — so this
+capture is necessarily the dispatcher's next line, never something done beforehand.
 
 **Inputs:** a `--task-id` (validated by the dispatcher before the call — see Discipline below), a
 `--prompt-file` holding the full sub-supervisor prompt (claim → SOP → completion tag, same prompt
 shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), and a `--log-dir`.
 
-**Behavior, in order:**
-1. Fork a **brand-new** `claude -p --output-format stream-json` process for that task-id and
-   prompt. Never `--continue` or `--resume` — every sub-supervisor must start with zero inherited
-   context, the exact same "Agent tool, never fork" discipline `skills/secondmate/SKILL.md` already
-   requires for the in-session case, just enforced via process flags instead of a tool-call
-   parameter. Then — as the very first action the parent takes once the child's PID is available,
-   before anything else — write a `<task-id>.pid` liveness sidecar into the log dir containing that
-   PID and the fork's own timestamp (e.g. `pid=<N> forked_at=<epoch-seconds>`, or a `date`-sourced
-   equivalent). **Not "before forking":** a PID cannot be known before the child exists — in bash,
-   `$!` (the backgrounded child's PID) is empty until after the `&` fork has already happened
-   (confirmed live: a probe script printed `$!` as empty immediately before forking a background
-   `sleep`, and only non-empty immediately after). The sidecar write happens immediately after the
-   fork instead, with a small, unavoidable window between fork and sidecar-write — normal and fine
-   for this idiom, same as any PID-file scheme. The `forked_at` timestamp is written here because
-   section 5's liveness check needs it later to corroborate that whatever process is holding this
-   PID at check time is actually still *this* task's wrapper, not a reused/unrelated PID (see
-   section 5). This sidecar is independent of `progress-ledger.py`'s self-reported checkpoints: it
-   gives the watchdog (section 4) a liveness signal even if the sub-supervisor dies before ever
-   recording its first checkpoint.
-2. Tee the raw `stream-json` output to `.secondmate/dispatch/<task-id>.jsonl` as it streams.
-3. On process exit, extract the final assistant message's plain-text content out of that
-   `stream-json` log into `.secondmate/dispatch/<task-id>.final.txt`.
-4. Run `bin/dispatch-report.py` against that `.final.txt` file — **never** the raw `.jsonl`.
+**Behavior, in order (inside `spawn-sub-sup.sh` itself, all synchronous):**
+1. Run `claude -p --output-format stream-json` for that task-id and prompt, in the foreground,
+   piping its output through `tee` to `.secondmate/dispatch/<task-id>.jsonl` as it streams, and
+   **block until that invocation exits.** Never `--continue` or `--resume` — every sub-supervisor
+   must start with zero inherited context, the exact same "Agent tool, never fork" discipline
+   `skills/secondmate/SKILL.md` already requires for the in-session case, just enforced via process
+   flags instead of a tool-call parameter.
+2. Once `claude -p` has exited, extract the final assistant message's plain-text content out of
+   the `.jsonl` log into `.secondmate/dispatch/<task-id>.final.txt`.
+3. Run `bin/dispatch-report.py` against that `.final.txt` file — **never** the raw `.jsonl`.
    `dispatch-report.py`'s own completion-tag regex is anchored at the start of a line; a completion
    tag that happens to appear inside a JSON string value in the raw stream (e.g. quoted inside a
    `"text": "...SM_DONE_MERGED:abc123..."` field) would never match there, so only the extracted
    plain text is a valid target.
-5. Exit with `dispatch-report.py`'s own exit code **verbatim** — never a raw bash `$?` from the
+4. Exit with `dispatch-report.py`'s own exit code **verbatim** — never a raw bash `$?` from the
    `claude -p` process itself (that reflects the CLI's own exit status, not the parsed completion
-   tag).
+   tag). This is also the exit code the dispatcher's own `kill -0`/reap sees (section 5), since
+   steps 1–4 all run inside the one PID it is tracking.
 
-**Outputs:** `.secondmate/dispatch/<task-id>.jsonl` (raw), `.secondmate/dispatch/<task-id>.final.txt`
-(extracted plain text), `.secondmate/dispatch/<task-id>.pid` (liveness sidecar).
+**Outputs:** `.secondmate/dispatch/<task-id>.jsonl` (raw) and `.secondmate/dispatch/<task-id>.final.txt`
+(extracted plain text), both written by `spawn-sub-sup.sh` itself. `.secondmate/dispatch/<task-id>.pid`
+(liveness sidecar) is written by the **dispatcher**, not by `spawn-sub-sup.sh` — see the invocation
+recipe above.
 
 **Exit code:** `dispatch-report.py`'s own exit code, relayed unchanged — the full set is
 0/1/2/3/4: `0` = `SM_DONE_MERGED` (integration already done), `1` = `SM_REFUSED` (relay the reason),
@@ -110,12 +120,15 @@ for the full detail.
 
 ## 2. Log convention
 
-Every spawned sub-supervisor leaves exactly two log artifacts under `.secondmate/dispatch/`:
-- `<task-id>.jsonl` — the raw `stream-json` transcript, append-only, useful for a human reading back
-  what actually happened.
-- `<task-id>.final.txt` — the extracted plain-text content of the final assistant message only.
-  This is the ONLY file the dispatcher parses programmatically — both for `dispatch-report.py`
-  (section 1) and for the claim-token line (section 3).
+Every spawned sub-supervisor leaves exactly three artifacts under `.secondmate/dispatch/`:
+- `<task-id>.jsonl` — the raw `stream-json` transcript, written by `spawn-sub-sup.sh` itself,
+  append-only, useful for a human reading back what actually happened.
+- `<task-id>.final.txt` — the extracted plain-text content of the final assistant message only,
+  also written by `spawn-sub-sup.sh` itself. This is the ONLY file the dispatcher parses
+  programmatically — both for `dispatch-report.py` (section 1) and for the claim-token line
+  (section 3).
+- `<task-id>.pid` — the liveness sidecar, written by the **dispatcher** (not `spawn-sub-sup.sh`)
+  immediately after backgrounding it (section 1). Used by the watchdog's reap check (section 5).
 
 ## 3. Extracting the claim token
 
@@ -128,10 +141,18 @@ SM_CLAIM_TOKEN:<the hex token claim-ledger.py printed>
 ```
 This is a **separate** line from the completion tag — `dispatch-report.py`'s own tag regex only
 recognizes `SM_DONE_MERGED` / `SM_REFUSED` / `SM_STUCK_NEED_HUMAN` / `SM_READY_UNMERGED` and does
-not look for `SM_CLAIM_TOKEN:` at all. The dispatcher extracts it itself:
+not look for `SM_CLAIM_TOKEN:` at all. The dispatcher extracts it itself, taking the **last**
+matching line, never the first:
 ```bash
-token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | head -1 | cut -d: -f2-)
+token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | tail -1 | cut -d: -f2-)
 ```
+`tail -1`, not `head -1`: `bin/dispatch-report.py`'s own docstring documents this exact precedent
+for its own tags — if the sub-supervisor's final text happens to echo back an example or
+instruction containing an `SM_CLAIM_TOKEN:`-shaped line before the real one, `head -1` would grab
+the fake one and the real claim's token would never be recoverable for release. `dispatch-report.py`
+solves this for its own tags by taking the LAST matching line (confirmed by reading its docstring:
+"the LAST one wins -- the same 'last block wins' precedent as verdict.py's own fenced-JSON
+handling"); the claim-token extraction here follows the identical rule, for the identical reason.
 The dispatcher needs this token later for `bin/claim-ledger.py release` at merge/teardown time
 (section 7) — without it, a claim opened inside a sub-supervisor's own disposable process can never
 be released from outside that process.
@@ -197,27 +218,27 @@ exit 127, `pid <N> is not a child of this shell`). So reaping, for every dispatc
 not — is a non-blocking poll on the loop's own cadence (section 4), per task-id, **checking PID
 liveness FIRST, not `.final.txt` presence first:**
 
-1. **Is the `.pid` sidecar's recorded PID still alive and still plausibly this task's wrapper?**
-   `.final.txt`'s mere presence does NOT prove the wrapper has finished: per section 1's own step
-   order, the wrapper writes `.final.txt` at step 3, then still has to run `dispatch-report.py`
-   (step 4) and exit with its code (step 5) — so `.final.txt` can exist while the wrapper is still
-   alive and mid-sequence. Checking PID liveness first avoids that race. Two sub-checks, both
-   against the `.pid` sidecar (PID + `forked_at` timestamp, section 1):
-   - `kill -0 <pid>` (non-blocking signal probe, never a blocking `wait`). If it fails outright
-     (no such process), the PID is dead — go to step 2.
-   - If `kill -0` succeeds, that alone only proves *some* process currently holds that PID number —
-     not that it's actually this task's wrapper (confirmed live: `kill -0` against an unrelated
-     backgrounded `sleep` process also returns success/exit 0 — any live PID passes it, regardless
-     of what it's actually running). Corroborate with `ps -p <pid> -o lstart=,command=` and check
-     that the reported start time is at/after the sidecar's own `forked_at` timestamp and that the
-     command line plausibly matches a `claude -p` invocation for this task. If `kill -0` succeeded
-     but this corroboration does NOT match, treat it exactly like "not alive" — something else now
-     holds that recycled PID number — and fall through to step 2.
-   - If both the liveness probe and the corroboration check pass: **still running** — poll again
-     next cycle, regardless of whether `.final.txt` already exists.
-2. **Only once the PID is confirmed not alive (or not corroborated as this task's wrapper) does
-   `.final.txt`'s presence/absence matter:**
-   - **Present** — the wrapper finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
+1. **Is the `.pid` sidecar's recorded PID still alive?** `.final.txt`'s mere presence does NOT
+   prove the process has finished: per section 1's own step order, `spawn-sub-sup.sh` writes
+   `.final.txt` at step 2, then still has to run `dispatch-report.py` (step 3) and exit with its
+   code (step 4) — so `.final.txt` can exist while the tracked PID is still alive and mid-sequence.
+   Checking PID liveness first avoids that race.
+   - `kill -0 <pid>` (non-blocking signal probe, never a blocking `wait`).
+   - **Alive** — still running; poll again next cycle, regardless of whether `.final.txt` already
+     exists.
+   - **Not alive** — go to step 2.
+
+   **Accepted limitation, not solved here:** `kill -0` is a best-effort liveness signal — it only
+   proves *some* process currently holds that PID number, not that it is still `spawn-sub-sup.sh`
+   (confirmed live: `kill -0` against an unrelated backgrounded process also returns success/exit
+   0 — any live PID passes it, regardless of what it's actually running). In the rare case the OS
+   reuses that exact PID for an unrelated process in the narrow window between the real process
+   exiting and the next watchdog poll, `kill -0` would false-positive "still alive." This is the
+   same single-operator, local-git trust model the parent skill already accepts elsewhere
+   ("detection only, no automated certainty") — this contract does not try to eliminate that narrow
+   race with a more elaborate corroboration scheme; it accepts it as a known, bounded limitation.
+2. **Once the PID is confirmed not alive, `.final.txt`'s presence/absence decides the outcome:**
+   - **Present** — the process finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
      to get the terminal exit code. Nothing further to poll for this task-id.
    - **Absent** — an ANOMALY: the process is gone but never produced output (crashed, killed
      externally, etc.). Escalate to the human exactly like a stuck task. Never silently retry it,
