@@ -18,7 +18,10 @@
 #   - `--task T`: on match, only a hold whose OWN task field equals T exactly (never substring).
 #     T is validated against the same charset hold.py's own task-ids use (alphanumeric plus -_,
 #     1-128 chars) and rejected early on anything else; it is never routed through eval/sh -c --
-#     bin/hold.py is invoked as a plain argv command.
+#     bin/hold.py is invoked as a plain argv command. An EXPLICITLY supplied empty value
+#     (`--task=`, `--task ""` -- e.g. a dispatcher variable that expanded to nothing) is NOT
+#     the same as omitting the flag: it fails the 1-128 charset and is rejected with exit 2,
+#     never silently treated as "match any open hold".
 #   - `hold.py open`'s `WARNING: N malformed line(s) ...` corruption lines are never a match:
 #     each is forwarded verbatim to THIS script's own stderr, and polling continues.
 #   - A --task filter matching zero holds while other holds are open is just the ordinary
@@ -42,7 +45,10 @@
 #     1s floor so even --timeout 0 gets one real poll; then TERM and, after a 1s grace, KILL), so
 #     a hung/slow single poll can never push the runtime meaningfully past --timeout.
 #   - --interval/--timeout accept zero-padded digit strings ("08" is the value it visually is,
-#     base-10 -- never bash's octal-literal arithmetic, which used to exit 1 undocumented).
+#     base-10 -- never bash's octal-literal arithmetic, which used to exit 1 undocumented),
+#     capped at 31536000 seconds (one year) so every accepted value is a duration any `sleep`
+#     actually honors -- an absurd value is rejected early with exit 2 instead of reaching the
+#     loop, where it would otherwise fail every poll/sleep forever with no documented exit.
 #   - Exit 2: usage/validation error (bad --task charset, non-numeric/out-of-range numerics, ...).
 
 set -u
@@ -195,7 +201,7 @@ bad() { printf 'selfcheck FAIL: %s\n' "$*" >&2; SC_FAILS=$((SC_FAILS + 1)); }
 
 selfcheck() {
   local t fix warnonly orphan want1 want2 ledger corrupt empty vfile entries shim realpy
-  local hid bid ofile err rc now elapsed wpid kpid long ok128
+  local hid bid ofile err out rc now elapsed wpid kpid long ok128
   t="$(mktemp -d)"
   ofile="$t/rw.out"
   err="$t/rw.err"
@@ -351,6 +357,26 @@ EOF
   [ "$elapsed" -le 4 ] || bad "zero-padded live run took ${elapsed}s (budget was 2s)"
   grep -q "after 2s (" "$ofile" || bad "NO-HOLD line must report the normalized timeout (2s) -- got: $(cat "$ofile")"
   rw "$empty" 3 --timeout 00                 # "00" = 0: accepted, one immediate poll
+
+  # explicitly-supplied EMPTY --task (round-3 bug 1): not the same as omitting the flag --
+  # with the unrelated batch-1 hold still open, both forms must be a loud early exit 2 and
+  # must never print that hold as if it were a match
+  rc=0; out="$(SM_HOLD_LEDGER="$ledger" "$0" --task= --timeout 0 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 2 ] || bad "explicitly empty --task= must be rejected with exit 2, got $rc"
+  [ -z "$out" ] || bad "explicitly empty --task= must not print any hold as a match, got: $out"
+  rc=0; SM_HOLD_LEDGER="$ledger" "$0" --task "" --timeout 0 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || bad "explicitly empty --task '' (space form) must exit 2, got $rc"
+
+  # absurd --interval/--timeout magnitudes (round-3 bug 2): every accepted value must be a
+  # duration `sleep` actually honors -- reject above the 1-year cap here, never loop on
+  # failing polls/sleeps forever (validated BEFORE any polling, so these are instant)
+  rc=0; "$0" --interval 999999999999999999 --timeout 1 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || bad "an absurd --interval must be rejected with exit 2, got $rc"
+  rc=0; "$0" --timeout 999999999999999999 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || bad "an absurd --timeout must be rejected with exit 2 (no unbounded failing loop), got $rc"
+  rw "$ledger" 0 --interval 31536000 --timeout 0   # exactly the cap: accepted, instant first-poll match
+  rc=0; "$0" --timeout 31536001 >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || bad "--timeout one second above the 1-year cap must exit 2, got $rc"
   rc=0; "$0" --bogus >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || bad "an unknown argument must be rejected with exit 2, got $rc"
   rc=0; "$0" --help >/dev/null 2>&1 || rc=$?
@@ -401,16 +427,18 @@ Stopping a running instance: prefer SIGTERM (always honored). SIGINT also works,
 a backgrounded `hold-watch.sh ... &` invocation: POSIX forces SIGINT ignored for non-job-
 control background commands (an ignored signal cannot be trapped), so the script detects that
 at startup with a one-shot self-probe and re-execs itself once through python3 to reset the
-disposition. Zero-padded --interval/--timeout digit strings are accepted as base-10.
+disposition. Zero-padded --interval/--timeout digit strings are accepted as base-10, capped
+at 31536000 seconds (one year). An explicitly supplied empty --task (`--task=`) is rejected
+with exit 2 -- it is not the same as omitting the flag.
 EOF
 }
 
 # ------------------------------------------------------------------ arg parsing
-TASK="" INTERVAL=30 TIMEOUT=1800 SELFCHECK=0
+TASK="" TASK_GIVEN=0 INTERVAL=30 TIMEOUT=1800 SELFCHECK=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --task)        [ $# -ge 2 ] || { echo "hold-watch: $1 requires a value" >&2; exit 2; }; TASK="$2"; shift 2 ;;
-    --task=*)      TASK="${1#--task=}"; shift ;;
+    --task)        [ $# -ge 2 ] || { echo "hold-watch: $1 requires a value" >&2; exit 2; }; TASK="$2"; TASK_GIVEN=1; shift 2 ;;
+    --task=*)      TASK="${1#--task=}"; TASK_GIVEN=1; shift ;;
     --interval)    [ $# -ge 2 ] || { echo "hold-watch: $1 requires a value" >&2; exit 2; }; INTERVAL="$2"; shift 2 ;;
     --interval=*)  INTERVAL="${1#--interval=}"; shift ;;
     --timeout)     [ $# -ge 2 ] || { echo "hold-watch: $1 requires a value" >&2; exit 2; }; TIMEOUT="$2"; shift 2 ;;
@@ -426,10 +454,15 @@ if [ "$SELFCHECK" -eq 1 ]; then
   exit 0  # unreachable: selfcheck always exits
 fi
 
-# validate BEFORE any polling, so a bad invocation fails fast with a clear error
-if [ -n "$TASK" ] && ! [[ "$TASK" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+# validate BEFORE any polling, so a bad invocation fails fast with a clear error.
+# TASK_GIVEN distinguishes "flag never supplied" (TASK empty = the documented default: match
+# any open hold) from "flag supplied with an empty value" (`--task=`, `--task ""`): the latter
+# must be a LOUD early error -- a dispatcher's accidental empty-variable expansion must never
+# silently behave like no filter and false-positive on an unrelated hold.
+if [ "$TASK_GIVEN" -eq 1 ] && ! [[ "$TASK" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
   echo "hold-watch: invalid --task '$TASK' (task-ids are alphanumeric plus -_, 1-128 chars --" \
-       "the same charset hold.py's own task-ids use)" >&2
+       "the same charset hold.py's own task-ids use; an empty explicitly-supplied value is" \
+       "not a valid task-id and is not the same as omitting --task)" >&2
   exit 2
 fi
 # digit strings only, zero-padding allowed ("08" is the value it visually is), length-capped
@@ -442,6 +475,13 @@ INTERVAL="$((10#$INTERVAL))"   # base-10 normalize: never bash's octal-literal a
 TIMEOUT="$((10#$TIMEOUT))"
 [ "$INTERVAL" -ge 1 ] \
   || { echo "hold-watch: --interval must be >= 1 second, got '$INTERVAL'" >&2; exit 2; }
+# cap at one year: far beyond any sane watch, and small enough that every accepted value is a
+# duration every sleep implementation actually honors (sleep rejects absurd magnitudes), so a
+# bad value dies HERE with a clear exit 2 -- never in the loop as an unbounded failing cycle
+[ "$INTERVAL" -le 31536000 ] \
+  || { echo "hold-watch: --interval must be <= 31536000 seconds (one year), got '$INTERVAL'" >&2; exit 2; }
+[ "$TIMEOUT" -le 31536000 ] \
+  || { echo "hold-watch: --timeout must be <= 31536000 seconds (one year), got '$TIMEOUT'" >&2; exit 2; }
 command -v python3 >/dev/null 2>&1 \
   || { echo "hold-watch: python3 not found in PATH (needed to run bin/hold.py)" >&2; exit 2; }
 [ -f "$HOLD_PY" ] \
