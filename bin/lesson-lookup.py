@@ -720,10 +720,12 @@ def cmd_mint(argv):
 
     try:
         content = draft_path.read_text(encoding='utf-8')
-    except OSError as e:
-        # Covers PermissionError (e.g. a mode-000 file), FileNotFoundError (a TOCTOU unlink between
-        # the is_file() check above and this read), and any other OS-level read failure -- every
-        # other invalid --file input gets a clean "mint: ..." rejection, never a raw traceback.
+    except (OSError, UnicodeDecodeError) as e:
+        # OSError covers PermissionError (e.g. a mode-000 file), FileNotFoundError (a TOCTOU unlink
+        # between the is_file() check above and this read), and any other OS-level read failure.
+        # UnicodeDecodeError (a ValueError subclass, NOT an OSError subclass -- caught separately on
+        # purpose) covers a draft containing invalid UTF-8 bytes. Every other invalid --file input
+        # gets a clean "mint: ..." rejection, never a raw traceback -- this must too.
         sys.stderr.write(f"mint: cannot read --file {file_arg!r} ({e})\n")
         return 2
     fm, body = parse_frontmatter(content)
@@ -1514,10 +1516,60 @@ Always do the one thing that must happen.
                     f"exception: {type(e).__name__}: {e}")
             assert rc != 0, "an unreadable --file must be rejected"
             assert 'cannot read' in err.getvalue().lower(), f"expected a controlled read-failure error:\n{err.getvalue()}"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a controlled rejection must never leak a Python traceback onto stderr:\n{err.getvalue()}")
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'unreadable.md')), (
                 "nothing must be written when --file can't be read")
         finally:
             os.chmod(draft, 0o644)  # restore so shutil.rmtree can clean up reliably
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-5 regression: a draft containing invalid UTF-8 bytes (e.g. a raw 0xff byte) must ALSO get
+    # a controlled rejection, same as an unreadable file -- UnicodeDecodeError is a ValueError
+    # subclass, not an OSError subclass, so round 4's `except OSError` alone didn't catch it.
+    def test_mint_invalid_utf8_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'bad-utf8.md')
+            with open(draft, 'wb') as f:
+                f.write(_VALID_DRAFT.encode('utf-8'))
+                f.write(b'\xff')  # invalid standalone UTF-8 byte
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            except Exception as e:
+                raise AssertionError(
+                    f"invalid UTF-8 in --file must produce a controlled rejection, not an unhandled "
+                    f"exception: {type(e).__name__}: {e}")
+            assert rc != 0, "a draft with invalid UTF-8 bytes must be rejected"
+            assert 'cannot read' in err.getvalue().lower(), f"expected a controlled read-failure error:\n{err.getvalue()}"
+            assert 'traceback' not in err.getvalue().lower(), (
+                f"a controlled rejection must never leak a Python traceback onto stderr:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'bad-utf8.md')), (
+                "nothing must be written when --file isn't valid UTF-8")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-5 regression: `mint` with no --file at all must be rejected -- this path already worked
+    # (exit 2, "mint: --file is required") but had no pinning regression test until now.
+    def test_mint_no_file_arg_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint([])
+            assert rc != 0, "mint with no --file must be rejected"
+            assert '--file is required' in err.getvalue(), f"expected a --file-is-required error:\n{err.getvalue()}"
+        finally:
             shutil.rmtree(tmp, ignore_errors=True)
             if 'SM_LESSONS_DIR' in os.environ:
                 del os.environ['SM_LESSONS_DIR']
@@ -1921,6 +1973,8 @@ Always do the one thing that must happen.
     test_tag_subcommand()
     test_tag_subcommand_concurrent_race()
     test_mint_unreadable_file_rejected()
+    test_mint_invalid_utf8_rejected()
+    test_mint_no_file_arg_rejected()
     test_mint_empty_tags_rejected()
     test_mint_bad_earned_in_rejected()
     test_mint_nonzero_counts_rejected()
