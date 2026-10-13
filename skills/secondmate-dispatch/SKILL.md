@@ -48,6 +48,94 @@ file — it is not reproduced here beyond this pointer summary:
 
 Everything below is what is genuinely different when the dispatcher is an external OS process.
 
+## Strict-mode exit-code discipline (read this before any shell recipe below)
+
+Every recipe below assumes the dispatcher runs under `set -euo pipefail` — correct discipline for
+a strict external process, where a mistake should fail loudly rather than silently continuing on
+bad data. But three consecutive review rounds on this file found the SAME two bug classes
+recurring in a new location each time: **(A)** a command's own real contract includes a
+*documented, expected* nonzero exit for a normal outcome (e.g. `dispatch-report.py` exits `4` for
+`SM_READY_UNMERGED`, the single most common terminal state) — a bare, uncaptured call under
+`set -e` treats that nonzero exit as the command itself failing and kills the dispatcher before it
+ever acts on the result; and **(B)** a fix for (A) that over-corrects into a blanket `|| true` —
+which then ALSO swallows a genuinely unexpected failure (a missing binary, a permissions problem, a
+corrupted file, an unrelated tool crash) by treating every nonzero exit as identical to the
+documented normal one.
+
+**One idiom closes both classes, applied everywhere below:** capture the real exit code
+explicitly, then classify it against — and ONLY against — that specific command's own real,
+observed contract at this call site. Anything outside that known set is NOT reinterpreted as the
+nearest documented outcome; it escalates to the human verbatim, citing the actual command and the
+actual exit code.
+
+```bash
+rc=0
+<command> || rc=$?
+case "$rc" in
+  <code-1>|<code-2>|...) : branch on $rc exactly as documented below for this command ;;
+  *) : UNEXPECTED — escalate to the human verbatim (command + "$rc"); never treat as any
+       documented outcome, never silently continue ;;
+esac
+```
+
+Never `|| true` on a bare command — that discards `$rc` entirely, which is exactly what collapses
+classes (A) and (B) into each other. Capture first, decide second.
+
+**Each tool's own real contract, read directly from source/tests, not assumed:**
+- `bin/dispatch-report.py <final.txt>` — `{0,1,2,3,4}` (`SM_DONE_MERGED` / `SM_REFUSED` /
+  `SM_STUCK_NEED_HUMAN` / malformed / `SM_READY_UNMERGED`). Confirmed live: calling it against a
+  file that does not exist raises an unhandled `FileNotFoundError` and ALSO exits `1` — the SAME
+  code as a legitimate `SM_REFUSED`. Mitigation: never call it without first confirming the target
+  file exists via an explicit `[ -f ... ]` test (see section 5) — that test, not the exit code
+  alone, is what rules out the file-missing case.
+- `bin/merge-sequencer.sh` — `{0,1,2,3,4,5}` for a normal (non-`--preflight-only`) invocation: `0`
+  success, `1` gate refusal/`BRANCH_MISMATCH`, `2` usage error, `3` merge conflict/rejection, `4`
+  push failed, `5` lock timeout (confirmed by reading its own header doc comment and test-fixture
+  assertions directly; codes `6`–`8` exist only for `--preflight-only`, never used by this
+  dispatcher). Anything outside `0`–`5` here is genuinely unexpected (e.g. `126`/`127` if the
+  script itself can't even run).
+- `bin/hold.py open` — binary: `0` success (even with zero open holds), any nonzero is a genuine
+  failure (confirmed live: a directory-backed ledger path raises an unhandled `IsADirectoryError`
+  and exits `1`). No in-between "documented failure" case to classify — any nonzero escalates.
+- `bin/progress-ledger.py stale` — `{0,1}`: `0` no hits, `1` a real stale/no-progress hit (the
+  exact signal this check exists to produce — confirmed by reading `sys.exit(1 if hits else 0)`
+  directly). A dispatcher-supplied `--threshold-seconds` is always numeric and under the
+  dispatcher's own control, so argparse's usage-error exit `2` should never occur in practice; if
+  it ever does, that is still outside `{0,1}` and must escalate, not be swallowed.
+- `bin/pane-reaper.py observe` — `{0}`: `0` success, `2` is `ERR_HERDR` (confirmed by reading
+  `ERR_HERDR = 2` directly, with its own source comment: "a tooling outage must never look like
+  'clean'"). This call site is already gated behind `command -v herdr`, so an `ERR_HERDR` here
+  means herdr was present at the gate but the actual call still failed — a real tooling outage,
+  not the "herdr absent" case that gate already handles. Any nonzero here escalates.
+- `bin/pane-reaper.py quiet` — `{0,1}`: `0` nothing quiet, `1` a real quiet-pane hit (confirmed by
+  reading `find_quiet`'s own hit construction and the command's `sys.exit(1 if hits else 0)`
+  directly).
+- `ps -o stat= -p <pid>` — `{0,1}`: `0` found (state printed), `1` no such process (empty stdout).
+  Confirmed live that this exit/output signature is IDENTICAL whether the PID is a genuinely dead
+  (but well-formed) process or the sidecar content is not a PID at all (e.g. `"not-a-pid"`) — `ps`
+  cannot tell these apart, so the PID-sidecar's own content must be validated as `^[0-9]+$` BEFORE
+  ever calling `ps` on it (see section 5). Confirmed live separately: a missing `ps` binary on
+  `PATH` exits `127`, outside `{0,1}` — genuinely unexpected, must escalate.
+- `grep` (any form used in this file) — `{0,1}` is the normal "match found / no match" contract;
+  `2` is a real error (confirmed live: a missing or unreadable target file exits `2` with a message
+  on stderr, distinct from the "zero matches" exit `1`). When `grep` reads from a pipe or an
+  in-memory string (never a filename argument), a file-not-found error is structurally impossible,
+  so `{0,1}` is the complete set at that call site and a plain `|| true` is honestly sufficient
+  there — see each site below for which case applies.
+- `wait "$pid"` — when `$pid` is genuinely this shell's own child and has already exited, `wait`
+  returns THAT CHILD'S OWN exit code verbatim (for `spawn-sub-sup.sh`, that means `{0,1,2,3,4}`,
+  the same set as `dispatch-report.py` above, since steps 1–4 of section 1's contract all run
+  inside the one PID being `wait`ed on). `wait` returns `127` if `$pid` was never this shell's own
+  child, and (confirmed live) a shell-specific message plus a nonzero code if `$pid` isn't even a
+  well-formed PID — both outside `{0,1,2,3,4}`, both mitigated the same way: validate PID format
+  before calling `wait`, exactly as for `ps`.
+
+Live-verified all of the above in one consolidated probe before writing this section: each tool's
+documented-normal case correctly continued past the capture-and-classify idiom, and each
+genuinely-unexpected case (file-missing, malformed PID content, `ps`/herdr binary absent,
+directory-backed ledger) was correctly routed to escalation instead of being silently reinterpreted
+as the nearest normal outcome.
+
 ## 1. Spawning a sub-supervisor: `bin/spawn-sub-sup.sh` contract
 
 `bin/spawn-sub-sup.sh` does not exist in `bin/` yet — a sibling task (`add-spawn-sub-sup-script`)
@@ -173,22 +261,33 @@ task's claim stuck open forever with no further signal that anything went wrong.
 
 So the dispatcher does not guess between head/tail at all. It counts the matching lines in
 `.final.txt` FIRST, directly off `grep`'s own line count — never through a value-bearing
-intermediate variable — and only extracts a value once that count is confirmed to be exactly 1:
+intermediate variable — using the idiom above (`grep` here reads a real FILE, not a pipe or an
+in-memory string, so its full `{0,1,2}` contract applies and a genuine file-read failure, exit `2`,
+must be told apart from "zero matches," exit `1`):
 ```bash
-n=$(grep -c '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" || true)
-if [ "$n" -eq 1 ]; then
-  token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | cut -d: -f2-)
+rc_g=0
+n=$(grep -c '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt") || rc_g=$?
+if [ "$rc_g" -ne 0 ] && [ "$rc_g" -ne 1 ]; then
+  : # ESCALATE to the human verbatim (task-id, "$rc_g") -- e.g. exit 2, the file vanished or became
+    # unreadable; NEVER silently treated as "zero matches"
+else
+  [ "$rc_g" -eq 1 ] && n=0  # grep's documented "zero matches" exit -- n legitimately 0
+  if [ "$n" -eq 1 ]; then
+    token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | cut -d: -f2-)
+  fi
 fi
 ```
 Two mechanical shell-correctness details, both load-bearing, both live-verified:
-- **The `|| true` on the counting `grep -c` is required**, not decorative. Under a normal strict
-  shell (`set -euo pipefail`, which a real dispatcher script should run under), `grep` exits 1 on
-  zero matches; with `pipefail` that fails the whole assignment and `set -e` then aborts the
-  script *before* it ever reaches the "zero matches → escalate" branch below. Confirmed live: the
-  unguarded form (`n=$(grep -c ... )`, no `|| true`) under `set -euo pipefail` against a file with
-  zero matching lines killed the script outright (exit 1, no further output) — the escalation
-  logic was never reached. With `|| true`, the same zero-match case instead correctly assigns
-  `n=0` and the script continues.
+- **`grep -c`'s own exit code must be captured and classified, never blanket `|| true`.** Under a
+  normal strict shell (`set -euo pipefail`, which a real dispatcher script should run under),
+  `grep` exits `1` on zero matches; with `pipefail` that fails the whole assignment and `set -e`
+  then aborts the script *before* it ever reaches the "zero matches → escalate" branch below if
+  left completely unguarded — confirmed live. But a blanket `|| true` goes too far the other
+  direction: it ALSO swallows `grep`'s genuine error exit `2` (the target `.final.txt` vanishing or
+  becoming unreadable between when `dispatch-report.py` read it and when this grep runs),
+  silently misreporting a real I/O problem as "zero `SM_CLAIM_TOKEN:` lines found." The capture
+  above distinguishes `rc_g == 1` (legitimately `n=0`) from any other nonzero (escalate, never
+  treated as `n=0`).
 - **Counting must happen on `grep`'s own match lines, never on a `cut`-derived, `$()`-captured
   value.** An earlier draft counted `cut -d: -f2-`'s *output* via `printf '%s\n' "$tokens" | grep
   -c .` — this undercounts whenever one of the matching lines has an EMPTY value after the colon
@@ -235,15 +334,34 @@ auto-`--steal`):
 
 ```bash
 while true; do
-  bin/progress-ledger.py stale --threshold-seconds "$N" "${task_id_flags[@]}" || true
+  rc_stale=0
+  bin/progress-ledger.py stale --threshold-seconds "$N" "${task_id_flags[@]}" || rc_stale=$?
+  if [ "$rc_stale" -ne 0 ] && [ "$rc_stale" -ne 1 ]; then
+    : # ESCALATE: an exit code outside stale's own documented {0,1} -- e.g. a dispatcher-own usage
+      # bug (bad --threshold-seconds). Never treated as "0 hits."
+  fi
   # the .pid sidecar liveness check (section 1/5) is the ALWAYS-available signal, no herdr required —
   # poll it here too, non-blocking (kill -0), for any task-id whose .final.txt hasn't appeared yet
   if command -v herdr >/dev/null 2>&1; then
-    bin/pane-reaper.py observe || true
-    bin/pane-reaper.py quiet --threshold-seconds "$N" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" || true
+    rc_obs=0
+    bin/pane-reaper.py observe || rc_obs=$?
+    if [ "$rc_obs" -ne 0 ]; then
+      : # ESCALATE: observe's only documented success is 0 -- a nonzero here (including ERR_HERDR=2)
+        # past the `command -v herdr` gate above means a REAL tooling outage, not "herdr absent."
+    fi
+    rc_quiet=0
+    quiet_output=$(bin/pane-reaper.py quiet --threshold-seconds "$N") || rc_quiet=$?
+    if [ "$rc_quiet" -ne 0 ] && [ "$rc_quiet" -ne 1 ]; then
+      : # ESCALATE: outside quiet's own documented {0,1}
+    else
+      printf '%s\n' "$quiet_output" | grep -F -e "\"pane_id\": \"${root_pane_id}\"" || true
+      # the `|| true` here is honestly sufficient (no fix needed): this grep reads a captured
+      # STRING via printf, never a filename argument, so its real {0,1,2} contract collapses to
+      # {0,1} at this call site -- a "file not found" exit 2 is structurally impossible here.
+    fi
   fi
-  # relay any hit from either call to the human verbatim, exactly as the in-session watchdog does —
-  # never restart, never steal, never treat a hit as a confirmed crash
+  # relay any hit/escalation from any of the three calls above to the human verbatim, exactly as
+  # the in-session watchdog does — never restart, never steal, never treat a hit as a confirmed crash
   sleep "$N"
 done
 ```
@@ -262,28 +380,38 @@ trailing `...` (shown fixed above) against the identical sample line matches cor
 the JSON line printed through).
 
 **If watching more than one pane id, repeat `-e` with the real second pattern, never a
-placeholder:**
+placeholder** — against the SAME already-captured `$quiet_output` from the loop above, never a
+second direct re-invocation of `pane-reaper.py quiet`:
 ```bash
-bin/pane-reaper.py quiet --threshold-seconds "$N" \
+printf '%s\n' "$quiet_output" \
   | grep -F -e "\"pane_id\": \"${root_pane_id}\"" -e "\"pane_id\": \"${checker_pane_id}\"" || true
 ```
 Confirmed live against three sample lines (`root_pane_id`, `checker_pane_id`, and an unrelated
 third pane id): this two-`-e` form matched both the root and checker pane lines and correctly
 excluded the unrelated one.
 
-**Both `|| true` guards are required under `set -e`, not decorative — a strict-mode loop must
-survive its own documented "normal" outcomes, not just its errors.** `bin/progress-ledger.py
-stale` exits `1` precisely when it finds a real stale/no-progress hit (confirmed by reading its
-own `stale` command directly: `sys.exit(1 if hits else 0)`) — that nonzero exit is the exact
-signal this watchdog exists to catch, not an error condition. Confirmed live: the unguarded call,
-under `set -euo pipefail`, aborted the loop body the moment it found a genuine stale hit — the
-watchdog would die on its own success case and never loop again. The `pane-reaper.py quiet | grep`
-line has the identical problem from the opposite direction: `grep` exits 1 whenever nothing
-currently matches the filter (the common, expected "nothing quiet right now" case), and under
-`pipefail` that kills the loop too — confirmed live against a filter with zero matches. Both `||
-true` guards let the loop survive either outcome and continue relaying whatever each call printed
-to stdout before `sleep`-ing and polling again; live-ran the fixed loop body across 3 iterations
-with a real recurring stale hit each time — it completed all 3 without aborting.
+**All three calls in the loop body apply the capture-and-classify idiom from "Strict-mode
+exit-code discipline" above, not a blanket `|| true`.** `bin/progress-ledger.py stale` exits `1`
+precisely when it finds a real stale/no-progress hit (confirmed by reading its own `stale` command
+directly: `sys.exit(1 if hits else 0)`) — that nonzero exit is the exact signal this watchdog
+exists to catch, not an error condition, so `{0,1}` are both normal and `rc_stale` is only
+escalated outside that set. Confirmed live: an unguarded bare call under `set -euo pipefail`
+aborted the loop body the moment it found a genuine stale hit — the watchdog would die on its own
+success case and never loop again — while the capture-and-classify form above survives it and
+keeps looping (live-ran across 3 iterations with a real recurring stale hit each time; completed
+all 3 without aborting). `bin/pane-reaper.py observe` is captured the same way, but its own
+contract has no "designed normal nonzero" at all once past the `command -v herdr` gate — ANY
+nonzero there (including a genuine `ERR_HERDR=2` tooling outage) escalates, which is why a blanket
+`|| true` on `observe` was itself a bug: it silently discarded exactly the outage its own source
+comment says must never look clean (confirmed live: `observe` with no `herdr` binary on `PATH`
+exits `2`, which the old blanket guard swallowed entirely). `pane-reaper.py quiet` is captured into
+`$quiet_output` BEFORE any `grep` runs on it, for the identical reason section 6 already
+established for `hold.py open`: collapsing `quiet`'s own exit code and the downstream `grep`'s
+exit code into one blanket guard over the whole pipe cannot tell "quiet legitimately found nothing
+AND grep found nothing" apart from "quiet itself failed." Only the final `grep` stage, reading the
+already-captured `$quiet_output` string (never a filename), keeps its plain `|| true` — confirmed
+safe per the idiom table above, since a string-input `grep -F` can only return `{0,1}`, never the
+file-not-found `2`.
 
 **`pane-reaper.py` requires herdr; guard it.** This dispatcher's own Scope section above only
 requires "terminal access + a scheduler" — herdr is optional infrastructure, not a hard dependency.
@@ -337,6 +465,25 @@ liveness FIRST, not `.final.txt` presence first:**
    immediately but was deliberately left unreaped — `ps -o stat=,command= -p <pid>` reported
    `Z    <defunct>` while `kill -0 <pid>` on that same PID still returned success (exit 0).
 
+   **Before any of that, validate the sidecar's own content is actually a PID — digits only —
+   BEFORE ever calling `ps` on it.** `ps -o stat= -p <pid>` returns the IDENTICAL signature (exit
+   `1`, empty stdout) for "this well-formed PID doesn't exist" and for "this content isn't a PID
+   at all" (confirmed live: `ps -o stat= -p "not-a-pid"` and `ps -o stat= -p 88888` — a genuinely
+   dead, well-formed PID — both gave `rc_ps=1` and empty `$state`, byte-for-byte indistinguishable).
+   A corrupted or truncated `.pid` sidecar (partial write, disk issue, a bug elsewhere writing the
+   wrong thing) must never be silently treated as "the task's process legitimately finished" —
+   that is a DIFFERENT, more serious anomaly than a normal exit:
+   ```bash
+   sidecar_pid=$(cat ".secondmate/dispatch/${task_id}.pid" 2>/dev/null)
+   if ! [[ "$sidecar_pid" =~ ^[0-9]+$ ]]; then
+     : # ESCALATE: corrupted/malformed .pid sidecar — never call ps on this, never treat as "not alive"
+   else
+     pid="$sidecar_pid"
+     # proceed to the ps-based liveness check below
+   fi
+   ```
+   Only once `$pid` is confirmed to be a well-formed positive integer does the check below run.
+
    So the check is `ps -o stat= -p <pid>` (portable across Linux and macOS/BSD), not `kill -0`
    alone — **and the `ps` call itself must be guarded under strict mode, but a blanket `|| true`
    is itself a bug**: a blanket guard reclassifies ANY `ps` failure — a dead PID, but also a
@@ -344,7 +491,8 @@ liveness FIRST, not `.final.txt` presence first:**
    error) — as the identical "not alive" outcome, so a still-possibly-running sub-supervisor could
    get silently treated as done just because `ps` itself malfunctioned. The fix captures `ps`'s
    own exit code explicitly and only treats its ONE documented "no such process" signature as
-   not-alive:
+   not-alive — using the general idiom from "Strict-mode exit-code discipline" above, applied to
+   `ps`'s own real `{0,1}` contract:
    ```bash
    rc_ps=0
    state=$(ps -o stat= -p "$pid" 2>/dev/null) || rc_ps=$?
@@ -393,26 +541,47 @@ liveness FIRST, not `.final.txt` presence first:**
    model the parent skill already accepts elsewhere ("detection only, no automated certainty") —
    this contract does not try to eliminate that narrow race with a more elaborate corroboration
    scheme; it accepts it as a known, bounded limitation.
-2. **Once the PID is confirmed not alive, `.final.txt`'s presence/absence decides the outcome:**
+2. **`.final.txt`'s presence/absence decides the outcome, checked with an explicit `[ -f ... ]`
+   test — never implied by just attempting the call below:**
+   ```bash
+   final_txt=".secondmate/dispatch/${task_id}.final.txt"
+   if [ -f "$final_txt" ]; then
+   ```
    - **Present** — the process finished cleanly. Run `bin/dispatch-report.py` against it (section 1)
      to get the terminal exit code — using the SAME capture discipline as the zombie reap in step
-     1, not a bare call:
+     1, not a bare call, and classifying `$rc` against `dispatch-report.py`'s own real `{0,1,2,3,4}`
+     contract from "Strict-mode exit-code discipline" above:
      ```bash
      rc=0
-     bin/dispatch-report.py ".secondmate/dispatch/${task_id}.final.txt" || rc=$?
+     bin/dispatch-report.py "$final_txt" || rc=$?
+     if [ "$rc" -gt 4 ]; then  # exit codes are never negative; only the upper bound matters
+       : # ESCALATE: outside dispatch-report.py's own documented {0,1,2,3,4} -- genuinely unexpected
+     fi
      ```
-     This capture is required for the identical reason as `wait`'s above: `dispatch-report.py`'s
-     exit code (`0`–`4`) IS the whole point of the call — not an error signal — and under `set -e`
-     a bare, unguarded invocation treats ANY nonzero code (including `4` for `SM_READY_UNMERGED`,
-     the single most common terminal outcome) as the command itself failing, aborting the strict
-     dispatcher before it ever acts on the parsed result. Confirmed live: a bare, unguarded call
-     against a real `.final.txt` containing `SM_READY_UNMERGED:deadbeef` killed the whole script
-     with exit `4`, never reaching anything after it; capturing via `rc=0; bin/dispatch-report.py
-     ... || rc=$?` instead correctly recorded `rc=4` and let the script continue to act on it.
-     Nothing further to poll for this task-id once `$rc` is captured.
+     The explicit `[ -f "$final_txt" ]` test above is why this `dispatch-report.py` call is safe
+     from the ambiguity the idiom table flags for this tool: confirmed live that calling
+     `dispatch-report.py` on a file that does NOT exist raises an unhandled `FileNotFoundError` and
+     ALSO exits `1` — the SAME code as a legitimate `SM_REFUSED`. Because this call only ever runs
+     inside the `[ -f ... ]`-confirmed "Present" branch, that collision can never actually occur
+     here; the file-missing case is routed to "Absent" below instead, before `dispatch-report.py`
+     is ever invoked.
+
+     The `rc` capture itself is required for the identical reason as `wait`'s above:
+     `dispatch-report.py`'s exit code (`0`–`4`) IS the whole point of the call — not an error
+     signal — and under `set -e` a bare, unguarded invocation treats ANY nonzero code (including
+     `4` for `SM_READY_UNMERGED`, the single most common terminal outcome) as the command itself
+     failing, aborting the strict dispatcher before it ever acts on the parsed result. Confirmed
+     live: a bare, unguarded call against a real `.final.txt` containing
+     `SM_READY_UNMERGED:deadbeef` killed the whole script with exit `4`, never reaching anything
+     after it; capturing via `rc=0; bin/dispatch-report.py ... || rc=$?` instead correctly
+     recorded `rc=4` and let the script continue to act on it. Nothing further to poll for this
+     task-id once `$rc` is captured and classified within `{0,1,2,3,4}`.
    - **Absent** — an ANOMALY: the process is gone but never produced output (crashed, killed
      externally, etc.). Escalate to the human exactly like a stuck task. Never silently retry it,
      and never assume success just because the process is gone.
+   ```bash
+   fi
+   ```
 
 The batch is closed once every fanned-out task-id's `spawn-sub-sup.sh` process has exited (reaped),
 or the batch TTL expires, whichever comes first. Only AFTER that — for the subset of task-ids whose
@@ -479,10 +648,12 @@ hold_output=$(bin/hold.py open) || rc_open=$?
   ```
   The `|| true` here is scoped to exactly one thing: `grep`'s own "zero matches" exit `1` on
   `hold.py open`'s ALREADY-CONFIRMED-SUCCESSFUL output — never a stand-in for `hold.py open`'s own
-  exit code, which was captured and checked separately above. Confirmed live: this two-step split
-  correctly proceeded to "no existing hold" on a genuine zero-open-holds case, and correctly
-  escalated instead of silently proceeding on the simulated ledger-I/O-error case — both exercised
-  against the real `hold.py` binary.
+  exit code, which was captured and checked separately above. This is honestly sufficient per the
+  idiom table above: `grep` here reads a `printf`-captured STRING, never a filename, so its real
+  `{0,1,2}` contract collapses to `{0,1}` at this call site — there is no file for it to fail to
+  find. Confirmed live: this two-step split correctly proceeded to "no existing hold" on a genuine
+  zero-open-holds case, and correctly escalated instead of silently proceeding on the simulated
+  ledger-I/O-error case — both exercised against the real `hold.py` binary.
 
 `hold.py open`'s own output format is `[<id>] (<task>) <question>` per open hold (confirmed by
 reading its `open` command source directly, and by running it live: it printed exactly
@@ -524,20 +695,35 @@ the same underlying principle as section 8's shared-ledger-path discipline below
 lock/ledger path requires every dispatcher invocation against a given repo to agree on the same
 env var) — apply it here too, for `SM_LOOP_STATE` specifically.
 
+**`merge-sequencer.sh`'s own exit code must be captured, never left to a bare call under
+`set -e`.** Its full documented exit set for a normal (non-`--preflight-only`) invocation is
+`{0,1,2,3,4,5}` (see "Strict-mode exit-code discipline" above) — codes `1`–`5` are ALL genuinely
+expected refusal/failure outcomes (gate refusal, usage error, merge conflict, push failure, lock
+timeout), not something the dispatcher is supposed to treat as a crash. A bare, unguarded call
+would, under `set -e`, die on the FIRST such refusal (e.g. a stale `--checked-sha` giving exit
+`1`) before the dispatcher's own "only clean up on success" logic below ever runs — never reaching
+it, never relaying the refusal, just an abrupt, uncommunicative script death:
 ```bash
+rc=0
 bin/merge-sequencer.sh --repo <repo> --worktree <worktree> --branch "sm/<task-id>" --base main \
-  --checked-sha <that entry's checked_sha>
-```
-**Only on exit 0** does the dispatcher run the follow-on cleanup — never unconditionally:
-```bash
-if command -v herdr >/dev/null 2>&1; then
-  herdr worktree remove --workspace <workspace-id>
-else
-  git -C <repo> worktree remove <worktree>
+  --checked-sha <that entry's checked_sha> || rc=$?
+if [ "$rc" -gt 5 ]; then  # exit codes are never negative; only the upper bound matters
+  : # ESCALATE: outside merge-sequencer.sh's own documented {0,1,2,3,4,5} -- e.g. 126/127 if the
+    # script itself couldn't even run. Genuinely unexpected, never treated as any refusal reason.
 fi
-git branch -d "sm/<task-id>"
-bin/claim-ledger.py release --task-id <task-id> --owner "sm-<task-id>" --token <token from section 3>
-bin/teardown-check.sh --task-id <task-id>
+```
+**Only when `rc` is `0`** does the dispatcher run the follow-on cleanup — never unconditionally:
+```bash
+if [ "$rc" -eq 0 ]; then
+  if command -v herdr >/dev/null 2>&1; then
+    herdr worktree remove --workspace <workspace-id>
+  else
+    git -C <repo> worktree remove <worktree>
+  fi
+  git branch -d "sm/<task-id>"
+  bin/claim-ledger.py release --task-id <task-id> --owner "sm-<task-id>" --token <token from section 3>
+  bin/teardown-check.sh --task-id <task-id>
+fi
 ```
 **Guard `herdr worktree remove` the same way section 4 already guards `pane-reaper.py`:** this
 dispatcher's own Scope section only requires "terminal access + a scheduler" — herdr is optional,
@@ -548,11 +734,14 @@ worktree remove <worktree>` — the same plain-git worktree operation the parent
 headless path already uses to CREATE a worktree (`bin/new-worktree.sh`'s own `git -C "$repo"
 worktree add -b "$branch" "$wt" "$base"`, confirmed by reading that script directly); removal just
 mirrors creation.
-On any **nonzero** `merge-sequencer.sh` exit (e.g. it refuses a stale `--checked-sha`), the
-dispatcher leaves the worktree, branch, and claim exactly as they are — do not remove the worktree,
-delete the branch, or release the claim — and relays the failure to the human, the same discipline
-as a stuck/refused task. Running the cleanup unconditionally discards an unmerged, still-good
-task's work and frees its task-id for someone else to claim out from under it.
+
+**On any `rc` in `{1,2,3,4,5}`** (a documented refusal reason — e.g. it refuses a stale
+`--checked-sha`, `rc=1`) **or outside `{0,...,5}` entirely** (a genuinely unexpected failure), the
+dispatcher leaves the worktree, branch, and claim exactly as they are — do not remove the
+worktree, delete the branch, or release the claim — and relays the failure (citing `$rc` and
+`merge-sequencer.sh`'s own ledger `reason_code` for the documented cases) to the human, the same
+discipline as a stuck/refused task. Running the cleanup unconditionally discards an unmerged,
+still-good task's work and frees its task-id for someone else to claim out from under it.
 
 A **rejected** task-id is left completely untouched: claim still open, worktree and branch still in
 place, nothing released. It stays `claimed, needs rework` until a human-driven rework round or an
