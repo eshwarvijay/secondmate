@@ -817,10 +817,11 @@ which task-ids belong to the batch in the first place.
 
 ## 6. One consolidated hold
 
-**Before building the entries file: filter `ready`'s output through BOTH this batch's own
-persisted task-id list AND `claim-ledger.py status`'s currently-OPEN claims — never trust
-`ready --batch-id` alone as proof a row belongs to THIS dispatcher's own batch.** Two independent
-reasons a row from `ready --batch-id <batch-id>` must not be taken at face value:
+**Before building the entries file: filter `ready`'s output through THREE things — this batch's
+own persisted task-id list, `claim-ledger.py status`'s currently-OPEN claims, AND this batch's own
+durable hold-history — never trust `ready --batch-id` alone as proof a row belongs to THIS
+dispatcher's own batch, or that it hasn't already been decided.** Three independent reasons a row
+from `ready --batch-id <batch-id>` must not be taken at face value:
 1. `progress-ledger.py`'s ledger rows are never deleted, so once a batch task-id reaches
    `verify_gate_pass`, `ready --batch-id` reports that SAME row forever, even long after that
    task-id was merged, its claim released, and its worktree torn down in a prior round of this
@@ -839,8 +840,50 @@ reasons a row from `ready --batch-id <batch-id>` must not be taken at face value
    claim-status filter alone could not tell them apart and wrongly kept `foreign1`. Only cross-
    checking against this batch's own `<batch-id>.batch.json` (section 5) — which lists EXACTLY the
    task-ids this dispatcher's own fan-out actually spawned — correctly excludes it.
+3. **A REJECTED task-id's claim is deliberately left open (section 7's own documented rule:
+   "left completely untouched... claimed, needs rework") — so the first two checks alone cannot
+   tell "ready and never yet asked about" apart from "already rejected by a human in a prior hold
+   for this exact batch-id."** `hold.py open` only shows currently-OPEN holds; once a hold is
+   answered it simply disappears from that view, so the "search for an existing open hold, open a
+   new one if none is found" logic below (re-)opens a BRAND-NEW hold asking the human to
+   re-adjudicate a task-id they already rejected, every time the dispatcher restarts and nothing
+   has changed. Confirmed live: opened a hold covering `t1`, answered it `--reject t1`, then
+   re-ran the exact "no open hold found → open a new one" logic — it found nothing in `hold.py
+   open`'s output (correctly empty, the hold is closed) and opened a SECOND hold for the identical,
+   unchanged `t1`. The fix needs a durable record of what this batch already asked a human about,
+   independent of `hold.py open`'s open-only view — see "Hold history: the third durable artifact"
+   below.
 
-Carry both cross-checks into this skill's own batch-close concretely:
+**Hold history: the third durable artifact.** Alongside `<batch-id>.batch.json` (section 5), this
+dispatcher also durably records every hold-id it has ever opened for this batch-id, at
+`$dispatch_dir/<batch-id>.hold-history.json` — a JSON array of
+`{"hold_id": "...", "entries": [{"task_id": ..., "checked_sha": ..., ...}, ...]}`, one record per
+hold ever opened (not just the currently-open one), written atomically (read, append, temp+`mv`,
+the same idiom as every other durable write in this file) the moment a NEW hold is opened (see the
+updated "open a new one" step below). A hold-id, once answered, is never reopened or reanswered
+(confirmed by reading `hold.py`'s own `_recs()`/`answer` handling directly: an already-answered id
+is rejected outright) — so a REJECTED decision recorded against a specific `checked_sha` is
+permanent for that `checked_sha`, and remains valid evidence across any number of dispatcher
+restarts without needing `hold.py open`'s live, open-only view at all. Reading whether a given
+historical hold-id was answered, and what it decided, means reading `hold.py`'s own ledger
+directly at `${SM_HOLD_LEDGER:-decisions.jsonl}` — the identical path hold.py itself resolves
+(confirmed by reading its own `LEDGER = pathlib.Path(os.environ.get("SM_HOLD_LEDGER",
+"decisions.jsonl"))` directly) — for the `{"ev": "answer", "id": "<hold-id>"}` record hold.py's
+own module docstring documents as its real, stable answer shape, extracting `.rejected[]`. This is
+reading a tool's own documented, stable on-disk contract directly, the same discipline this file
+already applies to `dispatch-report.py`'s regex, `claim-ledger.py`'s `_TOKEN_RE`, and
+`pane-reaper.py`'s exit codes elsewhere — not a second, parallel definition of "rejected."
+
+A rejected decision only disqualifies a task-id for the EXACT `checked_sha` it was rejected at —
+never for a later, genuinely different `checked_sha`. A human-driven rework/resubmission round
+produces a brand-new `verify_gate_pass` row with a new `checked_sha` (ordinary dispatcher
+discipline, unchanged), which is exactly the signal this file already treats as "legitimately
+different" everywhere else (`merge-sequencer.sh`'s own `--checked-sha` anti-reattachment gate,
+`hold.py`'s own `--sha` binding). Comparing on `"<task-id>@<checked_sha>"` pairs, not bare
+task-ids, is what lets a genuine resubmission through while still excluding an unchanged, already-
+rejected one.
+
+Carry all three cross-checks into this skill's own batch-close concretely:
 ```bash
 open_claims_output=$(bin/claim-ledger.py status)
 # status's own contract is binary like hold.py open: 0 = success, always, even with zero open
@@ -848,30 +891,64 @@ open_claims_output=$(bin/claim-ledger.py status)
 # unlike `ready`, which the parent skill's own fan-out section documents as "always exits 0" too.
 batch_task_ids=$(jq -r '.task_ids[]' "$dispatch_dir/${batch_id}.batch.json")
 ready_output=$(bin/progress-ledger.py ready --batch-id "$batch_id")
+
+# Build the rejected_unchanged set from this batch's own hold history -- independent of
+# hold.py open's open-only view (that view cannot distinguish "never asked" from "already
+# answered"); an answered hold-id is permanent, so this is safe to trust across any restart.
+history_file="$dispatch_dir/${batch_id}.hold-history.json"
+[ -f "$history_file" ] || echo '[]' > "$history_file"
+rejected_unchanged=()
+while IFS= read -r hrec; do
+  hid=$(printf '%s' "$hrec" | jq -r '.hold_id')
+  answer_rec=$(jq -c --arg id "$hid" 'select(.ev == "answer" and .id == $id)' \
+    "${SM_HOLD_LEDGER:-decisions.jsonl}")
+  [ -z "$answer_rec" ] && continue   # not yet answered -- nothing to exclude for this hold-id
+  rej_ids=$(printf '%s' "$answer_rec" | jq -r '.rejected[]? // empty')
+  while IFS= read -r rid; do
+    [ -z "$rid" ] && continue
+    rsha=$(printf '%s' "$hrec" | jq -r --arg t "$rid" '.entries[] | select(.task_id == $t) | .checked_sha')
+    rejected_unchanged+=("${rid}@${rsha}")
+  done <<< "$rej_ids"
+done < <(jq -c '.[]' "$history_file")
+
 entries_task_ids=()
 while IFS= read -r line; do
   [ -z "$line" ] && continue
   tid=$(printf '%s' "$line" | jq -r '.task_id')
+  sha=$(printf '%s' "$line" | jq -r '.checked_sha')
   claim_open=0
   printf '%s\n' "$open_claims_output" | grep -qF "[$tid] " && claim_open=1
   in_batch=0
   printf '%s\n' "$batch_task_ids" | grep -qxF "$tid" && in_batch=1
-  if [ "$claim_open" -eq 1 ] && [ "$in_batch" -eq 1 ]; then
-    entries_task_ids+=("$tid")  # claim open AND genuinely ours -- keep
+  already_rejected=0
+  for ru in "${rejected_unchanged[@]:-}"; do
+    [ "$ru" = "${tid}@${sha}" ] && already_rejected=1 && break
+  done
+  if [ "$claim_open" -eq 1 ] && [ "$in_batch" -eq 1 ] && [ "$already_rejected" -eq 0 ]; then
+    entries_task_ids+=("$tid")  # claim open, genuinely ours, AND not already decided -- keep
   fi
-  # else: either the claim is already gone (merged/torn down in a prior round of THIS batch), or
-  # this row never belonged to this batch at all (a batch-id collision with a foreign task-id).
-  # DROP it either way. Never re-include a task-id that fails either check.
+  # else: the claim is already gone (merged/torn down in a prior round of THIS batch), this row
+  # never belonged to this batch at all (a batch-id collision with a foreign task-id), or a human
+  # already rejected this EXACT checked_sha in a prior round of THIS batch. DROP it either way.
+  # Never re-include a task-id that fails any of the three checks.
 done <<< "$ready_output"
 ```
-Confirmed live, both scenarios: (1) a two-task-id batch where `t1` was already merged and its claim
-released in a prior round while `t2` was still pending — `ready --batch-id` kept reporting BOTH
-(ledger rows never deleted), but the claim-status half of the filter correctly dropped `t1` and
-kept only `t2`; (2) the batch-id-collision scenario above — the claim-status check ALONE wrongly
-kept the foreign `foreign1` (`claim_open=1`), but adding the batch-manifest membership check
-(`in_batch=0` for `foreign1`) correctly dropped it while still keeping the genuine `mine1`.
+Confirmed live, three scenarios: (1) a two-task-id batch where `t1` was already merged and its
+claim released in a prior round while `t2` was still pending — `ready --batch-id` kept reporting
+BOTH (ledger rows never deleted), but the claim-status half of the filter correctly dropped `t1`
+and kept only `t2`; (2) the batch-id-collision scenario above — the claim-status check ALONE
+wrongly kept the foreign `foreign1` (`claim_open=1`), but adding the batch-manifest membership
+check (`in_batch=0` for `foreign1`) correctly dropped it while still keeping the genuine `mine1`;
+(3) the rejected-and-unchanged scenario this round fixes — opened a hold for `t1@sha-aaa111`,
+rejected it, recorded that hold into `hold-history.json`, then re-ran this exact filter on a
+simulated restart: `entries_task_ids` correctly came back empty (the rejection, unchanged, is
+excluded) — then recorded a NEW `verify_gate_pass` row for `t1` at a genuinely different
+`checked_sha` (a real rework resubmission) and re-ran the identical filter again: `t1` correctly
+reappeared in `entries_task_ids`, confirming the exclusion is scoped to the exact rejected
+`checked_sha`, never to the bare task-id.
 
-Then write the JSON entries file, one object per task-id that survived the filter above —
+Then write the JSON entries file, one object per task-id that survived the filter above, to
+`entries_file="$dispatch_dir/${batch_id}.entries.json"` —
 ```json
 [{"task_id": "...", "checked_sha": "...", "checker_verdict_path": "..."}, ...]
 ```
@@ -922,10 +999,17 @@ hold_output=$(bin/hold.py open) || rc_open=$?
 
 - **A matching open hold is found** (`$existing_id` is non-empty) — reuse its id; do NOT call
   `hold.py hold` again. Just keep waiting for a human to answer that existing hold.
-- **No matching open hold is found** (`$existing_id` is empty) — only then open a new one:
+- **No matching open hold is found** (`$existing_id` is empty) — only then open a new one, and
+  immediately record it into `hold-history.json` above — this is what makes the rejected-and-
+  unchanged exclusion restart-safe: without this write, a dispatcher that restarts between opening
+  this hold and it being answered would have no durable way to ever learn this hold-id existed:
 ```bash
-bin/hold.py hold --task "<batch-label>" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
-  --entries-file <that JSON file>
+new_hold_id=$(bin/hold.py hold --task "$batch_id" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
+  --entries-file "$entries_file")
+tmp="$history_file.tmp"
+jq --arg hid "$new_hold_id" --slurpfile entries "$entries_file" \
+  '. + [{hold_id: $hid, entries: $entries[0]}]' "$history_file" > "$tmp"
+mv "$tmp" "$history_file"
 ```
 Wait for a genuine human answer; never self-answer. The answer is structured, not freeform prose,
 and must cover every entry in exactly one list:
