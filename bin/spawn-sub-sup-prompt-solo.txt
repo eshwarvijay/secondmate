@@ -16,7 +16,7 @@ Run the mandatory sequence:
    already at hand (optional, same posture as the log-round.sh bullet above — never estimate; omit
    instead).
 2. Derive every downstream name deterministically from {{TASK_ID}} (`sm/{{TASK_ID}}` branch,
-   `sm-pi-{{TASK_ID}}` agent name if a pi maker is routed, `root_pane` from `herdr worktree create`).
+   `sm-{{TASK_ID}}`/`sm-pi-{{TASK_ID}}` agent name, `root_pane` from `herdr worktree create`).
 3. Run the existing solo SOP completely untouched — plan-committee, maker routing, checker rounds,
    verify-gate — recording the SAME checkpoints a batch dispatch's sub-supervisor records (just without a
    `--batch-id`, since a solo dispatch has no batch to correlate against): `bin/progress-ledger.py record
