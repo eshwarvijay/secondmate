@@ -79,6 +79,13 @@ consolidated-hold check — in far more operational depth than this guide reprod
 guide's §3/§4/§5 as the colleague-facing overview and `skills/secondmate-dispatch/SKILL.md` as the
 detailed reference once it merges.
 
+**Caveat on that cross-reference:** `skills/secondmate-dispatch/SKILL.md`'s own shown
+`spawn-sub-sup.sh` invocation (its "Spawning a sub-supervisor" section) omits `--mode solo|batch` —
+live-confirmed that exact invocation, run as shown, exits `2` with `need --mode solo|batch` against
+the real script. `--mode` is required (`--mode batch` additionally requires `--batch-id`; `--mode
+solo` rejects `--batch-id` outright). Use this guide's own complete invocation in "Headless launch"
+below, not that cross-referenced recipe's example verbatim, until it's corrected.
+
 ### Pane-visible launch — use the herdr CLI directly (no wrapper script for this specific path)
 
 For the pane-visible path (a human can watch the sub-supervisor work), there's no dedicated
@@ -96,7 +103,7 @@ sub-supervisor's own loop (see SKILL.md's "Maker pane" recipe) — one level up:
 # `git worktree add -b sm/<task-id>` on a branch that already exists exits 255 ("fatal: a branch
 # named 'sm/<task-id>' already exists"), which is exactly what `herdr worktree create` would hit
 # internally.
-pane_id=$(herdr pane split --dir right --cwd <any-existing-checkout> --no-focus \
+pane_id=$(herdr pane split --direction right --cwd <any-existing-checkout> --no-focus \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
 herdr agent start sm-<task-id> --kind claude --pane "$pane_id" -- --permission-mode auto
 
