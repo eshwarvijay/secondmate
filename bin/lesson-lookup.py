@@ -591,6 +591,12 @@ _MINT_HELP_BODY = (
     "The draft's `tags` field must be a non-empty, flat list of string scalars -- either the\n"
     "inline `[a, b]` form or the multi-line `- a` / `- b` block form. No nesting (a tag may not\n"
     "itself be a list or mapping), no comments, and no raw control characters.\n"
+    "\n"
+    "A tag that looks like a YAML mapping indicator is rejected, not swallowed as text: a `:` in\n"
+    "mapping-value position (`name:`) and a leading `?` in explicit-key position (`? name`) each\n"
+    "count as a mapping indicator only when followed by whitespace, a flow-structural stop\n"
+    "character (`]` or `,`), or the end of the text -- e.g. `[name:]`, `[? name]`, and `[?]` are\n"
+    "all one-key mappings, not flat strings, and are rejected the same as a comment or nested list.\n"
 )
 
 
@@ -2083,6 +2089,18 @@ Always do the one thing that must happen.
                     f"help text must document that the tags grammar has no comment support:\n{out.getvalue()}")
                 assert 'no raw control characters' in help_text, (
                     f"help text must document that raw control characters are disallowed in tags:\n{out.getvalue()}")
+                # Round-16 Finding 1 regression: pins the mapping-indicator paragraph added to
+                # _MINT_HELP_BODY -- a prior version of the help text said tags may not be "a list
+                # or mapping" but never explained HOW a mapping is detected (the `:`/`?` rules and
+                # their whitespace/stop-char/end-of-text condition), leaving a user who hit
+                # `tags: [?]` or `tags: [name:]` with no way to understand the rejection from
+                # --help alone. Each phrase below is load-bearing text from that paragraph.
+                assert 'mapping-value position' in help_text, (
+                    f"help text must document the colon mapping-value rule:\n{out.getvalue()}")
+                assert 'explicit-key position' in help_text, (
+                    f"help text must document the leading-'?' explicit-key rule:\n{out.getvalue()}")
+                assert 'flow-structural stop' in help_text, (
+                    f"help text must document the whitespace/stop-char/end-of-text condition:\n{out.getvalue()}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3192,6 +3210,13 @@ Always do the one thing that must happen.
     # starting with `?` followed by whitespace constructs a mapping (`{name: null}`), the same as
     # the colon-based implicit-null form above, just keyed on the other side of the `:`. Both the
     # inline form (`[? name]`) and the equivalent block form (`- ? name`) must be rejected.
+    #
+    # Round-16 Finding 2 regression: the whitespace-followed case above isn't the only way `?`
+    # acts as the explicit-key indicator -- the same as the colon-based form, it also counts when
+    # followed by a flow-structural stop character (`]`/`,`) or the end of the text, with no space
+    # at all. The code already rejects `[?]` and `[?, mint]` correctly (confirmed by the round-16
+    # checker's own probes); this extends the test so a future narrowing of the check back to
+    # "whitespace only" would be caught here instead of slipping through unnoticed.
     def test_mint_explicit_key_mapping_tag_rejected():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -3219,6 +3244,29 @@ Always do the one thing that must happen.
                 "a multi-line tags block whose dash-item value is an explicit-key mapping "
                 "('- ? name') must be rejected too -- a tag is a flat scalar, not a mapping")
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-block.md'))
+
+            draft_stop_bracket = os.path.join(tmp, 'explicit-key-stop-bracket.md')
+            with open(draft_stop_bracket, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [?]\n'))
+            err3 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err3):
+                rc3 = cmd_mint(['--file', draft_stop_bracket])
+            assert rc3 != 0, (
+                f"'[?]' is a one-key mapping with a null key AND a null value, not a flat string "
+                f"-- a '?' right before the closing ']' (no whitespace at all) must be rejected "
+                f"too:\n{err3.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-stop-bracket.md'))
+
+            draft_stop_comma = os.path.join(tmp, 'explicit-key-stop-comma.md')
+            with open(draft_stop_comma, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [?, mint]\n'))
+            err4 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err4):
+                rc4 = cmd_mint(['--file', draft_stop_comma])
+            assert rc4 != 0, (
+                f"a '?' right before a ',' element separator is the same null-key/null-value "
+                f"explicit-key shorthand and must be rejected too:\n{err4.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-stop-comma.md'))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
