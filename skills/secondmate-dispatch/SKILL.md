@@ -169,6 +169,49 @@ the `&` backgrounding has actually happened (confirmed live: a probe script prin
 immediately before backgrounding a process, and only non-empty immediately after) — so this
 capture is necessarily the dispatcher's next line, never something done beforehand.
 
+**Before backgrounding `spawn-sub-sup.sh`: create the worktree (and, if herdr is in use, its
+workspace/pane) and durably record every identifier later recipes need — never leave them as
+in-memory values the dispatcher is assumed to still remember.** Section 4's watchdog pane filter
+and section 7's merge cleanup both reference `<workspace-id>`, `<worktree>`, `root_pane_id`, and
+`checker_pane_id` — an external OS-level process has no in-session context to recover these from
+after the sub-supervisor process exits or the dispatcher itself restarts, so they must be written
+to disk at the moment they're first known, the same discipline the batch manifest (section 5)
+already applies at the batch level:
+- **Headless / no herdr:** `read wt branch < <(bin/new-worktree.sh --repo <repo> --task <task-id>)`
+  — the same primitive `skills/secondmate/SKILL.md`'s own headless path uses. No workspace/pane
+  identifiers exist in this path.
+- **herdr in use:** `result=$(herdr worktree create --cwd <repo> --branch sm/<task-id> --base HEAD
+  --label sm-<task-id> --no-focus)`, then `worktree_path=$(printf '%s' "$result" | jq -r
+  '.result.worktree.path')` and `root_pane_id=$(printf '%s' "$result" | jq -r
+  '.result.root_pane.pane_id')` — the identical two JSON paths `skills/secondmate/SKILL.md`'s own
+  `herdr worktree create` call already relies on (confirmed by reading that file's Spawn step 2
+  directly). That same file passes a workspace id to `herdr worktree remove --workspace
+  <workspace-id>` too, but — like this skill, before this fix — never pins down which exact field
+  of `$result` that value comes from; extract it the same way as the two fields above, from
+  whichever field `herdr worktree create`'s own JSON result actually exposes it under, rather than
+  guessing a path neither file has verified.
+
+Either way, write a durable per-task manifest IMMEDIATELY, atomically (temp file + `mv`, the same
+idiom this skill already requires for round-state files elsewhere):
+```bash
+jq -n --arg task_id "<task-id>" --arg worktree_path "$worktree_path" \
+      --arg workspace_id "${workspace_id:-}" --arg root_pane_id "${root_pane_id:-}" \
+  '{task_id: $task_id, worktree_path: $worktree_path,
+    workspace_id: ($workspace_id | select(. != "") // null),
+    root_pane_id: ($root_pane_id | select(. != "") // null),
+    checker_pane_id: null}' > ".secondmate/dispatch/<task-id>.manifest.json.tmp"
+mv ".secondmate/dispatch/<task-id>.manifest.json.tmp" ".secondmate/dispatch/<task-id>.manifest.json"
+```
+An empty/unset `workspace_id` or `root_pane_id` (the headless path) correctly serializes to JSON
+`null`, not an empty string — confirmed live: `jq -r '.workspace_id'` on a `null` field prints the
+literal string `null`, so every later reader must check `[ "$ws" = "null" ]`, not just
+`[ -z "$ws" ]`. Confirmed live end-to-end: wrote this manifest for a headless (no-herdr) task-id,
+then re-read it from a **separate** process invocation simulating a dispatcher restart — the
+`worktree_path` and the correctly-`null` `workspace_id`/`root_pane_id` both came back identical to
+what was written, with no in-memory state involved at all. If a checker pane is later split off
+(the visible-orchestration case), update this SAME manifest file (read, patch `checker_pane_id`,
+atomic rewrite) rather than tracking it anywhere else.
+
 **Inputs:** a `--task-id` (validated by the dispatcher before the call — see Discipline below), a
 `--prompt-file` holding the full sub-supervisor prompt (claim → SOP → completion tag, same prompt
 shape as the Agent-tool version, plus the `SM_CLAIM_TOKEN:` line required below), and a `--log-dir`.
@@ -209,7 +252,7 @@ for the full detail.
 
 ## 2. Log convention
 
-Every spawned sub-supervisor leaves exactly three artifacts under `.secondmate/dispatch/`:
+Every spawned sub-supervisor leaves exactly four artifacts under `.secondmate/dispatch/`:
 - `<task-id>.jsonl` — the raw `stream-json` transcript, written by `spawn-sub-sup.sh` itself,
   append-only, useful for a human reading back what actually happened.
 - `<task-id>.final.txt` — the extracted plain-text content of the final assistant message only,
@@ -218,6 +261,12 @@ Every spawned sub-supervisor leaves exactly three artifacts under `.secondmate/d
   (section 3).
 - `<task-id>.pid` — the liveness sidecar, written by the **dispatcher** (not `spawn-sub-sup.sh`)
   immediately after backgrounding it (section 1). Used by the watchdog's reap check (section 5).
+- `<task-id>.manifest.json` — the worktree/herdr-identifier manifest, written by the
+  **dispatcher** (section 1) BEFORE backgrounding `spawn-sub-sup.sh`, holding `worktree_path`,
+  `workspace_id`, `root_pane_id`, and `checker_pane_id` (the last `null` until/unless a checker
+  pane is split off). Read back by the watchdog's pane filter (section 4) and the merge-cleanup
+  recipe (section 7) — durable on disk, so both survive a dispatcher restart with no in-memory
+  state to recover.
 
 ## 3. Extracting the claim token
 
@@ -380,6 +429,16 @@ while true; do
   sleep "$N"
 done
 ```
+
+**`root_pane_id` (and `checker_pane_id` below) are read from each watched task-id's own
+`<task-id>.manifest.json` (section 1/2) — never an in-memory value the watchdog loop is assumed to
+still hold.** For every task-id in `${task_id_flags[@]}`, read its own manifest
+(`root_pane_id=$(jq -r '.root_pane_id' ".secondmate/dispatch/${task_id}.manifest.json")`, same for
+`checker_pane_id`) and build the pane-id set to filter on from THOSE values, skipping any task-id
+whose manifest reports `"null"` (no herdr pane for that task-id at all) rather than filtering on a
+literal `"null"` string. This is what makes the pane filter restart-safe: a dispatcher that
+crashes and comes back has no conversation context left, but the manifest files on disk are
+exactly what it already needed to re-derive before it could even resume watching these task-ids.
 
 **Every example invocation here must be a complete, directly-runnable command — no literal "..."
 left sitting where a real argument belongs.** A trailing `...` after the `grep -F -e PATTERN` call
@@ -781,19 +840,37 @@ if [ "$rc" -gt 5 ]; then  # exit codes are never negative; only the upper bound 
     # script itself couldn't even run. Genuinely unexpected, never treated as any refusal reason.
 fi
 ```
+**`<workspace-id>` and `<worktree>` are read from this task-id's own `<task-id>.manifest.json`
+(section 1/2), never an in-memory value from whenever the worktree was originally created** — the
+same restart-safety reason section 4's pane filter now reads from the SAME manifest:
+```bash
+workspace_id=$(jq -r '.workspace_id' ".secondmate/dispatch/<task-id>.manifest.json")
+worktree=$(jq -r '.worktree_path' ".secondmate/dispatch/<task-id>.manifest.json")
+```
 **Only when `rc` is `0`** does the dispatcher run the follow-on cleanup — never unconditionally:
 ```bash
 if [ "$rc" -eq 0 ]; then
-  if command -v herdr >/dev/null 2>&1; then
-    herdr worktree remove --workspace <workspace-id>
+  if command -v herdr >/dev/null 2>&1 && [ "$workspace_id" != "null" ]; then
+    herdr worktree remove --workspace "$workspace_id"
   else
-    git -C <repo> worktree remove <worktree>
+    git -C <repo> worktree remove "$worktree"
   fi
   git branch -d "sm/<task-id>"
   bin/claim-ledger.py release --task-id <task-id> --owner "sm-<task-id>" --token <token from section 3>
-  bin/teardown-check.sh --task-id <task-id>
+  bin/teardown-check.sh --task-id <task-id> --repo <repo>
 fi
 ```
+**`teardown-check.sh` must always get `--repo <repo>` explicitly, never left to its own default.**
+`teardown-check.sh` defaults `--repo` to `.` when omitted (confirmed by reading its own argument
+parsing directly) — for an external dispatcher running from a non-repository CWD (the normal
+cron/daemon case this whole skill targets), that default resolves to a path that isn't a git
+working tree at all. Confirmed live: ran `teardown-check.sh --task-id t1 --repo <a real non-repo
+path>` directly and it printed `--repo <path> is not a git working tree` and exited `2` — the same
+failure a bare `--task-id`-only call would hit the moment the dispatcher's actual CWD isn't inside
+`<repo>`, instead of confirming cleanup on the real target repo. Every other recipe in this file
+already carries `<repo>` through explicitly (`merge-sequencer.sh`, `git -C <repo> worktree
+remove`); `teardown-check.sh` is no exception.
+
 **Guard `herdr worktree remove` the same way section 4 already guards `pane-reaper.py`:** this
 dispatcher's own Scope section only requires "terminal access + a scheduler" — herdr is optional,
 not a hard dependency. Running `herdr worktree remove` with no `herdr` binary on `PATH` fails with
@@ -844,6 +921,23 @@ or auto-`--steal`. Two additions apply specifically to the external case:
    called with an argv array (e.g. `subprocess.run([...])`, bash `"${arr[@]}"`), never a string
    handed to a shell `-c` — the same hygiene `claim-ledger.py` and `merge-sequencer.sh` already hold
    themselves to internally, now also required of the dispatcher's own calls into them.
+
+## Follow-ups / known robustness gaps
+
+Logged here deliberately rather than fixed, per an explicit human gate-scope decision — real
+shell-robustness-class findings, out of blocking scope for this file's own recipes, but tracked so
+they aren't silently lost:
+
+- **Section 6's `open_claims_output=$(bin/claim-ledger.py status)` is a bare call under
+  `set -e`, with no `rc=$?` capture.** `claim-ledger.py status` is not purely binary in practice:
+  confirmed live that pointing `SM_CLAIM_LEDGER` at a directory instead of a file makes it crash
+  with an unhandled `IsADirectoryError` and exit `1`, and the bare, unguarded call aborts the
+  whole script right there under `set -euo pipefail` — before the dispatcher's own promised
+  human-escalation step (the same step this file's "Strict-mode exit-code discipline" idiom
+  already applies to every other command in this recipe) ever runs. Suggested fix: capture via
+  `rc_status=0; open_claims_output=$(bin/claim-ledger.py status) || rc_status=$?`, escalate on
+  `rc_status != 0`, the identical idiom already applied to `hold.py open` two lines above it in
+  this same section.
 
 ## Proposed secondmate SKILL.md amendment (HUMAN-OWNED — apply by hand)
 
