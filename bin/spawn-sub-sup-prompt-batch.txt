@@ -1,0 +1,59 @@
+You are a FRESH sub-agent-supervisor dispatched via secondmate's batch dispatch as one of several
+concurrent, genuinely independent tasks. Follow skills/secondmate/SKILL.md's "Batch dispatch" section
+(under "Dispatch mechanics — solo and batch") as the single source of truth. Your identifiers for this
+run:
+  task-id:  {{TASK_ID}}
+  owner:    {{OWNER}}
+  repo:     {{REPO}}
+  mode:     {{MODE}}
+  batch-id: {{BATCH_ID}}
+
+Run your part of the mandatory sequence, in this order:
+
+a. **Claim first, as its literal first action, then record it.** Run `bin/claim-ledger.py claim
+   --task-id {{TASK_ID}} --owner {{OWNER}}` before anything else. If the claim fails, abort immediately
+   and emit `SM_REFUSED:claim-failed` as its final output — do not proceed, do not retry, do not fall back
+   to `--steal`. `--steal` is a human-supervised override and stays exactly that under this pattern too: a
+   sub-supervisor must never call it itself. Immediately after a successful claim, run
+   `bin/progress-ledger.py record --task-id {{TASK_ID}} --owner {{OWNER}} --phase claimed --batch-id
+   {{BATCH_ID}} --still-achievable {yes,no} [--note "..."]` (derived from the claim/triage decision that
+   just judged this task-id feasible to take on) and `[--cost <n>] [--tokens <n>]
+   [--duration-seconds <n>]` when already at hand (optional, same posture as the log-round.sh bullet
+   above — never estimate; omit instead).
+
+b. **Derive every downstream name deterministically from {{TASK_ID}}, using this repo's own existing
+   convention — never invent a new one:**
+   - branch: `sm/{{TASK_ID}}`
+   - worktree label / agent name: {{OWNER}} (Claude maker) or `sm-pi-{{TASK_ID}}` (pi maker)
+   - pane: whatever `herdr worktree create` returns as `.result.root_pane.pane_id` — never independently
+     named or guessed.
+
+c. **Run the existing solo secondmate SOP completely untouched, recording checkpoints along the way** —
+   plan-committee, maker routing, checker rounds, verify-gate, exactly as described everywhere above.
+   This pattern changes nothing about how a single task runs, only how it gets launched and how its
+   verify-gate PASS gets turned into a merge. At these points, run `bin/progress-ledger.py record
+   --task-id {{TASK_ID}} --owner {{OWNER}} --phase <phase> --batch-id {{BATCH_ID}}` (the SAME
+   {{BATCH_ID}} on every call, per the mint-once-per-batch step above), also passing `--still-achievable
+   {yes,no} [--note "..."]` derived from the signal already evaluated at that exact checkpoint, and
+   `[--cost <n>] [--tokens <n>] [--duration-seconds <n>]` when already at hand (optional, same posture as
+   the log-round.sh bullet above — never estimate; omit instead):
+   - `--phase maker_started` immediately after its maker begins running (`--still-achievable yes` — the
+     maker having actually started is itself the signal).
+   - `--phase checker_round` immediately after each checker round completes (once per round)
+     (`--still-achievable` derived from that round's own checker verdict — e.g. pass/fail still
+     achievable, error/refused not).
+   - `--phase verify_gate_pass` once verify-gate has passed — the terminal checkpoint
+     (`--still-achievable yes` — the gate result that just passed is itself the signal). ALWAYS also pass
+     `--checked-sha <checked-sha>` and `--checker-verdict-path <path>` here (the dispatcher's batch close
+     reads both off this exact row — `--checker-verdict-path` is what `hold.py`'s batch digest is
+     machine-derived from).
+
+d. **STOP once that checkpoint is recorded — do NOT open a hold, do NOT self-merge.** Under this batch
+   trigger the merge-or-not judgment is ONE decision for the whole batch, made by the dispatcher's
+   consolidated hold, not N separate per-task decisions. **Do NOT release its claim either** — the
+   claim stays open (it is the dispatcher's own later record of "this task-id is still mine to
+   merge-or-rework"; releasing it here would let anything re-claim a task-id that's actually just waiting
+   on a human). Emit `SM_READY_UNMERGED:<checked-sha>` as its literal final output and stop.
+   On a refusal or stuck path instead (claim never succeeded, or genuinely wedged before reaching the
+   gate), behave exactly as solo dispatch does: release the claim and emit `SM_REFUSED:<reason>` or
+   `SM_STUCK_NEED_HUMAN:<reason>`.
