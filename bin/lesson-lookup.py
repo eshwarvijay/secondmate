@@ -626,8 +626,15 @@ def _discover_categories(lessons_dir):
     return sorted(p.name for p in lessons_path.iterdir() if p.is_dir())
 
 
+# "always"/"never" are deliberately EXCLUDED from this anywhere-in-sentence marker set, even
+# though they're common in genuine rules -- they're just as common in plain declarative prose
+# ("The build server is always located in the east wing." / "X is never Y."), so matching them
+# bare and mid-sentence is too weak a signal on its own. They still count as legitimate
+# directives when they're the sentence's OPENING word (see _IMPERATIVE_LEAD_VERBS below) -- that
+# position is the actual imperative-mood marker ("Always do X." / "Never do Y."), distinct from
+# the word merely appearing in a descriptive clause.
 _IMPERATIVE_MARKERS = re.compile(
-    r"\b(must|never|always|avoid|should|shall|cannot|can't|do not|don't|ensure|stay|verify|confirm|refuse|reject)\b",
+    r"\b(must|avoid|should|shall|cannot|can't|do not|don't|ensure|stay|verify|confirm|refuse|reject)\b",
     re.IGNORECASE)
 
 _IMPERATIVE_LEAD_VERBS = {
@@ -642,13 +649,16 @@ def _is_single_sentence_body(body_text):
     stripped text is non-empty and ends in one of .!?, splitting on sentence-ending punctuation
     followed by whitespace yields exactly one non-empty segment, AND the sentence reads as a RULE
     rather than a plain declarative fact -- it either contains an obligation/prohibition marker word
-    (must/never/always/avoid/should/...) anywhere, or opens on a common bare imperative verb (e.g.
-    "Stay within scope.", "Avoid X."). This is a keyword heuristic, not a grammatical mood
-    classifier: a declarative sentence that happens to use a marker word in an unrelated sense would
-    still pass, and a genuinely imperative sentence using a verb outside the curated lead-verb list
-    with no marker word elsewhere would still be rejected. There's no stdlib primitive for "is this
-    an imperative rule, not a fact" -- this catches the clear declarative-fact case a checker found
-    ("The build server is located in the east wing."), not every edge case."""
+    (must/avoid/should/...) anywhere, or opens on a common bare imperative verb (e.g. "Stay within
+    scope.", "Avoid X.", "Always do X.", "Never do Y."). This is a keyword heuristic, not a
+    grammatical mood classifier: a declarative sentence that happens to use a marker word in an
+    unrelated sense would still pass, and a genuinely imperative sentence using a verb outside the
+    curated lead-verb list with no marker word elsewhere would still be rejected. There's no stdlib
+    primitive for "is this an imperative rule, not a fact" -- this catches the clear declarative-fact
+    case a checker found ("The build server is located in the east wing." and the harder adversarial
+    variant "The build server is always located in the east wing." -- see the
+    _IMPERATIVE_MARKERS comment above for why "always"/"never" don't count as anywhere-markers),
+    not every edge case."""
     stripped = body_text.strip()
     if not stripped or '\n\n' in stripped:
         return False
@@ -1603,6 +1613,67 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Finding A regression (round 3): a checker's adversarial repro -- "always"/"never" appearing
+    # BARE and MID-SENTENCE in an otherwise-declarative sentence used to be enough, on their own, to
+    # pass the imperative gate ("The build server is always located in the east wing." was wrongly
+    # accepted, since "always" matched _IMPERATIVE_MARKERS). Also asserts the fix doesn't
+    # overcorrect: a genuine directive that opens on "Always"/"Never" as its own imperative verb
+    # (the legitimate, different case) must still pass.
+    def test_mint_weak_marker_mid_sentence_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The build server is always located in the east wing.\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "a declarative sentence with 'always' merely appearing mid-sentence must still be "
+                "rejected -- 'always'/'never' bare and mid-sentence is not a strong enough rule signal")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+
+            # the symmetric "never" case must also be rejected.
+            draft_never = os.path.join(tmp, 'draft-never.md')
+            with open(draft_never, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'The build server is never located in the east wing.\n'))
+            err_never = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err_never):
+                rc_never = cmd_mint(['--file', draft_never])
+            assert rc_never != 0, "a declarative sentence with 'never' merely appearing mid-sentence must still be rejected"
+
+            # legitimate directives that OPEN on "Always"/"Never" as the imperative verb itself must
+            # still pass -- the fix must not overcorrect into rejecting real rules.
+            draft_always_lead = os.path.join(tmp, 'draft-always-lead.md')
+            with open(draft_always_lead, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Always commit before replying done.\n'))
+            err_lead = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err_lead):
+                rc_lead = cmd_mint(['--file', draft_always_lead])
+            assert rc_lead == 0, f"a genuine 'Always <verb>...' directive must still be accepted:\n{err_lead.getvalue()}"
+
+            draft_never_lead = os.path.join(tmp, 'draft-never-lead.md')
+            with open(draft_never_lead, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'Always do the one thing that must happen.\n',
+                    'Never skip the verification step.\n'))
+            err_never_lead = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err_never_lead):
+                rc_never_lead = cmd_mint(['--file', draft_never_lead])
+            assert rc_never_lead == 0, f"a genuine 'Never <verb>...' directive must still be accepted:\n{err_never_lead.getvalue()}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     def test_mint_unknown_category_rejected():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -1737,6 +1808,29 @@ Always do the one thing that must happen.
                 os.environ['PATH'] = old_path
             assert rc != 0, "a failing `git rev-parse --show-toplevel` must refuse (fail closed), never fail open"
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+
+            # Second sub-case: `git` exits 0 (success) but prints EMPTY stdout -- the OTHER half of
+            # the compound condition `out.returncode != 0 or not out.stdout.strip()`. A mutation that
+            # drops just this half (leaving only the returncode check) would still pass the sub-case
+            # above (nonzero exit) but silently fail OPEN here, since returncode == 0.
+            fakebin_empty = os.path.join(tmp, 'fakebin-empty-stdout')
+            os.makedirs(fakebin_empty)
+            fake_git_empty = os.path.join(fakebin_empty, 'git')
+            with open(fake_git_empty, 'w') as f:
+                f.write('#!/bin/sh\nexit 0\n')
+            os.chmod(fake_git_empty, 0o755)
+
+            os.environ['PATH'] = fakebin_empty
+            err2 = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err2):
+                    rc2 = cmd_mint(['--file', draft])
+            finally:
+                os.environ['PATH'] = old_path
+            assert rc2 != 0, (
+                "a `git rev-parse --show-toplevel` that exits 0 with EMPTY stdout must also refuse "
+                "(fail closed), not fail open just because the exit code was 0")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
@@ -1795,6 +1889,7 @@ Always do the one thing that must happen.
     test_mint_evidence_e4_rejected()
     test_mint_multi_sentence_body_rejected()
     test_mint_declarative_body_rejected()
+    test_mint_weak_marker_mid_sentence_rejected()
     test_mint_unknown_category_rejected()
     test_mint_destination_collision_rejected()
     test_mint_primary_checkout_only_refusal()
