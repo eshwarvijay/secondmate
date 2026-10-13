@@ -887,81 +887,174 @@ def _mint_tags_written_as_list(frontmatter_text):
             continue
         value = value.strip()
         if not value:
-            # Multi-line form is a real list only if the next non-blank line is a '- item' dash line.
+            # Multi-line form is a real list only if the subsequent non-blank lines are '- item'
+            # dash lines, and each one's OWN content is itself a well-formed scalar -- not merely
+            # shaped like a dash line. Consumes every consecutive dash line (blank lines in between
+            # are tolerated), stopping at the first non-blank line that isn't a dash line (that's
+            # where this key's block ends, e.g. the next frontmatter key) or at a malformed item.
+            found_item = False
             for later in frontmatter_text.splitlines()[i + 1:]:
                 later_stripped = later.strip()
                 if later_stripped == '':
                     continue
-                return later_stripped.startswith('- ')
-            return False  # 'tags:' with nothing at all after it -- not a list
+                if not later_stripped.startswith('- '):
+                    break  # end of this key's dash-block
+                if not _is_valid_yaml_scalar_entry(later_stripped[2:]):
+                    return False  # a dash line shaped right, but malformed content -- not a list
+                found_item = True
+            return found_item
         return _is_balanced_inline_list(value)  # inline bracketed list form, must be well-formed
     return False  # no 'tags' key found in the raw frontmatter at all
 
 
+# Shared recursive-descent recognizer for a single YAML flow-style value (a quoted scalar, a
+# bracketed flow sequence, or a plain scalar run) -- the one real parsing primitive both the
+# inline '[a, b]' list form and each multi-line '- item' dash line's own content are validated
+# against, rather than two separate hand-rolled checks drifting out of sync with each other (a
+# checker found exactly that: the dash-line check only looked at the '- ' prefix shape and never
+# validated what followed it, so `- [unterminated` sailed through; the inline-list check tracked
+# quotes but accepted ANY backslash escape inside a double-quoted scalar, so `"a\q"` -- not a real
+# YAML escape -- also sailed through). No YAML library dependency, by design -- this repo is
+# stdlib-only (see the top-of-file imports); this is a small, correct recursive-descent parser
+# rather than a byte-counting heuristic, scoped to exactly what a tags value can legally contain.
+_DOUBLE_QUOTE_SIMPLE_ESCAPES = frozenset('0abtnvfre"\\/N_LP ')
+_DOUBLE_QUOTE_HEX_ESCAPE_WIDTHS = {'x': 2, 'u': 4, 'U': 8}
+_HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
+
+
+def _consume_double_quoted_scalar(text, pos):
+    """`text[pos]` is a `"`. Returns the index just past the matching closing `"` if every escape
+    sequence inside is a LEGAL YAML double-quote escape, else None (unterminated, or an illegal
+    escape like `\\q`)."""
+    i = pos + 1
+    n = len(text)
+    while True:
+        if i >= n:
+            return None  # unterminated
+        ch = text[i]
+        if ch == '"':
+            return i + 1
+        if ch == '\\':
+            if i + 1 >= n:
+                return None  # trailing backslash, nothing to escape
+            esc = text[i + 1]
+            if esc in _DOUBLE_QUOTE_SIMPLE_ESCAPES:
+                i += 2
+                continue
+            width = _DOUBLE_QUOTE_HEX_ESCAPE_WIDTHS.get(esc)
+            if width is not None:
+                hex_digits = text[i + 2:i + 2 + width]
+                if len(hex_digits) != width or not all(c in _HEX_DIGITS for c in hex_digits):
+                    return None
+                i += 2 + width
+                continue
+            return None  # not a legal YAML double-quote escape
+        i += 1
+
+
+def _consume_single_quoted_scalar(text, pos):
+    """`text[pos]` is a `'`. YAML single-quoted scalars have no backslash-escaping at all -- a
+    backslash is just ordinary data -- and a doubled `''` is the only way to embed a literal `'`.
+    Returns the index just past the matching closing `'`, or None if unterminated."""
+    i = pos + 1
+    n = len(text)
+    while True:
+        if i >= n:
+            return None  # unterminated
+        if text[i] == "'":
+            if i + 1 < n and text[i + 1] == "'":
+                i += 2  # escaped literal quote
+                continue
+            return i + 1
+        i += 1
+
+
+def _consume_plain_scalar(text, pos):
+    """A plain (unquoted) scalar run: everything up to the next flow-structural character (`,`,
+    `[`, `]`, `{`, `}`) or a quote character, or the end of the string. Returns the index just past
+    the run, or None if nothing non-whitespace was actually consumed (an empty element, e.g. the
+    gap between two commas in `[testing,,mint]`)."""
+    n = len(text)
+    i = pos
+    while i < n and text[i] not in ',[]{}"\'':
+        i += 1
+    if not text[pos:i].strip():
+        return None  # empty element
+    return i
+
+
+def _parse_yaml_flow_scalar(text, pos):
+    """Parse exactly one YAML flow-style value -- a double/single-quoted scalar, a bracketed flow
+    sequence (recursing into this same function for each of ITS elements), or a plain scalar run --
+    starting at `text[pos]`. Returns the index just past the consumed value if well-formed, else
+    None."""
+    if pos >= len(text):
+        return None
+    ch = text[pos]
+    if ch == '"':
+        return _consume_double_quoted_scalar(text, pos)
+    if ch == "'":
+        return _consume_single_quoted_scalar(text, pos)
+    if ch == '[':
+        return _consume_flow_sequence(text, pos)
+    return _consume_plain_scalar(text, pos)
+
+
+def _consume_flow_sequence(text, pos):
+    """`text[pos]` is a `[`. Parses a full bracketed flow sequence -- possibly empty (`[]`/`[ ]`),
+    otherwise one or more comma-separated elements (each itself a `_parse_yaml_flow_scalar`, so
+    nested brackets/quotes are handled correctly), rejecting any empty element (e.g. a double
+    comma) or a missing closing `]`. Returns the index just past the matching `]`, or None."""
+    n = len(text)
+    i = pos + 1
+    while i < n and text[i] in ' \t':
+        i += 1
+    if i < n and text[i] == ']':
+        return i + 1  # '[]' (or '[ ]') -- syntactically valid empty list
+    while True:
+        end = _parse_yaml_flow_scalar(text, i)
+        if end is None:
+            return None
+        i = end
+        while i < n and text[i] in ' \t':
+            i += 1
+        if i >= n:
+            return None  # unterminated -- no closing ']'
+        if text[i] == ',':
+            i += 1
+            while i < n and text[i] in ' \t':
+                i += 1
+            continue
+        if text[i] == ']':
+            return i + 1
+        return None  # unexpected character where ',' or ']' was expected
+
+
 def _is_balanced_inline_list(value):
-    """True if `value` is a well-formed, CLOSED inline YAML flow-sequence of scalars: starts with
-    '[', ends with ']', every top-level (unquoted, unnested) comma-separated element is non-empty
-    after stripping -- rejecting a malformed double-comma like `[testing,,mint]`, which no real
-    YAML parser accepts -- and quoting is tracked so a bracket character INSIDE a quoted scalar
-    (e.g. `["a]"]`, a valid one-item list containing the string `a]`) is treated as data, not
-    structure, rather than miscounted as a real closing bracket (the previous bare bracket-counter
-    did exactly that and wrongly rejected it). Inside a double-quoted scalar, a backslash-escaped
-    quote (`"a\"b"`, standard YAML escape syntax) does not end the string either -- a bare "are we
-    in a quote" tracker would see that escaped `"` as the closing quote and misparse everything
-    after it, wrongly rejecting a valid list; a single-quoted scalar has no backslash-escaping in
-    YAML, so a backslash there stays an ordinary data character. No YAML library dependency, by
-    design -- this repo is stdlib-only (see the top-of-file imports); hand-rolled the same
-    lightweight way parse_frontmatter() already parses for lookup/tag's purposes, but strict rather
-    than lenient."""
+    """True if `value` is a well-formed, CLOSED inline YAML flow-sequence of scalars (see
+    `_consume_flow_sequence`): starts with '[', and the ENTIRE stripped value is consumed as one
+    flow sequence -- rejecting a malformed double-comma like `[testing,,mint]`, an unterminated
+    bracket, or an illegal backslash escape inside a quoted element like `["a\\q"]` (not a real
+    YAML escape)."""
     value = value.strip()
-    if not value.startswith('[') or not value.endswith(']'):
+    if not value.startswith('['):
         return False
-    inner = value[1:-1]
+    end = _consume_flow_sequence(value, 0)
+    return end is not None and end == len(value)
 
-    depth = 0
-    quote_char = None
-    escape_next = False
-    current = []
-    elements = []
-    for ch in inner:
-        if quote_char:
-            current.append(ch)
-            if escape_next:
-                escape_next = False
-            elif quote_char == '"' and ch == '\\':
-                escape_next = True
-            elif ch == quote_char:
-                quote_char = None
-            continue
-        if ch in ('"', "'"):
-            quote_char = ch
-            current.append(ch)
-            continue
-        if ch == '[':
-            depth += 1
-            current.append(ch)
-            continue
-        if ch == ']':
-            depth -= 1
-            if depth < 0:
-                return False  # unmatched closing bracket -- malformed
-            current.append(ch)
-            continue
-        if ch == ',' and depth == 0:
-            elements.append(''.join(current).strip())
-            current = []
-            continue
-        current.append(ch)
 
-    if quote_char is not None:
-        return False  # unterminated quote -- malformed
-    if depth != 0:
-        return False  # unbalanced nested brackets -- malformed
-
-    if inner.strip() == '':
-        return True  # '[]' -- syntactically a valid (empty) list; non-emptiness is checked elsewhere
-    elements.append(''.join(current).strip())
-    return all(e != '' for e in elements)  # rejects an empty element, e.g. the double comma above
+def _is_valid_yaml_scalar_entry(text):
+    """True if `text` (one multi-line tags dash-item's content, right after '- ') is, on its own,
+    exactly one well-formed YAML flow-style value -- a quoted scalar, a bracketed flow sequence, or
+    a plain scalar -- with nothing malformed or left over. Shares `_parse_yaml_flow_scalar` with
+    `_is_balanced_inline_list` so a dash-line's content is held to the same standard as an inline
+    list element, e.g. `- [unterminated` (an unclosed flow sequence as a dash-item's own value) is
+    rejected here exactly like it would be inside `[...]`."""
+    text = text.strip()
+    if not text:
+        return False
+    end = _parse_yaml_flow_scalar(text, 0)
+    return end is not None and end == len(text)
 
 
 def cmd_mint(argv):
@@ -2715,6 +2808,56 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-11 Finding 1 regression: the quote-aware scanner previously accepted ANY backslash
+    # escape inside a double-quoted scalar without checking it's a LEGAL YAML escape --
+    # `tags: ["a\q"]` (`\q` is not a real escape; legal ones are things like `\"`, `\\`, `\n`)
+    # must be rejected, not accepted.
+    def test_mint_illegal_escape_in_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'illegal-escape.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: ["a\\q"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"an inline tags list with an illegal backslash escape inside a double-quoted "
+                f"scalar (`[\"a\\q\"]` -- `\\q` is not a real YAML escape) must be rejected:\n{err.getvalue()}")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'illegal-escape.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-11 Finding 2 regression: the multi-line '- item' dash-block check previously only
+    # verified a subsequent non-blank line's SHAPE (starts with '- '), never its content --
+    # `tags:\n  - testing\n  - [unterminated` (the second item's own value is an unclosed flow
+    # sequence) must be rejected, not accepted.
+    def test_mint_block_list_item_unterminated_bracket_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'block-item-broken.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags:\n  - testing\n  - [unterminated\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                f"a multi-line tags block whose second dash-item's own content is an unterminated "
+                f"flow sequence (`- [unterminated`) must be rejected, not accepted just because the "
+                f"line starts with '- ':\n{err.getvalue()}")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'block-item-broken.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-7 Finding 4 regression: `_primary_checkout_refusal_reason()` called `os.getcwd()` with
     # no error handling -- if the CWD was removed out from under the process, that call raises an
     # unhandled FileNotFoundError traceback instead of mint's documented fail-closed refusal.
@@ -2819,6 +2962,8 @@ Always do the one thing that must happen.
     test_mint_double_comma_tags_rejected()
     test_mint_quoted_bracket_in_tags_accepted()
     test_mint_escaped_quote_in_tags_accepted()
+    test_mint_illegal_escape_in_tags_rejected()
+    test_mint_block_list_item_unterminated_bracket_rejected()
     test_mint_removed_cwd_refused()
     test_mint_positive_path_roundtrip()
 
