@@ -58,25 +58,28 @@ render_prompt() {
 
 # Reads an --output-format stream-json --verbose NDJSON log, prints the LAST line's "result" field
 # whose "type" is "result". Prints nothing (empty) if no such line exists. Malformed/non-JSON lines
-# are skipped silently -- NDJSON streams can interleave non-result events freely.
+# are skipped silently -- NDJSON streams can interleave non-result events freely. Takes a path
+# argument (used by isolated selfcheck tests against a real file), or reads stdin when called with
+# no argument (the real end-to-end path: fed the already-captured claude output directly, so this
+# never re-opens the log artifact's path from scratch after the fact).
 extract_result() {
   python3 -c '
 import json, sys
 last = None
-with open(sys.argv[1]) as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and obj.get("type") == "result" and isinstance(obj.get("result"), str):
-            last = obj["result"]
+f = open(sys.argv[1]) if len(sys.argv) > 1 else sys.stdin
+for line in f:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        continue
+    if isinstance(obj, dict) and obj.get("type") == "result" and isinstance(obj.get("result"), str):
+        last = obj["result"]
 if last is not None:
     sys.stdout.write(last)
-' "$1"
+' "$@"
 }
 
 if [ "${1:-}" = "--selfcheck" ]; then
@@ -125,6 +128,7 @@ if [ "${1:-}" = "--selfcheck" ]; then
   fakebin="$t/fakebin"; mkdir -p "$fakebin"
   cat > "$fakebin/claude" <<'FAKE'
 #!/usr/bin/env bash
+[ -n "${CLAUDE_INVOKED_MARKER:-}" ] && : > "$CLAUDE_INVOKED_MARKER"
 case "${FAKE_CLAUDE_BEHAVIOR:-ok}" in
   crash)
     echo '{"type":"system"}'
@@ -207,6 +211,17 @@ FAKE
   [ "$rc" = 0 ] || { echo "FAIL: --prompt-file run exit ($rc)"; fails=1; }
   grep -q 'CUSTOM TEMPLATE task=pf1 owner=sm-pf1' "$log_dir/sm-pf1.prompt" || { echo "FAIL: --prompt-file override not rendered with substituted placeholders"; fails=1; }
 
+  # 7b) an unreadable --prompt-file must stop with a clear config error BEFORE claude ever launches --
+  #     never silently proceed with an empty/partial prompt and relay a false success tag.
+  unreadable="$t/unreadable.txt"; printf 'should never be read or used\n' > "$unreadable"; chmod 000 "$unreadable"
+  claude_marker="$t/claude_invoked_marker"; rm -f "$claude_marker"
+  log_dir="$t/run7b"; mkdir -p "$log_dir"
+  rc=0; out="$(PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok CLAUDE_INVOKED_MARKER="$claude_marker" "$0" --task-id pfunreadable --mode solo --repo "$repo_dir" --log-dir "$log_dir" --prompt-file "$unreadable" 2>"$t/run7b.err")" || rc=$?
+  chmod 644 "$unreadable"
+  [ "$rc" = 2 ] || { echo "FAIL: unreadable --prompt-file should exit 2 (got $rc)"; fails=1; }
+  grep -qi 'not readable' "$t/run7b.err" || { echo "FAIL: unreadable --prompt-file refusal message missing"; fails=1; }
+  [ -f "$claude_marker" ] && { echo "FAIL: claude was invoked despite an unreadable --prompt-file"; fails=1; }
+
   # 8) symlink refusal: a pre-existing symlink at the .prompt/.log/.result path must be refused, not
   #    followed -- a local attacker pre-creating one must never get the victim file overwritten.
   log_dir="$t/run8"; mkdir -p "$log_dir"
@@ -232,6 +247,40 @@ FAKE
   [ "$rc" = 2 ] || { echo "FAIL: pre-existing symlink at .result path should be refused with exit 2 ($rc)"; fails=1; }
   grep -qi 'symlink' "$t/run10.err" || { echo "FAIL: .result symlink refusal message missing"; fails=1; }
   [ "$(cat "$victim3")" = "SENTINEL3" ] || { echo "FAIL: victim file for .result symlink was overwritten"; fails=1; }
+
+  # 8b) exclusive_open's OWN atomicity, distinct from tests 8-10 above: those only prove "refuses a
+  #     symlink that already existed before the process started" -- a check-then-open implementation
+  #     (`[ -e "$path" ] || : > "$path"`) would ALSO pass that. This races exclusive_open directly
+  #     against a tight toggler for a bounded window, proving there is no separate stat-then-open gap
+  #     at all, not merely a one-shot startup check.
+  race_victim="$t/race_victim"; echo RACE_VICTIM_SENTINEL > "$race_victim"
+  race_target="$t/race_target"
+  (
+    race_end=$((SECONDS + 2))
+    while [ "$SECONDS" -lt "$race_end" ]; do
+      ln -sf "$race_victim" "$race_target" 2>/dev/null
+      rm -f "$race_target" 2>/dev/null
+    done
+  ) &
+  race_togglerpid=$!
+  race_iterations=0
+  race_corrupted=0
+  race_end=$((SECONDS + 2))
+  { while [ "$SECONDS" -lt "$race_end" ]; do
+    if exclusive_open "$race_target"; then
+      printf 'owned-by-selfcheck\n' >&9
+      exec 9>&-
+    fi
+    race_iterations=$((race_iterations + 1))
+    if [ "$(cat "$race_victim")" != "RACE_VICTIM_SENTINEL" ]; then
+      race_corrupted=1
+      break
+    fi
+    rm -f "$race_target" 2>/dev/null
+  done; } 2>/dev/null
+  kill "$race_togglerpid" 2>/dev/null; wait "$race_togglerpid" 2>/dev/null
+  [ "$race_corrupted" = 0 ] || { echo "FAIL: exclusive_open race test -- victim corrupted after $race_iterations iterations (TOCTOU reopened)"; fails=1; }
+  [ "$race_iterations" -gt 20 ] || { echo "FAIL: exclusive_open race test ran suspiciously few iterations ($race_iterations) -- not a meaningful stress test"; fails=1; }
 
   # 9) cross-invocation lock: two concurrent runs for the SAME task-id/log-dir must not cross-
   #    contaminate -- the second one fails fast instead of racing or reading the first one's artifacts.
@@ -334,17 +383,27 @@ else
   template_file="$SCRIPT_DIR/spawn-sub-sup-prompt-${mode}.txt"
 fi
 [ -f "$template_file" ] || { echo "template file not found: $template_file" >&2; exit 2; }
+[ -r "$template_file" ] || { echo "template file not readable: $template_file -- refusing to launch claude with an empty/partial prompt" >&2; exit 2; }
+
+# Render the prompt into a bash variable (never re-read from disk) -- this is the exact string later
+# fed to `claude -p`, so there is no window after this point where an attacker could swap the on-disk
+# .prompt artifact for a symlink to attacker-controlled content and have it silently re-trusted.
+prompt_content="$(render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file")"
 
 rendered_prompt_path="${log_dir}/sm-${task_id}.prompt"
 if ! exclusive_open "$rendered_prompt_path"; then
   echo "SPAWN-SUB-SUP: refusing to write -- a file or symlink already exists at: $rendered_prompt_path" >&2
   exit 2
 fi
-render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file" >&9
+printf '%s' "$prompt_content" >&9
 exec 9>&-
 
 log_file="${log_dir}/sm-${task_id}.log"
 result_file="${log_dir}/sm-${task_id}.result"
+# Open log_file's fd now (before claude ever runs) so an unwritable/pre-existing-symlink log path is
+# refused without wasting a real claude invocation -- but keep the fd open and write to it only AFTER
+# claude's full output is captured below, so the actual persist-to-disk write still goes through this
+# SAME already-open fd, never a second, path-based reopen.
 if ! exclusive_open "$log_file"; then
   echo "SPAWN-SUB-SUP: refusing to write -- a file or symlink already exists at: $log_file" >&2
   exit 2
@@ -355,13 +414,15 @@ fi
 # a nonzero/killed exit must be caught here, not lost by falling through to the lines below.
 # `command claude` (not a bare `claude` call) bypasses shell function lookup -- an ambient/exported
 # `claude` function can otherwise shadow the real binary (or, in --selfcheck, the synthetic stub).
-# Output goes through the fd already opened exclusively above (>&9), never a second path-based open --
-# so a crashed/killed subprocess can never be confused with the exclusive-open check having failed.
-if ( cd "$repo" && command claude -p "$(cat "$rendered_prompt_path")" --dangerously-skip-permissions --output-format stream-json --verbose ) >&9 2>&1; then
+# Captured into a variable (not redirected to a file by path) so the result-tag extraction below can
+# consume it directly, with no re-open of the log artifact's path after the fact.
+if claude_output="$( ( cd "$repo" && command claude -p "$prompt_content" --dangerously-skip-permissions --output-format stream-json --verbose ) 2>&1 )"; then
   claude_rc=0
 else
   claude_rc=$?
 fi
+
+printf '%s' "$claude_output" >&9
 exec 9>&-
 
 if [ "$claude_rc" -ne 0 ]; then
@@ -369,11 +430,16 @@ if [ "$claude_rc" -ne 0 ]; then
   exit 5
 fi
 
+# Extract directly from the in-memory claude_output (stdin mode), never by re-opening log_file by
+# path -- the previous round's exclusive_open only guaranteed a race-free CREATE; a later re-open by
+# name for the actual read would have thrown that guarantee away just as surely as skipping it.
+extracted="$(printf '%s' "$claude_output" | extract_result)"
+
 if ! exclusive_open "$result_file"; then
   echo "SPAWN-SUB-SUP: refusing to write -- a file or symlink already exists at: $result_file" >&2
   exit 2
 fi
-extract_result "$log_file" >&9
+printf '%s' "$extracted" >&9
 exec 9>&-
 
 if dispatch_out="$("$SCRIPT_DIR/dispatch-report.py" "$result_file")"; then
