@@ -98,28 +98,40 @@ def _curator_lesson_id(filepath, lessons_dir):
 def _read_ledger_rows(ledger_path):
     """Read the injection ledger (the caller resolves the path with the same _lesson_ledger_path()
     anchoring lesson-lookup.py writes through). Returns one list-of-strings per WELL-FORMED row
-    (in file order). A missing file is the normal fresh state -> zero rows, no warning. A path
-    that EXISTS but cannot be read as the expected file (a directory, a permission error, ...)
-    RE-RAISES the OSError: the caller maps it to the single documented fatal exit code -- an
-    unreadable ledger must never silently masquerade as an empty one. A corrupt row (unparseable
-    JSON, not an object, or a non-list lesson_ids) is excluded from ALL counts with a stderr
-    warning -- a corrupt row must never drive a verdict in either direction. Ledger content is
-    only ever compared as strings against real lesson ids; no filesystem path is ever constructed
-    from it."""
+    (in file order). A path with NO filesystem entry at all is the normal fresh state -> zero
+    rows, no warning, exit 0. A filesystem entry that EXISTS at the path but cannot be read as
+    the expected file (a regular file we can't open, a directory, a permission error, or a
+    DANGLING SYMLINK -- the symlink entry itself is on disk, its target is not) RE-RAISES the
+    OSError: the caller maps it to the single documented fatal exit code -- an unreadable ledger
+    must never silently masquerade as an empty one. A corrupt row (unparseable JSON, not an
+    object, or a non-list lesson_ids) is excluded from ALL counts with a stderr warning -- a
+    corrupt row must never drive a verdict in either direction. Ledger content is only ever
+    compared as strings against real lesson ids; no filesystem path is ever constructed from
+    it."""
     p = pathlib.Path(ledger_path)
     try:
         text = p.read_text(encoding='utf-8', errors='replace')
     except FileNotFoundError:
-        # The ledger simply isn't there yet (never logged, or vanished between listing and read):
-        # the normal fresh state -- zero rows, no warning, exit 0.
+        # Opening raised ENOENT -- but two genuinely different causes share that errno, and
+        # os.path.lexists is the one probe that separates them (it lstats the path entry itself,
+        # without following a symlink):
+        if os.path.lexists(str(p)):
+            # A filesystem entry DOES exist at this path: a DANGLING SYMLINK -- the symlink
+            # itself is on disk, its target is not. The user configured a path that exists,
+            # just broken: an unreadable-ledger failure (fatal), never the fresh state.
+            raise
+        # No filesystem entry at this path at all (never logged, or vanished between listing
+        # and read): the ledger simply isn't there yet -- the normal fresh state: zero rows,
+        # no warning, exit 0.
         return []
     except OSError:
-        # The path EXISTS but cannot be read as the expected file (a directory, a permission
-        # error, ...): a genuine inability to produce a trustworthy report, NOT a fresh state.
-        # Silently treating it as empty would make EVERY lesson read zero injections at once and
-        # could cascade false retire-candidates across the whole report with no exit-status
-        # signal. Re-raise: the caller's OSError handler maps it to the single documented fatal
-        # nonzero exit code -- the same one as the missing-lessons-dir case.
+        # The path exists but cannot be read as the expected file (a directory, a permission
+        # error on the file or anywhere along its path, ...): a genuine inability to produce
+        # a trustworthy report, NOT a fresh state. Silently treating it as empty would make
+        # EVERY lesson read zero injections at once and could cascade false retire-candidates
+        # across the whole report with no exit-status signal. Re-raise: the caller's OSError
+        # handler maps it to the single documented fatal nonzero exit code -- the same one as
+        # the missing-lessons-dir case.
         raise
     rows = []
     for lineno, line in enumerate(text.splitlines(), 1):
@@ -167,14 +179,22 @@ def _explain_skipped(md_path):
     return "skipped by load_lessons but parses on re-read"
 
 
+def _walk_onerror(err):
+    """os.walk error hook: re-raise any enumeration failure instead of os.walk's default silent
+    prune of the failed directory -- see collect_curation() for why an incomplete lessons-tree
+    walk must be fatal rather than a silently partial report."""
+    raise err
+
+
 def collect_curation(lessons_dir, ledger_path):
     """The one real data pass: --report's own line-building and the selfcheck's assertions both go
     through this function, so the selfcheck can never be a reimplementation of the logic under
     test. Returns a list of entries (sorted by lesson id), one per *.md file under lessons_dir --
     including files whose frontmatter is unparseable (counted 0/0, with a stderr warning).
     Emits stderr warnings for unparseable frontmatter and orphaned ledger references. Raises
-    OSError if the lessons directory can't be listed or the ledger path exists but can't be read
-    as a file (callers map both to EXIT_CANNOT_RUN)."""
+    OSError if the lessons directory can't be listed or fully enumerated (including an
+    untraversable subdirectory) or the ledger path has a filesystem entry but can't be read as a
+    file (including a dangling symlink) (callers map all of these to EXIT_CANNOT_RUN)."""
     lessons_path = pathlib.Path(lessons_dir)
     if not lessons_path.is_dir():
         raise FileNotFoundError(f"lessons directory not found: {lessons_dir}")
@@ -185,7 +205,22 @@ def collect_curation(lessons_dir, ledger_path):
     # this is_file() filter is the report-side guarantee, at the one place this file discovers
     # lesson entries (every other path -- the loader, the diagnoser -- only ever sees entries
     # that came through here or already skip unreadable ones themselves).
-    md_files = sorted(p for p in lessons_path.rglob('*.md') if p.is_file())
+    #
+    # The enumeration itself is os.walk with a re-raising onerror hook, NOT pathlib's rglob:
+    # rglob SWALLOWS traversal failures, so a subdirectory that cannot be entered (PermissionError,
+    # ...) would otherwise silently vanish from the report -- missing lessons, exit 0, no warning
+    # at all. "One line per lesson" cannot be trusted if the walk could not even see every lesson,
+    # so a failure to fully enumerate the lessons tree is a genuine inability to run: the raised
+    # OSError flows to the caller's EXIT_CANNOT_RUN mapping (same fatal path as an unlistable
+    # lessons directory).
+    md_files = []
+    for dirpath, _dirnames, filenames in os.walk(str(lessons_path), onerror=_walk_onerror):
+        for name in filenames:
+            if name.endswith('.md'):
+                candidate = pathlib.Path(dirpath) / name
+                if candidate.is_file():
+                    md_files.append(candidate)
+    md_files.sort()
 
     # The one parse pass: the real loader. It warns on (and skips) unparseable/unreadable files;
     # the loop below detects those via its own listing and adds this tool's precise warning.
@@ -306,9 +341,10 @@ ledger rows (see above). stdout carries only the report.
 Exit status: 0 for every successful run of --report / --selfcheck / --help, whatever verdicts
 were computed. {EXIT_CANNOT_RUN} is the single documented nonzero exit code, used strictly for
 "could not run at all": unrecognized arguments, bin/lesson-lookup.py cannot be imported, the
-lessons directory does not exist / cannot be listed, or the ledger path exists but cannot be
-read as a file (a directory, a permission error, ...) -- a simply-MISSING ledger is the normal
-fresh state and stays exit 0, per above.
+lessons directory does not exist / cannot be listed / cannot be fully enumerated (e.g. an
+untraversable subdirectory), or the ledger path has a filesystem entry but cannot be read as a
+file (a directory, a permission error, a dangling symlink, ...) -- a path with NO filesystem
+entry at all is the normal fresh state and stays exit 0, per above.
 """
 
 
@@ -614,6 +650,59 @@ def selfcheck():
         assert 'FATAL' in err.getvalue(), (
             f"the nonzero exit must come from the documented fatal path:\n{err.getvalue()}")
         assert out.getvalue() == '', "no report may print when the ledger is unreadable"
+
+        # --- Scenario J: a DANGLING SYMLINK at the configured ledger path is an existing
+        #     filesystem entry pointing at a nonexistent target -- NOT the normal fresh state
+        #     (Scenario G's genuinely-absent ledger, lexists False, must stay exit 0). Opening
+        #     it raises the same FileNotFoundError as a truly missing path, so os.path.lexists
+        #     is what must disambiguate: entry exists + read failed -> the fatal unreadable-
+        #     ledger path, never the silent zero-injections path.
+        lessons, ledger = _scenario()
+        _lesson(lessons, 'real/lesson', helpful=1, harmful=0)
+        dangling = pathlib.Path(lessons) / 'dangling-ledger.jsonl'
+        os.symlink(str(pathlib.Path(lessons) / 'no-such-target.jsonl'), str(dangling))
+        assert os.path.lexists(str(dangling)), "fixture setup: the dangling symlink entry must exist"
+        os.environ['SM_LESSON_LEDGER'] = str(dangling)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                main(['--report'])
+                assert False, "--report with a dangling-symlink ledger path must not succeed"
+            except SystemExit as e:
+                assert e.code == EXIT_CANNOT_RUN, (
+                    f"a dangling-symlink ledger path must exit the documented code "
+                    f"{EXIT_CANNOT_RUN}, got {e.code!r}")
+        assert 'FATAL' in err.getvalue(), (
+            f"the nonzero exit must come from the documented fatal path:\n{err.getvalue()}")
+        assert out.getvalue() == '', "no report may print when the ledger path is a dangling symlink"
+
+        # --- Scenario K: a lessons subdirectory that cannot be traversed (here: mode 000) must
+        #     be fatal, not silently omitted: pathlib's rglob swallows traversal errors, so the
+        #     pre-fix behavior was a silently incomplete report -- the lesson inside the blocked
+        #     directory missing, exit 0, no warning at all. A report that cannot even see every
+        #     lesson is not trustworthy, so the real --report entry point must take the single
+        #     documented fatal exit code.
+        lessons, ledger = _scenario()
+        _lesson(lessons, 'real/lesson', helpful=1, harmful=0)
+        _lesson(lessons, 'locked/secret')  # written while the dir is still traversable
+        locked_dir = pathlib.Path(lessons) / 'locked'
+        try:
+            os.chmod(str(locked_dir), 0o000)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                try:
+                    main(['--report'])
+                    assert False, "--report with an untraversable lessons subdirectory must not succeed"
+                except SystemExit as e:
+                    assert e.code == EXIT_CANNOT_RUN, (
+                        f"an untraversable lessons subdirectory must exit the documented code "
+                        f"{EXIT_CANNOT_RUN}, got {e.code!r}")
+            assert 'FATAL' in err.getvalue(), (
+                f"the nonzero exit must come from the documented fatal path:\n{err.getvalue()}")
+            assert out.getvalue() == '', \
+                "no report may print when the lessons tree cannot be fully enumerated"
+        finally:
+            os.chmod(str(locked_dir), 0o700)  # restore so the temp-dir cleanup can remove it
 
         print("ok")
         return 0
