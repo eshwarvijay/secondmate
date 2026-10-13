@@ -590,10 +590,44 @@ _MINT_HELP_BODY = (
 )
 
 
-# A linked worktree's gitdir-pointer file always points at a path containing this component (git
-# creates it at <repo>/.git/worktrees/<name>) -- the filesystem-only signal checked below, no `git`
-# subprocess call needed at all.
-_WORKTREE_GITDIR_MARKER = '/worktrees/'
+# Git itself writes a file named `commondir` INSIDE a linked worktree's PRIVATE gitdir (at
+# <main-repo>/.git/worktrees/<name>/commondir, containing a relative path back to the shared/common
+# gitdir) -- and ONLY there. A primary checkout's own gitdir never has this file, whether it's the
+# standard `.git` directory or an external one from `git init --separate-git-dir=<dir>`. This is
+# the real, naming-independent structural signal for "is this gitdir a linked worktree's private
+# gitdir": unlike pattern-matching the gitdir-pointer's path TEXT for a '/worktrees/' substring
+# (fooled in BOTH directions -- dodged by routing the pointer through a symlink/alias whose own
+# path text contains no such substring, or misfired on an unrelated external gitdir that happens to
+# live under a directory literally named "worktrees" for other reasons), this inspects the actual
+# resolved target directory's own contents, which only git itself ever writes and only for a linked
+# worktree's private gitdir. No `git` subprocess call needed -- just a filesystem existence check.
+_WORKTREE_COMMONDIR_FILENAME = 'commondir'
+
+
+def _resolve_gitdir_target(gitdir_target, pointer_path):
+    """Resolve a `gitdir: <path>` pointer's target to an absolute, symlink-RESOLVED real path.
+    `pointer_path` is the `.git` file that contained the pointer -- a relative target is resolved
+    relative to ITS parent directory, the same way git itself resolves gitdir pointers. Following
+    symlinks here (via `.resolve()`) is what makes this immune to a pointer rewritten to go through
+    a symlink/alias: the real worktree-private gitdir underneath is still reached, and the
+    structural `commondir` signal checked against the real resolved directory, not the alias path."""
+    target = pathlib.Path(gitdir_target)
+    if not target.is_absolute():
+        target = pointer_path.parent / target
+    return target.resolve()
+
+
+def _is_worktree_private_gitdir(resolved_target):
+    """True if `resolved_target` (already symlink-resolved) is a linked worktree's PRIVATE gitdir --
+    detected via the structural `commondir` file git itself writes there (see
+    `_WORKTREE_COMMONDIR_FILENAME`'s comment), never present in a primary checkout's own gitdir.
+    Fails CLOSED (returns True, the safer "treat as a worktree, refuse" assumption) if the
+    filesystem check itself can't be made cleanly due to an OS error -- never silently treats an
+    unreadable/ambiguous target as safe to allow."""
+    try:
+        return (resolved_target / _WORKTREE_COMMONDIR_FILENAME).is_file()
+    except OSError:
+        return True
 
 
 def _find_dotgit_entries(start_dir):
@@ -631,17 +665,21 @@ def _primary_checkout_refusal_reason():
 
     Walks the FULL ancestor chain from the real CWD (`os.getcwd()`, never influenced by PATH or any
     executable) via `_find_dotgit_entries()`, not just the nearest `.git`: if ANY ancestor's `.git`
-    is a file whose `gitdir: <path>` line points under `_WORKTREE_GITDIR_MARKER`
-    (`.git/worktrees/<name>`), the CWD is physically contained within that linked worktree's
-    directory tree and this refuses immediately -- regardless of any nearer, nested `.git`
-    (directory or otherwise) found closer to the CWD, which a maker could create (deliberately or by
-    accident) specifically to defeat a nearest-match-only check. Only once no ancestor is a
-    worktree-pointer does the NEAREST `.git` entry decide the outcome: a real directory is a normal
-    primary checkout (allow); a file pointing somewhere else entirely (not under
-    `_WORKTREE_GITDIR_MARKER`) is still a legitimate primary checkout using an external gitdir (e.g.
-    `git init --separate-git-dir=<external>`) and is also allowed -- only a worktree-shaped pointer
-    is ever refused. Fails CLOSED (refuses) on any ambiguity, including a CWD that no longer exists
-    (`os.getcwd()` itself raising) -- never fails open."""
+    is a file whose `gitdir: <path>` line RESOLVES (following symlinks, see
+    `_resolve_gitdir_target()`) to a linked worktree's PRIVATE gitdir -- detected structurally via
+    `_is_worktree_private_gitdir()`'s `commondir`-file check, not by pattern-matching the pointer's
+    path text -- the CWD is physically contained within that linked worktree's directory tree and
+    this refuses immediately. This fires regardless of any nearer, nested `.git` (directory or
+    otherwise) found closer to the CWD, which a maker could create (deliberately or by accident)
+    specifically to defeat a nearest-match-only check, AND regardless of the pointer being routed
+    through a symlink/alias whose own path text contains no worktree-shaped substring. Only once no
+    ancestor resolves to a worktree's private gitdir does the NEAREST `.git` entry decide the
+    outcome: a real directory is a normal primary checkout (allow); a file resolving somewhere else
+    entirely (not a worktree's private gitdir) is still a legitimate primary checkout using an
+    external gitdir (e.g. `git init --separate-git-dir=<external>`, even one whose path happens to
+    contain the substring "worktrees" for unrelated reasons) and is also allowed -- only the real
+    structural signal ever triggers a refusal. Fails CLOSED (refuses) on any ambiguity, including a
+    CWD that no longer exists (`os.getcwd()` itself raising) -- never fails open."""
     try:
         cwd = os.getcwd()
     except OSError as e:
@@ -649,29 +687,30 @@ def _primary_checkout_refusal_reason():
 
     nearest_entry = None
     nearest_gitdir_target = None
-    nearest_read_error = None
 
     for git_path in _find_dotgit_entries(cwd):
         gitdir_target = None
-        read_error = None
+        resolved_target = None
         if git_path.is_file():
             try:
                 gitdir_line = git_path.read_text(encoding='utf-8', errors='replace').strip()
                 m = re.match(r'gitdir:\s*(.+)\Z', gitdir_line)
                 gitdir_target = m.group(1).strip() if m else None
+                if gitdir_target:
+                    resolved_target = _resolve_gitdir_target(gitdir_target, git_path)
             except OSError as e:
-                read_error = e
+                return f"mint: could not resolve/read {git_path} ({e}) -- refusing (fail closed)"
 
         if nearest_entry is None:
             nearest_entry = git_path
             nearest_gitdir_target = gitdir_target
-            nearest_read_error = read_error
 
-        if gitdir_target and _WORKTREE_GITDIR_MARKER in gitdir_target.replace('\\', '/'):
-            return (f"mint: refusing -- {git_path} is a file pointing to a linked-worktree gitdir "
-                    f"({gitdir_target}), so the CWD is physically contained within a maker's linked "
-                    f"worktree. mint only runs in the primary checkout, never inside a maker's "
-                    f"linked worktree, however deeply nested the CWD is below it.")
+        if resolved_target is not None and _is_worktree_private_gitdir(resolved_target):
+            return (f"mint: refusing -- {git_path} points (resolved: {resolved_target}) to a "
+                    f"linked worktree's private gitdir -- identified by the 'commondir' file git "
+                    f"itself writes only there -- so the CWD is physically contained within a "
+                    f"maker's linked worktree. mint only runs in the primary checkout, never inside "
+                    f"a maker's linked worktree, however deeply nested or aliased the path to it is.")
 
     if nearest_entry is None:
         return "mint: could not find a .git entry walking up from the CWD -- refusing (fail closed)"
@@ -680,14 +719,13 @@ def _primary_checkout_refusal_reason():
     if not nearest_entry.is_file():
         return (f"mint: refusing -- {nearest_entry} exists but is neither a directory nor a regular "
                 f"file -- ambiguous, refusing (fail closed)")
-    if nearest_read_error is not None:
-        return f"mint: could not read {nearest_entry} ({nearest_read_error}) -- refusing (fail closed)"
     if not nearest_gitdir_target:
         return (f"mint: refusing -- {nearest_entry} is a file but doesn't contain a parseable "
                 f"'gitdir: <path>' line -- ambiguous, refusing (fail closed)")
-    # No ancestor .git anywhere in the chain pointed under _WORKTREE_GITDIR_MARKER (checked in the
-    # loop above), so this nearest file-based .git is a legitimate, supported primary-checkout
-    # layout (e.g. `git init --separate-git-dir=<external>`), not a linked worktree.
+    # No ancestor .git anywhere in the chain resolved to a linked worktree's PRIVATE gitdir (checked
+    # structurally in the loop above), so this nearest file-based .git is a legitimate, supported
+    # primary-checkout layout (e.g. git init --separate-git-dir=<external>), not a linked worktree --
+    # regardless of what its path text happens to contain.
     return None
 
 
@@ -809,21 +847,59 @@ def _mint_tags_written_as_list(frontmatter_text):
 
 
 def _is_balanced_inline_list(value):
-    """True if `value` is a well-formed, CLOSED inline YAML flow-sequence: starts with '[', ends
-    with ']', and brackets are balanced throughout -- not merely `startswith('[')`, which let an
-    unterminated `tags: [testing` (no closing bracket at all) sail through as a checker found."""
+    """True if `value` is a well-formed, CLOSED inline YAML flow-sequence of scalars: starts with
+    '[', ends with ']', every top-level (unquoted, unnested) comma-separated element is non-empty
+    after stripping -- rejecting a malformed double-comma like `[testing,,mint]`, which no real
+    YAML parser accepts -- and quoting is tracked so a bracket character INSIDE a quoted scalar
+    (e.g. `["a]"]`, a valid one-item list containing the string `a]`) is treated as data, not
+    structure, rather than miscounted as a real closing bracket (the previous bare bracket-counter
+    did exactly that and wrongly rejected it). No YAML library dependency, by design -- this repo is
+    stdlib-only (see the top-of-file imports); hand-rolled the same lightweight way
+    parse_frontmatter() already parses for lookup/tag's purposes, but strict rather than lenient."""
     value = value.strip()
     if not value.startswith('[') or not value.endswith(']'):
         return False
+    inner = value[1:-1]
+
     depth = 0
-    for ch in value:
+    quote_char = None
+    current = []
+    elements = []
+    for ch in inner:
+        if quote_char:
+            current.append(ch)
+            if ch == quote_char:
+                quote_char = None
+            continue
+        if ch in ('"', "'"):
+            quote_char = ch
+            current.append(ch)
+            continue
         if ch == '[':
             depth += 1
-        elif ch == ']':
+            current.append(ch)
+            continue
+        if ch == ']':
             depth -= 1
             if depth < 0:
-                return False
-    return depth == 0
+                return False  # unmatched closing bracket -- malformed
+            current.append(ch)
+            continue
+        if ch == ',' and depth == 0:
+            elements.append(''.join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+
+    if quote_char is not None:
+        return False  # unterminated quote -- malformed
+    if depth != 0:
+        return False  # unbalanced nested brackets -- malformed
+
+    if inner.strip() == '':
+        return True  # '[]' -- syntactically a valid (empty) list; non-emptiness is checked elsewhere
+    elements.append(''.join(current).strip())
+    return all(e != '' for e in elements)  # rejects an empty element, e.g. the double comma above
 
 
 def cmd_mint(argv):
@@ -2305,6 +2381,90 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-8 Finding 1 regression: a real linked worktree whose `.git` pointer file is rewritten
+    # to point through a SYMLINK/alias whose own path text contains no '/worktrees/' substring, but
+    # which RESOLVES to the real `<repo>/.git/worktrees/<name>` private gitdir, must still be
+    # refused -- the structural `commondir`-file check (after following the symlink) catches this
+    # where a path-text substring match would not.
+    def test_mint_symlink_aliased_worktree_pointer_refused():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            wt = os.path.join(tmp, 'wt-alias')
+            subprocess.run(['git', '-C', repo, 'worktree', 'add', '-q', '-b', 'alias-feat', wt, 'main'], check=True)
+
+            real_private_gitdir = pathlib.Path(repo) / '.git' / 'worktrees' / 'wt-alias'
+            assert real_private_gitdir.is_dir(), (
+                "expected git to have created the worktree's private gitdir at the usual location")
+            alias = pathlib.Path(tmp) / 'opaque-alias-no-worktree-substring'
+            alias.symlink_to(real_private_gitdir, target_is_directory=True)
+            assert '/worktrees/' not in str(alias), "the alias path itself must not contain the substring this test is bypassing"
+
+            # Rewrite the worktree's .git pointer to go through the alias instead of the real path.
+            (pathlib.Path(wt) / '.git').write_text(f'gitdir: {alias}\n')
+
+            draft = os.path.join(tmp, 'alias-draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(wt), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "a worktree .git pointer routed through a symlink/alias whose path text contains no "
+                "'/worktrees/' substring must still be refused -- the structural commondir check "
+                "must follow the symlink to the real private gitdir, not trust the alias text")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'alias-draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 2 regression: a genuine `git init --separate-git-dir <dir>` primary checkout
+    # must be ALLOWED even when the chosen external gitdir path happens to contain the literal
+    # substring '/worktrees/' for unrelated naming reasons -- the structural commondir check (which
+    # that external gitdir does NOT have) correctly distinguishes it from an actual linked worktree,
+    # where a path-text substring match would wrongly refuse it.
+    def test_mint_separate_git_dir_named_worktrees_allowed():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            external_gitdir = os.path.join(tmp, 'worktrees', 'external.git')
+            os.makedirs(os.path.join(tmp, 'worktrees'))
+            repo = os.path.join(tmp, 'repo')
+            subprocess.run(
+                ['git', 'init', '-q', '-b', 'main', '--separate-git-dir', external_gitdir, repo],
+                check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.email', 'a@a'], check=True)
+            subprocess.run(['git', '-C', repo, 'config', 'user.name', 'a'], check=True)
+            with open(os.path.join(repo, 'f'), 'w') as f:
+                f.write('x')
+            subprocess.run(['git', '-C', repo, 'add', '-A'], check=True)
+            subprocess.run(['git', '-C', repo, 'commit', '-q', '-m', 'init'], check=True)
+
+            assert '/worktrees/' in str(pathlib.Path(external_gitdir)), (
+                "the external gitdir path must contain the substring this test is proving doesn't matter")
+            assert not (pathlib.Path(external_gitdir) / 'commondir').exists(), (
+                "a --separate-git-dir external gitdir should NOT have a commondir file -- if this "
+                "fails, the fixture isn't exercising the layout this test is about")
+
+            lessons_dir = os.path.join(tmp, 'lessons')
+            os.makedirs(os.path.join(lessons_dir, 'testing'))
+            draft = os.path.join(tmp, 'draft.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a --separate-git-dir primary checkout must be allowed even when its external "
+                f"gitdir path contains '/worktrees/' for unrelated reasons:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'draft.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
     # Round-7 Finding 3 regression: `_mint_tags_written_as_list`'s inline-list branch previously
     # only checked `value.startswith('[')`, so an unterminated flow sequence (`tags: [testing`, no
     # closing bracket at all) passed and installed. Must actually validate the list is closed.
@@ -2324,6 +2484,52 @@ Always do the one thing that must happen.
                 "be rejected, not accepted as a well-formed list")
             assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
             assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'broken-list.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 3 regression: a bare bracket-COUNTING check doesn't understand malformed
+    # elements -- `tags: [testing,,mint]` (an empty element between two commas) is not valid YAML
+    # (no real YAML parser accepts it), but the old counter only cared that brackets balanced.
+    def test_mint_double_comma_tags_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'double-comma.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [testing,,mint]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc != 0, (
+                "an inline tags list with an empty element from a double comma (`[testing,,mint]`) "
+                "must be rejected -- it's not valid YAML")
+            assert 'list' in err.getvalue().lower(), f"expected a tags-must-be-a-list error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'double-comma.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
+    # Round-8 Finding 4 regression: a bare bracket-COUNTING check doesn't understand quoting --
+    # `tags: ["a]"]` is valid YAML (a one-item list containing the quoted string `a]`), but the old
+    # counter saw the `]` inside the quotes as a structural closing bracket and miscounted,
+    # wrongly rejecting a legitimate list.
+    def test_mint_quoted_bracket_in_tags_accepted():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            draft = os.path.join(tmp, 'quoted-bracket.md')
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: ["a]"]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft])
+            assert rc == 0, (
+                f"a valid YAML list containing a quoted string with a bracket character inside the "
+                f"quotes (`[\"a]\"]`) must be accepted, not rejected on a miscounted bracket:\n{err.getvalue()}")
+            assert os.path.exists(os.path.join(lessons_dir, 'testing', 'quoted-bracket.md'))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
@@ -2424,7 +2630,11 @@ Always do the one thing that must happen.
     test_mint_primary_checkout_check_is_git_independent()
     test_mint_separate_git_dir_primary_allowed()
     test_mint_nested_dotgit_decoy_in_worktree_refused()
+    test_mint_symlink_aliased_worktree_pointer_refused()
+    test_mint_separate_git_dir_named_worktrees_allowed()
     test_mint_unterminated_bracket_tags_rejected()
+    test_mint_double_comma_tags_rejected()
+    test_mint_quoted_bracket_in_tags_accepted()
     test_mint_removed_cwd_refused()
     test_mint_positive_path_roundtrip()
 
