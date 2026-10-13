@@ -1020,22 +1020,28 @@ def _consume_single_quoted_scalar(text, pos):
         i += 1
 
 
+_YAML_FLOW_STOP_CHARS = ',[]{}"\'#'
+
+
 def _consume_plain_scalar(text, pos):
     """A plain (unquoted) scalar run: everything up to the next flow-structural character (`,`,
     `[`, `]`, `{`, `}`), a quote character, a `#` (mint's tags grammar does not support YAML
     comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), a
-    `:` that marks a YAML mapping-key (one followed by whitespace or by the end of the text -- real
-    YAML treats `name: value` this way even bare inside a flow sequence, e.g. `[name: value]`
-    parses as a one-key mapping element, not a flat string; a tag is a flat scalar, so this is
-    simply invalid here, not a mapping to recurse into), or the end of the string. Returns the
-    index just past the run, or None if nothing non-whitespace was actually consumed (an empty
-    element, e.g. the gap between two commas in `[testing,,mint]`, or a `[`/`{` immediately where a
-    flat scalar was expected -- nesting is not part of this grammar, so a structural-open character
-    here is simply invalid, not a sequence to recurse into)."""
+    `:` that marks a YAML mapping-key (one followed by whitespace, by the end of the text, or by one
+    of those same flow-structural characters -- real YAML treats `name:` this way even bare inside a
+    flow sequence, e.g. both `[name: value]` and `[name:]` parse as a one-key mapping element, not a
+    flat string; a tag is a flat scalar, so this is simply invalid here, not a mapping to recurse
+    into), or the end of the string. Returns the index just past the run, or None if nothing
+    non-whitespace was actually consumed (an empty element, e.g. the gap between two commas in
+    `[testing,,mint]`, or a `[`/`{` immediately where a flat scalar was expected -- nesting is not
+    part of this grammar, so a structural-open character here is simply invalid, not a sequence to
+    recurse into)."""
     n = len(text)
     i = pos
-    while i < n and text[i] not in ',[]{}"\'#':
-        if text[i] == ':' and (i + 1 == n or text[i + 1] in ' \t'):
+    while i < n and text[i] not in _YAML_FLOW_STOP_CHARS:
+        if text[i] == ':' and (
+            i + 1 == n or text[i + 1] in ' \t' or text[i + 1] in _YAML_FLOW_STOP_CHARS
+        ):
             break  # YAML mapping-key indicator -- tags are flat scalars, not mappings
         i += 1
     if not text[pos:i].strip():
@@ -2045,6 +2051,20 @@ Always do the one thing that must happen.
                 assert 'primary checkout' in help_text or 'linked' in help_text, (
                     f"help text must document mint's primary-checkout-only, worktree-refusing nature:\n{out.getvalue()}")
                 assert '--file' in help_text, f"help text must document --file:\n{out.getvalue()}"
+                # Round-14 Finding 2 regression: these four assertions pin the tags-grammar
+                # paragraph added in _MINT_HELP_BODY -- a prior version of this test only checked
+                # for '--file'/'primary checkout', which still passed even with the whole tags-
+                # grammar paragraph removed. Each phrase below is load-bearing text from that
+                # paragraph: removing any one of flat-list-requirement, no-nesting, no-comments, or
+                # no-control-characters must fail this test.
+                assert 'flat list of string scalars' in help_text, (
+                    f"help text must document that `tags` is a flat list of string scalars:\n{out.getvalue()}")
+                assert 'no nesting' in help_text, (
+                    f"help text must document that tags may not be nested:\n{out.getvalue()}")
+                assert 'no comments' in help_text, (
+                    f"help text must document that the tags grammar has no comment support:\n{out.getvalue()}")
+                assert 'no raw control characters' in help_text, (
+                    f"help text must document that raw control characters are disallowed in tags:\n{out.getvalue()}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3114,6 +3134,42 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-14 Finding 1 regression: a colon immediately followed by a structural character (`]`
+    # or `,`), not whitespace or end-of-text, is ALSO a YAML mapping-key indicator with an implicit
+    # null value (`name:` inside `[name:]` means a one-key mapping `{name: null}`, not the string
+    # "name:") -- round-13's fix only covered colon-followed-by-whitespace-or-end, missing this case.
+    def test_mint_implicit_null_mapping_tag_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_bracket = os.path.join(tmp, 'implicit-null-bracket.md')
+            with open(draft_bracket, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [name:]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_bracket])
+            assert rc != 0, (
+                f"'[name:]' is a one-key mapping with an implicit null value, not a flat string "
+                f"-- a colon right before the closing ']' must be rejected:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'implicit-null-bracket.md'))
+
+            draft_comma = os.path.join(tmp, 'implicit-null-comma.md')
+            with open(draft_comma, 'w') as f:
+                f.write(_VALID_DRAFT.replace(
+                    'tags:\n  - testing\n  - mint\n', 'tags: [name:, mint]\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_comma])
+            assert rc2 != 0, (
+                f"a colon right before a ',' element separator is the same implicit-null mapping "
+                f"shorthand and must be rejected too:\n{err2.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'implicit-null-comma.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-13 Finding 2 regression: a comment line directly after otherwise-valid block-list
     # items must be rejected outright, not silently treated as an unremarkable block boundary (the
     # way a legitimate next frontmatter key would be).
@@ -3275,6 +3331,7 @@ Always do the one thing that must happen.
     test_mint_unquoted_hash_in_tags_rejected()
     test_mint_raw_control_byte_in_tags_rejected()
     test_mint_mapping_tag_rejected_both_forms()
+    test_mint_implicit_null_mapping_tag_rejected()
     test_mint_comment_after_block_items_rejected()
     test_mint_duplicate_tags_key_uses_last_declaration()
     test_mint_removed_cwd_refused()
