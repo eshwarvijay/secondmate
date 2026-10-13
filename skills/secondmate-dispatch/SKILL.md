@@ -135,24 +135,39 @@ Every spawned sub-supervisor leaves exactly three artifacts under `.secondmate/d
 The sub-supervisor claims its task-id inside its own fresh process (`bin/claim-ledger.py claim
 --task-id <id> --owner sm-<id>`), which prints `token=<hex>` to that process's own stdout — but the
 external dispatcher never sees that process's live stdout, only the extracted `.final.txt`. So
-every sub-supervisor's prompt must instruct it to also emit a dedicated line in its final output:
+every sub-supervisor's prompt must require it to emit **exactly one** dedicated line in its final
+output:
 ```
 SM_CLAIM_TOKEN:<the hex token claim-ledger.py printed>
 ```
 This is a **separate** line from the completion tag — `dispatch-report.py`'s own tag regex only
 recognizes `SM_DONE_MERGED` / `SM_REFUSED` / `SM_STUCK_NEED_HUMAN` / `SM_READY_UNMERGED` and does
-not look for `SM_CLAIM_TOKEN:` at all. The dispatcher extracts it itself, taking the **last**
-matching line, never the first:
+not look for `SM_CLAIM_TOKEN:` at all, and critically, `SM_CLAIM_TOKEN:` carries no "must be the
+literal final line" requirement the way the completion tag does — it can legitimately appear
+anywhere in the final text. That means picking `head -1` or `tail -1` here is **guessing, not
+protocol enforcement**: `dispatch-report.py`'s own "last line wins" rule for ITS tags works only
+because that protocol *requires* the real tag to be the literal final output line, a guarantee
+`SM_CLAIM_TOKEN:` was never given. If the sub-supervisor's final text happens to contain two
+syntactically valid `SM_CLAIM_TOKEN:`-shaped lines (e.g. the real one plus an unrelated-but-
+valid-looking echoed example), blindly taking either the first or the last can silently grab the
+WRONG one — and releasing the claim with a wrong token fails, leaving a successfully merged
+task's claim stuck open forever with no further signal that anything went wrong.
+
+So the dispatcher does not guess between head/tail at all. It extracts **every** `^SM_CLAIM_TOKEN:`
+line from `.final.txt`:
 ```bash
-token=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | tail -1 | cut -d: -f2-)
+tokens=$(grep '^SM_CLAIM_TOKEN:' ".secondmate/dispatch/${task_id}.final.txt" | cut -d: -f2-)
+n=$(printf '%s\n' "$tokens" | grep -c .)
 ```
-`tail -1`, not `head -1`: `bin/dispatch-report.py`'s own docstring documents this exact precedent
-for its own tags — if the sub-supervisor's final text happens to echo back an example or
-instruction containing an `SM_CLAIM_TOKEN:`-shaped line before the real one, `head -1` would grab
-the fake one and the real claim's token would never be recoverable for release. `dispatch-report.py`
-solves this for its own tags by taking the LAST matching line (confirmed by reading its docstring:
-"the LAST one wins -- the same 'last block wins' precedent as verdict.py's own fenced-JSON
-handling"); the claim-token extraction here follows the identical rule, for the identical reason.
+- **Exactly one match** — use it. This is the well-behaved case.
+- **Zero matches, or more than one** — a protocol violation for this task-id. Do NOT guess which
+  one (if any) is real. Treat it exactly like a stuck task: escalate to the human verbatim (which
+  task-id, and whether zero or N>1 lines were found), the same "don't guess when ambiguous"
+  posture `dispatch-report.py` itself takes for a missing completion tag (its own exit 3,
+  `malformed`). This is the safety net, not the primary mechanism — the primary mechanism is the
+  prompt-contract requirement above: a well-behaved sub-supervisor emitting exactly one
+  `SM_CLAIM_TOKEN:` line never triggers this path in the first place.
+
 The dispatcher needs this token later for `bin/claim-ledger.py release` at merge/teardown time
 (section 7) — without it, a claim opened inside a sub-supervisor's own disposable process can never
 be released from outside that process.
@@ -271,12 +286,28 @@ which task-ids belong to the batch in the first place.
 
 ## 6. One consolidated hold
 
-Unchanged in shape, same as `skills/secondmate/SKILL.md`'s batch dispatch step (g)–(h): write a JSON
-entries file, one object per ready task-id —
+Same shape as `skills/secondmate/SKILL.md`'s batch dispatch step (g)–(h): write a JSON entries
+file, one object per ready task-id —
 ```json
 [{"task_id": "...", "checked_sha": "...", "checker_verdict_path": "..."}, ...]
 ```
-— then:
+
+**Restart-safe: check for an already-open hold before opening a new one.** If the dispatcher
+crashes after opening this batch's hold but before a human answers it, a naively-restarted
+dispatcher that just re-ran the recipe below would call `hold.py hold` again and open a SECOND,
+duplicate hold for the same batch (confirmed live: running the identical `hold.py hold
+--entries-file ...` call twice in a row produced two distinct open hold ids, both still open).
+So, before opening a hold, check whether one already exists for this batch:
+```bash
+existing_id=$(bin/hold.py open | grep -F "(<batch-label>)" | head -1 | sed -E 's/^\[([^]]+)\].*/\1/')
+```
+`hold.py open`'s own output format is `[<id>] (<task>) <question>` per open hold (confirmed by
+reading its `open` command source directly, and by running it live: it printed exactly
+`[dcfa5ec7] (batch-abc123) merge which of: t1?`), so matching on `(<batch-label>)` finds any open
+hold whose `task` field is this batch's own `--task` string.
+- **A matching open hold is found** — reuse its id (`$existing_id`); do NOT call `hold.py hold`
+  again. Just keep waiting for a human to answer that existing hold.
+- **No matching open hold is found** — only then open a new one:
 ```bash
 bin/hold.py hold --task "<batch-label>" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
   --entries-file <that JSON file>
@@ -316,11 +347,24 @@ bin/merge-sequencer.sh --repo <repo> --worktree <worktree> --branch "sm/<task-id
 ```
 **Only on exit 0** does the dispatcher run the follow-on cleanup — never unconditionally:
 ```bash
-herdr worktree remove --workspace <workspace-id>
+if command -v herdr >/dev/null 2>&1; then
+  herdr worktree remove --workspace <workspace-id>
+else
+  git -C <repo> worktree remove <worktree>
+fi
 git branch -d "sm/<task-id>"
 bin/claim-ledger.py release --task-id <task-id> --owner "sm-<task-id>" --token <token from section 3>
 bin/teardown-check.sh --task-id <task-id>
 ```
+**Guard `herdr worktree remove` the same way section 4 already guards `pane-reaper.py`:** this
+dispatcher's own Scope section only requires "terminal access + a scheduler" — herdr is optional,
+not a hard dependency. Running `herdr worktree remove` with no `herdr` binary on `PATH` fails with
+`command not found` and exit 127 (confirmed live), leaving the worktree behind with no further
+signal that cleanup silently failed. The headless/no-herdr fallback is plain `git -C <repo>
+worktree remove <worktree>` — the same plain-git worktree operation the parent skill's own
+headless path already uses to CREATE a worktree (`bin/new-worktree.sh`'s own `git -C "$repo"
+worktree add -b "$branch" "$wt" "$base"`, confirmed by reading that script directly); removal just
+mirrors creation.
 On any **nonzero** `merge-sequencer.sh` exit (e.g. it refuses a stale `--checked-sha`), the
 dispatcher leaves the worktree, branch, and claim exactly as they are — do not remove the worktree,
 delete the branch, or release the claim — and relays the failure to the human, the same discipline
