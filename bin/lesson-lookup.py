@@ -718,7 +718,14 @@ def cmd_mint(argv):
         sys.stderr.write(f"mint: --file {file_arg!r} is not a file\n")
         return 2
 
-    content = draft_path.read_text(encoding='utf-8')
+    try:
+        content = draft_path.read_text(encoding='utf-8')
+    except OSError as e:
+        # Covers PermissionError (e.g. a mode-000 file), FileNotFoundError (a TOCTOU unlink between
+        # the is_file() check above and this read), and any other OS-level read failure -- every
+        # other invalid --file input gets a clean "mint: ..." rejection, never a raw traceback.
+        sys.stderr.write(f"mint: cannot read --file {file_arg!r} ({e})\n")
+        return 2
     fm, body = parse_frontmatter(content)
     if fm is None:
         sys.stderr.write(f"mint: {file_arg} has no parseable frontmatter\n")
@@ -1485,6 +1492,36 @@ category: testing
 Always do the one thing that must happen.
 """
 
+    # Round-4 regression: an unreadable --file (e.g. mode-000) must get mint's documented controlled
+    # rejection ("mint: cannot read --file ...") like every other invalid input, never an unhandled
+    # OSError/PermissionError traceback.
+    def test_mint_unreadable_file_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        draft = os.path.join(tmp, 'unreadable.md')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+            with open(draft, 'w') as f:
+                f.write(_VALID_DRAFT)
+            os.chmod(draft, 0o000)
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            try:
+                with _in_dir(repo), redirect_stderr(err):
+                    rc = cmd_mint(['--file', draft])
+            except Exception as e:
+                raise AssertionError(
+                    f"an unreadable --file must produce a controlled rejection, not an unhandled "
+                    f"exception: {type(e).__name__}: {e}")
+            assert rc != 0, "an unreadable --file must be rejected"
+            assert 'cannot read' in err.getvalue().lower(), f"expected a controlled read-failure error:\n{err.getvalue()}"
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'unreadable.md')), (
+                "nothing must be written when --file can't be read")
+        finally:
+            os.chmod(draft, 0o644)  # restore so shutil.rmtree can clean up reliably
+            shutil.rmtree(tmp, ignore_errors=True)
+            if 'SM_LESSONS_DIR' in os.environ:
+                del os.environ['SM_LESSONS_DIR']
+
     def test_mint_empty_tags_rejected():
         tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
         try:
@@ -1883,6 +1920,7 @@ Always do the one thing that must happen.
     test_default_ledger_anchoring()
     test_tag_subcommand()
     test_tag_subcommand_concurrent_race()
+    test_mint_unreadable_file_rejected()
     test_mint_empty_tags_rejected()
     test_mint_bad_earned_in_rejected()
     test_mint_nonzero_counts_rejected()
