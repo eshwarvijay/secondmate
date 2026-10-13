@@ -101,8 +101,12 @@ own stdout) is what actually carries the sub-supervisor's output.
 ### Claiming (`bin/claim-ledger.py`)
 
 Atomic task-id claims so two concurrently-running sub-supervisors never work the same task-id at
-once. The sub-supervisor itself still runs `claim`/`release` exactly as SKILL.md's SOP already
-requires — nothing about this changes under external dispatch.
+once. The sub-supervisor itself always runs `claim` as its first action, exactly as SKILL.md's SOP
+already requires — nothing about this changes under external dispatch. `release` is where solo and
+batch diverge: a **solo** sub-supervisor releases its own claim on every terminal path. A **batch**
+sub-supervisor releases its claim only on a refusal/stuck path — on reaching verify-gate PASS it
+keeps the claim open and stops, and it's **the dispatcher** that releases it later, after merging
+that task-id (see "Merging" below).
 
 ```bash
 bin/claim-ledger.py claim --task-id <task-id> --owner sm-<task-id>
@@ -158,14 +162,20 @@ bin/hold.py next       # just the single oldest unanswered one
 ```
 
 **Proof it worked:** after a sub-supervisor runs `bin/hold.py hold --task <task-id> --q "..." --sha
-<sha>`, `bin/hold.py open` prints that question with its id.
+<sha>`, `bin/hold.py open` prints that question with its id. That `--sha` single-task shape is the
+**solo**-dispatch hold. Under **batch** dispatch, it's the dispatcher — never an individual
+sub-supervisor — that opens the one consolidated hold instead, via `--entries-file`, after
+collecting every ready task-id (see SKILL.md's "Batch dispatch" step (g)); `bin/hold.py open` still
+prints it, just shaped as one question covering every task-id in the batch rather than one `--sha`.
 
 ### Merging (`bin/merge-sequencer.sh`)
 
 Serializes concurrent merges to `main`/base across multiple sub-supervisors finishing around the same
 time, re-validating freshness via `bin/verify-gate.sh` inside its own lock immediately before the real
-`git merge`. The sub-supervisor itself calls this exactly as SKILL.md's SOP already specifies — once
-its own hold is answered, never before.
+`git merge`. Who calls it depends on solo vs. batch: under **solo** dispatch, the sub-supervisor
+itself calls this once its own hold is answered, never before. Under **batch** dispatch, per
+SKILL.md's "Batch dispatch" step (i), it's **the dispatcher — never an individual sub-supervisor**
+— that calls this once for each approved task-id, after its own consolidated hold is answered.
 
 ```bash
 bin/merge-sequencer.sh --repo <repo> --worktree <wt> --branch sm/<task-id> --base main \
@@ -255,17 +265,37 @@ Per `audit/flow/2026-10-13--fix-banner-thinking-wording.md` and
    (Eshwar) via the dispatcher chat roughly 5 minutes later. Never self-answered.
 9. **Merge** — `sm/fix-banner-thinking-wording` → `main` via the merge-sequencer, landing as
    `1d3a72748dcd72f7d899506b8cdd91c203fc8bc2`, pushed to origin.
-10. **Teardown** — worktree, branch, maker agent, and claim-ledger entry confirmed clean via
-    `bin/teardown-check.sh`. Per §3's Teardown section, that script's own scope stops at the
-    worktree, the branch, the maker agent, and the claim-ledger entry — it never queries the
-    checker pane, so closing that one is a separate step, not something this check confirms.
+10. **Teardown** — worktree, branch, and claim-ledger entry confirmed clean via
+    `bin/teardown-check.sh --task-id fix-banner-thinking-wording`. That command could **not** have
+    confirmed the maker agent specifically: `teardown-check.sh` derives the two agent names it
+    queries strictly from the literal `--task-id` it's given (`sm-<task-id>` /
+    `sm-pi-<task-id>` — see its own `_check_herdr`, around lines 124–125), so for this task-id it
+    checked `sm-fix-banner-thinking-wording` / `sm-pi-fix-banner-thinking-wording`, never the
+    actual shortened agent name from step 2, `sm-pi-banner-wording`. A leaked
+    `sm-pi-banner-wording` agent would still have reported `[herdr] clean`. Whenever a maker's own
+    agent name is shortened to fit herdr's 32-character limit (as it was here), confirm that
+    specific agent is gone yourself (e.g. `herdr agent get <the-actual-shortened-name>`) —
+    `teardown-check.sh`'s herdr check only covers the canonical, un-shortened name. Per §3's
+    Teardown section, the script also never queries the checker pane at all — closing that one is
+    a separate step, not something this check confirms either.
 11. **Audit** — both the flow and decision entries above were written as this task's permanent audit
     record.
 
-Under external dispatch, steps 1–7 and 9–11 are identical — they run inside the sub-supervisor's own
-Claude Code session, following the unmodified SOP. The only difference is step 8: instead of a
-Claude Code `SessionStart` hook surfacing the open hold automatically, the external dispatcher's own
-polling loop (§5) is what notices `bin/hold.py open` has a new entry and relays it to the human.
+This pilot ran as a **solo** dispatch, and the sentence below describes solo dispatch specifically —
+under **batch** dispatch, steps 9 and 10 move to the dispatcher instead. See the distinction:
+
+- **Solo dispatch** (this pilot): under external dispatch, steps 1–7 and 9–11 are identical — they
+  all run inside the sub-supervisor's own Claude Code session, following the unmodified SOP. The
+  only difference is step 8: instead of a Claude Code `SessionStart` hook surfacing the open hold
+  automatically, the external dispatcher's own polling loop (§5) is what notices `bin/hold.py open`
+  has a new entry and relays it to the human.
+- **Batch dispatch** (not this pilot): per `skills/secondmate/SKILL.md`'s "Batch dispatch" steps (d)
+  and (i), a batch sub-supervisor stops at step 7 (verify-gate PASS), emits
+  `SM_READY_UNMERGED:<sha>` instead of merging itself, and keeps its claim open rather than
+  releasing it. Steps 9 (merge) and 10 (teardown) move to **the dispatcher**, never an individual
+  sub-supervisor — it opens the one consolidated hold covering every ready task-id in the batch,
+  then sequences each approved task-id's own `bin/merge-sequencer.sh` call, worktree/branch cleanup,
+  claim release, and `bin/teardown-check.sh` confirmation itself, one at a time.
 
 ## 5. Troubleshooting: dispatcher-side signals
 
