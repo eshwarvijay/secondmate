@@ -24,8 +24,12 @@
 #     (`--task=`, `--task ""` -- e.g. a dispatcher variable that expanded to nothing) is NOT
 #     the same as omitting the flag: it fails the 1-128 charset and is rejected with exit 2,
 #     never silently treated as "match any open hold".
-#   - `hold.py open`'s `WARNING: N malformed line(s) ...` corruption lines are never a match:
-#     each is forwarded verbatim to THIS script's own stderr, and polling continues.
+#   - `hold.py open`'s corruption marker -- a line of its exact shape
+#     `WARNING: N malformed line(s) in ...` (printed once, after ALL holds) -- is never a match:
+#     each is forwarded verbatim to THIS script's own stderr, and polling continues, even inside
+#     a matched block. A line that merely STARTS with WARNING: is a different matter: inside a
+#     matched block it is the hold's own human question text (hold.py renders --q verbatim, no
+#     escaping) and stays in the printed block; outside a block it is forwarded to stderr.
 #   - A --task filter matching zero holds while other holds are open is just the ordinary
 #     no-match case: the same timeout/exit-3 path, nothing special.
 #   - Signals during the wait: SIGTERM -> exit 143, SIGINT -> exit 130 (both distinct from
@@ -36,12 +40,18 @@
 #     `trap -p INT` reflects as EMPTY (a successfully installed trap always lists -- verified
 #     live in foreground, backgrounded-no-job-control, and backgrounded-job-control modes). That
 #     empty listing is the self-heal's detection (near the bottom, see "SIGINT self-heal"):
-#     the instance execs a python that resets the disposition to default and execs this script
-#     back -- same pid/argv/env/fds, so the caller's `kill $!` still targets this process and
-#     the documented INT -> 130 then works. The interpreter is resolved FIRST through a
-#     bounded, group-tracked child so the exec never goes through a PATH wrapper script; a
-#     TERM/INT landing anywhere in the heal reaps the whole tree, never orphaning children.
-#     Prefer SIGTERM to stop a running instance anyway -- it needs none of this.
+#     the script execs a python DRIVER whose first statements install INT->130 / TERM->143
+#     handlers and which then execs this script back -- same pid/argv/env/fds, so the caller's
+#     `kill $!` still targets this process. The driver is exec'd from an ABSOLUTE system
+#     interpreter (/usr/bin/python3, /usr/local/bin/python3 -- each pretested, bounded and
+#     group-tracked) when a healthy one exists, so a slow PATH wrapper never widens the window.
+#     The ONLY remaining sliver, measured live at ~30-100ms with an absolute interpreter: from
+#     this script's first instruction until the exec'd interpreter's first sigaction line runs
+#     -- a signal arriving in that window is still POSIX-discarded (an entry-ignored signal
+#     cannot be observed by ANY image on this pid until something sigactions it). With no
+#     healthy absolute interpreter the fallback execs PATH python3 itself and the sliver grows
+#     by that wrapper's own startup (the dispatcher's environment, documented). Prefer SIGTERM
+#     to stop a running instance anyway -- it needs none of this.
 #   - The deadline is an absolute wall-clock instant (not a decrementing counter), so a slow poll
 #     never steals time from later ticks; sleeps are plain `sleep` (never `read -t`, which races
 #     stdin under cron), clamped to the remaining budget so the script never lingers past the
@@ -85,6 +95,12 @@ HOLD_PY="$SCRIPT_DIR/hold.py"
 # task-id charset, so exact equality against a validated --task can never false-positive on one.
 ANCHOR_RE='^\[[^]]+\] \(([^)]*)\)'
 
+# hold.py's own end-of-output corruption marker, the only WARNING-shaped line it ever prints
+# (open emits it once, after ALL holds). A byte-match of this SHAPE is corruption noise anywhere;
+# a line that merely starts with WARNING: inside a matched block is question text (see
+# match_block).
+CORRUPT_RE='^WARNING: [0-9]+ malformed line\(s\) in '
+
 MATCH_BLOCK=""
 # match_block <task-filter|""> -- reads one `hold.py open` output from stdin (file redirect or
 # herestring -- never a pipeline, which would run this in a subshell and lose MATCH_BLOCK).
@@ -97,7 +113,18 @@ MATCH_BLOCK=""
 #     and open's output has no other possible line shape; only the FIRST match wins (a later
 #     anchor is never appended to the block);
 #   - a WARNING line is never a match: forwarded to stderr, scanning/polling continues;
+#   - a WARNING-prefixed line: inside a matched block it is a continuation of that hold's own
+#     question text (hold.py renders --q verbatim -- human text can start with WARNING:) unless
+#     it byte-matches hold.py's corruption shape ($CORRUPT_RE), which is corruption noise ANYWHERE
+#     (it is only ever printed after all holds); outside a block it is forwarded to stderr;
 #   - anything else (before the first match) is ignored.
+# ACCEPTED AMBIGUITY (same posture as a task-id containing `)`, on record since round 3): a
+# continuation line byte-shaped like an anchor (a question that literally contains
+# `[fakehold] (fake-task) text`) is indistinguishable from a real new anchor by text alone --
+# hold.py's --q is rendered verbatim with no escaping, so no parser confined to this script's
+# scope can tell them apart. Documented behavior: it acts as a block boundary (the matched block
+# truncates there and the line is an anchor candidate for a later --task filter) -- the only
+# alternative would swallow REAL next anchors.
 # Returns 0 with MATCH_BLOCK set to the matched block (no trailing newline), 1 with no match.
 match_block() {
   local filter="$1" line="" in_block=0 matched_once=0 task="" block=""
@@ -105,7 +132,14 @@ match_block() {
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       "WARNING:"*)
-        printf '%s\n' "$line" >&2
+        if [ "$in_block" -eq 1 ] && ! [[ "$line" =~ $CORRUPT_RE ]]; then
+          # a continuation of the matched hold's own question that merely starts with WARNING:
+          # human text, not corruption noise -- hold.py's real corruption line always matches
+          # $CORRUPT_RE and is handled by the else below even inside a block
+          block+="$line"$'\n'
+        else
+          printf '%s\n' "$line" >&2
+        fi
         ;;
       "    - "*)
         [ "$in_block" -eq 1 ] && block+="$line"$'\n'
@@ -133,21 +167,22 @@ match_block() {
   [ -n "$MATCH_BLOCK" ]
 }
 
-# run_bounded <outfile> <budget-secs> <grouped 0|1> <argv...> -- run argv with stdout to
-# <outfile>, bounded by the budget: a killer subshell sleeps the budget, then TERMs the child
-# (KILL after a 1s grace). If <grouped> is 1, the CALLER spawns this under `set -m` so the child
-# becomes its own process-group leader; POLL_GROUP then records it so on_signal reaps the
-# child's ENTIRE tree -- a PATH interpreter may be a wrapper script with its own children, and
-# a bare pid-kill of the wrapper would orphan them. The killer's inner sleep is a tracked
-# child the subshell's own EXIT/TERM traps kill, and the subshell's fds are /dev/null, so
-# nothing outlives this call (round-4's no-linger fix, hoisted here so the SIGINT self-heal
-# can reuse the exact same machinery).
+# run_bounded <outfile> <budget-secs> <argv...> -- run argv with stdout to <outfile>, bounded by
+# the budget: a killer subshell sleeps the budget, then TERM-KILLs the child's whole PROCESS
+# GROUP (KILL after a 1s grace). The child is spawned under `set -m` so it is its own
+# process-group leader: a PATH interpreter may be a wrapper script with its OWN children, and a
+# bare pid-kill of the wrapper would orphan them -- the group reaps the whole tree on every path
+# (early signal via on_signal, budget expiry via the killer). The killer's inner sleep is a
+# tracked child the subshell's own EXIT/TERM traps kill, and the subshell's fds are /dev/null,
+# so nothing outlives this call (round-4's no-linger fix).
 run_bounded() {
-  local ofile="$1" budget="$2" grouped="$3"; shift 3
+  local ofile="$1" budget="$2"; shift 2
   local rc=0
+  set -m
   "$@" >"$ofile" 2>/dev/null &
   POLL_PID=$!
-  if [ "$grouped" -eq 1 ]; then POLL_GROUP="$POLL_PID"; else POLL_GROUP=""; fi
+  POLL_GROUP="$POLL_PID"
+  set +m
   (
     tpid=""
     trap '[ -n "${tpid:-}" ] && kill "$tpid" 2>/dev/null' EXIT
@@ -155,13 +190,14 @@ run_bounded() {
     sleep "$budget" &
     tpid=$!
     wait "$tpid"
-    kill -TERM "$POLL_PID" 2>/dev/null
+    kill -TERM -- "-$POLL_PID" 2>/dev/null
     sleep 1
-    kill -KILL "$POLL_PID" 2>/dev/null
+    kill -KILL -- "-$POLL_PID" 2>/dev/null
   ) >/dev/null 2>&1 &
   POLL_KILLER=$!
   wait "$POLL_PID"; rc=$?
   POLL_PID=""
+  POLL_GROUP=""
   kill "$POLL_KILLER" 2>/dev/null
   wait "$POLL_KILLER" 2>/dev/null
   POLL_KILLER=""
@@ -174,7 +210,7 @@ run_bounded() {
 # killed it). hold.py's stderr is suppressed: its "(no open decisions)" noise stays out of the
 # cron log, and its stdout WARNING lines still reach match_block for stderr forwarding.
 poll_once() {
-  run_bounded "$1" "$2" 0 python3 "$HOLD_PY" open
+  run_bounded "$1" "$2" python3 "$HOLD_PY" open
 }
 
 # watch -- the polling loop. Polls immediately (a hold that is already open is found without
@@ -299,6 +335,49 @@ second line of the question
   [ "$MATCH_BLOCK" = "[fff66666] (task-next) unrelated" ] \
     || bad "a skipped multi-line hold's continuation must not leak into another block -- got: $MATCH_BLOCK"
 
+  # WARNING-shaped question continuation (round-6 finding 1): inside a matched block a line that
+  # merely starts with WARNING: is the hold's own human question text; only hold.py's actual
+  # corruption SHAPE (printed once, after all holds) is corruption noise, even inside a block
+  fixw="$t/fix.warnq"
+  cat >"$fixw" <<'EOF'
+[aaa11111] (task-w) question start
+WARNING: this line is my own question text, not corruption
+    - sub-w (checked_sha=sha-w) sub-w: verdict=pass findings=0 files=0 lenses=none
+WARNING: 7 malformed line(s) in /x/decisions.jsonl — ledger may be corrupt; reconcile manually.
+[bbb22222] (task-next) next
+EOF
+  wantw='[aaa11111] (task-w) question start
+WARNING: this line is my own question text, not corruption
+    - sub-w (checked_sha=sha-w) sub-w: verdict=pass findings=0 files=0 lenses=none'
+  match_block "" <"$fixw" 2>"$err" || bad "any-filter: a WARNING-continuation hold must match"
+  [ "$MATCH_BLOCK" = "$wantw" ] \
+    || bad "a WARNING-shaped question continuation must stay in the block (only the corruption SHAPE is noise) -- got: $MATCH_BLOCK"
+  grep -qF "WARNING: 7 malformed line(s)" "$err" \
+    || bad "the corruption-shaped WARNING must still be forwarded to stderr even inside a block"
+  match_block "task-next" <"$fixw" 2>/dev/null \
+    || bad "--task must match a later anchor after a WARNING-continuation hold"
+  [ "$MATCH_BLOCK" = "[bbb22222] (task-next) next" ] \
+    || bad "later anchor after WARNING-continuation -- got: $MATCH_BLOCK"
+
+  # anchor-shaped question continuation (round-6 finding 1, ACCEPTED AMBIGUITY, same posture as
+  # a task-id containing `)` on record since round 3): hold.py renders --q verbatim with no
+  # escaping, so a continuation line byte-identical to an anchor is indistinguishable from a
+  # real new anchor by text alone. Documented behavior: it acts as a block boundary -- the
+  # matched block truncates there and the line is an anchor candidate for a later --task filter
+  fixa="$t/fix.anchorq"
+  cat >"$fixa" <<'EOF'
+[aaa11111] (task-a) before the fake anchor
+[fake-hold] (fake-task) still question text
+[bbb22222] (task-next) next
+EOF
+  match_block "" <"$fixa" 2>/dev/null || bad "any-filter must still match before a fake-anchor continuation"
+  [ "$MATCH_BLOCK" = "[aaa11111] (task-a) before the fake anchor" ] \
+    || bad "documented ambiguity behavior: the block must truncate at a byte-anchor-shaped continuation -- got: $MATCH_BLOCK"
+  match_block "task-next" <"$fixa" 2>/dev/null \
+    || bad "a --task filter must still reach a real anchor after a fake-anchor line"
+  [ "$MATCH_BLOCK" = "[bbb22222] (task-next) next" ] \
+    || bad "real anchor after a fake-anchor continuation -- got: $MATCH_BLOCK"
+
   # ---------- real round-trips: THIS script as a real subprocess + the REAL bin/hold.py,
   # against a scratch ledger. --timeout 0 = one immediate poll, no real wait. ----------
   rw() {  # rw <ledger> <expected-rc> <args...> ; captures stdout to $ofile, stderr to $err
@@ -350,6 +429,26 @@ second line of the question
   [ "$(cat "$ofile")" = "$want_rt" ] \
     || bad "multi-line question round-trip must print the block with its continuation line -- got: $(cat "$ofile")"
 
+  # a real WARNING-shaped question continuation round-trip (round-6 finding 1): the hold's own
+  # question text that starts a line with WARNING: must stay in the printed block, never be
+  # reclassified as fake corruption noise on stderr
+  wqid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task warnq --q $'real question\nWARNING: is this a corruption line?' --sha dd 2>/dev/null)" \
+    || bad "scratch WARNING-question hold creation failed"
+  rw "$ledger" 0 --task warnq --timeout 0
+  want_wq="[$wqid] (warnq) real question"$'\n'"WARNING: is this a corruption line?"
+  [ "$(cat "$ofile")" = "$want_wq" ] \
+    || bad "WARNING-shaped continuation round-trip: the full block must include the WARNING question line -- got: $(cat "$ofile")"
+  grep -q "is this a corruption line" "$err" \
+    && bad "the WARNING-shaped question line must NOT be routed to stderr as fake corruption"
+
+  # a real anchor-shaped question continuation round-trip (round-6 finding 1, ACCEPTED
+  # AMBIGUITY): asserted end-to-end per the documented truncation behavior
+  aqid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task anchorq --q $'before the fake\n[fake-hold] (fake-task) still question text' --sha ee 2>/dev/null)" \
+    || bad "scratch anchor-question hold creation failed"
+  rw "$ledger" 0 --task anchorq --timeout 0
+  [ "$(cat "$ofile")" = "[$aqid] (anchorq) before the fake" ] \
+    || bad "anchor-shaped continuation round-trip: documented truncation behavior -- got: $(cat "$ofile")"
+
   rw "$ledger" 3 --task batch --timeout 0  # substring of the batch task ('batch' vs 'batch-1'): no-match
 
   # WARNING forwarding end-to-end via hold.py's real corruption path: corrupt line + open hold
@@ -391,6 +490,11 @@ second line of the question
   [ "$rc" -eq 3 ] || bad "slow-poll substitute: rc=$rc (wanted 3)"
   [ "$elapsed" -le 3 ] || bad "a hung poll must be bounded by the remaining budget: 1s watch took ${elapsed}s"
   grep -q '^NO-HOLD:' "$ofile" || bad "slow-poll substitute must still end with the NO-HOLD line"
+  sleep 0.4   # the budget-expired poll was TERMed mid-wrapper-sleep: its child must die WITH the
+  # poll's process group (round-6 grouped polls), never be orphaned to linger out the shim delay
+  if ps -ax -o ppid=,command= 2>/dev/null | awk '$1==1 && $2=="sleep" && $3=="5" {f=1} END {exit !f}'; then
+    bad "the budget-expired poll orphaned the interpreter wrapper's child"
+  fi
 
   # ---------- argument validation ----------
   rc=0; "$0" --task 'bad task!' --timeout 0 >/dev/null 2>&1 || rc=$?
@@ -485,22 +589,47 @@ second line of the question
   kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
   [ "$rc" -eq 130 ] || bad "SIGINT during the wait must exit 130 (distinct from 3), got $rc"
 
-  # mid-heal TERM (round-5 finding 2): a slow PATH interpreter wrapper must not leak its own
-  # children when a TERM lands mid-resolution. The heal resolves the interpreter inside a
-  # bounded child in its OWN process group, so on_signal reaps the wrapper's whole tree; the
-  # exec then goes to the resolved interpreter directly, never through the wrapper.
+  # mid-run TERM with a slow PATH interpreter wrapper (round-5 finding 2 + round-6 grouped
+  # polls): the wrapper intercepts every poll; a TERM landing mid-poll must reap the wrapper's
+  # WHOLE tree (poll children run as their own process group now), never orphan its `sleep`
   shim2="$t/shim2"; mkdir -p "$shim2"
-  printf '#!/bin/sh\nsleep 1.6\nexec "%s" "$@"\n' "$realpy" >"$shim2/python3"
+  printf '#!/bin/sh\nsleep 1.6\nexec "%s" "$@\n' "$realpy" >"$shim2/python3"
   chmod +x "$shim2/python3"
   SM_HOLD_LEDGER="$empty" PATH="$shim2:$PATH" "$0" --interval 30 --timeout 3600 >"$t/heal.out" 2>"$t/heal.err" &
   wpid=$!
-  sleep 0.7   # mid-resolution: the wrapper is inside its `sleep 1.6` inside OUR tracked child
+  sleep 0.7   # mid-poll: the wrapper is inside its `sleep 1.6` inside our tracked group child
   kill -TERM "$wpid" 2>/dev/null
   wait "$wpid"; rc=$?
-  [ "$rc" -eq 143 ] || bad "a TERM during the SIGINT self-heal must exit 143, got $rc"
+  [ "$rc" -eq 143 ] || bad "a TERM mid-run with a wrapper interpreter must exit 143, got $rc"
   sleep 0.4   # an un-reaped wrapper child would show up here, orphaned (ppid 1) but still alive
   if ps -ax -o ppid=,command= 2>/dev/null | awk '$1==1 && $2=="sleep" && $3=="1.6" {f=1} END {exit !f}'; then
-    bad "a TERM during the self-heal orphaned the interpreter wrapper's child"
+    bad "a TERM mid-run orphaned the interpreter wrapper's child"
+  fi
+
+  # INT through the ENTIRE self-heal window (round-6 finding 2, the checker's exact repro): with
+  # a slow PATH wrapper the round-5 design stayed INT-deaf for the wrapper's whole resolution;
+  # the heal now execs a pretested ABSOLUTE interpreter (bypassing the wrapper) whose first
+  # statements arm INT->130, so kill -INT $! lands on a healed, INT-trapped watcher almost
+  # immediately -- and reaps the wrapper's tree as it goes
+  if [ -x /usr/bin/python3 ] || [ -x /usr/local/bin/python3 ]; then
+    shim3="$t/shim3"; mkdir -p "$shim3"
+    printf '#!/bin/sh\nsleep 2\nexec "%s" "$@"\n' "$realpy" >"$shim3/python3"
+    chmod +x "$shim3/python3"
+    SM_HOLD_LEDGER="$empty" PATH="$shim3:$PATH" "$0" --interval 30 --timeout 3600 >"$t/int.out" 2>/dev/null &
+    wpid=$!
+    sleep 0.6   # the round-5 design was INT-deaf here for the wrapper's whole startup+resolution
+    kill -INT "$wpid" 2>/dev/null
+    # bound the wait: a regression that re-breaks the window fails fast with 143 != 130
+    ( sleep 5; kill -TERM "$wpid" 2>/dev/null ) &
+    kpid=$!
+    wait "$wpid"; rc=$?
+    kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null
+    [ "$rc" -eq 130 ] || bad "kill -INT during the self-heal window must exit 130 (got $rc)"
+    if ps -ax -o ppid=,command= 2>/dev/null | awk '$1==1 && $2=="sleep" && $3=="2" {f=1} END {exit !f}'; then
+      bad "INT during the heal window orphaned the wrapper's child"
+    fi
+  else
+    echo "  (skipped: no absolute python3 for the fast-heal path -- documented PATH-fallback sliver)"
   fi
 
   # broken TMPDIR (round-5 finding 3): the poll scratch file must fail LOUDLY (exit 2), and the
@@ -608,43 +737,41 @@ command -v python3 >/dev/null 2>&1 \
 # on shell entry cannot be trapped: the `trap ... INT` at the top of this script was then a
 # silent no-op, which `trap -p INT` reflects as EMPTY (a successfully installed trap always
 # lists). That empty listing is the detection -- no mktemp, no self-delivered signal, nothing
-# that can silently misreport when TMPDIR is broken (round 4's mktemp probe silently skipped
-# the heal exactly when it was needed). When INT was force-ignored, only a runtime sigaction
-# can undo it, so this instance execs a python that resets the disposition to default and then
-# execs this script back: same pid, argv, environment, and fds, so the caller's `kill $!` still
-# targets THIS process and the documented INT -> 130 works from then on. The re-run instance
-# installs the INT trap successfully (disposition now default), finds `trap -p INT` non-empty,
-# and does not heal again -- no loop.
+# that can silently misreport. When INT was force-ignored, only a runtime sigaction on THIS pid
+# can undo it, so this instance execs a python DRIVER whose FIRST statements install
+# INT->130 / TERM->143 handlers and which then execs this script back: same pid/argv/env/fds,
+# and from the driver's first line on, the caller's `kill -INT $!` -> 130 holds THROUGH THE
+# ENTIRE heal, including while any interpreter child is slow -- round 5's design instead stayed
+# INT-deaf for the whole wrapper-dependent resolution window, which round 6's checker live-
+# reproduced. The re-run script instance installs the INT trap successfully (disposition now
+# default), finds `trap -p INT` non-empty, and does not heal again -- no loop.
 #
-# The exec itself must not leak: a PATH `python3` can be a wrapper SCRIPT that spawns its own
-# children (pyenv/conda activation shims, etc.), and a TERM/INT landing mid-resolution used to
-# kill only the wrapper, orphaning those children. So the real interpreter is resolved FIRST:
-# a bounded child in its own process GROUP runs PATH-python3 (wrapper included -- the wrapper's
-# children die with the group) just to print its own sys.executable; a signal during that run
-# reaps the whole tree via POLL_GROUP (on_signal, top of script). Then the exec goes to the
-# RESOLVED interpreter directly, never through the wrapper -- real interpreters spawn no
-# children, so a TERM/INT in the exec window dies cleanly by kernel default (143/130), no
-# orphan possible. Degraded corners are LOUD, never silent: unusable TMPDIR or a hung/broken
-# interpreter each print a stderr note and fall back to the direct PATH exec (round-3
-# behavior), where only a pathological wrapper could leak.
+# The driver is exec'd from an ABSOLUTE system interpreter when a healthy one exists
+# (/usr/bin/python3, /usr/local/bin/python3 -- each pretested through run_bounded so a broken
+# system interpreter, e.g. macOS without CLT, cannot kill the watcher, and so a slow PATH
+# wrapper never widens the deaf window: the wrapper only ever runs as a grouped poll child
+# here). Degraded corners are loud, never silent: an unusable TMPDIR (no scratch file for the
+# pretest) prints an explicit note and falls back to the direct PATH exec, whose deaf window
+# then includes that interpreter's own startup -- the documented sliver.
 if [ -z "$(trap -p INT)" ] && command -v python3 >/dev/null 2>&1; then
-  realpy=""
+  driver='import os,signal,sys; signal.signal(signal.SIGINT, lambda *a: sys.exit(130)); signal.signal(signal.SIGTERM, lambda *a: sys.exit(143)); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)'
+  cand_ok=""
   pf_file="$(mktemp "${TMPDIR:-/tmp}/hold-watch-heal.XXXXXX" 2>/dev/null)" || pf_file=""
   if [ -n "$pf_file" ]; then
     POLL_OUT="$pf_file"
-    set -m   # make the resolution child its own process-group leader so on_signal reaps its tree
-    run_bounded "$pf_file" 30 1 python3 -c 'import sys; print(sys.executable)' || true
-    set +m
-    realpy="$(head -n 1 "$pf_file" 2>/dev/null)"
+    for cand in /usr/bin/python3 /usr/local/bin/python3; do
+      [ -x "$cand" ] || continue
+      if run_bounded "$pf_file" 5 "$cand" -c 'pass'; then cand_ok="$cand"; break; fi
+    done
     rm -f "$pf_file"
     POLL_OUT=""
-    [ -n "$realpy" ] && [ -x "$realpy" ] \
-      || printf 'hold-watch: could not resolve the real python3 for the SIGINT self-heal (slow or broken interpreter in PATH?); falling back to a direct PATH exec\n' >&2
   else
-    printf 'hold-watch: cannot create a scratch file for the SIGINT self-heal (bad TMPDIR=%s?); falling back to a direct interpreter exec\n' "${TMPDIR:-/tmp}" >&2
+    printf 'hold-watch: cannot create a scratch file for the SIGINT self-heal interpreter probe (bad TMPDIR=%s?); falling back to a direct PATH exec\n' "${TMPDIR:-/tmp}" >&2
   fi
-  [ -n "$realpy" ] && [ -x "$realpy" ] || realpy="python3"
-  exec "$realpy" -c 'import os,signal,sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvpe(sys.argv[1], sys.argv[1:], os.environ)' "$0" "$@"
+  if [ -n "$cand_ok" ]; then
+    exec "$cand_ok" -c "$driver" "$0" "$@"
+  fi
+  exec python3 -c "$driver" "$0" "$@"
 fi
 
 watch
