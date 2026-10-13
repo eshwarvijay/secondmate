@@ -1022,26 +1022,44 @@ def _consume_single_quoted_scalar(text, pos):
 
 _YAML_FLOW_STOP_CHARS = ',[]{}"\'#'
 
+# YAML mapping-indicator characters that this grammar must recognize and reject rather than
+# swallow as plain-scalar text: `:` marks a mapping VALUE and is live at any position in the run
+# (`name:` mid-scalar still starts a mapping), while `?` marks a mapping KEY and is only an
+# indicator as the very first character of a node (`what?` is a fine plain scalar; `?name` is a
+# mapping). Both share the same "is this indicator actually acting as one" test: it's acting as an
+# indicator only when followed by whitespace, by one of the same flow-structural stop characters,
+# or by the end of the text -- `name:value`/`?x` with no gap are just ordinary scalar characters.
+_YAML_MAPPING_INDICATOR_CHARS = ':?'
+
+
+def _starts_yaml_mapping_indicator(text, i):
+    """True if `text[i]` is a YAML mapping-indicator character (see `_YAML_MAPPING_INDICATOR_CHARS`)
+    that is actually acting as one here -- i.e. followed by whitespace, a flow-structural stop
+    character, or the end of the text -- rather than being ordinary scalar text."""
+    n = len(text)
+    if text[i] not in _YAML_MAPPING_INDICATOR_CHARS:
+        return False
+    return i + 1 == n or text[i + 1] in ' \t' or text[i + 1] in _YAML_FLOW_STOP_CHARS
+
 
 def _consume_plain_scalar(text, pos):
     """A plain (unquoted) scalar run: everything up to the next flow-structural character (`,`,
     `[`, `]`, `{`, `}`), a quote character, a `#` (mint's tags grammar does not support YAML
-    comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), a
-    `:` that marks a YAML mapping-key (one followed by whitespace, by the end of the text, or by one
-    of those same flow-structural characters -- real YAML treats `name:` this way even bare inside a
-    flow sequence, e.g. both `[name: value]` and `[name:]` parse as a one-key mapping element, not a
-    flat string; a tag is a flat scalar, so this is simply invalid here, not a mapping to recurse
-    into), or the end of the string. Returns the index just past the run, or None if nothing
-    non-whitespace was actually consumed (an empty element, e.g. the gap between two commas in
-    `[testing,,mint]`, or a `[`/`{` immediately where a flat scalar was expected -- nesting is not
-    part of this grammar, so a structural-open character here is simply invalid, not a sequence to
-    recurse into)."""
+    comments at all -- an unquoted `#` is simply an illegal character, never comment-stripped), or a
+    live YAML mapping indicator (see `_starts_yaml_mapping_indicator` -- `:` checked at every
+    position since it marks a mapping VALUE anywhere in the run, `?` checked only at `pos` itself
+    since it marks a mapping KEY only as a node's first character), or the end of the string. A tag
+    is a flat scalar, so any of these is simply invalid here, never a mapping to recurse into.
+    Returns the index just past the run, or None if nothing non-whitespace was actually consumed (an
+    empty element, e.g. the gap between two commas in `[testing,,mint]`, a `[`/`{` immediately where
+    a flat scalar was expected -- nesting is not part of this grammar -- or a leading `?` acting as
+    a mapping-key indicator)."""
     n = len(text)
     i = pos
+    if i < n and text[i] == '?' and _starts_yaml_mapping_indicator(text, i):
+        return None  # explicit-key indicator as the first character -- not a flat scalar
     while i < n and text[i] not in _YAML_FLOW_STOP_CHARS:
-        if text[i] == ':' and (
-            i + 1 == n or text[i + 1] in ' \t' or text[i + 1] in _YAML_FLOW_STOP_CHARS
-        ):
+        if text[i] == ':' and _starts_yaml_mapping_indicator(text, i):
             break  # YAML mapping-key indicator -- tags are flat scalars, not mappings
         i += 1
     if not text[pos:i].strip():
@@ -3170,6 +3188,41 @@ Always do the one thing that must happen.
             shutil.rmtree(tmp, ignore_errors=True)
             del os.environ['SM_LESSONS_DIR']
 
+    # Round-15 Finding regression: `?` is YAML's EXPLICIT-KEY mapping indicator -- a plain scalar
+    # starting with `?` followed by whitespace constructs a mapping (`{name: null}`), the same as
+    # the colon-based implicit-null form above, just keyed on the other side of the `:`. Both the
+    # inline form (`[? name]`) and the equivalent block form (`- ? name`) must be rejected.
+    def test_mint_explicit_key_mapping_tag_rejected():
+        tmp = _tempfile.mkdtemp(prefix='lesson-mint-')
+        try:
+            repo, lessons_dir = _mint_fixture(tmp)
+
+            draft_inline = os.path.join(tmp, 'explicit-key-inline.md')
+            with open(draft_inline, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags: [? name]\n'))
+            os.environ['SM_LESSONS_DIR'] = lessons_dir
+            err = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err):
+                rc = cmd_mint(['--file', draft_inline])
+            assert rc != 0, (
+                f"'[? name]' is a one-key mapping via YAML's explicit-key indicator, not a flat "
+                f"string -- a leading '?' followed by whitespace must be rejected:\n{err.getvalue()}")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-inline.md'))
+
+            draft_block = os.path.join(tmp, 'explicit-key-block.md')
+            with open(draft_block, 'w') as f:
+                f.write(_VALID_DRAFT.replace('tags:\n  - testing\n  - mint\n', 'tags:\n  - ? name\n'))
+            err2 = io.StringIO()
+            with _in_dir(repo), redirect_stderr(err2):
+                rc2 = cmd_mint(['--file', draft_block])
+            assert rc2 != 0, (
+                "a multi-line tags block whose dash-item value is an explicit-key mapping "
+                "('- ? name') must be rejected too -- a tag is a flat scalar, not a mapping")
+            assert not os.path.exists(os.path.join(lessons_dir, 'testing', 'explicit-key-block.md'))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            del os.environ['SM_LESSONS_DIR']
+
     # Round-13 Finding 2 regression: a comment line directly after otherwise-valid block-list
     # items must be rejected outright, not silently treated as an unremarkable block boundary (the
     # way a legitimate next frontmatter key would be).
@@ -3332,6 +3385,7 @@ Always do the one thing that must happen.
     test_mint_raw_control_byte_in_tags_rejected()
     test_mint_mapping_tag_rejected_both_forms()
     test_mint_implicit_null_mapping_tag_rejected()
+    test_mint_explicit_key_mapping_tag_rejected()
     test_mint_comment_after_block_items_rejected()
     test_mint_duplicate_tags_key_uses_last_declaration()
     test_mint_removed_cwd_refused()
