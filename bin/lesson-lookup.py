@@ -3492,8 +3492,21 @@ Always do the one thing that must happen.
             assert len(tags) > 0, f"Tags should not be empty in {fpath}, got {tags}"
             # At least one tag should be a known category or related tag
             assert any(t in tags for t in ['maker', 'debugging', 'testing', 'workflow', 'scope', 'focus']), f"Expected at least one known tag in {fpath}, got {tags}"
-            # These 4 seed files predate helpful_count/harmful_count -- must still default to (0, 0).
-            assert _counts(fm) == (0, 0), f"seed file counts should default to (0, 0): {fpath}"
+            # Seed files may carry legitimately-tagged feedback counts: supervisors tag
+            # E4 seeds via `lesson-lookup.py tag` and those tags land as audit commits
+            # (e.g. helpful_count on commit-before-done). So the real files are asserted
+            # well-formed (non-negative ints), and the (0, 0) DEFAULT guarantee -- the
+            # original migration guard for files predating the fields -- is asserted
+            # hermetically on synthetic frontmatters below.
+            h, m = _counts(fm)
+            assert isinstance(h, int) and h >= 0, f"helpful_count must be a non-negative int in {fpath}, got {h!r}"
+            assert isinstance(m, int) and m >= 0, f"harmful_count must be a non-negative int in {fpath}, got {m!r}"
+
+        # Hermetic default-behavior checks (do not depend on real seed file state):
+        assert _counts({}) == (0, 0), "_counts must default absent fields to (0, 0)"
+        assert _counts({'helpful_count': 'garbage'}) == (0, 0), "_counts must degrade garbage to 0"
+        assert _counts({'helpful_count': '3'}) == (3, 0), "_counts must parse string ints"
+        assert _counts({'helpful_count': -2, 'harmful_count': 'x'}) == (0, 0), "_counts must clamp negatives and degrade garbage"
 
     test_real_seed_files()
 
