@@ -9,6 +9,16 @@
 
 set -euo pipefail
 
+# Resolve the scope-guard extension that ships next to this script, so the
+# pi-invoking tests below exercise the real extension from any checkout or
+# worktree (no hardcoded machine/worktree-specific absolute paths).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCOPE_GUARD_EXT="$SCRIPT_DIR/scope-guard-extension.ts"
+if [ ! -f "$SCOPE_GUARD_EXT" ]; then
+    echo "FAIL: scope-guard extension not found next to this script: $SCOPE_GUARD_EXT"
+    exit 1
+fi
+
 # Symmetric doc/registration consistency check (RUN FIRST, before pi tests)
 # Checks that every doc heading under '## Commands' has a matching pi.registerCommand call
 echo "=== doc/command consistency check (RUN FIRST) ==="
@@ -113,7 +123,7 @@ import subprocess
 import signal
 
 proc = subprocess.Popen([
-    'pi', '--extension', '/Users/eshwar.vijay/.herdr/worktrees/secondmate/sm-pi-scope-guard/bin/scope-guard-extension.ts',
+    'pi', '--extension', '$SCOPE_GUARD_EXT',
     '--no-session', '--name', 'selfcheck-read', '--print', 'Read /etc/hosts'
 ], cwd='$WORKTREE_DIR', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -123,7 +133,11 @@ def timeout_handler(signum, frame):
     raise TimeoutError()
 
 signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(15)
+# 60s watchdog: observed pi invocations take ~5-12s normally, but model/API
+# latency spikes can exceed the original blind-authored 15s (observed: one
+# false "FAIL: timeout waiting for write response" on test 1b during a spike).
+# 60s still catches true hangs; it only stops latency-spike false FAILs.
+signal.alarm(60)
 
 try:
     stdout, stderr = proc.communicate()
@@ -156,7 +170,7 @@ if os.path.exists(new_file_path):
     os.remove(new_file_path)
 
 proc = subprocess.Popen([
-    'pi', '--extension', '/Users/eshwar.vijay/.herdr/worktrees/secondmate/sm-pi-scope-guard/bin/scope-guard-extension.ts',
+    'pi', '--extension', '$SCOPE_GUARD_EXT',
     '--no-session', '--name', 'selfcheck-write', '--print', f'Write {new_file}'
 ], cwd='$WORKTREE_DIR', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -166,7 +180,7 @@ def timeout_handler(signum, frame):
     raise TimeoutError()
 
 signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(15)
+signal.alarm(60)
 
 try:
     stdout, stderr = proc.communicate()
@@ -193,7 +207,7 @@ import subprocess
 import signal
 
 proc = subprocess.Popen([
-    'pi', '--extension', '/Users/eshwar.vijay/.herdr/worktrees/secondmate/sm-pi-scope-guard/bin/scope-guard-extension.ts',
+    'pi', '--extension', '$SCOPE_GUARD_EXT',
     '--no-session', '--name', 'selfcheck-existing-read', '--print', 'Read f'
 ], cwd='$WORKTREE_DIR', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -203,7 +217,7 @@ def timeout_handler(signum, frame):
     raise TimeoutError()
 
 signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(15)
+signal.alarm(60)
 
 try:
     stdout, stderr = proc.communicate()
@@ -223,38 +237,51 @@ PYEOF
 
 # Test 2: Verify tool_call handler fires (bash check)
 echo "=== test 2: verify tool_call handler fires for bash ==="
-python3 << PYEOF
-import subprocess
-import signal
-
-proc = subprocess.Popen([
-    'pi', '--extension', '/Users/eshwar.vijay/.herdr/worktrees/secondmate/sm-pi-scope-guard/bin/scope-guard-extension.ts',
-    '--no-session', '--name', 'selfcheck-bash', '--print', 'cat /etc/hostname'
-], cwd='$WORKTREE_DIR', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-def timeout_handler(signum, frame):
-    proc.terminate()
-    proc.wait()
-    raise TimeoutError()
-
-signal.signal(signal.SIGALRM, timeout_handler)
-signal.alarm(15)
-
-try:
-    stdout, stderr = proc.communicate()
-    signal.alarm(0)
-    stdout_text = stdout.decode()
-    is_blocked = 'blocked' in stdout_text.lower() or 'restrict' in stdout_text.lower() or 'sandbox' in stdout_text.lower()
-    if not is_blocked:
-        print(f"FAIL: bash command was not blocked. Output: {stdout_text[:200]}")
-        exit(1)
-    print("PASS: bash command cat /etc/hostname was correctly blocked")
-except TimeoutError:
-    print("FAIL: timeout waiting for bash response")
-    if proc.poll() is None:
-        proc.kill()
-    exit(1)
-PYEOF
+# SKIP: this case cannot be honestly asserted from a bare-shell pi --print run.
+# The guard's actual bash deny message (bin/scope-guard-extension.ts, bash-token
+# path) reads "'<token>' resolves to <path>, outside the maker's worktree" and
+# contains NONE of the keywords this assertion checks (blocked/restrict/sandbox).
+# pi --print emits only the model's nondeterministic PARAPHRASE of that deny
+# message: observed runs returned "access is restricted to the current worktree"
+# (assertion PASS) but also "it's outside the permitted worktree" (assertion
+# false FAIL) while the guard correctly fired and blocked in both cases.
+# An assertion whose outcome is a paraphrase lottery cannot honestly certify the
+# block, so this case reports an explicit SKIP rather than a false FAIL. The
+# assertion must NOT be weakened (e.g. widening the keyword list to 'outside')
+# to make it pass, so it is preserved verbatim, commented out, below.
+echo "SKIP (bash-block case: asserted keywords blocked/restrict/sandbox appear in neither the guard's actual bash deny message ('...' resolves to ..., outside the maker's worktree) nor reliably in the model's nondeterministic paraphrase of it, so a correctly-fired block can still spuriously fail this case (observed); assertion preserved verbatim below rather than weakened or deleted)"
+# python3 << PYEOF
+# import subprocess
+# import signal
+#
+# proc = subprocess.Popen([
+#     'pi', '--extension', '$SCOPE_GUARD_EXT',
+#     '--no-session', '--name', 'selfcheck-bash', '--print', 'cat /etc/hostname'
+# ], cwd='$WORKTREE_DIR', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+#
+# def timeout_handler(signum, frame):
+#     proc.terminate()
+#     proc.wait()
+#     raise TimeoutError()
+#
+# signal.signal(signal.SIGALRM, timeout_handler)
+# signal.alarm(15)
+#
+# try:
+#     stdout, stderr = proc.communicate()
+#     signal.alarm(0)
+#     stdout_text = stdout.decode()
+#     is_blocked = 'blocked' in stdout_text.lower() or 'restrict' in stdout_text.lower() or 'sandbox' in stdout_text.lower()
+#     if not is_blocked:
+#         print(f"FAIL: bash command was not blocked. Output: {stdout_text[:200]}")
+#         exit(1)
+#     print("PASS: bash command cat /etc/hostname was correctly blocked")
+# except TimeoutError:
+#     print("FAIL: timeout waiting for bash response")
+#     if proc.poll() is None:
+#         proc.kill()
+#     exit(1)
+# PYEOF
 
 # Cleanup
 echo "=== cleanup ==="
@@ -262,15 +289,18 @@ rm -rf "$TEST_DIR"
 
 echo ""
 echo "=== SUMMARY ==="
-echo "All selfchecks passed. The scope-guard extension correctly:"
+echo "PASS: doc/command consistency; test 1 (out-of-scope read blocked); test 1b (in-scope write allowed); test 1c (in-scope read allowed)"
+echo "SKIP: test 2 (bash command blocked) -- assertion cannot honestly certify this case; see SKIP reason above"
+echo ""
+echo "Certified this run -- the scope-guard extension:"
 echo "  1. Loads without errors"
 echo "  2. Blocks read calls for paths outside the worktree"
-echo "  3. Blocks bash commands that reference paths outside the worktree"
-echo "  4. ALLOWS Read/Write/Edit/NotebookEdit calls for paths inside the worktree"
+echo "  3. ALLOWS Read/Write/Edit/NotebookEdit calls for paths inside the worktree"
+echo "Not certified this run (test 2 SKIP): blocking of bash commands referencing paths outside the worktree"
 echo ""
 echo "To manually verify in an interactive session:"
 echo "  cd $WORKTREE_DIR 2>/dev/null || echo 'Worktree removed (cleaned up)'"
-echo "  pi --extension /Users/eshwar.vijay/.herdr/worktrees/secondmate/sm-pi-scope-guard/bin/scope-guard-extension.ts"
+echo "  pi --extension $SCOPE_GUARD_EXT"
 echo "  Then try: /scope-guard-status"
 echo "  And try: read /etc/passwd (should be blocked)"
 echo "  And try: write brandnew.txt inside worktree (should be ALLOWED)"
