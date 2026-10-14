@@ -433,6 +433,13 @@ FAKECAT
   echo "$prod_text" | grep -qF 'extracted="$(extract_result "$log_file")"' \
     && { echo "FAIL: production extraction call site has regressed to re-reading log_file by name"; fails=1; }
 
+  # 8e) context-hygiene pin: the auto-memory suppression export must stay in the production
+  #     section -- batch-scale dispatch depends on it (rationale + empirical evidence in the
+  #     comment above the export itself).
+  # shellcheck disable=SC2016
+  echo "$prod_text" | grep -qF 'export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1' \
+    || { echo "FAIL: production section no longer exports CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 (batch context hygiene)"; fails=1; }
+
   # 9) cross-invocation lock: two concurrent runs for the SAME task-id/log-dir must not cross-
   #    contaminate -- the second one fails fast instead of racing or reading the first one's artifacts.
   log_dir="$t/run11"; mkdir -p "$log_dir"
@@ -498,6 +505,19 @@ FAKECAT
 fi
 
 task_id="" mode="" batch_id="" repo="$(pwd)" log_dir="/tmp" prompt_file_override=""
+
+# Context hygiene for batch scale (10-25 concurrent tasks): suppress Claude Code's per-project
+# auto-memory for this process tree. Auto-memory reads/writes ~/.claude/projects/<cwd-slug>/memory/
+# MEMORY.md -- every supervisor (and every maker session its herdr calls spawn, via env
+# inheritance) otherwise carries that machinery: a memory-survey preamble, periodic resync
+# traffic, and reads of whatever a PREVIOUS session in the same worktree wrote (supervisors have
+# been observed reading stale memory mid-loop instead of progressing the SOP). Verified
+# empirically on claude 2.1.299: with this set, MEMORY.md mentions drop to 0 in the session
+# transcript. The user-level CLAUDE.md (~/.claude/CLAUDE.md) still loads -- it cannot be dropped
+# per-source without breaking OAuth (`--setting-sources project` -> 401, verified) -- so it is
+# kept slim at the source instead. Never re-enable here: batch dispatch wants deterministic,
+# identical per-task context, not per-cwd accumulated state.
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 max_checker_rounds="6" budget_usd="15.00"
 while [ $# -gt 0 ]; do
   case "$1" in

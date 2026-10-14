@@ -12,6 +12,12 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Context hygiene (same rationale as spawn-sub-sup.sh): suppress Claude Code's per-project
+# auto-memory for any claude-based checker session this launcher starts -- harness and fallback
+# sessions inherit this env. pi-based checkers are unaffected. Checkers must see the same
+# deterministic context every round, never per-cwd accumulated memory state.
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+
 if [ "${1:-}" = "--selfcheck" ]; then
   fails=0
   rc=0; "$0" -- -p q >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: no-addendum exit $rc (want 2)"; fails=1; }
@@ -36,6 +42,9 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # but it IS in the script - verify it exists and is referenced in exec
   [ -f "$SCRIPT_DIR/checker-progress.py" ]            || { echo "FAIL: checker-progress.py not found"; fails=1; }
   grep -q 'checker-progress.py' "$0"                || { echo "FAIL: checker-progress.py not referenced in launch-checker.sh"; fails=1; }
+  # Context-hygiene pin: auto-memory suppression must stay exported (checkers see deterministic
+  # context, never per-cwd accumulated memory state -- see the export block for rationale).
+  grep -q 'export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1' "$0" || { echo "FAIL: auto-memory suppression export missing"; fails=1; }
   # Regression test: --mode json must come AFTER caller's args so it wins if they pass --mode text
   # Simulate this with dryrun: caller -- -p "..." --mode text should not override our --mode json
   out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec -- -p "test prompt" --mode text 2>&1)" || { echo "FAIL: dryrun failed for --mode override test"; fails=1; }
