@@ -388,13 +388,22 @@ ponytail as a companion to install; this is not the place to install it. Same ex
 
 8. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
 
-9. **Teardown** — immediately after integration, close everything created for this task:
+9. **Teardown** — immediately after integration, close everything created for this task with ONE fail-closed
+   command, run from the **primary checkout** (it works the same for a supervisor or an operator who took
+   over mid-loop):
    ```bash
-   herdr pane close "$ck"                              # checker pane (if visible path was used) - close BEFORE workspace removal
-   herdr worktree remove --workspace <workspace-id>   # removes git worktree + herdr workspace
-   git branch -d sm/<task-id>                          # delete the merged branch
+   TOK=$(${CLAUDE_PLUGIN_ROOT}/bin/claim-ledger.py token --task-id <task-id>)   # open claim's token, empty+nonzero if none
+   ${CLAUDE_PLUGIN_ROOT}/bin/close-out.sh --repo <repo> --task-id <task-id> --owner <owner> --token "$TOK"
    ```
-   A merged task that leaves a worktree or branch behind is incomplete. The worktree must not outlive its task.
+   `close-out.sh` refuses to destroy anything unverified: the branch must be merged into the integration
+   base (`origin/main` by default), the worktree must be clean; the worktree is removed via `herdr
+   worktree remove` (panes close with the workspace) or plain `git worktree remove` when herdr isn't
+   managing it; the branch is deleted with plain `-d`; the claim is released with the token — and kept
+   open if the branch is unmerged, because unmerged work is still owned work. Exit 0 = torn down (or
+   nothing left to tear down); exit 1 = REFUSE with every failing condition listed. `bin/close-out.sh
+   --selfcheck` proves the fail-closed paths. A merged task that leaves a worktree, branch, or claim
+   behind is incomplete. The worktree must not outlive its task; ledger records carry the audit weight —
+   verdict files in the worktree are point-in-time evidence, not a reason to defer teardown.
 
    Then run `${CLAUDE_PLUGIN_ROOT}/bin/teardown-check.sh --task-id <task-id> --repo <repo>` as an advisory
    confirmation — it reports whether a worktree, branch, herdr pane/agent, or claim-ledger entry for this

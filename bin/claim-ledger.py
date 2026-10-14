@@ -44,6 +44,9 @@ git worktree) never work the same task at once.
   claim-ledger.py status | list                                            -> lists all currently-open claims
                                                                                 (owner/claimed_at/scope/op if
                                                                                 declared -- never a token)
+  claim-ledger.py token --task-id ID                                        -> prints the open claim's release
+                                                                                token (read-only; nonzero + a
+                                                                                message when no open claim)
   claim-ledger.py selfcheck                                                -> asserts the fold + drives the
                                                                                 real CLI paths
 
@@ -729,15 +732,18 @@ def main(argv):
     sub.add_parser("list")
     sub.add_parser("selfcheck")
 
+    t = sub.add_parser("token")
+    t.add_argument("--task-id", required=True)
+
     k = sub.add_parser("conflicts")
     k.add_argument("--scope", required=True)
     args = p.parse_args(argv)
 
-    if args.cmd in ("claim", "release", "steal"):
+    if args.cmd in ("claim", "release", "steal", "token"):
         if not _valid_task_id(args.task_id):
             sys.exit(f"invalid --task-id {args.task_id!r}: must match [A-Za-z0-9_-] and be 1-128 chars "
                       f"(no path separators, no null bytes, no empty string)")
-        if not args.owner:
+        if args.cmd != "token" and not args.owner:
             sys.exit("--owner must be non-empty")
 
     scope = operation = None
@@ -778,6 +784,16 @@ def main(argv):
             ts = time.strftime("%Y-%m-%dT%H:%M:%S")
             _append({"ev": "released", "task_id": args.task_id, "owner": args.owner, "ts": ts})
         print(f"released {args.task_id}")
+
+    elif args.cmd == "token":
+        # read-only: the latest open claim's release token for a task-id, so a supervisor
+        # (or operator) running close-out.sh can release what spawn-sub-sup.sh claimed.
+        # Same trust level as holding the token: it requires reading the repo-local ledger.
+        # No lock: a torn read just yields the pre-write state, and release re-folds under lock.
+        existing = open_claims().get(args.task_id)
+        if existing is None:
+            sys.exit(f"no open claim for task-id {args.task_id} -- nothing to token")
+        print(existing["token"])
 
     elif args.cmd == "steal":
         if not args.reason.strip():
