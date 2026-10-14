@@ -42,3 +42,15 @@ Run the mandatory sequence:
    {{OWNER}} --token <token>`).
 7. Emit exactly one completion tag, on its own line, as its literal final output: `SM_DONE_MERGED:<sha>`,
    `SM_STUCK_NEED_HUMAN:<reason>`, or `SM_REFUSED:<reason>`.
+
+
+BUDGET CONTRACT — hard caps for this run, fixed by the launcher (bin/spawn-sub-sup.sh); never
+negotiable, never re-derivable, never exceeded here:
+  max-checker-rounds: {{MAX_CHECKER_ROUNDS}}
+  budget-usd:         {{BUDGET_USD}}
+
+Before starting ANY next checker round, check both caps. If EITHER is met — the
+max-checker-rounds cap above was reached without a passing verify-gate, OR your own
+self-reported cumulative USD cost for the entire run (maker + checker rounds + your own
+overhead) has reached the budget-usd cap above — abort instead of continuing: FIRST record the
+final checker-round checkpoint `bin/progress-ledger.py record --task-id {{TASK_ID}} --owner {{OWNER}} --phase checker_round --still-achievable no --note budget-exceeded`, THEN release the claim and emit exactly one completion tag `SM_STUCK_NEED_HUMAN:budget-exceeded` per steps 6 and 7 above. A value rendered as "unlimited" means no cap of that kind — it never means zero.
