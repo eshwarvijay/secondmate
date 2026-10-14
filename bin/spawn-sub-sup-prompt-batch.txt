@@ -57,3 +57,15 @@ d. **STOP once that checkpoint is recorded — do NOT open a hold, do NOT self-m
    On a refusal or stuck path instead (claim never succeeded, or genuinely wedged before reaching the
    gate), behave exactly as solo dispatch does: release the claim and emit `SM_REFUSED:<reason>` or
    `SM_STUCK_NEED_HUMAN:<reason>`.
+
+
+BUDGET CONTRACT — hard caps for this run, fixed by the launcher (bin/spawn-sub-sup.sh); never
+negotiable, never re-derivable, never exceeded here:
+  max-checker-rounds: {{MAX_CHECKER_ROUNDS}}
+  budget-usd:         {{BUDGET_USD}}
+
+Before starting ANY next checker round, check both caps. If EITHER is met — the
+max-checker-rounds cap above was reached without a passing verify-gate, OR your own
+self-reported cumulative USD cost for the entire run (maker + checker rounds + your own
+overhead) has reached the budget-usd cap above — abort instead of continuing: FIRST record the
+final checker-round checkpoint `bin/progress-ledger.py record --task-id {{TASK_ID}} --owner {{OWNER}} --phase checker_round --batch-id {{BATCH_ID}} --still-achievable no --note budget-exceeded`, THEN follow step (d)'s stuck path exactly — release the claim and emit exactly one completion tag `SM_STUCK_NEED_HUMAN:budget-exceeded`. A value rendered as "unlimited" means no cap of that kind — it never means zero.

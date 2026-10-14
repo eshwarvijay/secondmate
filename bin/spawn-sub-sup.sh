@@ -7,7 +7,9 @@
 # top-level dispatcher's job).
 #
 #   spawn-sub-sup.sh --task-id ID --mode solo|batch [--batch-id ID] [--repo DIR] [--log-dir DIR]
-#                     [--prompt-file FILE]
+#                     [--prompt-file FILE] [--max-checker-rounds N] [--budget-usd C]
+#   (--max-checker-rounds default 6, --budget-usd default 15.00; 0 means unlimited in either;
+#    both render into the prompt templates' BUDGET CONTRACT section)
 #   spawn-sub-sup.sh --selfcheck
 #
 # Exit codes (relayed straight from dispatch-report.py, except 5 which is this script's own):
@@ -27,6 +29,28 @@ validate_id() {
   fi
 }
 
+# Non-negative-number shape for the two budget-cap flags (0 is the "unlimited" sentinel, never a
+# cap of zero). Negative and non-numeric values are both rejected with exit 2 -- the same posture
+# validate_id takes for id-shaped flags.
+_NONNEG_NUM_RE='^[0-9]+([.][0-9]+)?$'
+
+validate_nonneg_number() {
+  local label="$1" val="$2"
+  if [[ ! "$val" =~ $_NONNEG_NUM_RE ]]; then
+    echo "invalid --$label '$val' (must be a non-negative number, e.g. 6 or 15.00; 0 means unlimited)" >&2
+    exit 2
+  fi
+}
+
+# True iff an already-VALIDATED non-negative number is numerically zero ("0", "00", "0.0",
+# "0.00" -- every digit a zero). Stripping all '0' digits then leaves "" (integer form) or "."
+# (fractional form); any nonzero value leaves at least one nonzero digit behind, so the zero
+# test needs no external process.
+value_is_zero() {
+  local stripped="${1//0/}"
+  [ -z "$stripped" ] || [ "$stripped" = "." ]
+}
+
 # Atomically opens fd 9 for writing to a predictable artifact path (prompt/log/result), failing with
 # no fd leaked if ANYTHING already exists there -- regular file or symlink (even dangling), checked by
 # the kernel's own O_EXCL at open() time, never a separate stat-then-write step a concurrent attacker
@@ -40,10 +64,13 @@ exclusive_open() {
   return "$rc"
 }
 
-# Substitutes {{TASK_ID}}/{{OWNER}}/{{REPO}}/{{MODE}}/{{BATCH_ID}} into a template file's contents.
-# batch_id may be "" (solo mode never has one). Prints the rendered prompt to stdout.
+# Substitutes {{TASK_ID}}/{{OWNER}}/{{REPO}}/{{MODE}}/{{BATCH_ID}}/{{MAX_CHECKER_ROUNDS}}/{{BUDGET_USD}}
+# into a template file's contents. batch_id may be "" (solo mode never has one); the two budget-cap
+# display strings arrive already sentinel-resolved (a validated flag value, or the literal word
+# "unlimited" for the 0 sentinel -- never a bare 0 the prompt could misread as a zero cap).
+# Prints the rendered prompt to stdout.
 render_prompt() {
-  local mode="$1" task_id="$2" owner="$3" repo="$4" batch_id="$5" template_file="$6"
+  local mode="$1" task_id="$2" owner="$3" repo="$4" batch_id="$5" max_rounds="$6" budget_usd="$7" template_file="$8"
   local prompt
   # Check the ACTUAL read's own exit status, not just an earlier -r check -- the file can pass that
   # check and still fail to read moments later (deleted, permissions changed, unmounted, etc). On
@@ -56,6 +83,8 @@ render_prompt() {
   if [ -n "$batch_id" ]; then
     prompt="${prompt//\{\{BATCH_ID\}\}/$batch_id}"
   fi
+  prompt="${prompt//\{\{MAX_CHECKER_ROUNDS\}\}/$max_rounds}"
+  prompt="${prompt//\{\{BUDGET_USD\}\}/$budget_usd}"
   printf '%s' "$prompt"
 }
 
@@ -101,23 +130,47 @@ if [ "${1:-}" = "--selfcheck" ]; then
   rc=0; "$0" --task-id 'bad id!' --mode solo >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: invalid --task-id shape ($rc)"; fails=1; }
   rc=0; "$0" --task-id t1 --mode batch --batch-id 'bad id!' >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: invalid --batch-id shape ($rc)"; fails=1; }
   rc=0; "$0" --task-id t1 --mode wat >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: unknown --mode ($rc)"; fails=1; }
+  rc=0; "$0" --task-id t1 --mode solo --max-checker-rounds -1 >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: negative --max-checker-rounds ($rc)"; fails=1; }
+  rc=0; "$0" --task-id t1 --mode solo --max-checker-rounds abc >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-checker-rounds ($rc)"; fails=1; }
+  rc=0; "$0" --task-id t1 --mode solo --budget-usd -0.01 >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: negative --budget-usd ($rc)"; fails=1; }
+  rc=0; "$0" --task-id t1 --mode solo --budget-usd 12.3.4 >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: non-numeric --budget-usd ($rc)"; fails=1; }
+  # value_is_zero: the 0 = "unlimited" sentinel's zero test, unit-level -- every digit zero means
+  # zero (so a "0.00" flag value renders "unlimited" too); any nonzero digit anywhere means not.
+  value_is_zero 0      || { echo "FAIL: value_is_zero(0) is false"; fails=1; }
+  value_is_zero 0.00   || { echo "FAIL: value_is_zero(0.00) is false"; fails=1; }
+  value_is_zero 10     && { echo "FAIL: value_is_zero(10) is true"; fails=1; }
+  value_is_zero 0.10   && { echo "FAIL: value_is_zero(0.10) is true"; fails=1; }
 
-  # --- template placeholder substitution (solo + batch) ---
-  out="$(render_prompt solo T1 sm-T1 /repo/x solo "$SCRIPT_DIR/spawn-sub-sup-prompt-solo.txt")"
+  # --- template placeholder substitution (solo + batch), incl. the BUDGET CONTRACT values ---
+  out="$(render_prompt solo T1 sm-T1 /repo/x solo 6 15.00 "$SCRIPT_DIR/spawn-sub-sup-prompt-solo.txt")"
   echo "$out" | grep -q 'task-id: T1'   || { echo "FAIL: solo template task-id not substituted"; fails=1; }
   echo "$out" | grep -q 'owner:   sm-T1' || { echo "FAIL: solo template owner not substituted"; fails=1; }
   echo "$out" | grep -q 'repo:    /repo/x' || { echo "FAIL: solo template repo not substituted"; fails=1; }
+  echo "$out" | grep -q 'max-checker-rounds: 6$' || { echo "FAIL: solo template default max-checker-rounds (6) not substituted"; fails=1; }
+  echo "$out" | grep -Eq 'budget-usd: +15\.00$' || { echo "FAIL: solo template default budget-usd (15.00) not substituted"; fails=1; }
+  echo "$out" | grep -qF 'SM_STUCK_NEED_HUMAN:budget-exceeded' || { echo "FAIL: solo template missing budget-exceeded abort instruction"; fails=1; }
   echo "$out" | grep -qF '{{' && { echo "FAIL: solo template left an unsubstituted placeholder"; fails=1; }
-  out="$(render_prompt batch T2 sm-T2 /repo/y B9 "$SCRIPT_DIR/spawn-sub-sup-prompt-batch.txt")"
+  out="$(render_prompt batch T2 sm-T2 /repo/y B9 6 15.00 "$SCRIPT_DIR/spawn-sub-sup-prompt-batch.txt")"
   echo "$out" | grep -q 'task-id:  T2'  || { echo "FAIL: batch template task-id not substituted"; fails=1; }
   echo "$out" | grep -q 'batch-id: B9'  || { echo "FAIL: batch template batch-id not substituted"; fails=1; }
+  echo "$out" | grep -q 'max-checker-rounds: 6$' || { echo "FAIL: batch template default max-checker-rounds (6) not substituted"; fails=1; }
+  echo "$out" | grep -Eq 'budget-usd: +15\.00$' || { echo "FAIL: batch template default budget-usd (15.00) not substituted"; fails=1; }
+  echo "$out" | grep -qF 'SM_STUCK_NEED_HUMAN:budget-exceeded' || { echo "FAIL: batch template missing budget-exceeded abort instruction"; fails=1; }
   echo "$out" | grep -qF '{{' && { echo "FAIL: batch template left an unsubstituted placeholder"; fails=1; }
+  # explicit budget-cap override values substitute verbatim; 0 arrives here already
+  # sentinel-resolved as the literal word "unlimited" (never a bare 0) -- both templates.
+  out="$(render_prompt solo T4 sm-T4 /repo/x solo 3 22.50 "$SCRIPT_DIR/spawn-sub-sup-prompt-solo.txt")"
+  echo "$out" | grep -q 'max-checker-rounds: 3$' || { echo "FAIL: solo template override max-checker-rounds (3) not substituted"; fails=1; }
+  echo "$out" | grep -Eq 'budget-usd: +22\.50$' || { echo "FAIL: solo template override budget-usd (22.50) not substituted"; fails=1; }
+  out="$(render_prompt batch T5 sm-T5 /repo/y B8 unlimited unlimited "$SCRIPT_DIR/spawn-sub-sup-prompt-batch.txt")"
+  echo "$out" | grep -q 'max-checker-rounds: unlimited$' || { echo "FAIL: batch template unlimited max-checker-rounds not substituted"; fails=1; }
+  echo "$out" | grep -Eq 'budget-usd: +unlimited$' || { echo "FAIL: batch template unlimited budget-usd not substituted"; fails=1; }
 
   # render_prompt must detect a failed read of template_file itself (not just rely on an earlier
   # stat-based -r check elsewhere) and return nonzero with no stdout. A directory is a deterministic,
   # non-racing way to construct "exists and even passes -r" yet still fails an actual `cat` read.
   mkdir -p "$t/render_prompt_unreadable_dir"
-  if render_prompt solo T3 sm-T3 /repo/z solo "$t/render_prompt_unreadable_dir" >/dev/null 2>"$t/render_prompt_fail.err"; then
+  if render_prompt solo T3 sm-T3 /repo/z solo 6 15.00 "$t/render_prompt_unreadable_dir" >/dev/null 2>"$t/render_prompt_fail.err"; then
     echo "FAIL: render_prompt should return nonzero when its template_file's actual read fails, but it succeeded"
     fails=1
   fi
@@ -264,6 +317,31 @@ FAKECAT
   [ "$rc" = 2 ] || { echo "FAIL: TOCTOU-failed template read should exit 2 (got $rc)"; fails=1; }
   grep -qi 'failed to read' "$t/run7c.err" || { echo "FAIL: TOCTOU-failed template read refusal message missing"; fails=1; }
   [ -f "$claude_marker2" ] && { echo "FAIL: claude was invoked despite the template read failing after the earlier readability check passed"; fails=1; }
+
+  # 7d) budget caps end-to-end: --max-checker-rounds/--budget-usd flow from argv through validation
+  #     and the 0 = unlimited sentinel into the .prompt artifact's BUDGET CONTRACT -- defaults,
+  #     explicit overrides, and the 0 sentinel, on BOTH templates. (The batch run uses the
+  #     claim_token behavior so its final tag is SM_READY_UNMERGED -> exit 4, avoiding the
+  #     unrelated batch self-merge violation an SM_DONE_MERGED stub would trip.)
+  log_dir="$t/run7d1"; mkdir -p "$log_dir"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id bdef1 --mode solo --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run7d1.err" || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL: budget-defaults solo run exit ($rc)"; fails=1; }
+  grep -q 'max-checker-rounds: 6$' "$log_dir/sm-bdef1.prompt" || { echo "FAIL: default --max-checker-rounds (6) not rendered into the solo prompt"; fails=1; }
+  grep -Eq 'budget-usd: +15\.00$' "$log_dir/sm-bdef1.prompt" || { echo "FAIL: default --budget-usd (15.00) not rendered into the solo prompt"; fails=1; }
+  grep -qF -- '--phase checker_round --still-achievable no --note budget-exceeded' "$log_dir/sm-bdef1.prompt" || { echo "FAIL: solo BUDGET CONTRACT record line not fully substituted"; fails=1; }
+  log_dir="$t/run7d2"; mkdir -p "$log_dir"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=claim_token "$0" --task-id bovr2 --mode batch --batch-id bb2 --max-checker-rounds 3 --budget-usd 22.50 --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run7d2.err" || rc=$?
+  [ "$rc" = 4 ] || { echo "FAIL: budget-override batch run exit ($rc, want 4 for SM_READY_UNMERGED)"; fails=1; }
+  grep -q 'max-checker-rounds: 3$' "$log_dir/sm-bovr2.prompt" || { echo "FAIL: override --max-checker-rounds (3) not rendered into the batch prompt"; fails=1; }
+  grep -Eq 'budget-usd: +22\.50$' "$log_dir/sm-bovr2.prompt" || { echo "FAIL: override --budget-usd (22.50) not rendered into the batch prompt"; fails=1; }
+  grep -qF -- '--phase checker_round --batch-id bb2 --still-achievable no --note budget-exceeded' "$log_dir/sm-bovr2.prompt" || { echo "FAIL: batch BUDGET CONTRACT record line not fully substituted"; fails=1; }
+  log_dir="$t/run7d3"; mkdir -p "$log_dir"
+  rc=0; PATH="$fakebin:$PATH" FAKE_CLAUDE_BEHAVIOR=ok "$0" --task-id bunl3 --mode solo --max-checker-rounds 0 --budget-usd 0.00 --repo "$repo_dir" --log-dir "$log_dir" >/dev/null 2>"$t/run7d3.err" || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL: budget-unlimited solo run exit ($rc)"; fails=1; }
+  grep -q 'max-checker-rounds: unlimited$' "$log_dir/sm-bunl3.prompt" || { echo "FAIL: --max-checker-rounds 0 must render as the literal word 'unlimited'"; fails=1; }
+  grep -Eq 'budget-usd: +unlimited$' "$log_dir/sm-bunl3.prompt" || { echo "FAIL: --budget-usd 0.00 must render as the literal word 'unlimited'"; fails=1; }
+  grep -Eq 'max-checker-rounds: +0' "$log_dir/sm-bunl3.prompt" && { echo "FAIL: 0 max-checker-rounds rendered as a bare 0 instead of 'unlimited'"; fails=1; }
+  grep -Eq 'budget-usd: +0' "$log_dir/sm-bunl3.prompt" && { echo "FAIL: 0 budget-usd rendered as a bare 0 instead of 'unlimited'"; fails=1; }
 
   # 8) symlink refusal: a pre-existing symlink at the .prompt/.log/.result path must be refused, not
   #    followed -- a local attacker pre-creating one must never get the victim file overwritten.
@@ -420,6 +498,7 @@ FAKECAT
 fi
 
 task_id="" mode="" batch_id="" repo="$(pwd)" log_dir="/tmp" prompt_file_override=""
+max_checker_rounds="6" budget_usd="15.00"
 while [ $# -gt 0 ]; do
   case "$1" in
     --task-id) [ $# -ge 2 ] || { echo "--task-id requires a value" >&2; exit 2; }; task_id="$2"; shift 2;;
@@ -428,6 +507,8 @@ while [ $# -gt 0 ]; do
     --repo) [ $# -ge 2 ] || { echo "--repo requires a value" >&2; exit 2; }; repo="$2"; shift 2;;
     --log-dir) [ $# -ge 2 ] || { echo "--log-dir requires a value" >&2; exit 2; }; log_dir="$2"; shift 2;;
     --prompt-file) [ $# -ge 2 ] || { echo "--prompt-file requires a value" >&2; exit 2; }; prompt_file_override="$2"; shift 2;;
+    --max-checker-rounds) [ $# -ge 2 ] || { echo "--max-checker-rounds requires a value" >&2; exit 2; }; max_checker_rounds="$2"; shift 2;;
+    --budget-usd) [ $# -ge 2 ] || { echo "--budget-usd requires a value" >&2; exit 2; }; budget_usd="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -448,6 +529,22 @@ fi
 
 validate_id task-id "$task_id"
 [ -n "$batch_id" ] && validate_id batch-id "$batch_id"
+validate_nonneg_number max-checker-rounds "$max_checker_rounds"
+validate_nonneg_number budget-usd "$budget_usd"
+
+# Resolve the 0 sentinel for rendering: the prompt templates' BUDGET CONTRACT must carry the
+# literal word "unlimited", never a bare 0 a sub-supervisor could misread as a cap of zero
+# rounds / zero dollars. Real values render exactly as validated.
+if value_is_zero "$max_checker_rounds"; then
+  max_rounds_disp="unlimited"
+else
+  max_rounds_disp="$max_checker_rounds"
+fi
+if value_is_zero "$budget_usd"; then
+  budget_usd_disp="unlimited"
+else
+  budget_usd_disp="$budget_usd"
+fi
 
 repo="$(cd "$repo" 2>/dev/null && pwd)" || { echo "no such --repo directory" >&2; exit 2; }
 mkdir -p "$log_dir"
@@ -474,7 +571,7 @@ fi
 # Render the prompt into a bash variable (never re-read from disk) -- this is the exact string later
 # fed to `claude -p`, so there is no window after this point where an attacker could swap the on-disk
 # .prompt artifact for a symlink to attacker-controlled content and have it silently re-trusted.
-if ! prompt_content="$(render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$template_file")"; then
+if ! prompt_content="$(render_prompt "$mode" "$task_id" "$owner" "$repo" "$batch_id" "$max_rounds_disp" "$budget_usd_disp" "$template_file")"; then
   echo "SPAWN-SUB-SUP: failed to read template file: $template_file (passed the earlier readability check but the actual read still failed -- deleted, permissions changed, or unmounted in between) -- refusing to launch claude with an empty/partial prompt" >&2
   exit 2
 fi
