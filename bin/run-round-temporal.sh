@@ -96,14 +96,26 @@
 #   right after it) -- mirroring the bridge's own `submit --wait` semantics, which is what this flag
 #   was actually designed to bound. It does NOT cover the one-time BOOTSTRAP costs that happen once
 #   per round before that phase ever starts: building the bridge CLI, starting the Temporal dev
-#   server, and starting the bridge worker. Each of those bootstrap steps is already individually
-#   capped at roughly 30 seconds in its own right (so none of them can hang indefinitely -- that
-#   invariant holds regardless of --max-seconds), but a small --max-seconds value does not shrink
-#   any of them. Practical consequence: for a --max-seconds smaller than bootstrap time, expect the
-#   round to still take roughly that bootstrap time before the deadline logic engages at all -- this
+#   server, and starting the bridge worker. These two kinds of bootstrap cost are NOT the same, and
+#   a round-10 checker review found an earlier revision of this note wrongly implied they were:
+#   - The dev-server-readiness poll and the worker-startup poll are each a fixed `for i in 1..100;
+#     sleep 0.3` loop -- genuinely capped at roughly 30 seconds each, so neither can hang
+#     indefinitely regardless of --max-seconds.
+#   - The `go build` step itself has NO timeout wrapper at all. It runs for exactly as long as the
+#     Go toolchain takes -- which, especially against a cold module cache, can legitimately exceed
+#     30 seconds for entirely ordinary reasons, not a bug. Confirmed live: a fake SM_TEMPORAL_GO_BIN
+#     that sleeps 31+ seconds makes the whole invocation take just as long. This is deliberately NOT
+#     artificially capped: unlike a readiness poll, there is no safe "give up and refuse" partway
+#     through a build -- killing it could corrupt the module cache mid-write or discard a build that
+#     was legitimately about to finish, which would be worse than not bounding it.
+#   A small --max-seconds value does not shrink any bootstrap step, capped or not. Practical
+#   consequence: for a --max-seconds smaller than bootstrap time, expect the round to still take
+#   roughly that bootstrap time (the readiness polls' ~30s each, PLUS however long the build
+#   actually takes, with no ceiling on that part) before the deadline logic engages at all -- this
 #   is accepted, documented behavior, not a defect. Making every individual bootstrap sub-step
-#   itself deadline-aware (the build step, the two separate port-open/pid-file polling loops) would
-#   be a materially larger change for a benefit this task's scope does not need.
+#   itself deadline-aware (which, for the build step, would mean choosing to kill a legitimately-
+#   progressing build or risk corrupting the module cache) would be a materially larger change, and
+#   a worse one, for a benefit this task's scope does not need.
 set -euo pipefail
 
 # Clear any inherited DEBUG trap and disable function tracing. These are the first two REAL
