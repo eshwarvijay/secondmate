@@ -34,7 +34,9 @@
 #
 # Exit codes: 0 ok | 1 preflight/environment failure | 2 usage error |
 #             10 ZERO_COMMIT_ROUND (maker reported ok but left the worktree unchanged -- refused,
-#                never handed to the checker) | 124 TEMPORAL_TIMEOUT (--max-seconds exceeded)
+#                never handed to the checker) | 11 TEMPORAL_FETCH_FAILED (a `bridge fetch` call itself
+#                exited non-zero -- a real engine/Temporal error, distinct from "not done yet") |
+#                124 TEMPORAL_TIMEOUT (--max-seconds exceeded)
 #
 # NAMED LIMITATIONS (accepted, documented -- see skills/secondmate/SKILL.md for the full list):
 # - No round-state.md/feature-list.json/ponytail/lesson-injection parity on this path (v1 scope).
@@ -79,18 +81,29 @@ _kill_sidecar() {  # _kill_sidecar <file> -- no-op if missing, or if the fingerp
 }
 
 # --- the one place a round's real changes are staged + committed: explicit paths, never -A/-u -----
-# Reads `git status --porcelain -z` (NUL-delimited: no quoting ambiguity, and renames carry a second
-# NUL-terminated orig-path field we must skip so we only ever `add --` the current path). Returns 10
-# (ZERO_COMMIT_ROUND) if the maker left nothing changed; otherwise stages + commits with the
-# Temporal-Workflow-Id/Temporal-Run-Id trailers and prints the new HEAD sha.
+# Reads `git status --porcelain -z` (NUL-delimited: no quoting ambiguity). A rename/copy carries a
+# second NUL-terminated orig-path field; both the current path AND that orig path are added
+# explicitly (never skipped) -- `git add` on a tracked path that's now missing from the worktree
+# correctly stages its removal, which is what actually leaves the tree clean after the commit. The
+# code check matches R/C in EITHER porcelain position (`R*|C*|*R|*C`), not just leading: a bare
+# `mv old new; git add -N -- new` produces a leading-space code (" R", R in the SECOND position).
+# Returns 10 (ZERO_COMMIT_ROUND) if the maker left nothing changed; otherwise stages + commits with
+# the Temporal-Workflow-Id/Temporal-Run-Id trailers and prints the new HEAD sha.
 _commit_round_changes() {  # _commit_round_changes <repo> <round> <goal> <wid> <rid>
   local repo="$1" round="$2" goal="$3" wid="$4" rid="$5"
-  local paths=() pending_skip=0 entry code path
+  local paths=() pending_orig=0 entry code path
   while IFS= read -r -d '' entry; do
-    if [ "$pending_skip" = 1 ]; then pending_skip=0; continue; fi
+    if [ "$pending_orig" = 1 ]; then
+      pending_orig=0
+      # the orig/old path for a rename/copy: must be explicitly added too, never just skipped --
+      # `git add` on a path that's tracked but now missing from the worktree correctly stages its
+      # removal (confirmed live), which is what makes the commit leave a clean tree afterward.
+      paths+=("$entry")
+      continue
+    fi
     code="${entry:0:2}"; path="${entry:3}"
     paths+=("$path")
-    case "$code" in R*|C*) pending_skip=1;; esac
+    case "$code" in R*|C*|*R|*C) pending_orig=1;; esac
   done < <(git -C "$repo" status --porcelain -z)
   if [ "${#paths[@]}" -eq 0 ]; then
     return 10
@@ -173,6 +186,8 @@ cmd_round() {
   fi
   [ -n "$maker_prompt" ] || { echo "need --maker-prompt-file F or --maker-prompt TEXT" >&2; usage; return 2; }
   [ -n "$goal" ] || goal="$checker_goal"
+  case "$max_seconds" in ''|*[!0-9]*) echo "invalid --max-seconds: $max_seconds (want a non-negative integer)" >&2; return 2;; esac
+  case "$max_cost_cents" in ''|*[!0-9]*) echo "invalid --max-cost-cents: $max_cost_cents (want a non-negative integer)" >&2; return 2;; esac
 
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "--repo $repo is not a git worktree" >&2; return 2; }
   repo="$(cd "$repo" && pwd)"
@@ -206,6 +221,21 @@ cmd_round() {
 
   # --- preflight: refuse loudly, never silently degrade -------------------------------------------
   [ -d "$bridge_dir" ] || { echo "bridge dir not found: $bridge_dir (read-only dependency; override with --bridge-dir)" >&2; return 1; }
+  bridge_dir="$(cd "$bridge_dir" && pwd)"
+
+  run_dir="${run_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-run.XXXXXX")}"
+  mkdir -p "$run_dir"
+  run_dir="$(cd "$run_dir" && pwd)"
+  # never write a throwaway build/cache/temporal.db underneath the read-only bridge dependency's own tree
+  case "$run_dir" in
+    "$bridge_dir"|"$bridge_dir"/*)
+      echo "refusing: --run-dir ($run_dir) is the same as or nested under --bridge-dir ($bridge_dir) -- must never write into the bridge prototype's own directory" >&2
+      rm -rf "$run_dir" 2>/dev/null || true  # the trap isn't set yet; don't leave even an empty dir under bridge_dir
+      run_dir=""
+      return 1
+      ;;
+  esac
+
   local fork_root server_bin
   fork_root="$(cd "$bridge_dir/.." && pwd)"
   server_bin="$fork_root/bin/temporal-local-standalone"
@@ -215,8 +245,6 @@ cmd_round() {
   command -v claude >/dev/null 2>&1 || { echo "'claude' not on PATH (needed by the bridge's maker activity)" >&2; return 1; }
   command -v pi >/dev/null 2>&1 || { echo "'pi' not on PATH (needed by the bridge's checker activity)" >&2; return 1; }
 
-  run_dir="${run_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-run.XXXXXX")}"
-  mkdir -p "$run_dir"
   trap cleanup EXIT INT TERM
   echo "$plan_json" > "$run_dir/plan.json"
 
@@ -242,7 +270,8 @@ cmd_round() {
 
   local i
   for i in $(seq 1 100); do
-    python3 -c "import socket;socket.create_connection(('127.0.0.1',$grpc_port),1).close()" 2>/dev/null && break
+    python3 -c 'import socket, sys
+socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$grpc_port" 2>/dev/null && break
     sleep 0.3
   done
 
@@ -261,25 +290,30 @@ cmd_round() {
   echo "submitting plan (round $round) ..." >&2
   local submit_out="$run_dir/submit.json" wid rid
   TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$run_dir/bridge" submit --plan-file "$run_dir/plan.json" --wait 0 > "$submit_out"
-  wid="$(python3 -c "import json;print(json.load(open('$submit_out'))['workflow_id'])")"
-  rid="$(python3 -c "import json;print(json.load(open('$submit_out'))['run_id'])")"
+  wid="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["workflow_id"])' "$submit_out")"
+  rid="$(python3 -c 'import json, sys
+print(json.load(open(sys.argv[1]))["run_id"])' "$submit_out")"
   echo "workflow_id=$wid run_id=$rid" >&2
 
   # idle-watchdog-safe polling: --wait 0 above already returned; this script owns the poll loop and
   # prints one heartbeat per cycle so a wrapping run-round.sh's idle watchdog stays fed, while
   # genuinely exercising the query-vs-history bridge fetch path every round (not just a blocking --wait).
-  local evidence_file="$run_dir/evidence.json" start_ts now elapsed done_flag
+  local evidence_file="$run_dir/evidence.json" start_ts now elapsed done_flag fetch_rc
   start_ts=$(date +%s)
   while :; do
-    TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$run_dir/bridge" fetch --workflow-id "$wid" --run-id "$rid" >"$evidence_file" 2>&1 || true
-    done_flag="$(python3 -c "
-import json
+    fetch_rc=0
+    TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$run_dir/bridge" fetch --workflow-id "$wid" --run-id "$rid" >"$evidence_file" 2>&1 || fetch_rc=$?
+    if [ "$fetch_rc" -ne 0 ]; then
+      echo "TEMPORAL_FETCH_FAILED: bridge fetch exited $fetch_rc -- $(cat "$evidence_file")" >&2
+      return 11
+    fi
+    done_flag="$(python3 -c 'import json, sys
 try:
-    d = json.load(open('$evidence_file'))
-    print('1' if d.get('evidence', {}).get('done') else '0')
+    d = json.load(open(sys.argv[1]))
+    print("1" if d.get("evidence", {}).get("done") else "0")
 except Exception:
-    print('0')
-")"
+    print("0")' "$evidence_file")"
     now=$(date +%s); elapsed=$((now - start_ts))
     echo "heartbeat: elapsed=${elapsed}s max=${max_seconds}s done=${done_flag}" >&2
     [ "$done_flag" = "1" ] && break
@@ -303,28 +337,28 @@ except Exception:
   local fresh_evidence="$run_dir/evidence.fresh.json"
   TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$run_dir/bridge" fetch --workflow-id "$wid" --run-id "$rid" > "$fresh_evidence"
 
-  python3 -c "
-import json
-d = json.load(open('$fresh_evidence'))
-ev = d['evidence']
-checker = next(s for s in ev['steps'] if s['step_id'] == 'step-checker')
-print(checker.get('output', ''))
-"
+  python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+ev = d["evidence"]
+checker = next(s for s in ev["steps"] if s["step_id"] == "step-checker")
+print(checker.get("output", ""))' "$fresh_evidence"
 
   local bridge_head
   bridge_head="$(cd "$bridge_dir" && git rev-parse HEAD 2>/dev/null || echo unknown)"
-  python3 -c "
-import json
-d = json.load(open('$fresh_evidence'))
-ev = d['evidence']
+  python3 -c 'import json, sys
+d = json.load(open(sys.argv[1]))
+ev = d["evidence"]
+max_cost_cents = float(sys.argv[2])
 total_cents = 0.0
-for s in ev['steps']:
-    cost = s.get('cost_usd') or 0.0
+for s in ev["steps"]:
+    cost = s.get("cost_usd") or 0.0
     total_cents += cost * 100
-    print(f\"{s['step_id']}: status={s.get('status')} duration_ms={s.get('duration_ms')} cost_usd={cost}\")
-if total_cents > $max_cost_cents:
-    print(f'WARNING: total cost {total_cents:.1f} cents exceeds --max-cost-cents=$max_cost_cents (post-hoc warning only; could not be preempted mid-flight)')
-" >&2
+    step_id = s["step_id"]
+    status = s.get("status")
+    duration_ms = s.get("duration_ms")
+    print(f"{step_id}: status={status} duration_ms={duration_ms} cost_usd={cost}")
+if total_cents > max_cost_cents:
+    print(f"WARNING: total cost {total_cents:.1f} cents exceeds --max-cost-cents={max_cost_cents} (post-hoc warning only; could not be preempted mid-flight)")' "$fresh_evidence" "$max_cost_cents" >&2
   echo "bridge HEAD: $bridge_head" >&2
   echo "committed sha: $commit_sha (round $round)" >&2
 }
@@ -353,10 +387,34 @@ _selfcheck() {
   echo "$out" | grep -q '"review_step": "step-maker"' || { echo "FAIL: dryrun plan missing review_step wiring"; fails=1; }
   echo "$out" | grep -q '"workdir": "."'      || { echo "FAIL: dryrun plan missing workdir \".\""; fails=1; }
 
+  # --max-seconds/--max-cost-cents must be rejected at arg-parse time, BEFORE even the dry-run path --
+  # using a valid worktree + SM_TEMPORAL_DRYRUN=1 here (not /tmp) so the two outcomes are genuinely
+  # distinguishable: validation present -> exit 2 from the new check; validation missing -> exit 0
+  # from the dry-run branch (never coincidentally the same exit code either way).
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --max-seconds abc >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-seconds exit $rc (want 2)"; fails=1; }
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --max-cost-cents abc >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-cost-cents exit $rc (want 2)"; fails=1; }
+
   rc=0; "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ >/tmp/sm-temporal-selfcheck-pf.$$ 2>&1 || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: missing-bridge-dir exit $rc (want 1)"; fails=1; }
   grep -q 'bridge dir not found' /tmp/sm-temporal-selfcheck-pf.$$ || { echo "FAIL: missing-bridge-dir message not found"; fails=1; }
   rm -f /tmp/sm-temporal-selfcheck-pf.$$
+
+  # --- refuse when --run-dir is the same as or nested under --bridge-dir: never write a throwaway
+  # build/cache/temporal.db underneath the read-only bridge dependency's own tree. Uses a fake
+  # existing directory as the "bridge dir" -- the nested-run-dir check runs before the heavier
+  # server-binary/Go-toolchain/claude/pi preflight checks, so this needs none of those to be present. ---
+  local fake_bridge; fake_bridge="$(mktemp -d)"
+  rc=0
+  "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+    --bridge-dir "$fake_bridge" --run-dir "$fake_bridge/nested-run-dir" \
+    >/tmp/sm-temporal-selfcheck-nest.$$ 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: nested --run-dir-under-bridge-dir exit $rc (want 1)"; fails=1; }
+  grep -q 'nested under --bridge-dir' /tmp/sm-temporal-selfcheck-nest.$$ || { echo "FAIL: nested-run-dir message not found"; fails=1; }
+  [ ! -e "$fake_bridge/nested-run-dir" ] || { echo "FAIL: refused run-dir was not cleaned up (still exists under bridge-dir)"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-nest.$$
+  rm -rf "$fake_bridge"
 
   # --- explicit-path git-add + zero-commit-round refusal, against the real function ---
   if _commit_round_changes "$t" 1 "g" "W" "R" >/dev/null 2>/tmp/sm-temporal-selfcheck-zc.$$; then
@@ -375,6 +433,25 @@ _selfcheck() {
   git -C "$t" log -1 --format=%B "$sha" | grep -q 'Temporal-Run-Id: RID456'      || { echo "FAIL: commit missing Temporal-Run-Id trailer"; fails=1; }
   [ -z "$(git -C "$t" status --porcelain)" ] || { echo "FAIL: repo not clean after commit"; fails=1; }
   rm -rf "$t"
+
+  # --- rename/copy detection must catch R/C in EITHER porcelain position, not just leading: a bare
+  # `mv old new; git add -N -- new` produces a leading-SPACE code (" R", R in the SECOND position --
+  # confirmed live). The old `R*|C*` pattern missed this, wrongly appended the orig-path field as a
+  # bogus extra "changed path", and `git add -- new ""` failed. ---
+  local rt; rt="$(mktemp -d)"
+  git -C "$rt" init -q -b main; git -C "$rt" config user.email a@a; git -C "$rt" config user.name a
+  echo content > "$rt/old"; git -C "$rt" add -A; git -C "$rt" commit -qm seed
+  mv "$rt/old" "$rt/new"
+  git -C "$rt" add -N -- new
+  local rename_sha
+  rename_sha="$(_commit_round_changes "$rt" 3 "rename repro" "WIDREN" "RIDREN")" \
+    || { echo "FAIL: _commit_round_changes must succeed on the \" R\" (space, R) rename repro"; fails=1; }
+  if [ -n "${rename_sha:-}" ]; then
+    [ "$(git -C "$rt" rev-parse HEAD)" = "$rename_sha" ] || { echo "FAIL: rename-repro returned sha does not match new HEAD"; fails=1; }
+    git -C "$rt" show --stat -q "$rename_sha" | grep -q 'new' || { echo "FAIL: rename-repro commit does not mention the new path"; fails=1; }
+    [ -z "$(git -C "$rt" status --porcelain)" ] || { echo "FAIL: rename-repro repo not clean after commit (bogus empty path staged?)"; fails=1; }
+  fi
+  rm -rf "$rt"
 
   # --- fingerprint-sidecar kill logic: real process killed; wrong fingerprint is never killed ---
   local sc="$(mktemp -d)"
