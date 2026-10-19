@@ -143,21 +143,30 @@ _kill_sidecar() {  # _kill_sidecar <file> -- no-op if missing, or if the fingerp
 # --- the one place a `bridge fetch` call actually happens: real exit code, real per-call ceiling ---
 # Wraps the invocation in run-round.sh (this repo's own wall-clock+idle watchdog, reused rather than
 # reimplemented) so a HUNG fetch can't block forever -- bounded by its OWN per-call ceiling,
-# FETCH_CALL_TIMEOUT_SECONDS, distinct from --max-seconds (the whole-round ceiling _poll_until_done
-# below checks BEFORE starting each call, not this function's own concern). Writes the real
-# stdout+stderr to <out_file> on success (same shape callers always expected); on ANY failure
-# (a genuine non-zero exit from `bridge fetch` itself, or this call's own timeout/idle ceiling),
-# returns 11 with a TEMPORAL_FETCH_FAILED message naming the real cause -- never silently retried.
-_fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out_file>
+# FETCH_CALL_TIMEOUT_SECONDS by default, distinct from --max-seconds (the whole-round ceiling
+# _poll_until_done below checks BEFORE starting each call). The optional <timeout_override> lets a
+# caller with limited whole-round budget remaining shrink THIS call's own ceiling below
+# FETCH_CALL_TIMEOUT_SECONDS -- _poll_until_done uses it; the other call sites (the post-commit
+# fresh-refetch, and --selfcheck's own direct tests) omit it and get the plain per-call default,
+# unchanged. Passes POLL=1 (run-round.sh's own watchdog check interval, default 5) unless a caller
+# already set POLL itself -- run-round.sh's own loop sleeps a full $poll BEFORE its first elapsed-
+# time check, so a shrunk <timeout_override> of 1-4s would otherwise still let the real subprocess
+# run for up to 5s (plus its own 2s kill grace period) before the watchdog ever notices, defeating
+# the whole point of shrinking it. Writes the real stdout+stderr to <out_file> on success (same
+# shape callers always expected); on ANY failure (a genuine non-zero exit from `bridge fetch`
+# itself, or this call's own timeout/idle ceiling), returns 11 with a TEMPORAL_FETCH_FAILED message
+# naming the real cause -- never silently retried.
+_fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out_file> [<timeout_override>]
   local bridge_bin="$1" grpc_port="$2" wid="$3" rid="$4" out_file="$5" rc=0
-  TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$SCRIPT_DIR/run-round.sh" \
+  local timeout="${6:-$FETCH_CALL_TIMEOUT_SECONDS}"
+  TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" POLL="${POLL:-1}" "$SCRIPT_DIR/run-round.sh" \
     --label bridge-fetch --log "$out_file" --audit "$(dirname "$out_file")/fetch-audit.jsonl" \
-    --timeout "$FETCH_CALL_TIMEOUT_SECONDS" --idle "$FETCH_CALL_TIMEOUT_SECONDS" \
+    --timeout "$timeout" --idle "$timeout" \
     -- "$bridge_bin" fetch --workflow-id "$wid" --run-id "$rid" || rc=$?
   case "$rc" in
     0) return 0 ;;
     124|125)
-      echo "TEMPORAL_FETCH_FAILED: bridge fetch did not complete within ${FETCH_CALL_TIMEOUT_SECONDS}s (run-round.sh exit $rc) -- $(cat "$out_file" 2>/dev/null)" >&2
+      echo "TEMPORAL_FETCH_FAILED: bridge fetch did not complete within ${timeout}s (run-round.sh exit $rc) -- $(cat "$out_file" 2>/dev/null)" >&2
       return 11
       ;;
     *)
@@ -172,15 +181,25 @@ _fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out
 # per-call FETCH_CALL_TIMEOUT_SECONDS). Checks elapsed time BEFORE starting each fetch call, not
 # only after one completes -- a round-10 checker found that --max-seconds 0 (or any value smaller
 # than a single fetch call's real duration) did not actually bound anything, because the only
-# elapsed-time check ran AFTER a fetch had already run to completion: a single slow (not even
-# hung) `bridge fetch` call could run past the whole-round ceiling before that ceiling ever got a
-# chance to fire. The post-fetch check below is kept too (not removed) so a round that finishes
-# exactly at the ceiling still times out immediately rather than waiting through one more `sleep 5`
-# first. Factored out of cmd_round so --selfcheck can exercise this exact ordering directly, against
-# a fake slow bridge binary, with no real server/worker/go toolchain needed.
+# elapsed-time check ran AFTER a fetch had already run to completion. The post-fetch check below is
+# kept too (not removed) so a round that finishes exactly at the ceiling still times out immediately
+# rather than waiting through one more sleep first.
+#
+# A round-8 checker review found that check alone still isn't enough: when SOME positive whole-round
+# budget remains, the pre-fetch check above lets a new fetch call start, but that call is then free
+# to run for up to its own full FETCH_CALL_TIMEOUT_SECONDS regardless of how little whole-round
+# budget is actually left -- e.g. --max-seconds=1 with a 3s-slow fetch still overruns the round-level
+# deadline by ~2s. Fixed by computing the REMAINING whole-round budget before each fetch call and
+# passing the SMALLER of (remaining budget, FETCH_CALL_TIMEOUT_SECONDS) as THIS call's own timeout
+# override -- so a single fetch call can never, by itself, push the round past --max-seconds by more
+# than ordinary process-exit overhead. The same reasoning applies to the fixed `sleep 5` between
+# iterations: never sleep longer than whatever whole-round budget remains, either.
+#
+# Factored out of cmd_round so --selfcheck can exercise this exact ordering directly, against a fake
+# slow bridge binary, with no real server/worker/go toolchain needed.
 _poll_until_done() {  # _poll_until_done <bridge_bin> <grpc_port> <wid> <rid> <evidence_file> <max_seconds>
   local bridge_bin="$1" grpc_port="$2" wid="$3" rid="$4" evidence_file="$5" max_seconds="$6"
-  local start_ts now elapsed done_flag
+  local start_ts now elapsed done_flag remaining call_timeout sleep_for
   start_ts=$(date +%s)
   while :; do
     now=$(date +%s); elapsed=$((now - start_ts))
@@ -188,7 +207,10 @@ _poll_until_done() {  # _poll_until_done <bridge_bin> <grpc_port> <wid> <rid> <e
       echo "TEMPORAL_TIMEOUT: round did not complete within --max-seconds=$max_seconds" >&2
       return 124
     fi
-    _fetch_evidence "$bridge_bin" "$grpc_port" "$wid" "$rid" "$evidence_file" || return $?
+    remaining=$((max_seconds - elapsed))
+    call_timeout="$remaining"
+    [ "$call_timeout" -gt "$FETCH_CALL_TIMEOUT_SECONDS" ] && call_timeout="$FETCH_CALL_TIMEOUT_SECONDS"
+    _fetch_evidence "$bridge_bin" "$grpc_port" "$wid" "$rid" "$evidence_file" "$call_timeout" || return $?
     done_flag="$(python3 -c 'import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -202,7 +224,10 @@ except Exception:
       echo "TEMPORAL_TIMEOUT: round did not complete within --max-seconds=$max_seconds" >&2
       return 124
     fi
-    sleep 5
+    remaining=$((max_seconds - elapsed))
+    sleep_for=5
+    [ "$remaining" -lt "$sleep_for" ] && sleep_for="$remaining"
+    sleep "$sleep_for"
   done
 }
 
@@ -859,6 +884,40 @@ SLOW_BRIDGE_EOF
   grep -q 'TEMPORAL_TIMEOUT' /tmp/sm-temporal-selfcheck-poll.$$ || { echo "FAIL: TEMPORAL_TIMEOUT message not found"; fails=1; }
   rm -f /tmp/sm-temporal-selfcheck-poll.$$
   rm -rf "$poll_dir"
+
+  # --- [CRITICAL] a round-8 checker review found the max-seconds=0 case above only covers an
+  # ALREADY-expired whole-round budget. When SOME positive budget remains, the pre-fetch check lets
+  # a new fetch call start, but -- before this fix -- that call was then free to run for up to its
+  # own full per-call FETCH_CALL_TIMEOUT_SECONDS (default 30s) regardless of how little whole-round
+  # budget was actually left: e.g. --max-seconds=1 against a 10s-slow fetch let that fetch run to
+  # its own natural completion before the post-fetch check ever noticed the whole-round deadline was
+  # blown -- wall-clock ~10s, not ~1s. Fixed by passing min(remaining whole-round budget,
+  # FETCH_CALL_TIMEOUT_SECONDS) as THIS call's own timeout override, AND by passing POLL=1 to
+  # run-round.sh's own watchdog (its default POLL=5 would otherwise still let a shrunk 1s timeout
+  # slip for up to 5s before the first check ever fires). Asserts the call returns well under the
+  # fake fetch's own 10s sleep -- a generous margin above the ~3s floor actually observed empirically
+  # (1s watchdog detection + run-round.sh's own existing, unrelated 2s SIGTERM-to-SIGKILL grace
+  # period, not something this fix touches or needs to). ---
+  local poll2_dir; poll2_dir="$(mktemp -d)"
+  cat > "$poll2_dir/slow-bridge" <<'SLOW_BRIDGE2_EOF'
+#!/usr/bin/env bash
+case "$1" in
+  fetch) sleep 10; echo '{"evidence":{"done":false}}' ;;
+  *) exit 1 ;;
+esac
+SLOW_BRIDGE2_EOF
+  chmod +x "$poll2_dir/slow-bridge"
+  local poll2_start poll2_end poll2_elapsed
+  rc=0
+  poll2_start=$(date +%s)
+  _poll_until_done "$poll2_dir/slow-bridge" 1 WID RID "$poll2_dir/evidence.out" 1 >/tmp/sm-temporal-selfcheck-poll2.$$ 2>&1 || rc=$?
+  poll2_end=$(date +%s)
+  poll2_elapsed=$((poll2_end - poll2_start))
+  [ "$rc" = 11 ] || { echo "FAIL: _poll_until_done with --max-seconds=1 against a 10s-slow fetch exit $rc (want 11, the shrunk per-call timeout firing)"; fails=1; }
+  [ "$poll2_elapsed" -le 6 ] || { echo "FAIL [CRITICAL]: _poll_until_done took ${poll2_elapsed}s against a --max-seconds=1 budget (want well under the fake fetch's own 10s sleep -- the whole-round deadline was not actually honored for an in-flight fetch)"; fails=1; }
+  grep -q 'TEMPORAL_FETCH_FAILED' /tmp/sm-temporal-selfcheck-poll2.$$ || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-poll2.$$
+  rm -rf "$poll2_dir"
 
   # --- _prepare_bridge_cli's own override-vs-real branching, tested DIRECTLY against the function
   # itself -- NOT through cmd_round, which never supplies a 6th argument at all (see its one call
