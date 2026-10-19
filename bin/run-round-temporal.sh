@@ -52,6 +52,9 @@
 #   `--permission-mode auto` maker path, not merely less visible. Running THIS WRAPPER inside a
 #   herdr pane does not fix either gap -- it only makes the wrapper's own output visible. Overridable
 #   with --i-accept-headless-autonomous-risk, which also prints a loud warning before proceeding.
+#   A separate task (task-id bridge-herdr-visible-activities) is already targeting the bridge itself
+#   to make its maker/checker activities herdr-visible -- this guard's limitation is pending that
+#   separate work landing, not indefinite.
 # - No round-state.md/feature-list.json/ponytail/lesson-injection parity on this path (v1 scope).
 # - No --lens support (the bridge's checker.go has no lens concept).
 # - Process cleanup uses a PID+start-time fingerprint sidecar (see _fingerprint below); a `kill -9` on

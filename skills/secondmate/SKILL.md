@@ -226,7 +226,9 @@ invocation. This is a known, deliberate limitation of the underlying bridge prot
 its maker/checker activities were built as bare subprocess calls, never herdr-aware — not something
 this wrapper silently inherited or glossed over, and it cannot be fixed by editing
 `maker.go`/`checker.go` to shell out through herdr instead, since that would mean modifying the
-read-only bridge dependency.
+read-only bridge dependency. A separate task (task-id `bridge-herdr-visible-activities`) is already
+targeting the bridge itself to make its maker/checker activities herdr-visible — this limitation is
+pending that separate work landing, not indefinite.
 
 **Named gaps for v1 (deliberately not ported into this path):** no `round-state.md`/
 `feature-list.json` continuity, no ponytail context injection, no lesson-injection — a dispatcher

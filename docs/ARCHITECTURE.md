@@ -192,8 +192,10 @@ actually progresses — a same-process tracking aid local to its own run, distin
    autonomous than this repo's own normal `--permission-mode auto` maker path, not merely less visible.
    Running the wrapper itself inside a herdr pane does not fix either gap; a known, deliberate
    limitation of the underlying bridge prototype's own design (bare subprocess calls, not herdr-aware),
-   not something this wrapper can close by itself without editing the read-only bridge dependency. See
-   SKILL.md's "Opt-in alternate engine: Temporal" subsection for the full writeup and the named v1 gaps
+   not something this wrapper can close by itself without editing the read-only bridge dependency —
+   a separate task (task-id `bridge-herdr-visible-activities`) is already targeting the bridge itself
+   for this, so the limitation is pending that work landing, not indefinite. See SKILL.md's "Opt-in
+   alternate engine: Temporal" subsection for the full writeup and the named v1 gaps
    (no round-state.md/feature-list.json/ponytail/lesson-injection parity, no `--lens` support,
    `--max-cost-cents` is a post-hoc warning only).
 
