@@ -126,8 +126,7 @@
 #     suite -- a design maintained consistently across every round of this task -- into something
 #     slow, network/toolchain-dependent, and potentially flaky on a machine without that exact
 #     toolchain set up. The real evidence that the build-success path works end-to-end is the
-#     live-proof round from round 1 (commit 766b034, still in branch history; see feature-list.json's
-#     own "live-proof-real-round" entry), not --selfcheck.
+#     live-proof round from round 1 (commit 766b034, still in branch history), not --selfcheck.
 set -euo pipefail
 
 # Clear any inherited DEBUG trap and disable function tracing. These are the first two REAL
