@@ -33,6 +33,11 @@
 #                                        (exit 11), same as a genuine non-zero exit from the bridge
 #                                        binary itself -- distinct from --max-seconds, the ceiling on
 #                                        the WHOLE round across every fetch call
+#      SM_TEMPORAL_FAKE_BRIDGE_BIN    -- TESTING ONLY, not a caller-facing feature: substitutes a
+#                                        pre-built fake `bridge` binary for the real Go-built one,
+#                                        skipping the real server-binary/Go-toolchain/claude/pi
+#                                        preflight checks and the real Temporal dev server. Used
+#                                        only by `--selfcheck`'s own happy-path test.
 #
 # On success: stdout is EXACTLY the checker step's Output text (already secondmate's own
 # verdict-envelope shape) -- pipe it straight into bin/verdict.py, zero translation. Everything else
@@ -76,6 +81,12 @@ DEFAULT_GO_DOWNLOAD_CACHE="/Users/eshwar.vijay/.herdr/worktrees/temporal-pilot/s
 # never hit that ceiling at all). Wrapped via run-round.sh, the same wall-clock+idle watchdog this
 # repo already built for exactly this "macOS ships no timeout(1)" problem -- not a new technique.
 FETCH_CALL_TIMEOUT_SECONDS="${SM_TEMPORAL_FETCH_TIMEOUT_SECONDS:-30}"
+# Validated the instant it's read, before anything uses it -- same class of bug as a non-numeric
+# --max-seconds/--max-cost-cents: a bad value would silently defeat this watchdog (the comparison
+# inside run-round.sh's own `-ge` check fails, set -e doesn't propagate out of an if-condition).
+case "$FETCH_CALL_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*) echo "invalid SM_TEMPORAL_FETCH_TIMEOUT_SECONDS: $FETCH_CALL_TIMEOUT_SECONDS (want a non-negative integer)" >&2; exit 2;;
+esac
 
 # --- process-identity fingerprint sidecar (PID + start-time, not bare PID) ------------------------
 # Same idiom as caffeinate-guard.sh's own _build_fingerprint: "comm=... lstart=..." lets a later
@@ -190,13 +201,21 @@ usage() {
 }
 
 run_dir=""  # intentionally NOT local anywhere -- the EXIT/INT/TERM trap's cleanup() reads this global
+run_dir_preexisted=0  # 1 iff --run-dir already existed on disk (as itself or via a symlink) BEFORE
+                      # this invocation touched it. cleanup() must NEVER recursively delete anything
+                      # this invocation did not itself create -- regardless of whether it's a symlink
+                      # or a real directory, and regardless of whether it resolves under --bridge-dir
+                      # or anywhere else. Confirmed live: a --run-dir symlink pointing at a
+                      # pre-existing directory (itself containing a real file) got recursively
+                      # deleted by a blind `rm -rf` on refusal -- exactly the kind of destruction this
+                      # whole task must never do to the read-only bridge dependency, or to anything.
 
 cleanup() {
   local ec=$?  # must be the FIRST command: preserves the real exit status through this whole handler,
                # regardless of what cleanup itself returns (a failing command below must never clobber it)
   _kill_sidecar "${run_dir}/worker.pidinfo"
   _kill_sidecar "${run_dir}/server.pidinfo"
-  if [ -n "$run_dir" ]; then
+  if [ -n "$run_dir" ] && [ "$run_dir_preexisted" != 1 ]; then
     # Go's module cache deliberately writes cached module directories read-only to prevent corruption;
     # a plain `rm -rf` on it fails with "Permission denied" (confirmed live) unless writable first.
     chmod -R u+w "$run_dir" 2>/dev/null || true
@@ -238,11 +257,46 @@ cmd_round() {
   case "$max_seconds" in ''|*[!0-9]*) echo "invalid --max-seconds: $max_seconds (want a non-negative integer)" >&2; return 2;; esac
   case "$max_cost_cents" in ''|*[!0-9]*) echo "invalid --max-cost-cents: $max_cost_cents (want a non-negative integer)" >&2; return 2;; esac
 
+  # --- HERDR_ENV=1 guard: refuse outright unless explicitly overridden --------------------------
+  # This repo's own SOP (skills/secondmate/SKILL.md, "Visible orchestration in herdr") requires the
+  # maker to run on a visible, interruptible herdr pane under HERDR_ENV=1, and explicitly PROHIBITS
+  # headless checker execution there -- specifically so a human can observe and intervene on live,
+  # autonomous model actions. The bridge's maker/checker activities (internal/planrun/maker.go,
+  # checker.go -- read-only dependency, never modified by this script) cannot satisfy that, for TWO
+  # distinct reasons, not one:
+  #   (1) the checker runs as a bare headless `pi` subprocess with no herdr-tracked agent lifecycle
+  #       at all -- a human watching a pane sees only this wrapper's own heartbeats and the final
+  #       result, never a live, interruptible model session. Running this wrapper itself inside a
+  #       herdr pane does NOT fix this -- it only makes the WRAPPER's output visible, not the inner
+  #       checker process's state.
+  #   (2) the maker runs `claude -p ... --permission-mode acceptEdits --allowedTools
+  #       Read,Edit,Write,Bash` -- Bash commands are auto-accepted with ZERO intervention
+  #       opportunity, which is MORE autonomous than this repo's own normal `--permission-mode auto`
+  #       Claude maker path (which still blocks, visibly, on Bash/risky commands), not merely less
+  #       visible.
+  # Placed HERE -- immediately after arg validation, BEFORE _build_plan_json (a python3 subprocess)
+  # or the git-worktree check or anything else that shells out -- so a refusal under HERDR_ENV=1
+  # genuinely means nothing executed yet, not even a benign dry-run preview build. This is stricter
+  # than an earlier revision, which placed the guard after _build_plan_json/the dry-run branch and
+  # so still let a python3 subprocess run before refusing; the checker caught that.
+  if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" != 1 ]; then
+    echo "REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk was not given. This engine's checker has no herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session), and its maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path, not merely less visible. This repo's own SOP requires a visible, interruptible pane and prohibits headless checker execution under HERDR_ENV=1 for exactly this reason. Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway." >&2
+    return 1
+  fi
+  if [ "${HERDR_ENV:-}" = 1 ]; then
+    echo "WARNING: running under HERDR_ENV=1 with --i-accept-headless-autonomous-risk. This round's checker has NO herdr-observable lifecycle (a bare headless subprocess) and this round's maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path. Proceeding only because the override was explicitly given." >&2
+  fi
+
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "--repo $repo is not a git worktree" >&2; return 2; }
   repo="$(cd "$repo" && pwd)"
 
   local go_bin="${SM_TEMPORAL_GO_BIN:-$DEFAULT_GO_BIN}"
   local go_cache="${SM_TEMPORAL_GO_DOWNLOAD_CACHE:-$DEFAULT_GO_DOWNLOAD_CACHE}"
+  # TESTING ONLY, not a caller-facing feature: when set, substitutes a pre-built fake `bridge`
+  # binary for the real Go-built one, and skips the real server-binary/Go-toolchain/claude/pi
+  # preflight checks and the real Temporal dev server -- lets --selfcheck drive a full happy-path
+  # cmd_round invocation with no real network/Temporal server. Used only by _selfcheck below.
+  local fake_bridge_bin="${SM_TEMPORAL_FAKE_BRIDGE_BIN:-}"
 
   local checker_goal_full="$checker_goal"
   if [ -n "$prior_verdict_file" ]; then
@@ -263,35 +317,6 @@ cmd_round() {
     return 0
   fi
 
-  # --- HERDR_ENV=1 guard: refuse a REAL round outright unless explicitly overridden --------------
-  # This repo's own SOP (skills/secondmate/SKILL.md, "Visible orchestration in herdr") requires the
-  # maker to run on a visible, interruptible herdr pane under HERDR_ENV=1, and explicitly PROHIBITS
-  # headless checker execution there -- specifically so a human can observe and intervene on live,
-  # autonomous model actions. The bridge's maker/checker activities (internal/planrun/maker.go,
-  # checker.go -- read-only dependency, never modified by this script) cannot satisfy that, for TWO
-  # distinct reasons, not one:
-  #   (1) the checker runs as a bare headless `pi` subprocess with no herdr-tracked agent lifecycle
-  #       at all -- a human watching a pane sees only this wrapper's own heartbeats and the final
-  #       result, never a live, interruptible model session. Running this wrapper itself inside a
-  #       herdr pane does NOT fix this -- it only makes the WRAPPER's output visible, not the inner
-  #       checker process's state.
-  #   (2) the maker runs `claude -p ... --permission-mode acceptEdits --allowedTools
-  #       Read,Edit,Write,Bash` -- Bash commands are auto-accepted with ZERO intervention
-  #       opportunity, which is MORE autonomous than this repo's own normal `--permission-mode auto`
-  #       Claude maker path (which still blocks, visibly, on Bash/risky commands), not merely less
-  #       visible.
-  # Exempt from this guard: SM_TEMPORAL_DRYRUN=1 above (never starts anything real) and every
-  # preflight check below it that can refuse for an unrelated reason before any build/server/maker/
-  # checker activity actually starts -- this guard exists to stop the REAL round, not to block
-  # unrelated refusals from being reachable in testing.
-  if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" != 1 ]; then
-    echo "REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk was not given. This engine's checker has no herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session), and its maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path, not merely less visible. This repo's own SOP requires a visible, interruptible pane and prohibits headless checker execution under HERDR_ENV=1 for exactly this reason. Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway." >&2
-    return 1
-  fi
-  if [ "${HERDR_ENV:-}" = 1 ]; then
-    echo "WARNING: running under HERDR_ENV=1 with --i-accept-headless-autonomous-risk. This round's checker has NO herdr-observable lifecycle (a bare headless subprocess) and this round's maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path. Proceeding only because the override was explicitly given." >&2
-  fi
-
   # snapshot precondition for the real round: must be clean BEFORE we start, so the post-round diff
   # against this same snapshot is what decides ZERO_COMMIT_ROUND vs. a real change (dry-run never
   # starts anything real, so it is exempt from this check).
@@ -306,63 +331,83 @@ cmd_round() {
   # physically sits under --bridge-dir would never match a string-prefix check on the unresolved path.
   bridge_dir="$(cd "$bridge_dir" && pwd -P)"
 
+  # Record BEFORE this invocation touches anything: did --run-dir already exist on disk (as itself
+  # or via a symlink -- `-e` follows symlinks)? If so, this invocation did NOT create it, and must
+  # never recursively delete it later, no matter what else happens (refusal or normal cleanup).
+  [ -n "$run_dir" ] && [ -e "$run_dir" ] && run_dir_preexisted=1
   run_dir="${run_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-run.XXXXXX")}"
   mkdir -p "$run_dir"
   run_dir="$(cd "$run_dir" && pwd -P)"
   # Trap installed the INSTANT run_dir exists on disk, covering its entire lifetime -- every
   # preflight check below this line can fail and return 1, and each one must not leak run_dir.
   # cleanup() already tolerates firing this early: no sidecar files exist yet (_kill_sidecar no-ops
-  # on a missing file), and the nested-bridge-dir case below clears run_dir itself before returning,
-  # so cleanup's own `rm -rf "$run_dir"` is a no-op for that path (never touches anything under
-  # bridge_dir -- not even to delete the empty dir it just created there).
+  # on a missing file), and cleanup() itself now respects run_dir_preexisted, so it never touches
+  # anything that existed before this invocation started -- not the empty dir it may have just
+  # created under bridge_dir, and never anything that was already there.
   trap cleanup EXIT INT TERM
   # never write a throwaway build/cache/temporal.db underneath the read-only bridge dependency's own tree
   case "$run_dir" in
     "$bridge_dir"|"$bridge_dir"/*)
       echo "refusing: --run-dir ($run_dir) is the same as or nested under --bridge-dir ($bridge_dir) -- must never write into the bridge prototype's own directory" >&2
-      rm -rf "$run_dir" 2>/dev/null || true  # clear it ourselves so the trap's own cleanup never touches bridge_dir's tree
+      if [ "$run_dir_preexisted" != 1 ]; then
+        rm -rf "$run_dir" 2>/dev/null || true  # this invocation's own freshly-created (empty) dir -- safe to remove ourselves, before the trap fires
+      else
+        echo "NOTE: --run-dir already existed before this invocation (as itself or via a symlink) -- left completely untouched, not removed, to avoid destroying pre-existing content." >&2
+      fi
       run_dir=""
       return 1
       ;;
   esac
 
   local fork_root server_bin
-  fork_root="$(cd "$bridge_dir/.." && pwd)"
-  server_bin="$fork_root/bin/temporal-local-standalone"
-  [ -x "$server_bin" ] || { echo "prebuilt dev-server binary missing/not executable: $server_bin" >&2; return 1; }
-  [ -x "$go_bin" ] || { echo "Go toolchain not found/not executable: $go_bin (override with SM_TEMPORAL_GO_BIN)" >&2; return 1; }
-  [ -d "$go_cache" ] || { echo "Go module download cache not found: $go_cache (override with SM_TEMPORAL_GO_DOWNLOAD_CACHE)" >&2; return 1; }
-  command -v claude >/dev/null 2>&1 || { echo "'claude' not on PATH (needed by the bridge's maker activity)" >&2; return 1; }
-  command -v pi >/dev/null 2>&1 || { echo "'pi' not on PATH (needed by the bridge's checker activity)" >&2; return 1; }
+  if [ -z "$fake_bridge_bin" ]; then
+    fork_root="$(cd "$bridge_dir/.." && pwd)"
+    server_bin="$fork_root/bin/temporal-local-standalone"
+    [ -x "$server_bin" ] || { echo "prebuilt dev-server binary missing/not executable: $server_bin" >&2; return 1; }
+    [ -x "$go_bin" ] || { echo "Go toolchain not found/not executable: $go_bin (override with SM_TEMPORAL_GO_BIN)" >&2; return 1; }
+    [ -d "$go_cache" ] || { echo "Go module download cache not found: $go_cache (override with SM_TEMPORAL_GO_DOWNLOAD_CACHE)" >&2; return 1; }
+    command -v claude >/dev/null 2>&1 || { echo "'claude' not on PATH (needed by the bridge's maker activity)" >&2; return 1; }
+    command -v pi >/dev/null 2>&1 || { echo "'pi' not on PATH (needed by the bridge's checker activity)" >&2; return 1; }
+  fi
 
   echo "$plan_json" > "$run_dir/plan.json"
 
-  echo "building bridge CLI into $run_dir ..." >&2
-  (
-    cd "$bridge_dir"
-    export GOTOOLCHAIN=local GOPROXY="file://$go_cache" GOSUMDB=off GOFLAGS=-mod=mod
-    export GOMODCACHE="$run_dir/gomodcache" GOCACHE="$run_dir/gocache"
-    mkdir -p "$GOMODCACHE" "$GOCACHE"
-    GOWORK=off "$go_bin" build -o "$run_dir/bridge" ./cmd/bridge
-  )
+  if [ -n "$fake_bridge_bin" ]; then
+    echo "SM_TEMPORAL_FAKE_BRIDGE_BIN set -- skipping the real Go build, using the fake bridge binary (testing only)" >&2
+    cp "$fake_bridge_bin" "$run_dir/bridge"
+    chmod +x "$run_dir/bridge"
+  else
+    echo "building bridge CLI into $run_dir ..." >&2
+    (
+      cd "$bridge_dir"
+      export GOTOOLCHAIN=local GOPROXY="file://$go_cache" GOSUMDB=off GOFLAGS=-mod=mod
+      export GOMODCACHE="$run_dir/gomodcache" GOCACHE="$run_dir/gocache"
+      mkdir -p "$GOMODCACHE" "$GOCACHE"
+      GOWORK=off "$go_bin" build -o "$run_dir/bridge" ./cmd/bridge
+    )
+  fi
 
   # port 0 bind-and-scrape for both listeners, immediately followed by the real server launch using
   # the scraped port numbers -- see the module header's port-allocation limitation note.
-  local grpc_port ui_port
-  grpc_port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
-  ui_port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+  local grpc_port ui_port i
+  if [ -n "$fake_bridge_bin" ]; then
+    grpc_port=0  # unused by the fake bridge; no real server is started
+    ui_port=0
+  else
+    grpc_port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+    ui_port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 
-  echo "starting temporal dev server on 127.0.0.1:$grpc_port (ui $ui_port) ..." >&2
-  "$server_bin" server start-dev --ip 127.0.0.1 --port "$grpc_port" --ui-ip 127.0.0.1 --ui-port "$ui_port" \
-    --db-filename "$run_dir/temporal.db" --log-level error >"$run_dir/server.log" 2>&1 &
-  _record_sidecar "$run_dir/server.pidinfo" "$!"
+    echo "starting temporal dev server on 127.0.0.1:$grpc_port (ui $ui_port) ..." >&2
+    "$server_bin" server start-dev --ip 127.0.0.1 --port "$grpc_port" --ui-ip 127.0.0.1 --ui-port "$ui_port" \
+      --db-filename "$run_dir/temporal.db" --log-level error >"$run_dir/server.log" 2>&1 &
+    _record_sidecar "$run_dir/server.pidinfo" "$!"
 
-  local i
-  for i in $(seq 1 100); do
-    python3 -c 'import socket, sys
+    for i in $(seq 1 100); do
+      python3 -c 'import socket, sys
 socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$grpc_port" 2>/dev/null && break
-    sleep 0.3
-  done
+      sleep 0.3
+    done
+  fi
 
   echo "starting bridge worker (BRIDGE_ROOT=$repo) ..." >&2
   BRIDGE_ROOT="$repo" CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 \
@@ -462,7 +507,7 @@ _selfcheck() {
   echo seed > "$t/f"; git -C "$t" add -A; git -C "$t" commit -qm seed
 
   local out
-  out="$(SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" --round 3 2>&1)" \
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" --round 3 2>&1)" \
     || { echo "FAIL: dryrun errored"; fails=1; }
   echo "$out" | grep -q '"schema_version": 1' || { echo "FAIL: dryrun plan missing schema_version"; fails=1; }
   echo "$out" | grep -q '"round": 3'          || { echo "FAIL: dryrun plan missing round"; fails=1; }
@@ -479,6 +524,18 @@ _selfcheck() {
   [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-seconds exit $rc (want 2)"; fails=1; }
   rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --max-cost-cents abc >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-cost-cents exit $rc (want 2)"; fails=1; }
+
+  # --- SM_TEMPORAL_FETCH_TIMEOUT_SECONDS must be rejected the instant it's read (module scope),
+  # same class of bug as --max-seconds/--max-cost-cents: a non-numeric value would silently defeat
+  # the per-fetch-call watchdog. Uses a valid worktree + SM_TEMPORAL_DRYRUN=1 (not a bare `round`
+  # with no args) so the two outcomes are genuinely distinguishable: validation present -> exit 2
+  # from the module-level check, which fires before arg parsing even starts; validation missing ->
+  # exit 0 from the dry-run branch (a bare `round` would coincidentally also exit 2 from the
+  # separate missing-"--repo" check regardless of whether this validation ran at all -- same
+  # coincidental-exit-code trap as an earlier round's own --max-seconds test, caught here before
+  # relying on it). ---
+  rc=0; HERDR_ENV="" SM_TEMPORAL_FETCH_TIMEOUT_SECONDS=abc SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: non-numeric SM_TEMPORAL_FETCH_TIMEOUT_SECONDS exit $rc (want 2)"; fails=1; }
 
   # --- HERDR_ENV=1 guard: refuse a REAL round outright (before any build/server) unless the
   # override is explicitly given. Uses --bridge-dir /nonexistent so a subsequent bug couldn't
@@ -502,6 +559,19 @@ _selfcheck() {
   echo "$out" | grep -q 'REFUSING: HERDR_ENV=1' && { echo "FAIL: HERDR guard still blocked despite the override being given"; fails=1; }
   echo "$out" | grep -q 'WARNING: running under HERDR_ENV=1' || { echo "FAIL: HERDR guard override did not print the expected warning"; fails=1; }
   echo "$out" | grep -q 'bridge dir not found' || { echo "FAIL: override did not let the round proceed to the next real check"; fails=1; }
+
+  # --- the HERDR guard must be positioned in the SOURCE before _build_plan_json is ever called, so
+  # a refusal genuinely means nothing executed yet -- not even a benign plan-preview python3
+  # subprocess. There is no black-box way to observe "did a python3 subprocess run" from outside, so
+  # this pins the ordering invariant structurally against the script's own source instead. ---
+  local guard_line build_call_line
+  guard_line="$(grep -n 'REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk' "$0" | head -1 | cut -d: -f1)"
+  build_call_line="$(grep -n 'plan_json="\$(_build_plan_json' "$0" | head -1 | cut -d: -f1)"
+  if [ -z "$guard_line" ] || [ -z "$build_call_line" ]; then
+    echo "FAIL: could not locate guard/build-call lines for ordering check"; fails=1
+  elif [ "$guard_line" -ge "$build_call_line" ]; then
+    echo "FAIL: HERDR guard must appear BEFORE the _build_plan_json call in cmd_round (guard line $guard_line, build-call line $build_call_line)"; fails=1
+  fi
 
   rc=0; HERDR_ENV="" "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ >/tmp/sm-temporal-selfcheck-pf.$$ 2>&1 || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: missing-bridge-dir exit $rc (want 1)"; fails=1; }
@@ -540,6 +610,29 @@ _selfcheck() {
   rm -f /tmp/sm-temporal-selfcheck-symlink.$$
   rm -rf "$outside_link"
   rm -rf "$fake_bridge"
+
+  # --- [CRITICAL] the containment refusal must NEVER recursively delete pre-existing content, even
+  # when the resolved run_dir sits under bridge_dir. Checker's exact repro: --run-dir is a symlink
+  # pointing at an EXISTING directory inside --bridge-dir that already contains a real "sentinel"
+  # file. Before this fix, the refusal path did a blind `rm -rf` on the RESOLVED (symlink-followed)
+  # path, destroying both the pre-existing directory and the file inside it -- exactly the kind of
+  # destruction under the read-only bridge dependency this whole task must never do. ---
+  local destr_bridge; destr_bridge="$(mktemp -d)"
+  mkdir -p "$destr_bridge/existing-target"
+  echo "sentinel-content-$$" > "$destr_bridge/existing-target/sentinel.txt"
+  local destr_link; destr_link="$(mktemp -d)"
+  ln -s "$destr_bridge/existing-target" "$destr_link/run-dir-link"
+  rc=0
+  HERDR_ENV="" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+    --bridge-dir "$destr_bridge" --run-dir "$destr_link/run-dir-link" \
+    >/tmp/sm-temporal-selfcheck-destructive.$$ 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: destructive-symlink-repro exit $rc (want 1)"; fails=1; }
+  [ -d "$destr_bridge/existing-target" ] || { echo "FAIL [CRITICAL]: pre-existing target directory was deleted by the refusal path"; fails=1; }
+  [ -f "$destr_bridge/existing-target/sentinel.txt" ] || { echo "FAIL [CRITICAL]: pre-existing sentinel file was deleted by the refusal path"; fails=1; }
+  [ "$(cat "$destr_bridge/existing-target/sentinel.txt" 2>/dev/null)" = "sentinel-content-$$" ] || { echo "FAIL [CRITICAL]: sentinel content changed/corrupted"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-destructive.$$
+  rm -rf "$destr_link"
+  rm -rf "$destr_bridge"
 
   # --- a preflight failure AFTER run_dir is created but that the OLD trap placement (set only after
   # ALL preflight checks) never covered must not leak run_dir on disk. Uses a fake bridge-dir+server
@@ -596,6 +689,72 @@ FAKE_BRIDGE_HANG_EOF
   [ "$rc" = 11 ] || { echo "FAIL: _fetch_evidence on a HUNG bridge exit $rc (want 11)"; fails=1; }
   echo "$fe_out" | grep -q 'TEMPORAL_FETCH_FAILED' || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found for a hung bridge fetch"; fails=1; }
   rm -rf "$fe_dir"
+
+  # --- Happy path: a full cmd_round invocation, driven end to end through a FAKE "bridge" CLI stub
+  # (worker/submit/fetch implementing just enough of the real bridge's actual output shape to
+  # return canned, fast, successful JSON) via SM_TEMPORAL_FAKE_BRIDGE_BIN -- no real network/Temporal
+  # server. Closes the "Happy path: NO" test-coverage gap the checker named. The fake worker writes
+  # a real marker file into BRIDGE_ROOT (standing in for "the maker made a real change") the instant
+  # it starts, before the fake fetch ever reports done=true, so the real
+  # git-status/_commit_round_changes logic runs for real against a real diff. ---
+  local hp_repo; hp_repo="$(mktemp -d)"
+  git -C "$hp_repo" init -q -b main
+  git -C "$hp_repo" config user.email a@a
+  git -C "$hp_repo" config user.name a
+  echo seed > "$hp_repo/f"
+  git -C "$hp_repo" add -A
+  git -C "$hp_repo" commit -qm seed
+
+  local hp_fake_dir; hp_fake_dir="$(mktemp -d)"
+  cat > "$hp_fake_dir/fake-bridge-happy" <<'FAKE_HAPPY_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  worker)
+    shift
+    pidfile=""
+    while [ $# -gt 0 ]; do case "$1" in --pid-file) pidfile="$2"; shift 2;; *) shift;; esac; done
+    if [ -n "${BRIDGE_ROOT:-}" ]; then
+      echo "fake maker change" > "$BRIDGE_ROOT/.sm-happy-path-marker"
+    fi
+    [ -n "$pidfile" ] && echo $$ > "$pidfile"
+    while :; do sleep 1; done
+    ;;
+  submit)
+    shift
+    planfile=""
+    while [ $# -gt 0 ]; do case "$1" in --plan-file) planfile="$2"; shift 2;; *) shift;; esac; done
+    round="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["round"])' "$planfile")"
+    printf '{"workflow_id":"WID-FAKE","run_id":"RID-FAKE","round":%s,"status":"started"}\n' "$round"
+    ;;
+  fetch)
+    cat <<'JSON'
+{"workflow_id":"WID-FAKE","run_id":"RID-FAKE","status":"COMPLETED","evidence_source":"history","evidence":{"schema_version":1,"round":1,"goal":"fake happy path","steps":[{"step_id":"step-maker","kind":"maker","status":"ok","output":"fake maker summary","duration_ms":5,"cost_usd":0.001,"diff":"fake diff"},{"step_id":"step-checker","kind":"checker","status":"ok","output":"FAKE_HAPPY_PATH_CHECKER_OUTPUT_SENTINEL","duration_ms":5,"cost_usd":0.001,"verdict":"pass"}],"done":true,"completed_at":"2026-01-01T00:00:00Z"}}
+JSON
+    ;;
+  *) exit 1 ;;
+esac
+FAKE_HAPPY_EOF
+  chmod +x "$hp_fake_dir/fake-bridge-happy"
+
+  local hp_run_dir; hp_run_dir="$(mktemp -d)"
+  rmdir "$hp_run_dir"  # cmd_round's own mkdir -p must be what creates it, so this proves nothing leaks
+  local hp_out hp_rc=0
+  hp_out="$(POLL=1 HERDR_ENV="" SM_TEMPORAL_FAKE_BRIDGE_BIN="$hp_fake_dir/fake-bridge-happy" "$0" round \
+    --repo "$hp_repo" --checker-goal "happy path check" --maker-prompt "happy path make" \
+    --bridge-dir "$hp_fake_dir" --run-dir "$hp_run_dir" 2>/tmp/sm-temporal-selfcheck-happy-err.$$)" || hp_rc=$?
+  if [ "$hp_rc" != 0 ]; then
+    echo "FAIL: happy-path cmd_round exit $hp_rc (want 0); stderr:"; fails=1
+    cat /tmp/sm-temporal-selfcheck-happy-err.$$
+  fi
+  [ "$hp_out" = "FAKE_HAPPY_PATH_CHECKER_OUTPUT_SENTINEL" ] || { echo "FAIL: happy-path stdout did not match the checker Output verbatim: $hp_out"; fails=1; }
+  git -C "$hp_repo" log -1 --format=%B | grep -q 'Temporal-Workflow-Id: WID-FAKE' || { echo "FAIL: happy-path commit missing Temporal-Workflow-Id trailer"; fails=1; }
+  git -C "$hp_repo" log -1 --format=%B | grep -q 'Temporal-Run-Id: RID-FAKE'      || { echo "FAIL: happy-path commit missing Temporal-Run-Id trailer"; fails=1; }
+  [ -f "$hp_repo/.sm-happy-path-marker" ] || { echo "FAIL: happy-path fake maker marker file missing -- the real diff/commit path was never exercised"; fails=1; }
+  [ -z "$(git -C "$hp_repo" status --porcelain)" ] || { echo "FAIL: happy-path repo not clean after commit"; fails=1; }
+  [ ! -e "$hp_run_dir" ] || { echo "FAIL: happy-path run_dir was not cleaned up after a successful round"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-happy-err.$$
+  rm -rf "$hp_fake_dir" "$hp_repo"
 
   # --- explicit-path git-add + zero-commit-round refusal, against the real function ---
   if _commit_round_changes "$t" 1 "g" "W" "R" >/dev/null 2>/tmp/sm-temporal-selfcheck-zc.$$; then
