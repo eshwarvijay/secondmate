@@ -131,9 +131,17 @@ usage() {
 run_dir=""  # intentionally NOT local anywhere -- the EXIT/INT/TERM trap's cleanup() reads this global
 
 cleanup() {
+  local ec=$?  # must be the FIRST command: preserves the real exit status through this whole handler,
+               # regardless of what cleanup itself returns (a failing command below must never clobber it)
   _kill_sidecar "${run_dir}/worker.pidinfo"
   _kill_sidecar "${run_dir}/server.pidinfo"
-  [ -n "$run_dir" ] && rm -rf "$run_dir"
+  if [ -n "$run_dir" ]; then
+    # Go's module cache deliberately writes cached module directories read-only to prevent corruption;
+    # a plain `rm -rf` on it fails with "Permission denied" (confirmed live) unless writable first.
+    chmod -R u+w "$run_dir" 2>/dev/null || true
+    rm -rf "$run_dir" 2>/dev/null || true
+  fi
+  exit "$ec"
 }
 
 cmd_round() {
@@ -383,6 +391,22 @@ _selfcheck() {
   kill -0 "$live_pid2" 2>/dev/null || { echo "FAIL: _kill_sidecar killed a process whose fingerprint did not match"; fails=1; }
   kill -9 "$live_pid2" 2>/dev/null || true
   rm -rf "$sc"
+
+  # --- cleanup() must preserve the real exit code even when its own rm/chmod fails (confirmed live:
+  # Go's module cache ships read-only directories; an unguarded `rm -rf` on it failed and clobbered a
+  # genuinely successful round's exit 0 into exit 1) ---
+  local cd2; cd2="$(mktemp -d)"
+  mkdir -p "$cd2/locked_parent/child_run_dir"
+  echo x > "$cd2/locked_parent/child_run_dir/f"
+  chmod 555 "$cd2/locked_parent"
+  local crc=0
+  # 42 is deliberately distinct from rm's own natural failure code (1), so a cleanup that lets the
+  # failing rm's exit status leak through instead of preserving the real one is caught, not masked by
+  # a coincidental match.
+  ( run_dir="$cd2/locked_parent/child_run_dir"; ( exit 42 ); cleanup ) || crc=$?
+  chmod 755 "$cd2/locked_parent" 2>/dev/null || true
+  rm -rf "$cd2"
+  [ "$crc" = 42 ] || { echo "FAIL: cleanup must preserve the pre-trap exit code even when its own rm fails (got $crc, want 42)"; fails=1; }
 
   [ "$fails" = 0 ] && echo ok
   return "$fails"
