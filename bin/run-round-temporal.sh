@@ -27,6 +27,11 @@
 #      SM_TEMPORAL_GO_BIN            -- override the pinned Go toolchain (default matches the bridge's
 #                                        own scripts/smoke_maker_checker.sh default)
 #      SM_TEMPORAL_GO_DOWNLOAD_CACHE -- override the offline Go module cache (same default source)
+#      SM_TEMPORAL_FETCH_TIMEOUT_SECONDS -- per-call ceiling (default 30) for a SINGLE `bridge fetch`
+#                                        invocation; a call that exceeds it is treated as a failure
+#                                        (exit 11), same as a genuine non-zero exit from the bridge
+#                                        binary itself -- distinct from --max-seconds, the ceiling on
+#                                        the WHOLE round across every fetch call
 #
 # On success: stdout is EXACTLY the checker step's Output text (already secondmate's own
 # verdict-envelope shape) -- pipe it straight into bin/verdict.py, zero translation. Everything else
@@ -55,6 +60,12 @@ DEFAULT_BRIDGE_DIR="/Users/eshwar.vijay/coupa/temporal-local-fork/bridge"
 DEFAULT_GO_BIN="/Users/eshwar.vijay/coupa/temporal-pilot/.toolchain/go/bin/go"
 DEFAULT_GO_DOWNLOAD_CACHE="/Users/eshwar.vijay/.herdr/worktrees/temporal-pilot/sm-temporal-hybrid-e2e-20261015/.toolchain/go-mod/cache/download"
 
+# Per-call ceiling for a SINGLE `bridge fetch` invocation (distinct from --max-seconds, which only
+# ever gets a chance to run BETWEEN completed fetch calls -- a single hung fetch would otherwise
+# never hit that ceiling at all). Wrapped via run-round.sh, the same wall-clock+idle watchdog this
+# repo already built for exactly this "macOS ships no timeout(1)" problem -- not a new technique.
+FETCH_CALL_TIMEOUT_SECONDS="${SM_TEMPORAL_FETCH_TIMEOUT_SECONDS:-30}"
+
 # --- process-identity fingerprint sidecar (PID + start-time, not bare PID) ------------------------
 # Same idiom as caffeinate-guard.sh's own _build_fingerprint: "comm=... lstart=..." lets a later
 # invocation tell a reused PID apart from the real process before reaping it.
@@ -78,6 +89,32 @@ _kill_sidecar() {  # _kill_sidecar <file> -- no-op if missing, or if the fingerp
   if [ -n "$fp_actual" ] && [ "$fp_actual" = "$fp_expected" ]; then
     kill "$pid" 2>/dev/null || true
   fi
+}
+
+# --- the one place a `bridge fetch` call actually happens: real exit code, real per-call ceiling ---
+# Wraps the invocation in run-round.sh (this repo's own wall-clock+idle watchdog, reused rather than
+# reimplemented) so a single HUNG fetch can't defeat --max-seconds either -- --max-seconds only ever
+# gets a chance to run BETWEEN completed fetch calls, never during one still in flight. Writes the
+# real stdout+stderr to <out_file> on success (same shape callers always expected); on ANY failure
+# (a genuine non-zero exit from `bridge fetch` itself, or this call's own timeout/idle ceiling),
+# returns 11 with a TEMPORAL_FETCH_FAILED message naming the real cause -- never silently retried.
+_fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out_file>
+  local bridge_bin="$1" grpc_port="$2" wid="$3" rid="$4" out_file="$5" rc=0
+  TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$SCRIPT_DIR/run-round.sh" \
+    --label bridge-fetch --log "$out_file" --audit "$(dirname "$out_file")/fetch-audit.jsonl" \
+    --timeout "$FETCH_CALL_TIMEOUT_SECONDS" --idle "$FETCH_CALL_TIMEOUT_SECONDS" \
+    -- "$bridge_bin" fetch --workflow-id "$wid" --run-id "$rid" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    124|125)
+      echo "TEMPORAL_FETCH_FAILED: bridge fetch did not complete within ${FETCH_CALL_TIMEOUT_SECONDS}s (run-round.sh exit $rc) -- $(cat "$out_file" 2>/dev/null)" >&2
+      return 11
+      ;;
+    *)
+      echo "TEMPORAL_FETCH_FAILED: bridge fetch exited $rc -- $(cat "$out_file" 2>/dev/null)" >&2
+      return 11
+      ;;
+  esac
 }
 
 # --- the one place a round's real changes are staged + committed: explicit paths, never -A/-u -----
@@ -221,16 +258,28 @@ cmd_round() {
 
   # --- preflight: refuse loudly, never silently degrade -------------------------------------------
   [ -d "$bridge_dir" ] || { echo "bridge dir not found: $bridge_dir (read-only dependency; override with --bridge-dir)" >&2; return 1; }
-  bridge_dir="$(cd "$bridge_dir" && pwd)"
+  # pwd -P (not plain pwd): resolves through symlinks to the REAL physical path, same idiom already
+  # used elsewhere in this repo (mark-maker.sh, new-worktree.sh, merge-sequencer.sh,
+  # sync-worktree-skills.sh) for exactly this class of containment check. A LEXICAL/plain-pwd
+  # comparison is bypassable: a --run-dir that is, or resolves through, a symlink whose real target
+  # physically sits under --bridge-dir would never match a string-prefix check on the unresolved path.
+  bridge_dir="$(cd "$bridge_dir" && pwd -P)"
 
   run_dir="${run_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-run.XXXXXX")}"
   mkdir -p "$run_dir"
-  run_dir="$(cd "$run_dir" && pwd)"
+  run_dir="$(cd "$run_dir" && pwd -P)"
+  # Trap installed the INSTANT run_dir exists on disk, covering its entire lifetime -- every
+  # preflight check below this line can fail and return 1, and each one must not leak run_dir.
+  # cleanup() already tolerates firing this early: no sidecar files exist yet (_kill_sidecar no-ops
+  # on a missing file), and the nested-bridge-dir case below clears run_dir itself before returning,
+  # so cleanup's own `rm -rf "$run_dir"` is a no-op for that path (never touches anything under
+  # bridge_dir -- not even to delete the empty dir it just created there).
+  trap cleanup EXIT INT TERM
   # never write a throwaway build/cache/temporal.db underneath the read-only bridge dependency's own tree
   case "$run_dir" in
     "$bridge_dir"|"$bridge_dir"/*)
       echo "refusing: --run-dir ($run_dir) is the same as or nested under --bridge-dir ($bridge_dir) -- must never write into the bridge prototype's own directory" >&2
-      rm -rf "$run_dir" 2>/dev/null || true  # the trap isn't set yet; don't leave even an empty dir under bridge_dir
+      rm -rf "$run_dir" 2>/dev/null || true  # clear it ourselves so the trap's own cleanup never touches bridge_dir's tree
       run_dir=""
       return 1
       ;;
@@ -245,7 +294,6 @@ cmd_round() {
   command -v claude >/dev/null 2>&1 || { echo "'claude' not on PATH (needed by the bridge's maker activity)" >&2; return 1; }
   command -v pi >/dev/null 2>&1 || { echo "'pi' not on PATH (needed by the bridge's checker activity)" >&2; return 1; }
 
-  trap cleanup EXIT INT TERM
   echo "$plan_json" > "$run_dir/plan.json"
 
   echo "building bridge CLI into $run_dir ..." >&2
@@ -299,15 +347,10 @@ print(json.load(open(sys.argv[1]))["run_id"])' "$submit_out")"
   # idle-watchdog-safe polling: --wait 0 above already returned; this script owns the poll loop and
   # prints one heartbeat per cycle so a wrapping run-round.sh's idle watchdog stays fed, while
   # genuinely exercising the query-vs-history bridge fetch path every round (not just a blocking --wait).
-  local evidence_file="$run_dir/evidence.json" start_ts now elapsed done_flag fetch_rc
+  local evidence_file="$run_dir/evidence.json" start_ts now elapsed done_flag
   start_ts=$(date +%s)
   while :; do
-    fetch_rc=0
-    TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$run_dir/bridge" fetch --workflow-id "$wid" --run-id "$rid" >"$evidence_file" 2>&1 || fetch_rc=$?
-    if [ "$fetch_rc" -ne 0 ]; then
-      echo "TEMPORAL_FETCH_FAILED: bridge fetch exited $fetch_rc -- $(cat "$evidence_file")" >&2
-      return 11
-    fi
+    _fetch_evidence "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$evidence_file" || return $?
     done_flag="$(python3 -c 'import json, sys
 try:
     d = json.load(open(sys.argv[1]))
@@ -335,7 +378,7 @@ except Exception:
   # re-fetch ONE more time from a brand-new, syntactically fresh `bridge fetch` process -- proves the
   # durable-read-from-a-new-process property, not just the poll loop's own repeated calls.
   local fresh_evidence="$run_dir/evidence.fresh.json"
-  TEMPORAL_ADDRESS="127.0.0.1:$grpc_port" "$run_dir/bridge" fetch --workflow-id "$wid" --run-id "$rid" > "$fresh_evidence"
+  _fetch_evidence "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$fresh_evidence" || return $?
 
   python3 -c 'import json, sys
 d = json.load(open(sys.argv[1]))
@@ -414,7 +457,81 @@ _selfcheck() {
   grep -q 'nested under --bridge-dir' /tmp/sm-temporal-selfcheck-nest.$$ || { echo "FAIL: nested-run-dir message not found"; fails=1; }
   [ ! -e "$fake_bridge/nested-run-dir" ] || { echo "FAIL: refused run-dir was not cleaned up (still exists under bridge-dir)"; fails=1; }
   rm -f /tmp/sm-temporal-selfcheck-nest.$$
+
+  # --- the SAME refusal must fire even when --run-dir is a symlink whose REAL target physically
+  # sits under --bridge-dir: a lexical/string comparison on the unresolved paths would miss this
+  # (confirmed: plain `pwd` after `cd` through a symlink prints the symlink path, not the real one;
+  # `pwd -P` resolves it). The symlink's target is pre-created (not dangling) because `mkdir -p` on a
+  # dangling symlink fails outright on this platform's mkdir (confirmed live) -- a pre-existing target
+  # is also the more realistic shape of a real bypass attempt anyway. ---
+  mkdir -p "$fake_bridge/real-target"
+  local outside_link; outside_link="$(mktemp -d)"
+  ln -s "$fake_bridge/real-target" "$outside_link/run-dir-link"
+  rc=0
+  "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+    --bridge-dir "$fake_bridge" --run-dir "$outside_link/run-dir-link" \
+    >/tmp/sm-temporal-selfcheck-symlink.$$ 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: symlinked --run-dir resolving under --bridge-dir exit $rc (want 1)"; fails=1; }
+  grep -q 'nested under --bridge-dir' /tmp/sm-temporal-selfcheck-symlink.$$ || { echo "FAIL: symlinked-run-dir message not found -- lexical check bypassed by the symlink"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-symlink.$$
+  rm -rf "$outside_link"
   rm -rf "$fake_bridge"
+
+  # --- a preflight failure AFTER run_dir is created but that the OLD trap placement (set only after
+  # ALL preflight checks) never covered must not leak run_dir on disk. Uses a fake bridge-dir+server
+  # binary so the missing-Go-toolchain check is what actually fails, exercising exactly the gap
+  # between run_dir creation and the old trap registration point. ---
+  local leak_root; leak_root="$(mktemp -d)"
+  mkdir -p "$leak_root/fakebridge/bridge" "$leak_root/fakebridge/bin"
+  touch "$leak_root/fakebridge/bin/temporal-local-standalone"
+  chmod +x "$leak_root/fakebridge/bin/temporal-local-standalone"
+  local leak_run_dir="$leak_root/explicit-run-dir"
+  rc=0
+  SM_TEMPORAL_GO_BIN="/nonexistent-go-xyz-$$" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+    --bridge-dir "$leak_root/fakebridge/bridge" --run-dir "$leak_run_dir" \
+    >/tmp/sm-temporal-selfcheck-trap.$$ 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: missing-go-bin exit $rc (want 1)"; fails=1; }
+  grep -q 'Go toolchain not found' /tmp/sm-temporal-selfcheck-trap.$$ || { echo "FAIL: missing-go-bin message not found"; fails=1; }
+  [ ! -e "$leak_run_dir" ] || { echo "FAIL: run_dir leaked after a preflight failure past run_dir creation (trap not covering this span)"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-trap.$$
+  rm -rf "$leak_root"
+
+  # --- _fetch_evidence must surface a real `bridge fetch` failure as exit 11/TEMPORAL_FETCH_FAILED,
+  # not loop/time out -- exercised directly against a fake "bridge" stub (fast, free, no live
+  # Temporal), the same PATH/stub-faking idiom bin/teardown-check.sh already uses for an external CLI. ---
+  local fe_dir; fe_dir="$(mktemp -d)"
+  cat > "$fe_dir/fake-bridge" <<'FAKE_BRIDGE_EOF'
+#!/usr/bin/env bash
+case "$1" in
+  fetch) echo "simulated bridge fetch failure" >&2; exit 7 ;;
+  *) exit 1 ;;
+esac
+FAKE_BRIDGE_EOF
+  chmod +x "$fe_dir/fake-bridge"
+  rc=0
+  fe_out="$(_fetch_evidence "$fe_dir/fake-bridge" 1 WID RID "$fe_dir/evidence.out" 2>&1)" || rc=$?
+  [ "$rc" = 11 ] || { echo "FAIL: _fetch_evidence on a failing bridge exit $rc (want 11)"; fails=1; }
+  echo "$fe_out" | grep -q 'TEMPORAL_FETCH_FAILED' || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found for a failing bridge fetch"; fails=1; }
+
+  # --- _fetch_evidence must ALSO treat a HUNG single fetch call as a failure (exit 11), not let it
+  # defeat --max-seconds by never returning control to the poll loop's own elapsed-time check.
+  # Overrides the per-call ceiling to 1s (via SM_TEMPORAL_FETCH_TIMEOUT_SECONDS) so this stays fast. ---
+  cat > "$fe_dir/fake-bridge-hang" <<'FAKE_BRIDGE_HANG_EOF'
+#!/usr/bin/env bash
+case "$1" in
+  fetch) sleep 30 ;;
+  *) exit 1 ;;
+esac
+FAKE_BRIDGE_HANG_EOF
+  chmod +x "$fe_dir/fake-bridge-hang"
+  local orig_fetch_timeout="$FETCH_CALL_TIMEOUT_SECONDS"
+  FETCH_CALL_TIMEOUT_SECONDS=1
+  rc=0
+  fe_out="$(POLL=1 _fetch_evidence "$fe_dir/fake-bridge-hang" 1 WID RID "$fe_dir/evidence-hang.out" 2>&1)" || rc=$?
+  FETCH_CALL_TIMEOUT_SECONDS="$orig_fetch_timeout"
+  [ "$rc" = 11 ] || { echo "FAIL: _fetch_evidence on a HUNG bridge exit $rc (want 11)"; fails=1; }
+  echo "$fe_out" | grep -q 'TEMPORAL_FETCH_FAILED' || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found for a hung bridge fetch"; fails=1; }
+  rm -rf "$fe_dir"
 
   # --- explicit-path git-add + zero-commit-round refusal, against the real function ---
   if _commit_round_changes "$t" 1 "g" "W" "R" >/dev/null 2>/tmp/sm-temporal-selfcheck-zc.$$; then
