@@ -142,9 +142,10 @@ _kill_sidecar() {  # _kill_sidecar <file> -- no-op if missing, or if the fingerp
 
 # --- the one place a `bridge fetch` call actually happens: real exit code, real per-call ceiling ---
 # Wraps the invocation in run-round.sh (this repo's own wall-clock+idle watchdog, reused rather than
-# reimplemented) so a single HUNG fetch can't defeat --max-seconds either -- --max-seconds only ever
-# gets a chance to run BETWEEN completed fetch calls, never during one still in flight. Writes the
-# real stdout+stderr to <out_file> on success (same shape callers always expected); on ANY failure
+# reimplemented) so a HUNG fetch can't block forever -- bounded by its OWN per-call ceiling,
+# FETCH_CALL_TIMEOUT_SECONDS, distinct from --max-seconds (the whole-round ceiling _poll_until_done
+# below checks BEFORE starting each call, not this function's own concern). Writes the real
+# stdout+stderr to <out_file> on success (same shape callers always expected); on ANY failure
 # (a genuine non-zero exit from `bridge fetch` itself, or this call's own timeout/idle ceiling),
 # returns 11 with a TEMPORAL_FETCH_FAILED message naming the real cause -- never silently retried.
 _fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out_file>
@@ -164,6 +165,45 @@ _fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out
       return 11
       ;;
   esac
+}
+
+# --- owns the whole-round poll loop: calls _fetch_evidence repeatedly until the bridge reports
+# done, enforcing --max-seconds (the WHOLE-ROUND ceiling, distinct from _fetch_evidence's own
+# per-call FETCH_CALL_TIMEOUT_SECONDS). Checks elapsed time BEFORE starting each fetch call, not
+# only after one completes -- a round-10 checker found that --max-seconds 0 (or any value smaller
+# than a single fetch call's real duration) did not actually bound anything, because the only
+# elapsed-time check ran AFTER a fetch had already run to completion: a single slow (not even
+# hung) `bridge fetch` call could run past the whole-round ceiling before that ceiling ever got a
+# chance to fire. The post-fetch check below is kept too (not removed) so a round that finishes
+# exactly at the ceiling still times out immediately rather than waiting through one more `sleep 5`
+# first. Factored out of cmd_round so --selfcheck can exercise this exact ordering directly, against
+# a fake slow bridge binary, with no real server/worker/go toolchain needed.
+_poll_until_done() {  # _poll_until_done <bridge_bin> <grpc_port> <wid> <rid> <evidence_file> <max_seconds>
+  local bridge_bin="$1" grpc_port="$2" wid="$3" rid="$4" evidence_file="$5" max_seconds="$6"
+  local start_ts now elapsed done_flag
+  start_ts=$(date +%s)
+  while :; do
+    now=$(date +%s); elapsed=$((now - start_ts))
+    if [ "$elapsed" -ge "$max_seconds" ]; then
+      echo "TEMPORAL_TIMEOUT: round did not complete within --max-seconds=$max_seconds" >&2
+      return 124
+    fi
+    _fetch_evidence "$bridge_bin" "$grpc_port" "$wid" "$rid" "$evidence_file" || return $?
+    done_flag="$(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("1" if d.get("evidence", {}).get("done") else "0")
+except Exception:
+    print("0")' "$evidence_file")"
+    now=$(date +%s); elapsed=$((now - start_ts))
+    echo "heartbeat: elapsed=${elapsed}s max=${max_seconds}s done=${done_flag}" >&2
+    [ "$done_flag" = "1" ] && break
+    if [ "$elapsed" -ge "$max_seconds" ]; then
+      echo "TEMPORAL_TIMEOUT: round did not complete within --max-seconds=$max_seconds" >&2
+      return 124
+    fi
+    sleep 5
+  done
 }
 
 # --- the one place a round's real changes are staged + committed: explicit paths, never -A/-u -----
@@ -263,20 +303,29 @@ usage() {
 
 run_dir=""  # intentionally NOT local anywhere -- the EXIT/INT/TERM trap's cleanup() reads this global
 run_dir_preexisted=0  # 1 iff --run-dir already existed on disk (as itself or via a symlink) BEFORE
-                      # this invocation touched it. cleanup() must NEVER recursively delete anything
-                      # this invocation did not itself create -- regardless of whether it's a symlink
-                      # or a real directory, and regardless of whether it resolves under --bridge-dir
-                      # or anywhere else. Confirmed live: a --run-dir symlink pointing at a
-                      # pre-existing directory (itself containing a real file) got recursively
-                      # deleted by a blind `rm -rf` on refusal -- exactly the kind of destruction this
-                      # whole task must never do to the read-only bridge dependency, or to anything.
+                      # this invocation touched it. cleanup() must NEVER recursively delete anything,
+                      # or kill any process via a sidecar file, that this invocation did not itself
+                      # create -- regardless of whether it's a symlink or a real directory, and
+                      # regardless of whether it resolves under --bridge-dir or anywhere else.
+                      # Confirmed live (deletion): a --run-dir symlink pointing at a pre-existing
+                      # directory (itself containing a real file) got recursively deleted by a blind
+                      # `rm -rf` on refusal. Confirmed live (kill): a round-10 checker reproduced a
+                      # --run-dir path that already contained valid worker.pidinfo/server.pidinfo
+                      # sidecar files from a DIFFERENT, still-running process -- cleanup() killed that
+                      # unrelated process because it called _kill_sidecar BEFORE this flag was ever
+                      # consulted. Exactly the kind of destruction/disruption this whole task must
+                      # never do to anything that existed before this invocation started.
 
 cleanup() {
   local ec=$?  # must be the FIRST command: preserves the real exit status through this whole handler,
                # regardless of what cleanup itself returns (a failing command below must never clobber it)
-  _kill_sidecar "${run_dir}/worker.pidinfo"
-  _kill_sidecar "${run_dir}/server.pidinfo"
   if [ -n "$run_dir" ] && [ "$run_dir_preexisted" != 1 ]; then
+    # run_dir_preexisted must be checked BEFORE calling _kill_sidecar on anything, not just before the
+    # rm -rf below: if this invocation didn't create run_dir, it must not kill a process via a sidecar
+    # it didn't write either, even if that sidecar's PID+start-time fingerprint happens to match a
+    # real, currently-running process left over from someone else's use of this same path.
+    _kill_sidecar "${run_dir}/worker.pidinfo"
+    _kill_sidecar "${run_dir}/server.pidinfo"
     # Go's module cache deliberately writes cached module directories read-only to prevent corruption;
     # a plain `rm -rf` on it fails with "Permission denied" (confirmed live) unless writable first.
     chmod -R u+w "$run_dir" 2>/dev/null || true
@@ -473,28 +522,11 @@ print(json.load(open(sys.argv[1]))["workflow_id"])' "$submit_out")"
 print(json.load(open(sys.argv[1]))["run_id"])' "$submit_out")"
   echo "workflow_id=$wid run_id=$rid" >&2
 
-  # idle-watchdog-safe polling: --wait 0 above already returned; this script owns the poll loop and
-  # prints one heartbeat per cycle so a wrapping run-round.sh's idle watchdog stays fed, while
+  # idle-watchdog-safe polling: --wait 0 above already returned; _poll_until_done owns the poll loop
+  # and prints one heartbeat per cycle so a wrapping run-round.sh's idle watchdog stays fed, while
   # genuinely exercising the query-vs-history bridge fetch path every round (not just a blocking --wait).
-  local evidence_file="$run_dir/evidence.json" start_ts now elapsed done_flag
-  start_ts=$(date +%s)
-  while :; do
-    _fetch_evidence "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$evidence_file" || return $?
-    done_flag="$(python3 -c 'import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print("1" if d.get("evidence", {}).get("done") else "0")
-except Exception:
-    print("0")' "$evidence_file")"
-    now=$(date +%s); elapsed=$((now - start_ts))
-    echo "heartbeat: elapsed=${elapsed}s max=${max_seconds}s done=${done_flag}" >&2
-    [ "$done_flag" = "1" ] && break
-    if [ "$elapsed" -ge "$max_seconds" ]; then
-      echo "TEMPORAL_TIMEOUT: round did not complete within --max-seconds=$max_seconds" >&2
-      return 124
-    fi
-    sleep 5
-  done
+  local evidence_file="$run_dir/evidence.json"
+  _poll_until_done "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$evidence_file" "$max_seconds" || return $?
 
   if [ -z "$(git -C "$repo" status --porcelain)" ]; then
     echo "ZERO_COMMIT_ROUND: maker step completed but left the worktree unchanged -- refusing to hand an empty diff to the checker" >&2
@@ -724,6 +756,39 @@ CAT_RAN_EOF
   rm -f /tmp/sm-temporal-selfcheck-trap.$$
   rm -rf "$leak_root"
 
+  # --- [CRITICAL] cleanup() must NEVER kill a process via a sidecar file inherited from a
+  # pre-existing run_dir this invocation did not create -- exactly the same principle already
+  # applied to not deleting pre-existing files/directories (the destructive-symlink test above).
+  # Checker's exact repro: --run-dir already exists and already contains valid worker.pidinfo/
+  # server.pidinfo sidecar files pointing at a DIFFERENT, real, still-running process (e.g. a
+  # concurrent session's own worker that happens to be using that same run-dir path). Reuses the
+  # missing-Go-toolchain preflight failure above as the trigger -- it fails AFTER run_dir is
+  # created/trap-installed without ever clearing the run_dir variable (unlike the
+  # nested-under-bridge-dir refusal earlier, which clears it before returning and so can never
+  # reach _kill_sidecar with the real path at all), so cleanup() runs against the real,
+  # pre-existing path with run_dir_preexisted=1 -- exactly the scenario the checker demonstrated. ---
+  local kill_root; kill_root="$(mktemp -d)"
+  mkdir -p "$kill_root/fakebridge/bridge" "$kill_root/fakebridge/bin"
+  touch "$kill_root/fakebridge/bin/temporal-local-standalone"
+  chmod +x "$kill_root/fakebridge/bin/temporal-local-standalone"
+  local kill_run_dir="$kill_root/preexisting-run-dir"
+  mkdir -p "$kill_run_dir"
+  sleep 60 &
+  local unrelated_pid=$!
+  _record_sidecar "$kill_run_dir/worker.pidinfo" "$unrelated_pid"
+  _record_sidecar "$kill_run_dir/server.pidinfo" "$unrelated_pid"
+  rc=0
+  HERDR_ENV="" SM_TEMPORAL_GO_BIN="/nonexistent-go-xyz-$$" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+    --bridge-dir "$kill_root/fakebridge/bridge" --run-dir "$kill_run_dir" \
+    >/tmp/sm-temporal-selfcheck-killsidecar.$$ 2>&1 || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: pre-existing-sidecar missing-go-bin exit $rc (want 1)"; fails=1; }
+  kill -0 "$unrelated_pid" 2>/dev/null || { echo "FAIL [CRITICAL]: cleanup() killed an unrelated process via a sidecar file inherited from a pre-existing run_dir"; fails=1; }
+  [ -d "$kill_run_dir" ] || { echo "FAIL [CRITICAL]: pre-existing run_dir was deleted (should have been left untouched)"; fails=1; }
+  kill "$unrelated_pid" 2>/dev/null || true
+  wait "$unrelated_pid" 2>/dev/null || true
+  rm -f /tmp/sm-temporal-selfcheck-killsidecar.$$
+  rm -rf "$kill_root"
+
   # --- _fetch_evidence must surface a real `bridge fetch` failure as exit 11/TEMPORAL_FETCH_FAILED,
   # not loop/time out -- exercised directly against a fake "bridge" stub (fast, free, no live
   # Temporal), the same PATH/stub-faking idiom bin/teardown-check.sh already uses for an external CLI. ---
@@ -760,6 +825,40 @@ FAKE_BRIDGE_HANG_EOF
   [ "$rc" = 11 ] || { echo "FAIL: _fetch_evidence on a HUNG bridge exit $rc (want 11)"; fails=1; }
   echo "$fe_out" | grep -q 'TEMPORAL_FETCH_FAILED' || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found for a hung bridge fetch"; fails=1; }
   rm -rf "$fe_dir"
+
+  # --- [CRITICAL] --max-seconds (the WHOLE-ROUND ceiling) must be checked BEFORE starting each
+  # fetch call, not only after one completes. A round-10 checker found that --max-seconds 0 (or any
+  # value smaller than a single fetch call's own real duration) did not actually bound anything,
+  # because the only elapsed-time check ran AFTER a fetch had already run to completion -- a single
+  # SLOW (not even hung) `bridge fetch` call could run past the whole-round ceiling before that
+  # ceiling ever got a chance to fire, bounded only by the separate, larger per-call
+  # SM_TEMPORAL_FETCH_TIMEOUT_SECONDS. Exercises _poll_until_done directly (no real server/worker/go
+  # toolchain needed) against a fake bridge binary whose `fetch` subcommand touches a marker then
+  # sleeps for several seconds, with --max-seconds=0. Asserts the fetch's own marker is NEVER
+  # created (a deterministic check that the fetch never even started, not just a timing guess) and
+  # that the whole call returns well under the fake fetch's own sleep duration. ---
+  local poll_dir; poll_dir="$(mktemp -d)"
+  local poll_marker="$poll_dir/fetch-started-marker"
+  cat > "$poll_dir/slow-bridge" <<SLOW_BRIDGE_EOF
+#!/usr/bin/env bash
+case "\$1" in
+  fetch) touch "$poll_marker"; sleep 3; echo '{"evidence":{"done":false}}' ;;
+  *) exit 1 ;;
+esac
+SLOW_BRIDGE_EOF
+  chmod +x "$poll_dir/slow-bridge"
+  local poll_start poll_end poll_elapsed
+  rc=0
+  poll_start=$(date +%s)
+  _poll_until_done "$poll_dir/slow-bridge" 1 WID RID "$poll_dir/evidence.out" 0 >/tmp/sm-temporal-selfcheck-poll.$$ 2>&1 || rc=$?
+  poll_end=$(date +%s)
+  poll_elapsed=$((poll_end - poll_start))
+  [ "$rc" = 124 ] || { echo "FAIL: _poll_until_done with --max-seconds=0 against a slow fetch exit $rc (want 124)"; fails=1; }
+  [ ! -f "$poll_marker" ] || { echo "FAIL [CRITICAL]: _poll_until_done started a fetch call despite --max-seconds=0 already being exceeded -- the whole-round ceiling was not checked before starting it"; fails=1; }
+  [ "$poll_elapsed" -le 2 ] || { echo "FAIL [CRITICAL]: _poll_until_done took ${poll_elapsed}s to time out (want well under the fake fetch's own 3s sleep)"; fails=1; }
+  grep -q 'TEMPORAL_TIMEOUT' /tmp/sm-temporal-selfcheck-poll.$$ || { echo "FAIL: TEMPORAL_TIMEOUT message not found"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-poll.$$
+  rm -rf "$poll_dir"
 
   # --- _prepare_bridge_cli's own override-vs-real branching, tested DIRECTLY against the function
   # itself -- NOT through cmd_round, which never supplies a 6th argument at all (see its one call
