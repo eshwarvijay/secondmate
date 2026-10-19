@@ -219,7 +219,7 @@ credentials only you can supply.
 | `SM_TEMPORAL_DRYRUN` | unset | set to `1` to make `bin/run-round-temporal.sh round` print the assembled plan JSON + commands instead of starting a real server/worker/build |
 | `SM_TEMPORAL_GO_BIN` | the bridge's own `scripts/smoke_maker_checker.sh` default pinned Go toolchain path | overrides the Go toolchain `bin/run-round-temporal.sh` uses to build the bridge CLI. Like `SM_CHECKER_HARNESS` and every other PATH-resolved binary this plugin execs (`claude`, `pi`, `git`), this trusts the operator's own environment — it is not a sandboxed input |
 | `SM_TEMPORAL_GO_DOWNLOAD_CACHE` | the bridge's own `scripts/smoke_maker_checker.sh` default offline module cache path | overrides the read-only local Go module proxy `bin/run-round-temporal.sh` builds against |
-| `SM_TEMPORAL_FETCH_TIMEOUT_SECONDS` | `30` | per-call ceiling for a single `bridge fetch` invocation in `bin/run-round-temporal.sh`; a call that hangs past this is treated as a failure (exit `11`), distinct from `--max-seconds` (the ceiling on the whole round) |
+| `SM_TEMPORAL_FETCH_TIMEOUT_SECONDS` | `30` | per-call ceiling for a single `bridge fetch` invocation in `bin/run-round-temporal.sh`; a call that hangs past this is treated as a failure (exit `11`), distinct from `--max-seconds` (the ceiling on the round-completion polling phase, not one-time bootstrap costs like building the bridge CLI or starting the dev server/worker — see the script's own header for the full boundary) |
 
 The default model IDs are Amazon Bedrock inference-profile IDs — override them for your provider.
 

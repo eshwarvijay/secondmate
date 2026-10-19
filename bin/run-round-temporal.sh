@@ -15,7 +15,12 @@
 #     [--prior-verdict-file F]         (spliced into the checker step's goal text)
 #     [--bridge-dir PATH]              (default /Users/eshwar.vijay/coupa/temporal-local-fork/bridge)
 #     [--run-dir PATH]                 (default: mktemp OUTSIDE --repo)
-#     [--max-seconds N]                (default 900; genuinely enforced -- this script owns the poll loop)
+#     [--max-seconds N]                (default 900; genuinely enforced for the ROUND-COMPLETION
+#                                        polling phase -- this script owns that poll loop -- and the
+#                                        mandatory post-commit fresh-fetch after it. Does NOT cover
+#                                        one-time bootstrap costs before that phase starts (building
+#                                        the bridge CLI, starting the dev server, starting the
+#                                        worker); see NAMED LIMITATIONS below)
 #     [--max-cost-cents N]             (default 200; POST-HOC WARNING ONLY -- a model call already in
 #                                        flight cannot be preempted without touching the bridge's own
 #                                        activity code, which is out of scope; see SKILL.md)
@@ -86,6 +91,19 @@
 #   compromised ~/.bashrc/~/.zshrc, or any other interpreter-level hook an attacker-controlled shell
 #   could install are all out of scope, consistent with this repo's own single-operator, no-
 #   multi-tenant-auth trust model -- not a gap unique to this script, and not chased further here.
+# - --max-seconds bounds the ROUND-COMPLETION polling phase (the loop that polls `bridge fetch`
+#   until the maker/checker workflow reports done, plus the one mandatory post-commit fresh-fetch
+#   right after it) -- mirroring the bridge's own `submit --wait` semantics, which is what this flag
+#   was actually designed to bound. It does NOT cover the one-time BOOTSTRAP costs that happen once
+#   per round before that phase ever starts: building the bridge CLI, starting the Temporal dev
+#   server, and starting the bridge worker. Each of those bootstrap steps is already individually
+#   capped at roughly 30 seconds in its own right (so none of them can hang indefinitely -- that
+#   invariant holds regardless of --max-seconds), but a small --max-seconds value does not shrink
+#   any of them. Practical consequence: for a --max-seconds smaller than bootstrap time, expect the
+#   round to still take roughly that bootstrap time before the deadline logic engages at all -- this
+#   is accepted, documented behavior, not a defect. Making every individual bootstrap sub-step
+#   itself deadline-aware (the build step, the two separate port-open/pid-file polling loops) would
+#   be a materially larger change for a benefit this task's scope does not need.
 set -euo pipefail
 
 # Clear any inherited DEBUG trap and disable function tracing. These are the first two REAL
@@ -197,6 +215,31 @@ _fetch_evidence() {  # _fetch_evidence <bridge_bin> <grpc_port> <wid> <rid> <out
 #
 # Factored out of cmd_round so --selfcheck can exercise this exact ordering directly, against a fake
 # slow bridge binary, with no real server/worker/go toolchain needed.
+#
+# A round-9 checker review found one more caller of _fetch_evidence that needed this same
+# treatment: the mandatory post-commit fresh-fetch in cmd_round (proving durable-read-from-a-new-
+# process, after the round has already succeeded and been committed) used to call _fetch_evidence
+# with no override at all, so a round finishing right at its --max-seconds deadline could still
+# overrun by up to one more full FETCH_CALL_TIMEOUT_SECONDS on that one extra call. The remaining-
+# budget computation below is shared (via _budget_aware_timeout, defined just above this function)
+# between this loop and that one extra call -- same pattern, same function, not a second hand-
+# written copy of this arithmetic.
+_budget_aware_timeout() {  # _budget_aware_timeout <max_seconds> <elapsed> -- clamps to [1, FETCH_CALL_TIMEOUT_SECONDS]
+  local max_seconds="$1" elapsed="$2" remaining timeout
+  remaining=$((max_seconds - elapsed))
+  timeout="$remaining"
+  [ "$timeout" -gt "$FETCH_CALL_TIMEOUT_SECONDS" ] && timeout="$FETCH_CALL_TIMEOUT_SECONDS"
+  # Floors at 1, never 0 or negative, even if the whole-round budget is already fully consumed by
+  # the time this is computed. _poll_until_done's own call site never actually hits this floor (its
+  # caller already refused BEFORE calling here whenever elapsed >= max_seconds, so remaining is
+  # always >= 1 there) -- but cmd_round's post-commit fresh-fetch call site can: that call is
+  # MANDATORY evidence for a round that has ALREADY succeeded and been committed, not something
+  # that can be skipped or refused the way a new poll iteration can, so it must still get some
+  # realistic chance to complete rather than a timeout of 0.
+  [ "$timeout" -lt 1 ] && timeout=1
+  echo "$timeout"
+}
+
 _poll_until_done() {  # _poll_until_done <bridge_bin> <grpc_port> <wid> <rid> <evidence_file> <max_seconds>
   local bridge_bin="$1" grpc_port="$2" wid="$3" rid="$4" evidence_file="$5" max_seconds="$6"
   local start_ts now elapsed done_flag remaining call_timeout sleep_for
@@ -207,9 +250,7 @@ _poll_until_done() {  # _poll_until_done <bridge_bin> <grpc_port> <wid> <rid> <e
       echo "TEMPORAL_TIMEOUT: round did not complete within --max-seconds=$max_seconds" >&2
       return 124
     fi
-    remaining=$((max_seconds - elapsed))
-    call_timeout="$remaining"
-    [ "$call_timeout" -gt "$FETCH_CALL_TIMEOUT_SECONDS" ] && call_timeout="$FETCH_CALL_TIMEOUT_SECONDS"
+    call_timeout="$(_budget_aware_timeout "$max_seconds" "$elapsed")"
     _fetch_evidence "$bridge_bin" "$grpc_port" "$wid" "$rid" "$evidence_file" "$call_timeout" || return $?
     done_flag="$(python3 -c 'import json, sys
 try:
@@ -550,7 +591,11 @@ print(json.load(open(sys.argv[1]))["run_id"])' "$submit_out")"
   # idle-watchdog-safe polling: --wait 0 above already returned; _poll_until_done owns the poll loop
   # and prints one heartbeat per cycle so a wrapping run-round.sh's idle watchdog stays fed, while
   # genuinely exercising the query-vs-history bridge fetch path every round (not just a blocking --wait).
-  local evidence_file="$run_dir/evidence.json"
+  # poll_start_ts marks the start of the round-completion polling phase that --max-seconds actually
+  # bounds (see the module header's own note on this) -- reused below to budget the mandatory
+  # post-commit fresh-fetch call too, not just this loop.
+  local evidence_file="$run_dir/evidence.json" poll_start_ts
+  poll_start_ts=$(date +%s)
   _poll_until_done "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$evidence_file" "$max_seconds" || return $?
 
   if [ -z "$(git -C "$repo" status --porcelain)" ]; then
@@ -562,9 +607,13 @@ print(json.load(open(sys.argv[1]))["run_id"])' "$submit_out")"
   echo "committed $commit_sha" >&2
 
   # re-fetch ONE more time from a brand-new, syntactically fresh `bridge fetch` process -- proves the
-  # durable-read-from-a-new-process property, not just the poll loop's own repeated calls.
-  local fresh_evidence="$run_dir/evidence.fresh.json"
-  _fetch_evidence "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$fresh_evidence" || return $?
+  # durable-read-from-a-new-process property, not just the poll loop's own repeated calls. Budgeted
+  # the same remaining-budget-aware way as every fetch call inside the poll loop above (round-9
+  # checker review finding): a round finishing right at its --max-seconds deadline must not still be
+  # able to overrun by a whole extra FETCH_CALL_TIMEOUT_SECONDS on this one mandatory extra call.
+  local fresh_evidence="$run_dir/evidence.fresh.json" fresh_elapsed
+  fresh_elapsed=$(( $(date +%s) - poll_start_ts ))
+  _fetch_evidence "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$fresh_evidence" "$(_budget_aware_timeout "$max_seconds" "$fresh_elapsed")" || return $?
 
   python3 -c 'import json, sys
 d = json.load(open(sys.argv[1]))
@@ -918,6 +967,61 @@ SLOW_BRIDGE2_EOF
   grep -q 'TEMPORAL_FETCH_FAILED' /tmp/sm-temporal-selfcheck-poll2.$$ || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found"; fails=1; }
   rm -f /tmp/sm-temporal-selfcheck-poll2.$$
   rm -rf "$poll2_dir"
+
+  # --- [CRITICAL] a round-9 checker review found the mandatory post-commit fresh-fetch call in
+  # cmd_round (proving durable-read-from-a-new-process, after the round has already succeeded and
+  # been committed) used the flat per-call FETCH_CALL_TIMEOUT_SECONDS default with no remaining-
+  # budget awareness at all -- so a round finishing right at its --max-seconds deadline could still
+  # overrun by up to one more full per-call ceiling on this one extra call. Fixed by sharing
+  # _poll_until_done's own remaining-budget computation via a small extracted function,
+  # _budget_aware_timeout, used by both call sites now. Tested directly (deterministic, no process
+  # spawning) against representative values matching the fresh-fetch scenario. ---
+  [ "$(_budget_aware_timeout 1 0)" = "1" ] || { echo "FAIL: _budget_aware_timeout(max=1, elapsed=0) = $(_budget_aware_timeout 1 0) (want 1, the full remaining budget, well under the default)"; fails=1; }
+  [ "$(_budget_aware_timeout 5 3)" = "2" ] || { echo "FAIL: _budget_aware_timeout(max=5, elapsed=3) = $(_budget_aware_timeout 5 3) (want 2, the remaining budget)"; fails=1; }
+  [ "$(_budget_aware_timeout 100 0)" = "$FETCH_CALL_TIMEOUT_SECONDS" ] || { echo "FAIL: _budget_aware_timeout(max=100, elapsed=0) = $(_budget_aware_timeout 100 0) (want $FETCH_CALL_TIMEOUT_SECONDS, clamped to the per-call default when ample budget remains)"; fails=1; }
+  [ "$(_budget_aware_timeout 1 10)" = "1" ] || { echo "FAIL [CRITICAL]: _budget_aware_timeout(max=1, elapsed=10) = $(_budget_aware_timeout 1 10) (want 1, the floor -- budget already consumed at the fresh-fetch point must never floor to 0 or negative, since that call is mandatory, not skippable)"; fails=1; }
+
+  # --- the same scenario, but exercising the REAL mechanism (not just the arithmetic): a fresh-
+  # fetch-like call, computed via _budget_aware_timeout for a "little budget left" scenario, against
+  # a real slow fake bridge binary -- proves the computed override genuinely bounds wall-clock time
+  # for this call site too, the same way round 11's poll2 test proved it for the in-loop call site. ---
+  local ff_dir; ff_dir="$(mktemp -d)"
+  cat > "$ff_dir/slow-bridge" <<'FF_SLOW_BRIDGE_EOF'
+#!/usr/bin/env bash
+case "$1" in
+  fetch) sleep 10; echo '{"evidence":{"done":true}}' ;;
+  *) exit 1 ;;
+esac
+FF_SLOW_BRIDGE_EOF
+  chmod +x "$ff_dir/slow-bridge"
+  local ff_start ff_end ff_elapsed ff_timeout
+  rc=0
+  ff_timeout="$(_budget_aware_timeout 1 0)"
+  ff_start=$(date +%s)
+  _fetch_evidence "$ff_dir/slow-bridge" 1 WID RID "$ff_dir/evidence.out" "$ff_timeout" >/tmp/sm-temporal-selfcheck-ff.$$ 2>&1 || rc=$?
+  ff_end=$(date +%s)
+  ff_elapsed=$((ff_end - ff_start))
+  [ "$rc" = 11 ] || { echo "FAIL: budget-aware fresh-fetch simulation exit $rc (want 11, the shrunk per-call timeout firing)"; fails=1; }
+  [ "$ff_elapsed" -le 6 ] || { echo "FAIL [CRITICAL]: budget-aware fresh-fetch simulation took ${ff_elapsed}s (want well under the fake fetch's own 10s sleep -- a round finishing right at its deadline could still overrun on the mandatory post-commit fresh-fetch)"; fails=1; }
+  grep -q 'TEMPORAL_FETCH_FAILED' /tmp/sm-temporal-selfcheck-ff.$$ || { echo "FAIL: TEMPORAL_FETCH_FAILED message not found"; fails=1; }
+  rm -f /tmp/sm-temporal-selfcheck-ff.$$
+  rm -rf "$ff_dir"
+
+  # --- [CRITICAL] structural guard for cmd_round's own real call site. The tests above exercise
+  # the shared mechanism (_budget_aware_timeout + _fetch_evidence) directly -- proven to work, but
+  # none of them can drive cmd_round's own post-commit fresh-fetch call site without a real live
+  # round (building the bridge CLI, starting a real server/worker), which this task's own scope
+  # explicitly excludes from --selfcheck. Confirmed this gap live: reverting ONLY that one call site
+  # back to its old no-override shape left --selfcheck fully green, since every test above bypasses
+  # cmd_round entirely. A literal-text grep of this script's own source is the only thing that can
+  # catch that specific regression cheaply. MUST search only cmd_round's own function body (between
+  # its own `cmd_round() {` line and the next top-level `_selfcheck() {` line), not the whole file --
+  # confirmed live that searching the whole file is a trivial, silent false-pass: the expected text
+  # is ALSO, necessarily, embedded verbatim in the grep command's own argument a few lines below,
+  # so a whole-file search "finds" that occurrence and reports success even when cmd_round's real
+  # call site has been reverted. ---
+  sed -n '/^cmd_round() {$/,/^_selfcheck() {$/p' "$0" | grep -qF '_fetch_evidence "$run_dir/bridge" "$grpc_port" "$wid" "$rid" "$fresh_evidence" "$(_budget_aware_timeout "$max_seconds" "$fresh_elapsed")" || return $?' \
+    || { echo "FAIL [CRITICAL]: cmd_round's post-commit fresh-fetch call site no longer wires in a _budget_aware_timeout override -- Finding 1's fix was reverted at the one call site no dynamic test can reach"; fails=1; }
 
   # --- _prepare_bridge_cli's own override-vs-real branching, tested DIRECTLY against the function
   # itself -- NOT through cmd_round, which never supplies a 6th argument at all (see its one call
