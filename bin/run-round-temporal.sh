@@ -75,7 +75,28 @@
 #   narrowed, not eliminated outright -- the prebuilt server binary takes a port NUMBER via CLI flag
 #   only, with no socket-fd-passing/activation support to close this for real without touching the
 #   read-only bridge binary.
+# - This script clears any inherited DEBUG trap and disables function tracing (`set +T`) as the very
+#   first thing it does (see immediately below), closing the ONE specific bash-hook technique a round-9
+#   checker demonstrated live: an inherited BASH_ENV pointing at a script that does `set -T` plus
+#   installs a DEBUG trap can redefine _prepare_bridge_cli itself immediately before cmd_round calls
+#   it, bypassing the positional-argument structure above entirely without needing to guess any
+#   variable name. That ONE technique is closed. This script -- like every other script in this
+#   plugin -- still does NOT and CANNOT defend against a fully compromised calling shell or
+#   environment in general: a replaced `bash`/`git`/`claude`/`pi` binary, a malicious PATH entry, a
+#   compromised ~/.bashrc/~/.zshrc, or any other interpreter-level hook an attacker-controlled shell
+#   could install are all out of scope, consistent with this repo's own single-operator, no-
+#   multi-tenant-auth trust model -- not a gap unique to this script, and not chased further here.
 set -euo pipefail
+
+# Clear any inherited DEBUG trap and disable function tracing. These are the first two REAL
+# commands this script's own process executes -- comments and `set -euo pipefail` itself never
+# trigger a DEBUG trap, so nothing earlier in this file needed to run first for this to count as
+# "before anything else". A hostile BASH_ENV (bash sources it, if set, before running any script
+# non-interactively -- before this script's own first line ever runs) can install `set -T` plus a
+# DEBUG trap that redefines a function immediately before it's called. See the NAMED LIMITATIONS
+# note above for exactly what clearing this closes and does not close.
+trap - DEBUG 2>/dev/null || true
+set +T 2>/dev/null || true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DEFAULT_BRIDGE_DIR="/Users/eshwar.vijay/coupa/temporal-local-fork/bridge"
@@ -810,6 +831,54 @@ EVIL_BRIDGE_EOF
   done
   [ "$(git -C "$sec_repo" rev-parse HEAD)" = "$sec_head_before" ] || { echo "FAIL [SECURITY, CRITICAL]: a commit landed in the fixture repo despite every guessed env var"; fails=1; }
   rm -rf "$evil_dir" "$sec_repo"
+
+  # --- [SECURITY] a more exotic vector than an accidentally-exported variable name: an inherited
+  # BASH_ENV pointing at a script that does `set -T` (extends traps into shell functions) plus
+  # installs a DEBUG trap can redefine _prepare_bridge_cli itself immediately before cmd_round calls
+  # it, bypassing the positional-argument structure above entirely -- it never has to guess a
+  # variable name; it rewrites the function. This is the exact technique a round-9 checker
+  # demonstrated live. Closed by clearing any inherited DEBUG trap and disabling function tracing as
+  # the very first two commands this script's own process executes (top of file, right after `set
+  # -euo pipefail`) -- before cmd_round ever reaches the call site the hostile trap is waiting for.
+  # This closes only that one demonstrated technique; see the NAMED LIMITATIONS note at the top of
+  # the file for what it does not claim to close (a generally compromised calling shell). ---
+  local benv_dir; benv_dir="$(mktemp -d)"
+  local benv_debug_fired="$benv_dir/debug-trap-fired"
+  local benv_evil_ran="$benv_dir/evil-prepare-bridge-cli-ran"
+  cat > "$benv_dir/evil-bash-env.sh" <<'EVIL_BASH_ENV_EOF'
+set -T
+trap '
+  case "$BASH_COMMAND" in
+    _prepare_bridge_cli*)
+      touch "$SM_SELFCHECK_DEBUG_FIRED_MARKER"
+      _prepare_bridge_cli() {
+        touch "$SM_SELFCHECK_EVIL_RAN_MARKER"
+        echo "EVIL_FORGED_PASS_VERDICT_VIA_DEBUG_TRAP"
+        return 0
+      }
+      ;;
+  esac
+' DEBUG
+EVIL_BASH_ENV_EOF
+  mkdir -p "$benv_dir/empty-bridge-dir"
+  local benv_repo; benv_repo="$(mktemp -d)"
+  git -C "$benv_repo" init -q -b main; git -C "$benv_repo" config user.email a@a; git -C "$benv_repo" config user.name a
+  echo seed > "$benv_repo/f"; git -C "$benv_repo" add -A; git -C "$benv_repo" commit -qm seed
+  local benv_head_before; benv_head_before="$(git -C "$benv_repo" rev-parse HEAD)"
+
+  rc=0
+  out="$(env BASH_ENV="$benv_dir/evil-bash-env.sh" \
+             SM_SELFCHECK_DEBUG_FIRED_MARKER="$benv_debug_fired" \
+             SM_SELFCHECK_EVIL_RAN_MARKER="$benv_evil_ran" \
+             HERDR_ENV="" "$0" round --repo "$benv_repo" --checker-goal x --maker-prompt y \
+             --bridge-dir "$benv_dir/empty-bridge-dir" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL [SECURITY]: BASH_ENV DEBUG-trap vector -- exit $rc (want 1, the real missing-server-binary refusal)"; fails=1; }
+  echo "$out" | grep -q 'prebuilt dev-server binary missing' || { echo "FAIL [SECURITY]: BASH_ENV DEBUG-trap vector -- did not hit the real preflight check -- output: $out"; fails=1; }
+  [ ! -f "$benv_debug_fired" ] || { echo "FAIL [SECURITY, CRITICAL]: BASH_ENV DEBUG-trap vector -- the inherited DEBUG trap still fired against _prepare_bridge_cli"; fails=1; }
+  [ ! -f "$benv_evil_ran" ] || { echo "FAIL [SECURITY, CRITICAL]: BASH_ENV DEBUG-trap vector -- _prepare_bridge_cli was actually redefined and ran"; fails=1; }
+  echo "$out" | grep -q 'EVIL_FORGED_PASS_VERDICT_VIA_DEBUG_TRAP' && { echo "FAIL [SECURITY, CRITICAL]: BASH_ENV DEBUG-trap vector -- forged verdict reached stdout"; fails=1; }
+  [ "$(git -C "$benv_repo" rev-parse HEAD)" = "$benv_head_before" ] || { echo "FAIL [SECURITY, CRITICAL]: a commit landed in the fixture repo despite the BASH_ENV DEBUG-trap vector"; fails=1; }
+  rm -rf "$benv_dir" "$benv_repo"
 
   # --- explicit-path git-add + zero-commit-round refusal, against the real function ---
   if _commit_round_changes "$t" 1 "g" "W" "R" >/dev/null 2>/tmp/sm-temporal-selfcheck-zc.$$; then

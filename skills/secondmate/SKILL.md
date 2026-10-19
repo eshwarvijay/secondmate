@@ -238,6 +238,19 @@ only, never a mid-flight preemption, since a model call already in flight can't 
 outside the bridge's own activity code. These are accepted scope boundaries for this increment, not
 bugs — see `docs/ARCHITECTURE.md` for the full rationale.
 
+**`BASH_ENV`/`DEBUG`-trap hardening — one specific technique closed, not a general shell sandbox.**
+`run-round-temporal.sh` clears any inherited `DEBUG` trap and disables function tracing (`set +T`) as
+the first two commands it executes, closing one specific demonstrated attack: an inherited
+`BASH_ENV` pointing at a script that does `set -T` plus installs a `DEBUG` trap can redefine
+`_prepare_bridge_cli` itself immediately before `cmd_round` calls it, bypassing the positional-
+argument fix entirely without needing to guess any variable name. That one technique is closed and
+has its own `--selfcheck` case. This script — like every other script in this plugin — still does
+not and cannot defend against a fully compromised calling shell or environment in general: a
+replaced `bash`/`git`/`claude`/`pi` binary, a malicious `PATH` entry, or a compromised
+`~/.bashrc`/`~/.zshrc` are all out of scope, consistent with this repo's own single-operator,
+no-multi-tenant-auth trust model — not a gap unique to this script, and not something to chase
+further here.
+
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
 Immediately after claiming and recording the `claimed` progress-ledger checkpoint, and before
