@@ -199,14 +199,34 @@ real server/worker (mirrors `launch-checker.sh`'s own `SM_CHECKER_DRYRUN`); `--s
 arg validation, the dry-run plan shape, and the explicit-path-commit/zero-commit logic against a
 fixture repo — fast, free, no live Temporal.
 
-**`HERDR_ENV=1` visible-pane carve-out.** The strict rule above ("checker MUST run in a visible herdr
-pane, headless is prohibited") is satisfied literally, not bypassed: run this script itself inside a
-visible herdr pane using the same `herdr pane run <pane> bash <script-path>` + `pane wait-output` +
-`pane read` recipe the native checker pane already uses (write the invocation to a script file first,
-same quoting-safety reason as the native checker pane). **Named limitation:** unlike
-`checker-progress.py`'s live token-by-token streaming, the bridge buffers all subprocess output until
-the round ends — the pane shows a start line, periodic poll heartbeats, and the final result, not
-live progress. This is an honest, visible degradation, not a silent one.
+**`HERDR_ENV=1` — refuses by default; this is NOT satisfied by running the wrapper in a pane.** An
+earlier version of this section claimed that running `run-round-temporal.sh` itself inside a visible
+herdr pane "satisfied literally" the strict rule above ("checker MUST run in a visible herdr pane,
+headless is prohibited"). That was wrong, and the dispatcher (not the checker) caught it. Running
+the *wrapper* in a pane only makes the *wrapper's own* stdout/stderr visible there — it does nothing
+about the two actual gaps underneath:
+- **(a) No observable checker lifecycle at all.** The bridge's checker activity
+  (`internal/planrun/checker.go`, read-only dependency, never modified by this script) shells out to
+  a bare headless `pi` subprocess with no herdr-tracked agent state (no `idle`/`working`/`blocked`) —
+  a human watching the pane sees only this wrapper's own heartbeats and the final result, never a
+  live, interruptible model session the way the native checker pane gives one.
+- **(b) The maker is MORE autonomous than this repo's own normal maker path, not just less visible.**
+  The bridge's maker activity (`internal/planrun/maker.go`) runs
+  `claude -p ... --permission-mode acceptEdits --allowedTools Read,Edit,Write,Bash` — Bash commands
+  are auto-accepted with zero intervention opportunity. The normal Claude maker path in this file
+  runs `--permission-mode auto`, which auto-applies edits but still blocks, visibly, on Bash/risky
+  commands. This is a real autonomy increase, not a visibility decrease.
+
+Because of (a) and (b), `bin/run-round-temporal.sh round` **refuses outright under `HERDR_ENV=1`**
+(exit 1, naming both gaps) unless the caller passes `--i-accept-headless-autonomous-risk`, a CLI flag
+(not an env var, so it can't be set once and forgotten) that must be given with real, deliberate
+intent — never as a routine bypass. Even with the override, the script still prints a loud warning
+naming both gaps to stderr before proceeding, so it's visible in whatever pane/log captures the
+invocation. This is a known, deliberate limitation of the underlying bridge prototype's own design —
+its maker/checker activities were built as bare subprocess calls, never herdr-aware — not something
+this wrapper silently inherited or glossed over, and it cannot be fixed by editing
+`maker.go`/`checker.go` to shell out through herdr instead, since that would mean modifying the
+read-only bridge dependency.
 
 **Named gaps for v1 (deliberately not ported into this path):** no `round-state.md`/
 `feature-list.json` continuity, no ponytail context injection, no lesson-injection — a dispatcher

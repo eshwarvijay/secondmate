@@ -19,6 +19,7 @@
 #     [--max-cost-cents N]             (default 200; POST-HOC WARNING ONLY -- a model call already in
 #                                        flight cannot be preempted without touching the bridge's own
 #                                        activity code, which is out of scope; see SKILL.md)
+#     [--i-accept-headless-autonomous-risk]   (required if HERDR_ENV=1; see the HERDR_ENV guard below)
 #   run-round-temporal.sh --selfcheck
 #
 # Env: SM_TEMPORAL_DRYRUN=1          -- print the assembled plan JSON + the commands this would run,
@@ -44,6 +45,13 @@
 #                124 TEMPORAL_TIMEOUT (--max-seconds exceeded)
 #
 # NAMED LIMITATIONS (accepted, documented -- see skills/secondmate/SKILL.md for the full list):
+# - Under HERDR_ENV=1, this script REFUSES a real round by default (see the guard in cmd_round):
+#   the bridge's checker activity has no herdr-observable lifecycle at all (a bare headless `pi`
+#   subprocess, not a live interruptible session), and its maker activity auto-accepts Bash
+#   commands with zero intervention opportunity -- more autonomous than this repo's own normal
+#   `--permission-mode auto` maker path, not merely less visible. Running THIS WRAPPER inside a
+#   herdr pane does not fix either gap -- it only makes the wrapper's own output visible. Overridable
+#   with --i-accept-headless-autonomous-risk, which also prints a loud warning before proceeding.
 # - No round-state.md/feature-list.json/ponytail/lesson-injection parity on this path (v1 scope).
 # - No --lens support (the bridge's checker.go has no lens concept).
 # - Process cleanup uses a PID+start-time fingerprint sidecar (see _fingerprint below); a `kill -9` on
@@ -196,9 +204,10 @@ cleanup() {
 
 cmd_round() {
   local repo="" round=1 goal="" criteria="" maker_prompt_file="" maker_prompt="" checker_goal="" prior_verdict_file=""
-  local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200
+  local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200 accept_headless_risk=0
   while [ $# -gt 0 ]; do
     case "$1" in
+      --i-accept-headless-autonomous-risk) accept_headless_risk=1; shift 1;;
       --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; repo="$2"; shift 2;;
       --round) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; round="$2"; shift 2;;
       --goal) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; goal="$2"; shift 2;;
@@ -249,6 +258,35 @@ cmd_round() {
     echo "WOULD RUN: <run-dir>/bridge submit --plan-file <run-dir>/plan.json --wait 0"
     echo "WOULD RUN: <run-dir>/bridge fetch --workflow-id <wid> --run-id <rid>   (polled every 5s up to ${max_seconds}s)"
     return 0
+  fi
+
+  # --- HERDR_ENV=1 guard: refuse a REAL round outright unless explicitly overridden --------------
+  # This repo's own SOP (skills/secondmate/SKILL.md, "Visible orchestration in herdr") requires the
+  # maker to run on a visible, interruptible herdr pane under HERDR_ENV=1, and explicitly PROHIBITS
+  # headless checker execution there -- specifically so a human can observe and intervene on live,
+  # autonomous model actions. The bridge's maker/checker activities (internal/planrun/maker.go,
+  # checker.go -- read-only dependency, never modified by this script) cannot satisfy that, for TWO
+  # distinct reasons, not one:
+  #   (1) the checker runs as a bare headless `pi` subprocess with no herdr-tracked agent lifecycle
+  #       at all -- a human watching a pane sees only this wrapper's own heartbeats and the final
+  #       result, never a live, interruptible model session. Running this wrapper itself inside a
+  #       herdr pane does NOT fix this -- it only makes the WRAPPER's output visible, not the inner
+  #       checker process's state.
+  #   (2) the maker runs `claude -p ... --permission-mode acceptEdits --allowedTools
+  #       Read,Edit,Write,Bash` -- Bash commands are auto-accepted with ZERO intervention
+  #       opportunity, which is MORE autonomous than this repo's own normal `--permission-mode auto`
+  #       Claude maker path (which still blocks, visibly, on Bash/risky commands), not merely less
+  #       visible.
+  # Exempt from this guard: SM_TEMPORAL_DRYRUN=1 above (never starts anything real) and every
+  # preflight check below it that can refuse for an unrelated reason before any build/server/maker/
+  # checker activity actually starts -- this guard exists to stop the REAL round, not to block
+  # unrelated refusals from being reachable in testing.
+  if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" != 1 ]; then
+    echo "REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk was not given. This engine's checker has no herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session), and its maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path, not merely less visible. This repo's own SOP requires a visible, interruptible pane and prohibits headless checker execution under HERDR_ENV=1 for exactly this reason. Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway." >&2
+    return 1
+  fi
+  if [ "${HERDR_ENV:-}" = 1 ]; then
+    echo "WARNING: running under HERDR_ENV=1 with --i-accept-headless-autonomous-risk. This round's checker has NO herdr-observable lifecycle (a bare headless subprocess) and this round's maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path. Proceeding only because the override was explicitly given." >&2
   fi
 
   # snapshot precondition for the real round: must be clean BEFORE we start, so the post-round diff
@@ -439,7 +477,30 @@ _selfcheck() {
   rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --max-cost-cents abc >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-cost-cents exit $rc (want 2)"; fails=1; }
 
-  rc=0; "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ >/tmp/sm-temporal-selfcheck-pf.$$ 2>&1 || rc=$?
+  # --- HERDR_ENV=1 guard: refuse a REAL round outright (before any build/server) unless the
+  # override is explicitly given. Uses --bridge-dir /nonexistent so a subsequent bug couldn't
+  # accidentally let this limp forward into real preflight/build work even if the guard failed to
+  # fire -- the FIRST line of output must be the refusal, before any preflight message at all. ---
+  rc=0
+  out="$(HERDR_ENV=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: HERDR_ENV=1 without override exit $rc (want 1)"; fails=1; }
+  echo "$out" | grep -q 'REFUSING: HERDR_ENV=1' || { echo "FAIL: HERDR guard refusal message not found"; fails=1; }
+  echo "$out" | grep -q 'no herdr-observable lifecycle' || { echo "FAIL: HERDR guard message missing the checker-visibility gap"; fails=1; }
+  echo "$out" | grep -q 'auto-accepts Bash commands' || { echo "FAIL: HERDR guard message missing the maker-autonomy gap"; fails=1; }
+  echo "$out" | grep -q 'bridge dir not found' && { echo "FAIL: HERDR guard did not fire first -- preflight ran instead"; fails=1; }
+
+  # --- the override must actually let a real round proceed PAST the guard -- paired with
+  # --bridge-dir /nonexistent so it still exits early for an unrelated reason, confirming only that
+  # the HERDR guard itself did not block it (same precedent as the dry-run/missing-bridge-dir tests
+  # elsewhere in this suite: a clean, fast, no-live-Temporal way to observe "did this check pass"). ---
+  rc=0
+  out="$(HERDR_ENV=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ --i-accept-headless-autonomous-risk 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: HERDR_ENV=1 WITH override exit $rc (want 1, from the unrelated missing-bridge-dir refusal)"; fails=1; }
+  echo "$out" | grep -q 'REFUSING: HERDR_ENV=1' && { echo "FAIL: HERDR guard still blocked despite the override being given"; fails=1; }
+  echo "$out" | grep -q 'WARNING: running under HERDR_ENV=1' || { echo "FAIL: HERDR guard override did not print the expected warning"; fails=1; }
+  echo "$out" | grep -q 'bridge dir not found' || { echo "FAIL: override did not let the round proceed to the next real check"; fails=1; }
+
+  rc=0; HERDR_ENV="" "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ >/tmp/sm-temporal-selfcheck-pf.$$ 2>&1 || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: missing-bridge-dir exit $rc (want 1)"; fails=1; }
   grep -q 'bridge dir not found' /tmp/sm-temporal-selfcheck-pf.$$ || { echo "FAIL: missing-bridge-dir message not found"; fails=1; }
   rm -f /tmp/sm-temporal-selfcheck-pf.$$
@@ -450,7 +511,7 @@ _selfcheck() {
   # server-binary/Go-toolchain/claude/pi preflight checks, so this needs none of those to be present. ---
   local fake_bridge; fake_bridge="$(mktemp -d)"
   rc=0
-  "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+  HERDR_ENV="" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
     --bridge-dir "$fake_bridge" --run-dir "$fake_bridge/nested-run-dir" \
     >/tmp/sm-temporal-selfcheck-nest.$$ 2>&1 || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: nested --run-dir-under-bridge-dir exit $rc (want 1)"; fails=1; }
@@ -468,7 +529,7 @@ _selfcheck() {
   local outside_link; outside_link="$(mktemp -d)"
   ln -s "$fake_bridge/real-target" "$outside_link/run-dir-link"
   rc=0
-  "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+  HERDR_ENV="" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
     --bridge-dir "$fake_bridge" --run-dir "$outside_link/run-dir-link" \
     >/tmp/sm-temporal-selfcheck-symlink.$$ 2>&1 || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: symlinked --run-dir resolving under --bridge-dir exit $rc (want 1)"; fails=1; }
@@ -487,7 +548,7 @@ _selfcheck() {
   chmod +x "$leak_root/fakebridge/bin/temporal-local-standalone"
   local leak_run_dir="$leak_root/explicit-run-dir"
   rc=0
-  SM_TEMPORAL_GO_BIN="/nonexistent-go-xyz-$$" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
+  HERDR_ENV="" SM_TEMPORAL_GO_BIN="/nonexistent-go-xyz-$$" "$0" round --repo "$t" --checker-goal x --maker-prompt y \
     --bridge-dir "$leak_root/fakebridge/bridge" --run-dir "$leak_run_dir" \
     >/tmp/sm-temporal-selfcheck-trap.$$ 2>&1 || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: missing-go-bin exit $rc (want 1)"; fails=1; }
