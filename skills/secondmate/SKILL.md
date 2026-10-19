@@ -169,6 +169,53 @@ After either maker path completes, **always proceed to step 4 (Check)** — same
 `launch-checker.sh --addendum-text "..." --diff-base <base> --repo <wt> -- -p "review the change"` → `verdict.py`.
 Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker ≠ checker invariant holds regardless of which maker path is chosen.
 
+### Opt-in alternate engine: Temporal (steps 0d + 4 replaced by one call)
+
+**Strictly opt-in, zero default-behavior change.** A dispatcher may replace step 0d's maker launch
+AND step 4's checker launch for ONE round with a single `bin/run-round-temporal.sh round ...` call,
+which routes that round through a proven external Temporal plan-bridge prototype instead of the
+direct herdr-pane path: a real headless `claude` maker activity edits the worktree, a real
+cross-model `pi`/Bedrock checker activity reviews the real diff, and the wrapper itself commits the
+maker's exact changed paths (never `-A`/`-u`) with `Temporal-Workflow-Id`/`Temporal-Run-Id` trailers.
+Nobody is routed here by default — a dispatcher opts in explicitly per round, e.g. by setting
+`SM_ENGINE=temporal` as its own documentation-level convention before deciding to call it. No other
+call site in this file changes.
+
+```bash
+bin/run-round-temporal.sh round --repo <wt> --round <N> \
+  --goal "<goal>" --criteria "<success condition>" \
+  --maker-prompt-file <plan-file> --checker-goal "<what the checker should confirm>" \
+  [--prior-verdict-file <last round's verdict>]
+# stdout is the checker step's Output verbatim -- pipe it straight into verdict.py, same as launch-checker.sh's stdout
+bin/run-round-temporal.sh round ... | ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py
+```
+
+`<wt>` must already be a clean worktree (no uncommitted changes) — this is a hard precondition, not
+a suggestion: the script snapshots `git status --porcelain` before the round and diffs against that
+same snapshot after, which is how it tells a real change from `ZERO_COMMIT_ROUND` (maker reported
+`ok` but left nothing changed — refused outright, never handed to the checker, distinct exit code).
+`SM_TEMPORAL_DRYRUN=1` prints the assembled plan JSON + the commands it would run without touching a
+real server/worker (mirrors `launch-checker.sh`'s own `SM_CHECKER_DRYRUN`); `--selfcheck` exercises
+arg validation, the dry-run plan shape, and the explicit-path-commit/zero-commit logic against a
+fixture repo — fast, free, no live Temporal.
+
+**`HERDR_ENV=1` visible-pane carve-out.** The strict rule above ("checker MUST run in a visible herdr
+pane, headless is prohibited") is satisfied literally, not bypassed: run this script itself inside a
+visible herdr pane using the same `herdr pane run <pane> bash <script-path>` + `pane wait-output` +
+`pane read` recipe the native checker pane already uses (write the invocation to a script file first,
+same quoting-safety reason as the native checker pane). **Named limitation:** unlike
+`checker-progress.py`'s live token-by-token streaming, the bridge buffers all subprocess output until
+the round ends — the pane shows a start line, periodic poll heartbeats, and the final result, not
+live progress. This is an honest, visible degradation, not a silent one.
+
+**Named gaps for v1 (deliberately not ported into this path):** no `round-state.md`/
+`feature-list.json` continuity, no ponytail context injection, no lesson-injection — a dispatcher
+using this engine gets a single, self-contained round with no cross-round maker memory. No `--lens`
+support (the bridge's checker activity has no lens concept). `--max-cost-cents` is a POST-HOC warning
+only, never a mid-flight preemption, since a model call already in flight can't be stopped from
+outside the bridge's own activity code. These are accepted scope boundaries for this increment, not
+bugs — see `docs/ARCHITECTURE.md` for the full rationale.
+
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
 Immediately after claiming and recording the `claimed` progress-ledger checkpoint, and before
