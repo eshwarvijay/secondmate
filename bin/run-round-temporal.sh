@@ -98,9 +98,11 @@
 #   per round before that phase ever starts: building the bridge CLI, starting the Temporal dev
 #   server, and starting the bridge worker. These two kinds of bootstrap cost are NOT the same, and
 #   a round-10 checker review found an earlier revision of this note wrongly implied they were:
-#   - The dev-server-readiness poll and the worker-startup poll are each a fixed `for i in 1..100;
-#     sleep 0.3` loop -- genuinely capped at roughly 30 seconds each, so neither can hang
-#     indefinitely regardless of --max-seconds.
+#   - The dev-server-readiness poll (`for i in 1..100; sleep 0.3`, ~30s) and the worker-readiness
+#     poll (`for i in 1..50; sleep 0.2`, ~10s) are two DIFFERENT fixed loops with two different caps
+#     -- a round-11 checker review found an earlier revision of this note wrongly claimed both use
+#     the same "~30s" shape. Each is genuinely capped at its own stated duration, so neither can
+#     hang indefinitely regardless of --max-seconds.
 #   - The `go build` step itself has NO timeout wrapper at all. It runs for exactly as long as the
 #     Go toolchain takes -- which, especially against a cold module cache, can legitimately exceed
 #     30 seconds for entirely ordinary reasons, not a bug. Confirmed live: a fake SM_TEMPORAL_GO_BIN
@@ -110,12 +112,22 @@
 #     was legitimately about to finish, which would be worse than not bounding it.
 #   A small --max-seconds value does not shrink any bootstrap step, capped or not. Practical
 #   consequence: for a --max-seconds smaller than bootstrap time, expect the round to still take
-#   roughly that bootstrap time (the readiness polls' ~30s each, PLUS however long the build
-#   actually takes, with no ceiling on that part) before the deadline logic engages at all -- this
-#   is accepted, documented behavior, not a defect. Making every individual bootstrap sub-step
-#   itself deadline-aware (which, for the build step, would mean choosing to kill a legitimately-
-#   progressing build or risk corrupting the module cache) would be a materially larger change, and
-#   a worse one, for a benefit this task's scope does not need.
+#   roughly that bootstrap time (~30s for the server-readiness poll, PLUS ~10s for the
+#   worker-readiness poll, PLUS however long the build actually takes, with no ceiling on that part)
+#   before the deadline logic engages at all -- this is accepted, documented behavior, not a defect.
+#   Making every individual bootstrap sub-step itself deadline-aware (which, for the build step,
+#   would mean choosing to kill a legitimately-progressing build or risk corrupting the module
+#   cache) would be a materially larger change, and a worse one, for a benefit this task's scope
+#   does not need.
+#   - --selfcheck intentionally does NOT exercise _prepare_bridge_cli's real, non-override
+#     build-SUCCESS path (only the fake-override path and the real-failure/missing-server-binary
+#     path are tested): doing so would need a working pinned Go toolchain and a populated module
+#     cache available wherever --selfcheck runs, turning this task's fast, free, hermetic selfcheck
+#     suite -- a design maintained consistently across every round of this task -- into something
+#     slow, network/toolchain-dependent, and potentially flaky on a machine without that exact
+#     toolchain set up. The real evidence that the build-success path works end-to-end is the
+#     live-proof round from round 1 (commit 766b034, still in branch history; see feature-list.json's
+#     own "live-proof-real-round" entry), not --selfcheck.
 set -euo pipefail
 
 # Clear any inherited DEBUG trap and disable function tracing. These are the first two REAL
