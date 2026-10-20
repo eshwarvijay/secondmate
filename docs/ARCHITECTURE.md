@@ -56,6 +56,8 @@ flowchart TD
     MK -. guarded by .-> GD[loop-guard.sh plus run-round.sh]
     MK -->|commit diff| PR[prune-output.sh: trim logs]
     PR --> CH[launch-checker.sh: gpt-terra, edit-locked]
+    WT -.->|opt-in, replaces maker+checker for THIS round| RT[run-round-temporal.sh:<br/>Temporal plan-bridge, real claude maker +<br/>real pi checker activities]
+    RT -.-> EV
     CH --> EV[/verdict envelope JSON/]
     EV --> VD{verdict.py}
     VD -->|fail| S3[Sub-supervisor: synthesize fix plan]
@@ -174,6 +176,28 @@ actually progresses — a same-process tracking aid local to its own run, distin
    *Guards against:* correlated blind spots (different model); a checker that mutates the code (edit-locked);
    non-deterministic adjudication (structured verdict vs reading vibes); round-level patterns (recurring
    finding categories, verdict rates) only visible by re-reading prose across every past task.
+
+   **Optional alternate engine (steps 3+4 together, strictly opt-in):** `bin/run-round-temporal.sh round`
+   routes one maker+checker round through a proven external Temporal plan-bridge prototype instead of the
+   direct herdr-pane path above — a real headless `claude` maker activity and a real cross-model `pi`
+   checker activity, both durable Temporal activities, with the wrapper script itself committing the
+   maker's exact changed paths (never `-A`/`-u`) and a `ZERO_COMMIT_ROUND` refusal if nothing changed.
+   Its stdout is the checker step's Output verbatim, feeding `verdict.py` exactly where
+   `launch-checker.sh`'s stdout normally would — no other call site or script changes. This is a
+   documented alternate branch, not a new default stage: nothing routes here unless a dispatcher opts in
+   per round. **Refuses outright under `HERDR_ENV=1`** unless `--i-accept-headless-autonomous-risk` is
+   explicitly given: the bridge's checker activity has no herdr-observable lifecycle at all (a bare
+   headless subprocess, not a live interruptible session a human could watch or intervene on), and its
+   maker activity auto-accepts Bash commands with zero intervention opportunity — strictly MORE
+   autonomous than this repo's own normal `--permission-mode auto` maker path, not merely less visible.
+   Running the wrapper itself inside a herdr pane does not fix either gap; a known, deliberate
+   limitation of the underlying bridge prototype's own design (bare subprocess calls, not herdr-aware),
+   not something this wrapper can close by itself without editing the read-only bridge dependency —
+   a separate task (task-id `bridge-herdr-visible-activities`) is already targeting the bridge itself
+   for this, so the limitation is pending that work landing, not indefinite. See SKILL.md's "Opt-in
+   alternate engine: Temporal" subsection for the full writeup and the named v1 gaps
+   (no round-state.md/feature-list.json/ponytail/lesson-injection parity, no `--lens` support,
+   `--max-cost-cents` is a post-hoc warning only).
 
 5. **Gate.** Before anything integrates, `verify-gate.sh` re-derives ground truth from the worktree: clean
    tree, non-empty diff vs base, tests green, and the **exact commit the checker reviewed still equals HEAD**

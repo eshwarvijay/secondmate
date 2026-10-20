@@ -169,6 +169,88 @@ After either maker path completes, **always proceed to step 4 (Check)** — same
 `launch-checker.sh --addendum-text "..." --diff-base <base> --repo <wt> -- -p "review the change"` → `verdict.py`.
 Checker model: `global.openai.gpt-5.6-terra` (default `SM_CHECKER_MODEL`). Maker ≠ checker invariant holds regardless of which maker path is chosen.
 
+### Opt-in alternate engine: Temporal (steps 0d + 4 replaced by one call)
+
+**Strictly opt-in, zero default-behavior change.** A dispatcher may replace step 0d's maker launch
+AND step 4's checker launch for ONE round with a single `bin/run-round-temporal.sh round ...` call,
+which routes that round through a proven external Temporal plan-bridge prototype instead of the
+direct herdr-pane path: a real headless `claude` maker activity edits the worktree, a real
+cross-model `pi`/Bedrock checker activity reviews the real diff, and the wrapper itself commits the
+maker's exact changed paths (never `-A`/`-u`) with `Temporal-Workflow-Id`/`Temporal-Run-Id` trailers.
+Nobody is routed here by default — a dispatcher opts in explicitly per round, e.g. by setting
+`SM_ENGINE=temporal` as its own documentation-level convention before deciding to call it. No other
+call site in this file changes.
+
+```bash
+bin/run-round-temporal.sh round --repo <wt> --round <N> \
+  --goal "<goal>" --criteria "<success condition>" \
+  --maker-prompt-file <plan-file> --checker-goal "<what the checker should confirm>" \
+  [--prior-verdict-file <last round's verdict>]
+# stdout is the checker step's Output verbatim -- pipe it straight into verdict.py, same as launch-checker.sh's stdout
+bin/run-round-temporal.sh round ... | ${CLAUDE_PLUGIN_ROOT}/bin/verdict.py
+```
+
+`<wt>` must already be a clean worktree (no uncommitted changes) — this is a hard precondition, not
+a suggestion: the script snapshots `git status --porcelain` before the round and diffs against that
+same snapshot after, which is how it tells a real change from `ZERO_COMMIT_ROUND` (maker reported
+`ok` but left nothing changed — refused outright, never handed to the checker, distinct exit code).
+`SM_TEMPORAL_DRYRUN=1` prints the assembled plan JSON + the commands it would run without touching a
+real server/worker (mirrors `launch-checker.sh`'s own `SM_CHECKER_DRYRUN`); `--selfcheck` exercises
+arg validation, the dry-run plan shape, and the explicit-path-commit/zero-commit logic against a
+fixture repo — fast, free, no live Temporal.
+
+**`HERDR_ENV=1` — refuses by default; this is NOT satisfied by running the wrapper in a pane.** An
+earlier version of this section claimed that running `run-round-temporal.sh` itself inside a visible
+herdr pane "satisfied literally" the strict rule above ("checker MUST run in a visible herdr pane,
+headless is prohibited"). That was wrong, and the dispatcher (not the checker) caught it. Running
+the *wrapper* in a pane only makes the *wrapper's own* stdout/stderr visible there — it does nothing
+about the two actual gaps underneath:
+- **(a) No observable checker lifecycle at all.** The bridge's checker activity
+  (`internal/planrun/checker.go`, read-only dependency, never modified by this script) shells out to
+  a bare headless `pi` subprocess with no herdr-tracked agent state (no `idle`/`working`/`blocked`) —
+  a human watching the pane sees only this wrapper's own heartbeats and the final result, never a
+  live, interruptible model session the way the native checker pane gives one.
+- **(b) The maker is MORE autonomous than this repo's own normal maker path, not just less visible.**
+  The bridge's maker activity (`internal/planrun/maker.go`) runs
+  `claude -p ... --permission-mode acceptEdits --allowedTools Read,Edit,Write,Bash` — Bash commands
+  are auto-accepted with zero intervention opportunity. The normal Claude maker path in this file
+  runs `--permission-mode auto`, which auto-applies edits but still blocks, visibly, on Bash/risky
+  commands. This is a real autonomy increase, not a visibility decrease.
+
+Because of (a) and (b), `bin/run-round-temporal.sh round` **refuses outright under `HERDR_ENV=1`**
+(exit 1, naming both gaps) unless the caller passes `--i-accept-headless-autonomous-risk`, a CLI flag
+(not an env var, so it can't be set once and forgotten) that must be given with real, deliberate
+intent — never as a routine bypass. Even with the override, the script still prints a loud warning
+naming both gaps to stderr before proceeding, so it's visible in whatever pane/log captures the
+invocation. This is a known, deliberate limitation of the underlying bridge prototype's own design —
+its maker/checker activities were built as bare subprocess calls, never herdr-aware — not something
+this wrapper silently inherited or glossed over, and it cannot be fixed by editing
+`maker.go`/`checker.go` to shell out through herdr instead, since that would mean modifying the
+read-only bridge dependency. A separate task (task-id `bridge-herdr-visible-activities`) is already
+targeting the bridge itself to make its maker/checker activities herdr-visible — this limitation is
+pending that separate work landing, not indefinite.
+
+**Named gaps for v1 (deliberately not ported into this path):** no `round-state.md`/
+`feature-list.json` continuity, no ponytail context injection, no lesson-injection — a dispatcher
+using this engine gets a single, self-contained round with no cross-round maker memory. No `--lens`
+support (the bridge's checker activity has no lens concept). `--max-cost-cents` is a POST-HOC warning
+only, never a mid-flight preemption, since a model call already in flight can't be stopped from
+outside the bridge's own activity code. These are accepted scope boundaries for this increment, not
+bugs — see `docs/ARCHITECTURE.md` for the full rationale.
+
+**`BASH_ENV`/`DEBUG`-trap hardening — one specific technique closed, not a general shell sandbox.**
+`run-round-temporal.sh` clears any inherited `DEBUG` trap and disables function tracing (`set +T`) as
+the first two commands it executes, closing one specific demonstrated attack: an inherited
+`BASH_ENV` pointing at a script that does `set -T` plus installs a `DEBUG` trap can redefine
+`_prepare_bridge_cli` itself immediately before `cmd_round` calls it, bypassing the positional-
+argument fix entirely without needing to guess any variable name. That one technique is closed and
+has its own `--selfcheck` case. This script — like every other script in this plugin — still does
+not and cannot defend against a fully compromised calling shell or environment in general: a
+replaced `bash`/`git`/`claude`/`pi` binary, a malicious `PATH` entry, or a compromised
+`~/.bashrc`/`~/.zshrc` are all out of scope, consistent with this repo's own single-operator,
+no-multi-tenant-auth trust model — not a gap unique to this script, and not something to chase
+further here.
+
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
 Immediately after claiming and recording the `claimed` progress-ledger checkpoint, and before
