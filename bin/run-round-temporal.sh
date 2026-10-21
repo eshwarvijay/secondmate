@@ -453,11 +453,11 @@ cleanup() {
 
 cmd_round() {
   local repo="" round=1 goal="" criteria="" maker_prompt_file="" maker_prompt="" checker_goal="" prior_verdict_file=""
-  local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200 accept_headless_risk=0 herdr_task_id=""
+  local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200 accept_headless_risk=0 herdr_task_id="" herdr_task_id_given=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --i-accept-headless-autonomous-risk) accept_headless_risk=1; shift 1;;
-      --herdr-task-id) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; herdr_task_id="$2"; shift 2;;
+      --herdr-task-id) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; herdr_task_id="$2"; herdr_task_id_given=1; shift 2;;
       --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; repo="$2"; shift 2;;
       --round) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; round="$2"; shift 2;;
       --goal) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; goal="$2"; shift 2;;
@@ -490,7 +490,7 @@ cmd_round() {
   # --max-seconds/--max-cost-cents above) -- against the bridge's own sanitizeTaskID charset/length
   # rule (internal/planrun/herdr.go's taskIDRE), read directly from that file, not guessed: lowercase
   # alnum/dash/underscore, 1-20 chars, starting with alnum.
-  if [ -n "$herdr_task_id" ]; then
+  if [ "$herdr_task_id_given" = 1 ]; then
     [[ "$herdr_task_id" =~ ^[a-z0-9][a-z0-9_-]{0,19}$ ]] || { echo "invalid --herdr-task-id: $herdr_task_id (must match ^[a-z0-9][a-z0-9_-]{0,19}\$ -- lowercase alnum/dash/underscore, 1-20 chars, starting with alnum; same rule the bridge's sanitizeTaskID enforces)" >&2; return 2; }
   fi
 
@@ -517,7 +517,7 @@ cmd_round() {
   # than an earlier revision, which placed the guard after _build_plan_json/the dry-run branch and
   # so still let a python3 subprocess run before refusing; the checker caught that.
   if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" != 1 ] && [ -z "$herdr_task_id" ]; then
-    echo "REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk was not given. This engine's checker has no herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session), and its maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path, not merely less visible. This repo's own SOP requires a visible, interruptible pane and prohibits headless checker execution under HERDR_ENV=1 for exactly this reason. Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway, or --herdr-task-id ID to run the bridge's herdr-visible mode instead (a real interactive pane, not a bare headless subprocess)." >&2
+    echo "REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk was not given. This engine's checker has no herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session), and its maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path, not merely less visible. This repo's own SOP requires a visible, interruptible pane and prohibits headless checker execution under HERDR_ENV=1 for exactly this reason. Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway." >&2
     return 1
   fi
   if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" = 1 ]; then
@@ -752,6 +752,17 @@ _selfcheck() {
   rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --herdr-task-id "123456789012345678901" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: 21-char --herdr-task-id exit $rc (want 2)"; fails=1; }
 
+  # --- [SECURITY, CRITICAL] an EXPLICITLY-GIVEN empty --herdr-task-id '' must ALSO fail validation
+  # (it has 0 chars, outside the 1-20 required) -- distinct from the flag never being given at all,
+  # which also leaves the value "" but must NOT be validated (absent -> ordinary headless plan,
+  # unchanged default). A checker found an earlier revision gated validation on [ -n "$herdr_task_id" ],
+  # which can't tell "never passed" apart from "passed empty" -- both leave the variable "", so an
+  # explicitly-empty flag silently fell through to "no flag given" behavior (exit 0, ordinary headless
+  # plan, no herdr_task_id key at all) instead of the exit-2 usage error this charset/length rule
+  # demands. ---
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --herdr-task-id "" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [SECURITY, CRITICAL]: empty --herdr-task-id '' exit $rc (want 2 -- an explicitly-given empty value must fail validation, not silently fall back to no-flag-given behavior)"; fails=1; }
+
   # --- a VALID --herdr-task-id must thread "herdr_task_id" into BOTH plan steps' params, carried
   # through the dry-run plan JSON. ---
   out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" --herdr-task-id "task-abc" 2>&1)" \
@@ -786,6 +797,16 @@ _selfcheck() {
   echo "$out" | grep -q 'no herdr-observable lifecycle' || { echo "FAIL: HERDR guard message missing the checker-visibility gap"; fails=1; }
   echo "$out" | grep -q 'auto-accepts Bash commands' || { echo "FAIL: HERDR guard message missing the maker-autonomy gap"; fails=1; }
   echo "$out" | grep -q 'bridge dir not found' && { echo "FAIL: HERDR guard did not fire first -- preflight ran instead"; fails=1; }
+  # --- [CRITICAL] byte-identical zero-behavior-change check: the neither-flag-given refusal message
+  # must be EXACTLY the base script's original wording, never appended to -- a checker caught an
+  # earlier revision tacking on an "...or --herdr-task-id ID to run the bridge's herdr-visible mode
+  # instead..." clause onto this exact message, which is new text in a path the task's own spec says
+  # must refuse "exactly as it does today" when neither flag is given. The new flag is already
+  # documented in this script's own header comment and in SKILL.md; this message doesn't need to
+  # advertise it too. ---
+  echo "$out" | grep -qF 'anyway, or --herdr-task-id' && { echo "FAIL [CRITICAL]: neither-flag-given REFUSING message was appended with new --herdr-task-id text -- must stay byte-identical to the base script for this path"; fails=1; }
+  echo "$out" | grep -qF 'Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway.' \
+    || { echo "FAIL [CRITICAL]: neither-flag-given REFUSING message does not end exactly where the base script's did"; fails=1; }
 
   # --- the HERDR guard must ALSO refuse before --maker-prompt-file's content is ever read (a real
   # `cat` subprocess) -- checker's exact repro: a PATH-controlled `cat` proved it ran before the
