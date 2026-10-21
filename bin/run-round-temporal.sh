@@ -620,13 +620,7 @@ cmd_round() {
   # accepts a comma-separated list in one flag; NAME resolves to bin/lenses/<NAME>.md. Lands in
   # checker_goal_full ONLY -- never maker_prompt_full, never the bare checker_goal used verbatim in
   # the commit message (see _commit_round_changes).
-  # Real path of bin/lenses itself, resolved once -- the root every candidate lens file must stay
-  # confined under. Same cd+pwd -P idiom this script already uses for the --run-dir vs --bridge-dir
-  # containment check above (not realpath -- staying consistent with this script's own existing
-  # idiom for this exact class of check, not introducing a second one).
-  local _lenses_dir_real
-  _lenses_dir_real="$(cd "$SCRIPT_DIR/lenses" 2>/dev/null && pwd -P)" || _lenses_dir_real=""
-  local _lens_group _lens_names _lens_name _lens_file _lens_content _lens_unknown_msg _lens_file_dir_real
+  local _lens_group _lens_names _lens_name _lens_file _lens_content _lens_unknown_msg _lens_file_real
   for _lens_group in "${lenses[@]:-}"; do
     [ -n "$_lens_group" ] || continue
     IFS=',' read -ra _lens_names <<< "$_lens_group"
@@ -636,19 +630,28 @@ cmd_round() {
       [ -f "$_lens_file" ] || { echo "$_lens_unknown_msg" >&2; return 2; }
       # [round-1 checker, CONFIRMED] a bare [ -f ] existence check alone is bypassable: "..".
       # segments in $_lens_name walk the STRING path straight out of bin/lenses/ before that check
-      # ever runs, so any file that exists ANYWHERE on disk passes. Resolve the candidate's real
-      # containing directory (through any ".." segments or symlinks) and confirm it is still
-      # actually under the real lenses dir before ever cat-ing it -- mirrors
-      # bin/lesson-lookup.py's own _resolve_lesson_path (.resolve() + .relative_to()), in bash.
-      _lens_file_dir_real="$(cd "$(dirname "$_lens_file")" 2>/dev/null && pwd -P)" || _lens_file_dir_real=""
-      if [ -z "$_lenses_dir_real" ] || [ -z "$_lens_file_dir_real" ]; then
-        echo "$_lens_unknown_msg" >&2; return 2
-      fi
-      case "$_lens_file_dir_real" in
-        "$_lenses_dir_real"|"$_lenses_dir_real"/*) : ;;
-        *) echo "$_lens_unknown_msg" >&2; return 2 ;;
-      esac
-      _lens_content="$(cat "$_lens_file")"
+      # ever runs, so any file that exists ANYWHERE on disk passes.
+      # [round-2 checker, CONFIRMED] a `cd "$(dirname ...)" && pwd -P` containment check only
+      # resolves symlinks in the PARENT directory components -- it structurally cannot resolve a
+      # symlink on the FINAL path component itself, since you can't `cd` into a file. A lens file
+      # that is itself a symlink (parent dir genuinely under bin/lenses/, leaf symlinked elsewhere)
+      # passed that check and then `cat` followed the symlink straight through it. Fixed the same
+      # way bin/lesson-lookup.py's own _resolve_lesson_path actually avoids this exact class of bug:
+      # resolve the FULL candidate path (not just its parent) via Python's .resolve(), which follows
+      # every symlink in the chain including the leaf, then require .relative_to() the real,
+      # fully-resolved lenses root to succeed.
+      _lens_file_real="$(python3 -c '
+import pathlib, sys
+lenses_dir = pathlib.Path(sys.argv[1]).resolve()
+candidate = pathlib.Path(sys.argv[2]).resolve()
+try:
+    candidate.relative_to(lenses_dir)
+except ValueError:
+    sys.exit(1)
+print(candidate)
+' "$SCRIPT_DIR/lenses" "$_lens_file" 2>/dev/null)" || _lens_file_real=""
+      [ -n "$_lens_file_real" ] || { echo "$_lens_unknown_msg" >&2; return 2; }
+      _lens_content="$(cat "$_lens_file_real")"
       checker_goal_full="$checker_goal_full"$'\n\n'"You are being evaluated against the named lens '$_lens_name'. If your envelope includes a lens_coverage field, report this lens by this exact string."$'\n\n'"$_lens_content"
     done
   done
@@ -953,6 +956,28 @@ assert "QA sub-lens: coverage" not in maker_prompt, "lens content leaked into ma
   echo "$out" | grep -q 'unknown lens:' || { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens did not produce the unknown-lens message"; fails=1; }
   echo "$out" | grep -qF "$trav_marker" && { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens payload landed in the assembled prompt"; fails=1; }
   rm -rf "$trav_dir"
+
+  # --- [Defect 1 follow-up, round-2 checker, CONFIRMED] a --lens whose PARENT directory is
+  # genuinely under bin/lenses/ but whose FINAL path component is itself a symlink to an external
+  # file must ALSO be rejected -- round 1's fix only resolved the parent directory via
+  # `cd "$(dirname ...)" && pwd -P`, which cannot resolve a symlink on the final component (you
+  # can't `cd` into a file). Checker's exact repro: a real symlink living directly inside this
+  # repo's own bin/lenses/qa/ pointing at an external payload file -- the only way to genuinely
+  # exercise "parent dir really is under bin/lenses/", since SCRIPT_DIR/lenses isn't parameterized.
+  # Uses a $$-qualified unique name and always cleans up its own symlink + payload dir below. ---
+  local symlink_payload_dir; symlink_payload_dir="$(mktemp -d)"
+  local symlink_marker="FINAL-COMPONENT-SYMLINK-PAYLOAD-$$"
+  echo "$symlink_marker" > "$symlink_payload_dir/outside-target.md"
+  local symlink_lens_name="selfcheck-final-component-escape-$$"
+  local symlink_lens_file="$SCRIPT_DIR/lenses/qa/${symlink_lens_name}.md"
+  ln -s "$symlink_payload_dir/outside-target.md" "$symlink_lens_file"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --lens "qa/$symlink_lens_name" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [Defect 1 follow-up, SECURITY, CRITICAL]: final-component-symlink --lens exit $rc (want 2)"; fails=1; }
+  echo "$out" | grep -q 'unknown lens:' || { echo "FAIL [Defect 1 follow-up, SECURITY, CRITICAL]: final-component-symlink --lens did not produce the unknown-lens message"; fails=1; }
+  echo "$out" | grep -qF "$symlink_marker" && { echo "FAIL [Defect 1 follow-up, SECURITY, CRITICAL]: final-component-symlink --lens payload landed in the assembled prompt"; fails=1; }
+  rm -f "$symlink_lens_file"
+  rm -rf "$symlink_payload_dir"
 
   # --- [Defect 2, round-1 checker, CONFIRMED] a round-state.md with NO trailing newline must not
   # glue into whatever follows it (the real bin/lesson-lookup.py output, since no feature-list.json
