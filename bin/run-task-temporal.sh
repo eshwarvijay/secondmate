@@ -147,72 +147,91 @@ def strict_json_load(path, what):
     _check_go_compatible_value(data, what)
     return data
 
-rounds = strict_json_load(rounds_file, "--rounds-file")
+# [CONFIRMED finding 1, checker round 6] a pathologically deep input (e.g. 1000 nested JSON
+# arrays) crashes json.load itself, or _check_go_compatible_value own recursion, or the final
+# json.dumps re-serialization, with an uncaught RecursionError and a raw traceback -- and the SAME
+# depth with an ordinary, otherwise-valid value at the bottom crashes identically, even though the
+# real Go encoding/json would accept it fine (a false-positive rejection risk, not just an ugly
+# crash). Fixed pragmatically, NOT by trying to replicate Go own depth tolerance byte for byte (a
+# rabbit hole not worth chasing) -- the entire pipeline below is wrapped in ONE outer function,
+# with ONE try/except RecursionError boundary around the single call site, converting ANY recursion
+# overflow anywhere in parse/walk/serialize into a clean, named, exit-2 usage error. This is a
+# deliberate, documented, proportionate limitation (same "accepted, documented tradeoff" posture as
+# the NAMED LIMITATIONS this repo own run-round-temporal.sh header already uses): extremely-deep-
+# but-otherwise-valid input is rejected too under this limit, on purpose, rather than chasing a more
+# clever depth-aware parser.
+def _run():
+    rounds = strict_json_load(rounds_file, "--rounds-file")
 
-if not isinstance(rounds, list) or len(rounds) == 0:
-    fail("--rounds-file must be a non-empty JSON array of Plan objects")
+    if not isinstance(rounds, list) or len(rounds) == 0:
+        fail("--rounds-file must be a non-empty JSON array of Plan objects")
 
-for i, p in enumerate(rounds):
-    if not isinstance(p, dict):
-        fail(f"rounds[{i}] is not a JSON object")
-    sv = p.get("schema_version")
-    if not is_go_int(sv):
-        fail(f"rounds[{i}].schema_version must be an int within the Go int64 range (got {sv!r})")
-    if sv != 1:
-        fail(f"rounds[{i}].schema_version must be the literal int 1 (got {sv!r})")
-    rnd = p.get("round")
-    if not is_go_int(rnd):
-        fail(f"rounds[{i}].round must be an int within the Go int64 range (got {rnd!r})")
-    if rnd < 1:
-        fail(f"rounds[{i}].round must be >= 1 (got {rnd!r})")
-    goal = p.get("goal")
-    if not isinstance(goal, str) or goal == "":
-        fail(f"rounds[{i}].goal must be a non-empty string (got {goal!r})")
-    steps = p.get("steps")
-    if not isinstance(steps, list) or len(steps) == 0:
-        fail(f"rounds[{i}].steps must be a non-empty array")
-    seen_ids = set()
-    for j, s in enumerate(steps):
-        if not isinstance(s, dict):
-            fail(f"rounds[{i}].steps[{j}] is not a JSON object")
-        sid = s.get("id")
-        kind = s.get("kind")
-        params = s.get("params")
-        if not isinstance(sid, str) or sid == "":
-            fail(f"rounds[{i}].steps[{j}].id must be a non-empty string (got {sid!r})")
-        if not isinstance(kind, str) or kind == "":
-            fail(f"rounds[{i}].steps[{j}].kind must be a non-empty string (got {kind!r})")
-        # [CONFIRMED finding 2, checker round 3] the real bridge Step.Params field is
-        # map[string]any with a json omitempty tag -- the bridge own TaskWorkflow test uses a step
-        # with NO params field at all as a valid Plan. An absent key (s.get returns None) or an
-        # explicit JSON null (also None) must be treated as an empty object, not rejected. Only
-        # reject params when it is PRESENT and actually the wrong type (a string, array, or number).
-        if params is not None and not isinstance(params, dict):
-            fail(f"rounds[{i}].steps[{j}].params, when present, must be an object (got {params!r})")
-        if sid in seen_ids:
-            fail(f"rounds[{i}].steps[{j}].id {sid!r} is a duplicate within this round -- step ids must be unique per round")
-        seen_ids.add(sid)
+    for i, p in enumerate(rounds):
+        if not isinstance(p, dict):
+            fail(f"rounds[{i}] is not a JSON object")
+        sv = p.get("schema_version")
+        if not is_go_int(sv):
+            fail(f"rounds[{i}].schema_version must be an int within the Go int64 range (got {sv!r})")
+        if sv != 1:
+            fail(f"rounds[{i}].schema_version must be the literal int 1 (got {sv!r})")
+        rnd = p.get("round")
+        if not is_go_int(rnd):
+            fail(f"rounds[{i}].round must be an int within the Go int64 range (got {rnd!r})")
+        if rnd < 1:
+            fail(f"rounds[{i}].round must be >= 1 (got {rnd!r})")
+        goal = p.get("goal")
+        if not isinstance(goal, str) or goal == "":
+            fail(f"rounds[{i}].goal must be a non-empty string (got {goal!r})")
+        steps = p.get("steps")
+        if not isinstance(steps, list) or len(steps) == 0:
+            fail(f"rounds[{i}].steps must be a non-empty array")
+        seen_ids = set()
+        for j, s in enumerate(steps):
+            if not isinstance(s, dict):
+                fail(f"rounds[{i}].steps[{j}] is not a JSON object")
+            sid = s.get("id")
+            kind = s.get("kind")
+            params = s.get("params")
+            if not isinstance(sid, str) or sid == "":
+                fail(f"rounds[{i}].steps[{j}].id must be a non-empty string (got {sid!r})")
+            if not isinstance(kind, str) or kind == "":
+                fail(f"rounds[{i}].steps[{j}].kind must be a non-empty string (got {kind!r})")
+            # [CONFIRMED finding 2, checker round 3] the real bridge Step.Params field is
+            # map[string]any with a json omitempty tag -- the bridge own TaskWorkflow test uses a
+            # step with NO params field at all as a valid Plan. An absent key (s.get returns None)
+            # or an explicit JSON null (also None) must be treated as an empty object, not
+            # rejected. Only reject params when it is PRESENT and actually the wrong type.
+            if params is not None and not isinstance(params, dict):
+                fail(f"rounds[{i}].steps[{j}].params, when present, must be an object (got {params!r})")
+            if sid in seen_ids:
+                fail(f"rounds[{i}].steps[{j}].id {sid!r} is a duplicate within this round -- step ids must be unique per round")
+            seen_ids.add(sid)
 
-task = {"task_id": task_id, "rounds": rounds}
+    task = {"task_id": task_id, "rounds": rounds}
 
-if seed_rounds_file:
-    seed_rounds = strict_json_load(seed_rounds_file, "--seed-rounds-file")
-    if not isinstance(seed_rounds, list):
-        fail("--seed-rounds-file must be a JSON array of Evidence objects")
-    for i, e in enumerate(seed_rounds):
-        if not isinstance(e, dict):
-            fail(f"seed_rounds[{i}] is not a JSON object")
-        if not isinstance(e.get("steps"), list):
-            fail(f"seed_rounds[{i}].steps must be an array (Evidence shape)")
-        done = e.get("done")
-        # isinstance(done, bool) correctly excludes str/int/None here (bool is NOT a superclass of
-        # int -- isinstance(1, bool) is False) -- a truthy non-bool like "not-a-boolean" must fail.
-        if not isinstance(done, bool):
-            fail(f"seed_rounds[{i}].done must be a real bool, not {type(done).__name__} (got {done!r}) -- same Evidence shape bridge fetch already returns")
-    if seed_rounds:
-        task["seed_rounds"] = seed_rounds
+    if seed_rounds_file:
+        seed_rounds = strict_json_load(seed_rounds_file, "--seed-rounds-file")
+        if not isinstance(seed_rounds, list):
+            fail("--seed-rounds-file must be a JSON array of Evidence objects")
+        for i, e in enumerate(seed_rounds):
+            if not isinstance(e, dict):
+                fail(f"seed_rounds[{i}] is not a JSON object")
+            if not isinstance(e.get("steps"), list):
+                fail(f"seed_rounds[{i}].steps must be an array (Evidence shape)")
+            done = e.get("done")
+            # isinstance(done, bool) correctly excludes str/int/None (bool is NOT a superclass of
+            # int -- isinstance(1, bool) is False) -- a truthy non-bool like "not-a-boolean" fails.
+            if not isinstance(done, bool):
+                fail(f"seed_rounds[{i}].done must be a real bool, not {type(done).__name__} (got {done!r}) -- same Evidence shape bridge fetch already returns")
+        if seed_rounds:
+            task["seed_rounds"] = seed_rounds
 
-print(json.dumps(task, indent=2))
+    print(json.dumps(task, indent=2))
+
+try:
+    _run()
+except RecursionError:
+    fail("JSON nesting too deep to validate safely (Python recursion limit exceeded while parsing, walking, or re-serializing the input) -- a deliberate, named limitation of this validator, not a crash: reduce the nesting depth of --rounds-file/--seed-rounds-file content. This rejects some extremely-deep-but-otherwise-valid input too; that is an accepted, documented tradeoff, not something this script tries to solve more cleverly by replicating the real bridge own depth tolerance.")
 ' "$1" "$2" "${3:-}"
 }
 
@@ -249,8 +268,28 @@ cmd_task() {
   fi
 
   out_dir="${out_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-task.XXXXXX")}"
+  # Same bug class as the artifact-path collision guard just below, one level up: a pre-existing
+  # --out-dir that is itself a plain file (not a directory) crashes `mkdir -p` with a raw shell
+  # "File exists" error under set -e -- found via this round's own further adversarial testing,
+  # directly adjacent to the checker's artifact-collision finding, so fixed here too rather than
+  # left as a sibling crash.
+  if [ -e "$out_dir" ] && [ ! -d "$out_dir" ]; then
+    echo "refusing: --out-dir already exists and is not a directory: $out_dir -- cannot write the TaskInput artifact there" >&2
+    return 2
+  fi
   mkdir -p "$out_dir"
   local artifact="$out_dir/task-input.json"
+  # [CONFIRMED finding 2, checker round 6] a bare `echo ... > "$artifact"` crashes with a raw
+  # shell "Is a directory" error (exit 1, under set -e) when something already sits at this exact
+  # path and is not a plain file -- with NEITHER the mandated WROTE: line NOR the mandated
+  # REFUSING: three-fact report ever printed. A caller (accidentally, or an attacker deliberately)
+  # pre-creating a directory at this exact path would silently suppress the refusal report. Checked
+  # BEFORE attempting the write, so this is always a clean, named, exit-2 usage error -- never an
+  # uncaught crash -- on this path.
+  if [ -e "$artifact" ] && [ ! -f "$artifact" ]; then
+    echo "refusing: artifact path already exists and is not a plain file: $artifact (e.g. a pre-existing directory at this exact path) -- cannot write the TaskInput artifact there" >&2
+    return 2
+  fi
   echo "$task_json" > "$artifact"
 
   echo "WROTE: $artifact"
@@ -580,6 +619,60 @@ SEED_EOF
   echo '[{"steps":[{"step_id":"s1","cost_breakdown":{"items":[{"amount":1e999}]}}],"done":true}]' > "$adversarial_seed_nested_inf_file"
   rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$adversarial_seed_nested_inf_file" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 5, adversarial]: 1e999 nested inside seed_rounds[].steps[].cost_breakdown.items[] exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 1, checker round 6] a pathologically deep rounds-file (well past Python own
+  # default recursion limit) must fail cleanly, exit 2, with a named message -- never an uncaught
+  # RecursionError/raw traceback. Built via plain string concatenation (never json.dump, which
+  # itself recurses once per level and would crash building this very fixture at this depth).
+  local deep_rounds_file="$t/rounds-deeply-nested.json"
+  python3 -c '
+depth = 1000
+nested = "[" * depth + "42" + "]" * depth
+doc = ("[{\"schema_version\":1,\"round\":1,\"goal\":\"g\",\"steps\":[{\"id\":\"s1\",\"kind\":\"maker\","
+       "\"params\":{\"a\":" + nested + "}}]}]")
+with open("'"$deep_rounds_file"'", "w") as fh:
+    fh.write(doc)
+'
+rc=0
+out="$("$0" task --task-id "x" --rounds-file "$deep_rounds_file" 2>&1)" || rc=$?
+[ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 6]: pathologically deep (1000-level) rounds-file exit $rc (want 2, not a crash)"; fails=1; }
+echo "$out" | grep -qi 'traceback' && { echo "FAIL [CONFIRMED finding 1, round 6]: pathologically deep rounds-file leaked a raw Python traceback instead of a clean message"; fails=1; }
+echo "$out" | grep -qi 'too deep' || { echo "FAIL [CONFIRMED finding 1, round 6]: pathologically deep rounds-file did not produce the expected clean too-deep message"; fails=1; }
+
+  # [CONFIRMED finding 2, checker round 6] if the real-path artifact's target path already exists
+  # AS A DIRECTORY, the write must refuse cleanly, exit 2, with NEITHER a misleading WROTE: line
+  # NOR a misleading REFUSING: report -- never an uncaught shell "Is a directory" crash that could
+  # let a caller (or an attacker pre-creating that exact path) silently suppress the refusal report.
+  local collision_out_dir="$t/collision-out"
+  mkdir -p "$collision_out_dir/task-input.json"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$collision_out_dir" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path-is-a-directory collision exit $rc (want 2, not a crash)"; fails=1; }
+  echo "$out" | grep -qi 'traceback\|is a directory' && { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision leaked a raw crash/shell error instead of a clean message"; fails=1; }
+  echo "$out" | grep -q '^WROTE:' && { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision still printed a WROTE: line despite the write never happening"; fails=1; }
+  echo "$out" | grep -q '^REFUSING:' && { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision still printed the REFUSING: report despite the write never happening"; fails=1; }
+  echo "$out" | grep -qi 'already exists' || { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision did not name the collision clearly"; fails=1; }
+  [ -d "$collision_out_dir/task-input.json" ] || { echo "FAIL: pre-existing collision directory was unexpectedly removed/altered by this check"; fails=1; }
+
+  # [CONFIRMED finding 2, checker round 6] the ordinary (non-collision) real-path write must still
+  # work exactly as before -- the new guard must not be a false positive on a normal, fresh out-dir.
+  local normal_out_dir="$t/normal-out"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$normal_out_dir" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: ordinary real-path write with a fresh --out-dir exit $rc (want 1, the normal refusal)"; fails=1; }
+  [ -f "$normal_out_dir/task-input.json" ] || { echo "FAIL: ordinary real-path write did not actually write the artifact (new guard false-positived)"; fails=1; }
+
+  # [found via this round's OWN further adversarial testing, same bug class as finding 2] --out-dir
+  # itself (one level up from the artifact file inside it) already existing as a plain file must
+  # also refuse cleanly, exit 2, never an uncaught `mkdir -p` "File exists" crash.
+  local out_dir_as_file="$t/out-dir-as-file"
+  echo "not a directory" > "$out_dir_as_file"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$out_dir_as_file" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [found via further testing, same class as finding 2]: --out-dir pre-existing as a plain file exit $rc (want 2, not a crash)"; fails=1; }
+  echo "$out" | grep -qi 'traceback\|file exists' && { echo "FAIL [found via further testing, same class as finding 2]: --out-dir-as-a-file leaked a raw mkdir/shell crash instead of a clean message"; fails=1; }
+  echo "$out" | grep -q '^WROTE:' && { echo "FAIL [found via further testing, same class as finding 2]: --out-dir-as-a-file still printed a WROTE: line despite the write never happening"; fails=1; }
+  [ "$(cat "$out_dir_as_file")" = "not a directory" ] || { echo "FAIL: pre-existing --out-dir file content was unexpectedly altered by this check"; fails=1; }
 
   # [CONFIRMED finding 2, checker round 3] a step with NO params field at all is a bridge-VALID
   # Plan shape (Step.Params is `map[string]any `json:"params,omitempty"``, and the bridge's own
