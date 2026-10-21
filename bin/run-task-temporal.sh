@@ -291,7 +291,16 @@ cmd_task() {
     return 0
   fi
 
-  out_dir="${out_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-task.XXXXXX")}"
+  # [CONFIRMED finding, checker round 8] this is the 5th filesystem touch point at a caller-
+  # influenced path (TMPDIR), not a new one: when --out-dir is not given, the default mktemp -d
+  # call was NOT routed through the shared _refuse_fs_error mechanism below, so a poisoned TMPDIR
+  # (e.g. TMPDIR=/dev/null) raised a raw, uncaught `mktemp: mkdtemp failed ...: Not a directory`
+  # error instead of the same clean refusal the other 4 sites already produce. Fixed with the SAME
+  # helper, not a 6th mechanism -- only runs when --out-dir was not given (command substitution
+  # inside ${out_dir:-...} would otherwise always invoke mktemp even when unused).
+  if [ -z "$out_dir" ]; then
+    out_dir="$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-task.XXXXXX" 2>&1)" || { _refuse_fs_error "creating a scratch --out-dir under TMPDIR=${TMPDIR:-/tmp}" "$out_dir"; return $?; }
+  fi
   local artifact="$out_dir/task-input.json"
   # [CONFIRMED findings, checker rounds 6+7] this script touches the filesystem at a caller-
   # supplied path in exactly two places on this bash side (creating --out-dir, writing the
@@ -319,6 +328,16 @@ cmd_task() {
 
 _selfcheck() {
   local fails=0 rc out
+
+  # [CONFIRMED finding, checker round 8] pin TMPDIR to a known-safe value for every one of this
+  # suite's OWN internal mktemp calls (the fixture git repo below, oracle_state_dir, etc.) --
+  # without this, a calling shell with a poisoned TMPDIR (e.g. TMPDIR=/dev/null, the checker's own
+  # repro) breaks --selfcheck's own setup before any real test logic ever runs. Same hermeticity
+  # class already fixed for SM_TEMPORAL_DRYRUN and SM_TEMPORAL_FETCH_TIMEOUT_SECONDS. Hardcoded to
+  # /tmp, matching the same precedent run-round-temporal.sh's own --selfcheck already uses for its
+  # scratch paths. Harmless to the rest of this process: --selfcheck is always this script's last
+  # action before exit (see the dispatch at the bottom of this file).
+  TMPDIR=/tmp
 
   # (a) ordinary CLI arg validation -- the two cases that have no valid-input ambiguity at all.
   rc=0; "$0" task >/dev/null 2>&1 || rc=$?; [ "$rc" = 2 ] || { echo "FAIL: no --task-id exit $rc (want 2)"; fails=1; }
@@ -715,6 +734,15 @@ echo "$out" | grep -qi 'too deep' || { echo "FAIL [CONFIRMED finding 1, round 6]
   _assert_clean_fs_refusal "$out" 2 "$rc"
   [ -L "$dangling_out_dir/task-input.json" ] || { echo "FAIL: pre-existing dangling symlink was unexpectedly removed by this check"; fails=1; }
 
+  # (5) [CONFIRMED finding, checker round 8] the 5th filesystem touch point, same class as (1)-(4):
+  # when --out-dir is NOT given, the default `mktemp -d` scratch directory is created under
+  # TMPDIR -- a poisoned TMPDIR (e.g. TMPDIR=/dev/null) must refuse cleanly via the SAME
+  # _refuse_fs_error mechanism, not a raw, uncaught `mktemp: mkdtemp failed` error. No --out-dir
+  # given here (deliberately), so this exercises the mktemp-under-TMPDIR branch itself.
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" TMPDIR=/dev/null "$0" task --task-id "x" --rounds-file "$rounds_file" 2>&1)" || rc=$?
+  _assert_clean_fs_refusal "$out" 2 "$rc"
+
   # (5) [CONFIRMED finding 1, checker round 7] an UNREADABLE --rounds-file (permission denied) --
   # a chmod-000 file still passes cmd_task's own bash-level `[ -f ... ]` presence check (test -f
   # does not check readability), so the real failure only surfaces once strict_json_load actually
@@ -749,14 +777,15 @@ echo "$out" | grep -qi 'too deep' || { echo "FAIL [CONFIRMED finding 1, round 6]
   [ "$rc" = 1 ] || { echo "FAIL: ordinary real-path write with a fresh --out-dir exit $rc (want 1, the normal refusal)"; fails=1; }
   [ -f "$normal_out_dir/task-input.json" ] || { echo "FAIL: ordinary real-path write did not actually write the artifact (new mechanism false-positived)"; fails=1; }
 
-  # (7) structural guard: the two bash-side filesystem sites must share ONE helper
-  # (_refuse_fs_error), not a growing pile of scenario-specific copy-pasted error handlers.
+  # (7) structural guard: the three bash-side filesystem sites (creating the default scratch
+  # --out-dir under TMPDIR, creating an explicit --out-dir, writing the artifact) must share ONE
+  # helper (_refuse_fs_error), not a growing pile of scenario-specific copy-pasted error handlers.
   # Scoped to cmd_task's own function body only, never this selfcheck's own source -- a whole-file
   # search would trivially self-match the literal pattern text of this very check (same class of
   # false-pass this file already guards against for the bridge-invocation structural check above).
   local fs_error_call_count
   fs_error_call_count="$(sed -n '/^cmd_task() {$/,/^_selfcheck() {$/p' "$0" | grep -c '_refuse_fs_error "')"
-  [ "$fs_error_call_count" = 2 ] || { echo "FAIL [CRITICAL]: expected exactly 2 call sites of the shared _refuse_fs_error helper in cmd_task (creating --out-dir, writing the artifact), found $fs_error_call_count -- a new filesystem touch point was added without reusing the shared pattern, or an existing one was duplicated instead of reused"; fails=1; }
+  [ "$fs_error_call_count" = 3 ] || { echo "FAIL [CRITICAL]: expected exactly 3 call sites of the shared _refuse_fs_error helper in cmd_task (default scratch --out-dir under TMPDIR, explicit --out-dir, writing the artifact), found $fs_error_call_count -- a new filesystem touch point was added without reusing the shared pattern, or an existing one was duplicated instead of reused"; fails=1; }
 
   # [CONFIRMED finding 2, checker round 3] a step with NO params field at all is a bridge-VALID
   # Plan shape (Step.Params is `map[string]any `json:"params,omitempty"``, and the bridge's own
