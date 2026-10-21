@@ -251,6 +251,15 @@ def _run():
             for j, step in enumerate(ev_steps):
                 if not isinstance(step, dict):
                     fail(f"seed_rounds[{i}].steps[{j}] must be a StepResult object, not {type(step).__name__} (got {step!r})")
+                # [CONFIRMED finding, checker round 10] a syntactically-object-but-incomplete step
+                # (bare {}, or one with mistyped fields) still passed -- the real bridge
+                # StepResult struct has NO omitempty on step_id/kind/status/output, so these 4 are
+                # required, each a string value; the other declared fields (reason/duration_ms/
+                # cost_usd/diff/verdict/lenses/fix_strategy) ARE omitempty and so stay unchecked
+                # here, per the checker own explicit statement after re-reading the real struct.
+                for field in ("step_id", "kind", "status", "output"):
+                    if not isinstance(step.get(field), str):
+                        fail(f"seed_rounds[{i}].steps[{j}].{field} must be a string (got {step.get(field)!r})")
             done = e.get("done")
             # isinstance(done, bool) correctly excludes str/int/None (bool is NOT a superclass of
             # int -- isinstance(1, bool) is False) -- a truthy non-bool like "not-a-boolean" fails.
@@ -843,6 +852,29 @@ echo "$out" | grep -qi 'too deep' || { echo "FAIL [CONFIRMED finding 1, round 6]
   echo '[{"schema_version":"not-an-int","round":false,"goal":7,"steps":[null],"done":true}]' > "$malformed_evidence_file"
   rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$malformed_evidence_file" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 9]: malformed Evidence shape (checker's exact repro: schema_version/round/goal wrong types + null in steps[]) exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding, checker round 10] round 9's fix only checked that a steps[] element IS an
+  # object -- a bare {} (syntactically an object, but missing every required StepResult field)
+  # still passed and exited 0. Must now be rejected: step_id/kind/status/output are the 4 required
+  # (no omitempty) fields on the real bridge StepResult struct.
+  local bare_step_evidence_file="$t/seed-bare-step.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{}],"done":true}]' > "$bare_step_evidence_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$bare_step_evidence_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding, round 10]: seed_rounds[].steps[] entry as a bare {} (missing all 4 required StepResult fields) exit $rc (want 2)"; fails=1; }
+
+  # a step object present with ALL 4 required fields but one mistyped (step_id as a number, not a
+  # string) must also be rejected -- proving the fix checks TYPE, not just presence.
+  local wrong_type_step_evidence_file="$t/seed-wrongtype-step.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"step_id":123,"kind":"maker","status":"ok","output":"x"}],"done":true}]' > "$wrong_type_step_evidence_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$wrong_type_step_evidence_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding, round 10]: seed_rounds[].steps[].step_id given as a number instead of a string exit $rc (want 2)"; fails=1; }
+
+  # a genuinely valid, fully-formed Evidence object (correct step_id/kind/status/output, all
+  # strings) must still assemble successfully, exit 0 -- the fix must not over-reject.
+  local valid_step_evidence_file="$t/seed-valid-step.json"
+  echo '[{"schema_version":1,"round":0,"goal":"seed evidence","steps":[{"step_id":"step-maker","kind":"maker","status":"ok","output":"x","diff":""}],"done":true}]' > "$valid_step_evidence_file"
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$valid_step_evidence_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL [CONFIRMED finding, round 10]: a fully-valid Evidence step entry exit $rc (want 0 -- the fix must not over-reject a genuinely valid StepResult)"; fails=1; }
 
   # [CONFIRMED finding 3, checker round 1] --selfcheck's own result must not depend on whatever
   # SM_TEMPORAL_DRYRUN the calling shell already has exported -- the real-path refusal sub-test
