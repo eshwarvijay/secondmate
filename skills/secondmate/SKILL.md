@@ -222,13 +222,35 @@ Because of (a) and (b), `bin/run-round-temporal.sh round` **refuses outright und
 (not an env var, so it can't be set once and forgotten) that must be given with real, deliberate
 intent — never as a routine bypass. Even with the override, the script still prints a loud warning
 naming both gaps to stderr before proceeding, so it's visible in whatever pane/log captures the
-invocation. This is a known, deliberate limitation of the underlying bridge prototype's own design —
-its maker/checker activities were built as bare subprocess calls, never herdr-aware — not something
-this wrapper silently inherited or glossed over, and it cannot be fixed by editing
-`maker.go`/`checker.go` to shell out through herdr instead, since that would mean modifying the
-read-only bridge dependency. A separate task (task-id `bridge-herdr-visible-activities`) is already
-targeting the bridge itself to make its maker/checker activities herdr-visible — this limitation is
-pending that separate work landing, not indefinite.
+invocation. This was a known, deliberate limitation of the underlying bridge prototype's own design —
+its maker/checker activities were built as bare subprocess calls, never herdr-aware.
+
+**The bridge has since landed a real, opt-in herdr-visible mode** (`internal/planrun/maker.go`'s
+`runMakerStepHerdr`, `checker.go`'s `runCheckerStepHerdr`): when a plan step's `params.herdr_task_id`
+is a non-empty id matching the bridge's own `sanitizeTaskID` charset/length rule
+(`^[a-z0-9][a-z0-9_-]{0,19}$`, read from `internal/planrun/herdr.go`), the maker runs a REAL
+interactive `claude` agent on a real herdr pane/worktree instead of a bare headless subprocess, and
+the checker runs on a fresh pane split off it — both genuinely herdr-observable, closing gaps (a) and
+(b) above for that round. `bin/run-round-temporal.sh round` now exposes this as `--herdr-task-id ID`:
+validated against that exact rule by this script itself (fails fast, exit 2, before anything else
+runs) and threaded into **both** the maker and checker plan steps' `params.herdr_task_id`. This is an
+ADDED THIRD BRANCH on the `HERDR_ENV=1` guard, not a replacement of the existing one:
+- Neither flag given, `HERDR_ENV=1` → refuses exactly as before (unchanged default).
+- `--i-accept-headless-autonomous-risk` given → proceeds, prints the existing loud WARNING (unchanged).
+- `--herdr-task-id ID` given (no risk override needed) → proceeds, prints a plain informational NOTE
+  instead (no risk is being accepted, nothing to warn about).
+
+**Caller contract for `--herdr-task-id`:** the bridge's herdr-visible maker ignores `--repo`/
+`BRIDGE_ROOT` entirely for *where it edits* — it resolves/creates its OWN herdr worktree keyed by the
+task id (branch `herdr-task-<ID>`). This wrapper's own diff/commit/`ZERO_COMMIT_ROUND` logic always
+operates on `--repo`. The two only line up when `--repo` IS that same `herdr-task-<ID>` worktree (so
+the bridge's branch-name lookup finds and reuses it rather than creating a separate one) — a
+dispatcher convention, not something this script enforces or auto-derives. Passing a mismatched
+`--herdr-task-id` doesn't corrupt anything, but likely surfaces as a spurious `ZERO_COMMIT_ROUND`
+since the maker's real edits would land in a worktree this wrapper never looks at.
+It cannot be fixed by editing `maker.go`/`checker.go` further here, since that would mean modifying
+the read-only bridge dependency — any further changes to the bridge's own herdr-visible mechanics are
+out of scope for this script.
 
 **Named gaps for v1 (deliberately not ported into this path):** no `round-state.md`/
 `feature-list.json` continuity, no ponytail context injection, no lesson-injection — a dispatcher

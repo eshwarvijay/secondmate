@@ -24,7 +24,16 @@
 #     [--max-cost-cents N]             (default 200; POST-HOC WARNING ONLY -- a model call already in
 #                                        flight cannot be preempted without touching the bridge's own
 #                                        activity code, which is out of scope; see SKILL.md)
-#     [--i-accept-headless-autonomous-risk]   (required if HERDR_ENV=1; see the HERDR_ENV guard below)
+#     [--i-accept-headless-autonomous-risk]   (required if HERDR_ENV=1 AND --herdr-task-id is not
+#                                        given; see the HERDR_ENV guard below)
+#     [--herdr-task-id ID]             (opt-in: threads ID into both the maker and checker plan
+#                                        steps' params.herdr_task_id, so the bridge's maker/checker
+#                                        activities run on a real herdr-visible pane/worktree instead
+#                                        of a bare headless subprocess -- see the HERDR_ENV guard
+#                                        below. Validated against ^[a-z0-9][a-z0-9_-]{0,19}$, the same
+#                                        charset/length rule the bridge's own sanitizeTaskID enforces
+#                                        (internal/planrun/herdr.go) -- a bad value fails fast, exit 2,
+#                                        before anything else runs)
 #   run-round-temporal.sh --selfcheck
 #
 # Env: SM_TEMPORAL_DRYRUN=1          -- print the assembled plan JSON + the commands this would run,
@@ -68,9 +77,25 @@
 #   `--permission-mode auto` maker path, not merely less visible. Running THIS WRAPPER inside a
 #   herdr pane does not fix either gap -- it only makes the wrapper's own output visible. Overridable
 #   with --i-accept-headless-autonomous-risk, which also prints a loud warning before proceeding.
-#   A separate task (task-id bridge-herdr-visible-activities) is already targeting the bridge itself
-#   to make its maker/checker activities herdr-visible -- this guard's limitation is pending that
-#   separate work landing, not indefinite.
+#   The bridge has since landed a real, opt-in herdr-visible mode for its maker/checker activities
+#   (internal/planrun/maker.go's runMakerStepHerdr, checker.go's runCheckerStepHerdr): when a plan
+#   step's params.herdr_task_id is a non-empty, validated id, the maker runs a real interactive
+#   `claude` agent on a real herdr pane/worktree, and the checker runs on a fresh pane split off it --
+#   both genuinely herdr-observable, closing both gaps above for that round. Passing --herdr-task-id
+#   ID (validated by this script itself, before anything else runs) threads that id into both plan
+#   steps and lets a round proceed under HERDR_ENV=1 WITHOUT --i-accept-headless-autonomous-risk --
+#   an ADDED THIRD BRANCH, not a replacement: the default headless path (neither flag given) still
+#   refuses exactly as before.
+# - --herdr-task-id's CALLER CONTRACT: the bridge's herdr-visible maker (runMakerStepHerdr) ignores
+#   params.workdir/BRIDGE_ROOT entirely -- it resolves/creates ITS OWN herdr worktree keyed by the
+#   task id (branch `herdr-task-<ID>`, via herdr.go's resolveOrCreateMakerWorktreePane), independent
+#   of --repo. This wrapper's own diff/commit/ZERO_COMMIT_ROUND logic always operates on --repo. The
+#   two only line up -- i.e. the maker's real edits land where this wrapper looks for them -- when
+#   --repo IS that same `herdr-task-<ID>` worktree (so the bridge's branch-name lookup finds and
+#   reuses it instead of creating a separate one). Passing an --herdr-task-id that does not match
+#   --repo's own branch does not corrupt anything, but likely surfaces as a spurious
+#   ZERO_COMMIT_ROUND: the maker's real work would land in a different worktree this wrapper never
+#   looks at. Not enforced here -- this is a caller/dispatcher contract, not a new config knob.
 # - No round-state.md/feature-list.json/ponytail/lesson-injection parity on this path (v1 scope).
 # - No --lens support (the bridge's checker.go has no lens concept).
 # - Process cleanup uses a PID+start-time fingerprint sidecar (see _fingerprint below); a `kill -9` on
@@ -365,10 +390,10 @@ _prepare_bridge_cli() {  # _prepare_bridge_cli <bridge_dir> <server_bin> <go_bin
   )
 }
 
-_build_plan_json() {  # _build_plan_json <round> <goal> <criteria> <maker_prompt> <checker_goal>
+_build_plan_json() {  # _build_plan_json <round> <goal> <criteria> <maker_prompt> <checker_goal> [<herdr_task_id>]
   python3 -c '
 import json, sys
-round_n, goal, criteria, maker_prompt, checker_goal = sys.argv[1:6]
+round_n, goal, criteria, maker_prompt, checker_goal, herdr_task_id = sys.argv[1:7]
 plan = {
     "schema_version": 1,
     "round": int(round_n),
@@ -379,14 +404,17 @@ plan = {
          "params": {"review_step": "step-maker", "workdir": ".", "goal": checker_goal}},
     ],
 }
+if herdr_task_id:
+    plan["steps"][0]["params"]["herdr_task_id"] = herdr_task_id
+    plan["steps"][1]["params"]["herdr_task_id"] = herdr_task_id
 if criteria:
     plan["criteria"] = criteria
 print(json.dumps(plan, indent=2))
-' "$1" "$2" "$3" "$4" "$5"
+' "$1" "$2" "$3" "$4" "$5" "${6:-}"
 }
 
 usage() {
-  echo "usage: $0 round --repo PATH --checker-goal TEXT (--maker-prompt-file F | --maker-prompt TEXT) [options]" >&2
+  echo "usage: $0 round --repo PATH --checker-goal TEXT (--maker-prompt-file F | --maker-prompt TEXT) [--herdr-task-id ID] [options]" >&2
   echo "       $0 --selfcheck" >&2
 }
 
@@ -425,10 +453,11 @@ cleanup() {
 
 cmd_round() {
   local repo="" round=1 goal="" criteria="" maker_prompt_file="" maker_prompt="" checker_goal="" prior_verdict_file=""
-  local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200 accept_headless_risk=0
+  local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200 accept_headless_risk=0 herdr_task_id="" herdr_task_id_given=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --i-accept-headless-autonomous-risk) accept_headless_risk=1; shift 1;;
+      --herdr-task-id) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; herdr_task_id="$2"; herdr_task_id_given=1; shift 2;;
       --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; repo="$2"; shift 2;;
       --round) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; round="$2"; shift 2;;
       --goal) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; goal="$2"; shift 2;;
@@ -457,6 +486,13 @@ cmd_round() {
   case "$round" in ''|*[!0-9]*) echo "invalid --round: $round (want a non-negative integer)" >&2; return 2;; esac
   case "$max_seconds" in ''|*[!0-9]*) echo "invalid --max-seconds: $max_seconds (want a non-negative integer)" >&2; return 2;; esac
   case "$max_cost_cents" in ''|*[!0-9]*) echo "invalid --max-cost-cents: $max_cost_cents (want a non-negative integer)" >&2; return 2;; esac
+  # Validated the instant it's given, before anything else runs (same posture as --round/
+  # --max-seconds/--max-cost-cents above) -- against the bridge's own sanitizeTaskID charset/length
+  # rule (internal/planrun/herdr.go's taskIDRE), read directly from that file, not guessed: lowercase
+  # alnum/dash/underscore, 1-20 chars, starting with alnum.
+  if [ "$herdr_task_id_given" = 1 ]; then
+    [[ "$herdr_task_id" =~ ^[a-z0-9][a-z0-9_-]{0,19}$ ]] || { echo "invalid --herdr-task-id: $herdr_task_id (must match ^[a-z0-9][a-z0-9_-]{0,19}\$ -- lowercase alnum/dash/underscore, 1-20 chars, starting with alnum; same rule the bridge's sanitizeTaskID enforces)" >&2; return 2; }
+  fi
 
   # --- HERDR_ENV=1 guard: refuse outright unless explicitly overridden --------------------------
   # This repo's own SOP (skills/secondmate/SKILL.md, "Visible orchestration in herdr") requires the
@@ -480,12 +516,14 @@ cmd_round() {
   # genuinely means nothing executed yet, not even a benign dry-run preview build. This is stricter
   # than an earlier revision, which placed the guard after _build_plan_json/the dry-run branch and
   # so still let a python3 subprocess run before refusing; the checker caught that.
-  if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" != 1 ]; then
+  if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" != 1 ] && [ -z "$herdr_task_id" ]; then
     echo "REFUSING: HERDR_ENV=1 and --i-accept-headless-autonomous-risk was not given. This engine's checker has no herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session), and its maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path, not merely less visible. This repo's own SOP requires a visible, interruptible pane and prohibits headless checker execution under HERDR_ENV=1 for exactly this reason. Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway." >&2
     return 1
   fi
-  if [ "${HERDR_ENV:-}" = 1 ]; then
+  if [ "${HERDR_ENV:-}" = 1 ] && [ "$accept_headless_risk" = 1 ]; then
     echo "WARNING: running under HERDR_ENV=1 with --i-accept-headless-autonomous-risk. This round's checker has NO herdr-observable lifecycle (a bare headless subprocess) and this round's maker auto-accepts Bash commands with zero intervention opportunity -- more autonomous than this repo's own normal maker path. Proceeding only because the override was explicitly given." >&2
+  elif [ "${HERDR_ENV:-}" = 1 ] && [ -n "$herdr_task_id" ]; then
+    echo "NOTE: running under HERDR_ENV=1 with --herdr-task-id=$herdr_task_id. This round's maker and checker will run on a real, herdr-observable pane/worktree for this task (the bridge's herdr-visible mode) instead of a bare headless subprocess -- no autonomy risk being accepted here, nothing to warn about." >&2
   fi
 
   # Deferred from arg validation above: reading the FILE'S CONTENT is a real `cat` subprocess, so it
@@ -509,7 +547,7 @@ cmd_round() {
   fi
 
   local plan_json
-  plan_json="$(_build_plan_json "$round" "$goal" "$criteria" "$maker_prompt" "$checker_goal_full")"
+  plan_json="$(_build_plan_json "$round" "$goal" "$criteria" "$maker_prompt" "$checker_goal_full" "$herdr_task_id")"
 
   if [ "${SM_TEMPORAL_DRYRUN:-}" = 1 ]; then
     echo "PLAN:"
@@ -702,6 +740,40 @@ _selfcheck() {
   rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --max-cost-cents abc >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL: non-numeric --max-cost-cents exit $rc (want 2)"; fails=1; }
 
+  # --- --herdr-task-id: validated against the bridge's own sanitizeTaskID charset/length rule,
+  # before _build_plan_json (or anything else) ever runs -- same posture/distinguishing pattern as
+  # --round/--max-seconds/--max-cost-cents above (valid worktree + SM_TEMPORAL_DRYRUN=1, so exit 2
+  # means validation fired and exit 0 means it didn't). Covers: uppercase (charset), leading dash
+  # (must start with alnum), and 21 chars (over the 20-char cap). ---
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --herdr-task-id "Upper" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: uppercase --herdr-task-id exit $rc (want 2)"; fails=1; }
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --herdr-task-id "-leading-dash" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: leading-dash --herdr-task-id exit $rc (want 2)"; fails=1; }
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --herdr-task-id "123456789012345678901" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: 21-char --herdr-task-id exit $rc (want 2)"; fails=1; }
+
+  # --- [SECURITY, CRITICAL] an EXPLICITLY-GIVEN empty --herdr-task-id '' must ALSO fail validation
+  # (it has 0 chars, outside the 1-20 required) -- distinct from the flag never being given at all,
+  # which also leaves the value "" but must NOT be validated (absent -> ordinary headless plan,
+  # unchanged default). A checker found an earlier revision gated validation on [ -n "$herdr_task_id" ],
+  # which can't tell "never passed" apart from "passed empty" -- both leave the variable "", so an
+  # explicitly-empty flag silently fell through to "no flag given" behavior (exit 0, ordinary headless
+  # plan, no herdr_task_id key at all) instead of the exit-2 usage error this charset/length rule
+  # demands. ---
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --herdr-task-id "" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [SECURITY, CRITICAL]: empty --herdr-task-id '' exit $rc (want 2 -- an explicitly-given empty value must fail validation, not silently fall back to no-flag-given behavior)"; fails=1; }
+
+  # --- a VALID --herdr-task-id must thread "herdr_task_id" into BOTH plan steps' params, carried
+  # through the dry-run plan JSON. ---
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" --herdr-task-id "task-abc" 2>&1)" \
+    || { echo "FAIL: dryrun with --herdr-task-id errored"; fails=1; }
+  echo "$out" | grep -c '"herdr_task_id": "task-abc"' | grep -q '^2$' \
+    || { echo "FAIL: dryrun plan with --herdr-task-id must carry herdr_task_id on BOTH steps (maker + checker)"; fails=1; }
+
+  # --- absent --herdr-task-id: the key must not appear at all (zero-behavior-change default path). ---
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" 2>&1)"
+  echo "$out" | grep -q 'herdr_task_id' && { echo "FAIL: dryrun plan must not mention herdr_task_id when --herdr-task-id is not given"; fails=1; }
+
   # --- SM_TEMPORAL_FETCH_TIMEOUT_SECONDS must be rejected the instant it's read (module scope),
   # same class of bug as --max-seconds/--max-cost-cents: a non-numeric value would silently defeat
   # the per-fetch-call watchdog. Uses a valid worktree + SM_TEMPORAL_DRYRUN=1 (not a bare `round`
@@ -725,6 +797,16 @@ _selfcheck() {
   echo "$out" | grep -q 'no herdr-observable lifecycle' || { echo "FAIL: HERDR guard message missing the checker-visibility gap"; fails=1; }
   echo "$out" | grep -q 'auto-accepts Bash commands' || { echo "FAIL: HERDR guard message missing the maker-autonomy gap"; fails=1; }
   echo "$out" | grep -q 'bridge dir not found' && { echo "FAIL: HERDR guard did not fire first -- preflight ran instead"; fails=1; }
+  # --- [CRITICAL] byte-identical zero-behavior-change check: the neither-flag-given refusal message
+  # must be EXACTLY the base script's original wording, never appended to -- a checker caught an
+  # earlier revision tacking on an "...or --herdr-task-id ID to run the bridge's herdr-visible mode
+  # instead..." clause onto this exact message, which is new text in a path the task's own spec says
+  # must refuse "exactly as it does today" when neither flag is given. The new flag is already
+  # documented in this script's own header comment and in SKILL.md; this message doesn't need to
+  # advertise it too. ---
+  echo "$out" | grep -qF 'anyway, or --herdr-task-id' && { echo "FAIL [CRITICAL]: neither-flag-given REFUSING message was appended with new --herdr-task-id text -- must stay byte-identical to the base script for this path"; fails=1; }
+  echo "$out" | grep -qF 'Pass --i-accept-headless-autonomous-risk if you genuinely intend to run this engine under HERDR_ENV=1 anyway.' \
+    || { echo "FAIL [CRITICAL]: neither-flag-given REFUSING message does not end exactly where the base script's did"; fails=1; }
 
   # --- the HERDR guard must ALSO refuse before --maker-prompt-file's content is ever read (a real
   # `cat` subprocess) -- checker's exact repro: a PATH-controlled `cat` proved it ran before the
@@ -759,6 +841,20 @@ CAT_RAN_EOF
   echo "$out" | grep -q 'REFUSING: HERDR_ENV=1' && { echo "FAIL: HERDR guard still blocked despite the override being given"; fails=1; }
   echo "$out" | grep -q 'WARNING: running under HERDR_ENV=1' || { echo "FAIL: HERDR guard override did not print the expected warning"; fails=1; }
   echo "$out" | grep -q 'bridge dir not found' || { echo "FAIL: override did not let the round proceed to the next real check"; fails=1; }
+
+  # --- the added THIRD branch: --herdr-task-id alone (no --i-accept-headless-autonomous-risk) must
+  # ALSO let a real round proceed past the guard under HERDR_ENV=1 -- the bridge's herdr-visible mode
+  # gives a real interactive pane, closing the two gaps the guard exists for. Prints a plain NOTE, not
+  # the risk-override's loud WARNING (nothing is being accepted here). Same /nonexistent --bridge-dir
+  # precedent as the override test above: a clean way to observe "did the guard block it" without a
+  # real build/server. ---
+  rc=0
+  out="$(HERDR_ENV=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --bridge-dir /nonexistent-xyz-$$ --herdr-task-id "task-vis" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: HERDR_ENV=1 WITH --herdr-task-id exit $rc (want 1, from the unrelated missing-bridge-dir refusal)"; fails=1; }
+  echo "$out" | grep -q 'REFUSING: HERDR_ENV=1' && { echo "FAIL: HERDR guard still blocked despite --herdr-task-id being given"; fails=1; }
+  echo "$out" | grep -q 'WARNING: running under HERDR_ENV=1' && { echo "FAIL: --herdr-task-id branch must not print the risk-override's WARNING (no risk is being accepted)"; fails=1; }
+  echo "$out" | grep -q 'NOTE: running under HERDR_ENV=1 with --herdr-task-id=task-vis' || { echo "FAIL: --herdr-task-id branch did not print the expected informational NOTE"; fails=1; }
+  echo "$out" | grep -q 'bridge dir not found' || { echo "FAIL: --herdr-task-id did not let the round proceed to the next real check"; fails=1; }
 
   # --- the HERDR guard must be positioned in the SOURCE before _build_plan_json is ever called, so
   # a refusal genuinely means nothing executed yet -- not even a benign plan-preview python3
