@@ -88,18 +88,38 @@ if not isinstance(rounds, list) or len(rounds) == 0:
 for i, p in enumerate(rounds):
     if not isinstance(p, dict):
         fail(f"rounds[{i}] is not a JSON object")
-    if not isinstance(p.get("schema_version"), int):
-        fail(f"rounds[{i}] missing/invalid schema_version (want an int -- same shape run-round-temporal.sh own dry-run Plan JSON produces)")
-    if not isinstance(p.get("round"), int):
-        fail(f"rounds[{i}] missing/invalid round (want an int)")
-    if not isinstance(p.get("goal"), str):
-        fail(f"rounds[{i}] missing/invalid goal (want a string)")
+    # bool is a subclass of int in Python -- isinstance(True, int) is True -- so every numeric
+    # check below excludes bool explicitly, not just checks isinstance(..., int). schema_version
+    # must be the literal int 1: the only value run-round-temporal own oracle Plan JSON (the
+    # one real, proven producer of this shape in this repo) ever emits.
+    sv = p.get("schema_version")
+    if not isinstance(sv, int) or isinstance(sv, bool) or sv != 1:
+        fail(f"rounds[{i}].schema_version must be the literal int 1 (got {sv!r})")
+    rnd = p.get("round")
+    if not isinstance(rnd, int) or isinstance(rnd, bool) or rnd < 1:
+        fail(f"rounds[{i}].round must be a non-bool int >= 1 (got {rnd!r})")
+    goal = p.get("goal")
+    if not isinstance(goal, str) or goal == "":
+        fail(f"rounds[{i}].goal must be a non-empty string (got {goal!r})")
     steps = p.get("steps")
     if not isinstance(steps, list) or len(steps) == 0:
-        fail(f"rounds[{i}] missing/invalid steps (want a non-empty array)")
+        fail(f"rounds[{i}].steps must be a non-empty array")
+    seen_ids = set()
     for j, s in enumerate(steps):
-        if not isinstance(s, dict) or not isinstance(s.get("id"), str) or not isinstance(s.get("kind"), str) or not isinstance(s.get("params"), dict):
-            fail(f"rounds[{i}].steps[{j}] does not match the Plan step shape (id/kind/params)")
+        if not isinstance(s, dict):
+            fail(f"rounds[{i}].steps[{j}] is not a JSON object")
+        sid = s.get("id")
+        kind = s.get("kind")
+        params = s.get("params")
+        if not isinstance(sid, str) or sid == "":
+            fail(f"rounds[{i}].steps[{j}].id must be a non-empty string (got {sid!r})")
+        if not isinstance(kind, str) or kind == "":
+            fail(f"rounds[{i}].steps[{j}].kind must be a non-empty string (got {kind!r})")
+        if not isinstance(params, dict):
+            fail(f"rounds[{i}].steps[{j}].params must be an object (got {params!r})")
+        if sid in seen_ids:
+            fail(f"rounds[{i}].steps[{j}].id {sid!r} is a duplicate within this round -- step ids must be unique per round")
+        seen_ids.add(sid)
 
 task = {"task_id": task_id, "rounds": rounds}
 
@@ -112,8 +132,15 @@ if seed_rounds_file:
     if not isinstance(seed_rounds, list):
         fail("--seed-rounds-file must be a JSON array of Evidence objects")
     for i, e in enumerate(seed_rounds):
-        if not isinstance(e, dict) or not isinstance(e.get("steps"), list) or "done" not in e:
-            fail(f"seed_rounds[{i}] does not match the Evidence shape (steps[]/done -- same shape bridge fetch already returns under its own evidence key)")
+        if not isinstance(e, dict):
+            fail(f"seed_rounds[{i}] is not a JSON object")
+        if not isinstance(e.get("steps"), list):
+            fail(f"seed_rounds[{i}].steps must be an array (Evidence shape)")
+        done = e.get("done")
+        # isinstance(done, bool) correctly excludes str/int/None here (bool is NOT a superclass of
+        # int -- isinstance(1, bool) is False) -- a truthy non-bool like "not-a-boolean" must fail.
+        if not isinstance(done, bool):
+            fail(f"seed_rounds[{i}].done must be a real bool, not {type(done).__name__} (got {done!r}) -- same Evidence shape bridge fetch already returns")
     if seed_rounds:
         task["seed_rounds"] = seed_rounds
 
@@ -296,8 +323,15 @@ SEED_EOF
 
   # (h) the real (non-dry-run) refusal: exit 1, three-fact message, artifact actually written, and
   # (structurally) zero code path in this script could ever invoke a real bridge binary.
+  # SM_TEMPORAL_DRYRUN is explicitly PINNED EMPTY here, not just HERDR_ENV -- without this, a
+  # calling shell that already has SM_TEMPORAL_DRYRUN=1 exported (e.g. an operator who was just
+  # working with the sibling script) silently converts this sub-invocation into a dry-run call,
+  # which exits 0 instead of 1 and never exercises the refusal path at all. Confirmed live: running
+  # `SM_TEMPORAL_DRYRUN=1 bin/run-task-temporal.sh --selfcheck` used to fail THIS check for exactly
+  # that reason, even though the script under test was correct -- --selfcheck's own result must not
+  # depend on what the calling shell happens to have exported.
   rc=0
-  out="$(HERDR_ENV="" "$0" task --task-id "selfcheck-task" --rounds-file "$rounds_file" 2>&1)" || rc=$?
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "selfcheck-task" --rounds-file "$rounds_file" 2>&1)" || rc=$?
   [ "$rc" = 1 ] || { echo "FAIL: real-path invocation exit $rc (want 1)"; fails=1; }
   echo "$out" | grep -q 'REFUSING:' || { echo "FAIL: refusal message missing"; fails=1; }
   echo "$out" | grep -q 'registers ONLY planrun.PlanWorkflow' || { echo "FAIL: refusal missing fact 1 (worker never registers TaskWorkflow)"; fails=1; }
@@ -313,6 +347,80 @@ SEED_EOF
   # search would trivially self-match and falsely "pass" a reintroduced invocation too).
   sed -n '/^cmd_task() {$/,/^_selfcheck() {$/p' "$0" | grep -qE '"\$.*bridge"|bridge submit|bridge worker|bridge fetch' \
     && { echo "FAIL [CRITICAL]: cmd_task contains a literal bridge-binary invocation -- the refusal must be unconditional, with zero code path that could ever call a real bridge binary"; fails=1; }
+
+  # [CONFIRMED finding 1, checker round 1] a rounds[] entry that satisfies bare Python types but
+  # violates the real Plan contract (empty goal, empty/duplicate step ids/kinds, schema_version 0)
+  # must be rejected, exit 2 -- not silently accepted and emitted into TASK_INPUT.
+  local weak_plan_file="$t/rounds-weak-plan.json"
+  echo '[{"schema_version":0,"round":0,"goal":"","steps":[{"id":"","kind":"","params":{}},{"id":"","kind":"","params":{}}]}]' > "$weak_plan_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$weak_plan_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: schema_version:0/round:0/empty-goal/empty-dup-step-ids rounds[] entry exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 1, checker round 1] Python's bool-is-an-int-subclass trap: schema_version
+  # and round given as JSON `true` must NOT pass as valid ints.
+  local bool_plan_file="$t/rounds-bool.json"
+  echo '[{"schema_version":true,"round":true,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$bool_plan_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$bool_plan_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: schema_version/round given as JSON true (bool-is-int trap) exit $rc (want 2)"; fails=1; }
+
+  # Isolated single-field violations -- each fixture below is otherwise fully valid, so disabling
+  # any ONE of these checks (confirmed live by mutation-testing each in turn) is caught by exactly
+  # that fixture and no other. weak_plan_file/bool_plan_file above each break multiple fields at
+  # once, which a mutation test proved is not enough on its own: neutering the schema_version check
+  # alone left the SAME overall exit code (2) on both those fixtures, because their OTHER broken
+  # fields (round, goal, step ids) independently also trip exit 2 -- fully masking that one
+  # specific check from ever being exercised in isolation.
+  local valid_base='"round":1,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{}}]'
+  local iso_schema_file="$t/rounds-iso-schema.json"
+  echo "[{\"schema_version\":2,${valid_base}}]" > "$iso_schema_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$iso_schema_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: schema_version:2 (otherwise fully valid) exit $rc (want 2)"; fails=1; }
+
+  local iso_round_file="$t/rounds-iso-round.json"
+  echo '[{"schema_version":1,"round":0,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$iso_round_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$iso_round_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: round:0 (otherwise fully valid) exit $rc (want 2)"; fails=1; }
+
+  local iso_goal_file="$t/rounds-iso-goal.json"
+  echo '[{"schema_version":1,"round":1,"goal":"","steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$iso_goal_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$iso_goal_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: empty goal (otherwise fully valid) exit $rc (want 2)"; fails=1; }
+
+  local iso_stepid_file="$t/rounds-iso-stepid.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"","kind":"maker","params":{}}]}]' > "$iso_stepid_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$iso_stepid_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: empty step id (otherwise fully valid) exit $rc (want 2)"; fails=1; }
+
+  local iso_stepkind_file="$t/rounds-iso-stepkind.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"","params":{}}]}]' > "$iso_stepkind_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$iso_stepkind_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: empty step kind (otherwise fully valid) exit $rc (want 2)"; fails=1; }
+
+  # duplicate non-empty step ids within one round must also be rejected (order-position-only
+  # uniqueness, same spirit as the (d) order-preservation guarantee above).
+  local dup_id_file="$t/rounds-dup-id.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"dup","kind":"maker","params":{}},{"id":"dup","kind":"checker","params":{}}]}]' > "$dup_id_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$dup_id_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: duplicate step ids within one round exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 2, checker round 1] a seed_rounds[] entry with done given as a non-bool
+  # (a Python str, not a real bool) must be rejected, exit 2 -- not echoed straight into TASK_INPUT.
+  local bad_done_seed_file="$t/seed-bad-done.json"
+  echo '[{"steps":[],"done":"not-a-boolean"}]' > "$bad_done_seed_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$bad_done_seed_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2]: seed_rounds[].done as a non-bool string exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 3, checker round 1] --selfcheck's own result must not depend on whatever
+  # SM_TEMPORAL_DRYRUN the calling shell already has exported -- the real-path refusal sub-test
+  # above used to silently turn into a dry-run call under an inherited SM_TEMPORAL_DRYRUN=1,
+  # masking the very thing it was meant to prove. Re-runs the WHOLE suite once, polluted with
+  # SM_TEMPORAL_DRYRUN=1 ambient, and asserts it still exits 0. _SM_SELFCHECK_NESTED guards against
+  # unbounded recursion: this check only ever fires at the top level, never inside its own child.
+  if [ "${_SM_SELFCHECK_NESTED:-}" != 1 ]; then
+    rc=0
+    SM_TEMPORAL_DRYRUN=1 _SM_SELFCHECK_NESTED=1 "$0" --selfcheck >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 0 ] || { echo "FAIL [CONFIRMED finding 3]: --selfcheck run under an inherited SM_TEMPORAL_DRYRUN=1 exited $rc (want 0) -- its own sub-tests must be hermetic against the calling shell's ambient env"; fails=1; }
+  fi
 
   rm -rf "$t" "$oracle_state_dir"
 
