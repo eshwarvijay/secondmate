@@ -138,10 +138,23 @@ def _check_go_compatible_value(value, path):
             _check_go_compatible_value(v, f"{path}[{idx}]")
         return
 
+# [CONFIRMED finding 1, checker round 7] an unreadable rounds-file/seed-rounds-file (permission
+# denied, or any other OSError-family cause reading a caller-supplied path) raised a raw, uncaught
+# PermissionError traceback. The bash-level `[ -f "$rounds_file" ]` presence check in cmd_task
+# cannot catch this -- a chmod-000 file is still a regular file, test -f still returns true, and
+# the real failure only surfaces once Python actually tries to open() it. Caught here, in the ONE
+# shared loader both --rounds-file and --seed-rounds-file already go through, same pattern as the
+# bash-side _refuse_fs_error below: attempt the real operation, catch whatever OSError-family
+# failure it raises, convert to the SAME clean, named, exit-2 message -- not a point-fix for
+# "permission denied" specifically, since this catches the whole OSError class (missing parent
+# directory, too-many-open-files, whatever else shows up), the identical principle applied on the
+# Python side of this script instead of the bash side.
 def strict_json_load(path, what):
     try:
         with open(path) as f:
             data = json.load(f, parse_constant=_reject_nonstandard_json_constant)
+    except OSError as e:
+        fail(f"could not read {what} ({path}): {e}")
     except ValueError as e:
         fail(f"could not parse {what} as strict, Go-compatible JSON: {e}")
     _check_go_compatible_value(data, what)
@@ -235,6 +248,17 @@ except RecursionError:
 ' "$1" "$2" "${3:-}"
 }
 
+# [CONFIRMED findings, checker round 7] the one shared bash-side pattern for every filesystem
+# operation this script attempts at a caller-supplied path (creating --out-dir, writing the
+# artifact): run the real operation, capture its own stderr, and on failure print ONE consistently-
+# shaped refusal naming the operation and path plus the real underlying error text, then return a
+# clean exit 2 -- never an uncaught mkdir/shell traceback. Used at both bash-side filesystem sites
+# in cmd_task below (never a third, fourth copy-pasted with slightly different wording).
+_refuse_fs_error() {  # _refuse_fs_error <description> <captured-error-text>
+  echo "refusing: $1 failed: $2" >&2
+  return 2
+}
+
 cmd_task() {
   local task_id="" rounds_file="" seed_rounds_file="" out_dir=""
   while [ $# -gt 0 ]; do
@@ -268,29 +292,24 @@ cmd_task() {
   fi
 
   out_dir="${out_dir:-$(mktemp -d "${TMPDIR:-/tmp}/sm-temporal-task.XXXXXX")}"
-  # Same bug class as the artifact-path collision guard just below, one level up: a pre-existing
-  # --out-dir that is itself a plain file (not a directory) crashes `mkdir -p` with a raw shell
-  # "File exists" error under set -e -- found via this round's own further adversarial testing,
-  # directly adjacent to the checker's artifact-collision finding, so fixed here too rather than
-  # left as a sibling crash.
-  if [ -e "$out_dir" ] && [ ! -d "$out_dir" ]; then
-    echo "refusing: --out-dir already exists and is not a directory: $out_dir -- cannot write the TaskInput artifact there" >&2
-    return 2
-  fi
-  mkdir -p "$out_dir"
   local artifact="$out_dir/task-input.json"
-  # [CONFIRMED finding 2, checker round 6] a bare `echo ... > "$artifact"` crashes with a raw
-  # shell "Is a directory" error (exit 1, under set -e) when something already sits at this exact
-  # path and is not a plain file -- with NEITHER the mandated WROTE: line NOR the mandated
-  # REFUSING: three-fact report ever printed. A caller (accidentally, or an attacker deliberately)
-  # pre-creating a directory at this exact path would silently suppress the refusal report. Checked
-  # BEFORE attempting the write, so this is always a clean, named, exit-2 usage error -- never an
-  # uncaught crash -- on this path.
-  if [ -e "$artifact" ] && [ ! -f "$artifact" ]; then
-    echo "refusing: artifact path already exists and is not a plain file: $artifact (e.g. a pre-existing directory at this exact path) -- cannot write the TaskInput artifact there" >&2
-    return 2
-  fi
-  echo "$task_json" > "$artifact"
+  # [CONFIRMED findings, checker rounds 6+7] this script touches the filesystem at a caller-
+  # supplied path in exactly two places on this bash side (creating --out-dir, writing the
+  # artifact) -- both must NEVER let a raw mkdir/shell error escape (a directory sitting at the
+  # artifact path; --out-dir itself existing as a plain file; --out-dir under a non-directory path
+  # component like /dev/null/x; a dangling symlink at the artifact path, etc). A round-6 revision
+  # pre-checked each path with `[ -e ... ] && [ ! -f/-d ... ]` -- the checker proved that approach
+  # is structurally incomplete: bash `-e` FOLLOWS symlinks and reports false for a dangling one, so
+  # a dangling symlink at the artifact path sailed straight past the pre-check and then crashed the
+  # write anyway. Pre-checks are inherently racy and can never enumerate every OSError-family cause
+  # (permissions, ENOTDIR, ENOENT, dangling symlinks, whatever else). The robust, structural fix:
+  # stop pre-validating and just ATTEMPT the real operation, capturing its own stderr, and convert
+  # ANY failure into the SAME clean, named, exit-2 refusal via _refuse_fs_error -- one shared
+  # pattern at both sites, not a growing pile of scenario-specific pre-checks.
+  local mkdir_err
+  mkdir_err="$(mkdir -p "$out_dir" 2>&1)" || { _refuse_fs_error "creating --out-dir ($out_dir)" "$mkdir_err"; return $?; }
+  local write_err
+  write_err="$( { echo "$task_json" > "$artifact"; } 2>&1 )" || { _refuse_fs_error "writing the TaskInput artifact ($artifact)" "$write_err"; return $?; }
 
   echo "WROTE: $artifact"
   echo "WORKFLOW_ID: $workflow_id"
@@ -639,40 +658,105 @@ out="$("$0" task --task-id "x" --rounds-file "$deep_rounds_file" 2>&1)" || rc=$?
 echo "$out" | grep -qi 'traceback' && { echo "FAIL [CONFIRMED finding 1, round 6]: pathologically deep rounds-file leaked a raw Python traceback instead of a clean message"; fails=1; }
 echo "$out" | grep -qi 'too deep' || { echo "FAIL [CONFIRMED finding 1, round 6]: pathologically deep rounds-file did not produce the expected clean too-deep message"; fails=1; }
 
-  # [CONFIRMED finding 2, checker round 6] if the real-path artifact's target path already exists
-  # AS A DIRECTORY, the write must refuse cleanly, exit 2, with NEITHER a misleading WROTE: line
-  # NOR a misleading REFUSING: report -- never an uncaught shell "Is a directory" crash that could
-  # let a caller (or an attacker pre-creating that exact path) silently suppress the refusal report.
+  # [CONFIRMED findings, checker rounds 6+7] every bash-side filesystem operation at a caller-
+  # supplied path (creating --out-dir, writing the artifact) must refuse cleanly, exit 2, via
+  # _refuse_fs_error -- NEVER an uncaught raw mkdir/shell error, and NEVER a misleading WROTE:/
+  # REFUSING: line once the real operation has failed. Round 7's mechanism is attempt-and-catch
+  # (no pre-checks), so the clean message legitimately ECHOES the real underlying OS error text
+  # (e.g. "...failed: ...: Is a directory") for diagnostic value -- these assertions check for the
+  # shared "refusing: <op> failed:" shape and the absence of an actual traceback, not for the
+  # ABSENCE of words like "directory" that now appear ON PURPOSE inside the captured error text
+  # (a round-6 version of this suite asserted the opposite, which stopped being correct the moment
+  # the mechanism changed to attempt-and-catch).
+  _assert_clean_fs_refusal() {  # _assert_clean_fs_refusal <out> <want_rc> <rc>
+    local out="$1" want_rc="$2" got_rc="$3"
+    [ "$got_rc" = "$want_rc" ] || { echo "FAIL: fs-refusal exit $got_rc (want $want_rc, not a crash)"; fails=1; }
+    echo "$out" | grep -qi 'traceback' && { echo "FAIL [CRITICAL]: fs-refusal leaked a raw Python traceback"; fails=1; }
+    echo "$out" | grep -q '^WROTE:' && { echo "FAIL [CRITICAL]: fs-refusal still printed a WROTE: line despite the write never happening"; fails=1; }
+    echo "$out" | grep -q '^REFUSING:' && { echo "FAIL [CRITICAL]: fs-refusal still printed the three-fact REFUSING: report despite the write never happening"; fails=1; }
+    echo "$out" | grep -q '^refusing: ' || { echo "FAIL: fs-refusal did not use the shared _refuse_fs_error/strict_json_load clean-message shape"; fails=1; }
+  }
+
+  # (1) artifact path already exists AS A DIRECTORY.
   local collision_out_dir="$t/collision-out"
   mkdir -p "$collision_out_dir/task-input.json"
   rc=0
   out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$collision_out_dir" 2>&1)" || rc=$?
-  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path-is-a-directory collision exit $rc (want 2, not a crash)"; fails=1; }
-  echo "$out" | grep -qi 'traceback\|is a directory' && { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision leaked a raw crash/shell error instead of a clean message"; fails=1; }
-  echo "$out" | grep -q '^WROTE:' && { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision still printed a WROTE: line despite the write never happening"; fails=1; }
-  echo "$out" | grep -q '^REFUSING:' && { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision still printed the REFUSING: report despite the write never happening"; fails=1; }
-  echo "$out" | grep -qi 'already exists' || { echo "FAIL [CONFIRMED finding 2, round 6]: artifact-path collision did not name the collision clearly"; fails=1; }
+  _assert_clean_fs_refusal "$out" 2 "$rc"
   [ -d "$collision_out_dir/task-input.json" ] || { echo "FAIL: pre-existing collision directory was unexpectedly removed/altered by this check"; fails=1; }
 
-  # [CONFIRMED finding 2, checker round 6] the ordinary (non-collision) real-path write must still
-  # work exactly as before -- the new guard must not be a false positive on a normal, fresh out-dir.
-  local normal_out_dir="$t/normal-out"
-  rc=0
-  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$normal_out_dir" 2>&1)" || rc=$?
-  [ "$rc" = 1 ] || { echo "FAIL: ordinary real-path write with a fresh --out-dir exit $rc (want 1, the normal refusal)"; fails=1; }
-  [ -f "$normal_out_dir/task-input.json" ] || { echo "FAIL: ordinary real-path write did not actually write the artifact (new guard false-positived)"; fails=1; }
-
-  # [found via this round's OWN further adversarial testing, same bug class as finding 2] --out-dir
-  # itself (one level up from the artifact file inside it) already existing as a plain file must
-  # also refuse cleanly, exit 2, never an uncaught `mkdir -p` "File exists" crash.
+  # (2) --out-dir itself already exists as a plain file.
   local out_dir_as_file="$t/out-dir-as-file"
   echo "not a directory" > "$out_dir_as_file"
   rc=0
   out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$out_dir_as_file" 2>&1)" || rc=$?
-  [ "$rc" = 2 ] || { echo "FAIL [found via further testing, same class as finding 2]: --out-dir pre-existing as a plain file exit $rc (want 2, not a crash)"; fails=1; }
-  echo "$out" | grep -qi 'traceback\|file exists' && { echo "FAIL [found via further testing, same class as finding 2]: --out-dir-as-a-file leaked a raw mkdir/shell crash instead of a clean message"; fails=1; }
-  echo "$out" | grep -q '^WROTE:' && { echo "FAIL [found via further testing, same class as finding 2]: --out-dir-as-a-file still printed a WROTE: line despite the write never happening"; fails=1; }
+  _assert_clean_fs_refusal "$out" 2 "$rc"
   [ "$(cat "$out_dir_as_file")" = "not a directory" ] || { echo "FAIL: pre-existing --out-dir file content was unexpectedly altered by this check"; fails=1; }
+
+  # (3) [CONFIRMED finding 2, checker round 7] --out-dir under a path whose own parent component
+  # is NOT a directory (/dev/null is a character device) -- a generic mkdir -p failure the shared
+  # helper must catch, not a scenario-specific pre-check added just for this one shape.
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "/dev/null/sm-selfcheck-$$" 2>&1)" || rc=$?
+  _assert_clean_fs_refusal "$out" 2 "$rc"
+
+  # (4) [CONFIRMED finding 3, checker round 7] a DANGLING symlink at the exact artifact path --
+  # the checker's own exact repro: bash `-e` FOLLOWS symlinks and reports false for a dangling one,
+  # so a round-6-style pre-check (`[ -e "$artifact" ]`) never even sees this collision; only
+  # attempting the real write and catching its own failure (today's mechanism) catches it. The
+  # symlink target's own parent directory does not exist either, so the write itself genuinely
+  # fails (ENOENT), proving this is attempt-and-catch working, not a pre-check that happens to
+  # coincidentally still pass.
+  local dangling_out_dir="$t/dangling-out"
+  mkdir -p "$dangling_out_dir"
+  ln -s "/nonexistent-dir-$$/target" "$dangling_out_dir/task-input.json"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$dangling_out_dir" 2>&1)" || rc=$?
+  _assert_clean_fs_refusal "$out" 2 "$rc"
+  [ -L "$dangling_out_dir/task-input.json" ] || { echo "FAIL: pre-existing dangling symlink was unexpectedly removed by this check"; fails=1; }
+
+  # (5) [CONFIRMED finding 1, checker round 7] an UNREADABLE --rounds-file (permission denied) --
+  # a chmod-000 file still passes cmd_task's own bash-level `[ -f ... ]` presence check (test -f
+  # does not check readability), so the real failure only surfaces once strict_json_load actually
+  # calls open() -- caught there via the shared OSError handling, same clean-message shape.
+  local unreadable_rounds_file="$t/rounds-unreadable.json"
+  cp "$rounds_file" "$unreadable_rounds_file"
+  chmod 000 "$unreadable_rounds_file"
+  rc=0
+  out="$("$0" task --task-id "x" --rounds-file "$unreadable_rounds_file" 2>&1)" || rc=$?
+  chmod 644 "$unreadable_rounds_file"
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 7]: unreadable --rounds-file exit $rc (want 2, not a crash)"; fails=1; }
+  echo "$out" | grep -qi 'traceback' && { echo "FAIL [CONFIRMED finding 1, round 7]: unreadable --rounds-file leaked a raw PermissionError traceback"; fails=1; }
+  echo "$out" | grep -qi 'could not read' || { echo "FAIL [CONFIRMED finding 1, round 7]: unreadable --rounds-file did not produce the expected clean message"; fails=1; }
+
+  # the SAME unreadable-file handling must apply to --seed-rounds-file too -- same shared
+  # strict_json_load mechanism, not a second, possibly-forgotten copy for this loader.
+  local unreadable_seed_file="$t/seed-unreadable.json"
+  echo '[{"steps":[],"done":true}]' > "$unreadable_seed_file"
+  chmod 000 "$unreadable_seed_file"
+  rc=0
+  out="$("$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$unreadable_seed_file" 2>&1)" || rc=$?
+  chmod 644 "$unreadable_seed_file"
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 7]: unreadable --seed-rounds-file exit $rc (want 2, not a crash)"; fails=1; }
+  echo "$out" | grep -qi 'traceback' && { echo "FAIL [CONFIRMED finding 1, round 7]: unreadable --seed-rounds-file leaked a raw PermissionError traceback"; fails=1; }
+  echo "$out" | grep -qi 'could not read' || { echo "FAIL [CONFIRMED finding 1, round 7]: unreadable --seed-rounds-file did not produce the expected clean message"; fails=1; }
+
+  # (6) the ordinary (non-collision) real-path write must still work exactly as before -- none of
+  # the attempt-and-catch mechanism above must be a false positive on a normal, fresh out-dir.
+  local normal_out_dir="$t/normal-out"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN="" "$0" task --task-id "x" --rounds-file "$rounds_file" --out-dir "$normal_out_dir" 2>&1)" || rc=$?
+  [ "$rc" = 1 ] || { echo "FAIL: ordinary real-path write with a fresh --out-dir exit $rc (want 1, the normal refusal)"; fails=1; }
+  [ -f "$normal_out_dir/task-input.json" ] || { echo "FAIL: ordinary real-path write did not actually write the artifact (new mechanism false-positived)"; fails=1; }
+
+  # (7) structural guard: the two bash-side filesystem sites must share ONE helper
+  # (_refuse_fs_error), not a growing pile of scenario-specific copy-pasted error handlers.
+  # Scoped to cmd_task's own function body only, never this selfcheck's own source -- a whole-file
+  # search would trivially self-match the literal pattern text of this very check (same class of
+  # false-pass this file already guards against for the bridge-invocation structural check above).
+  local fs_error_call_count
+  fs_error_call_count="$(sed -n '/^cmd_task() {$/,/^_selfcheck() {$/p' "$0" | grep -c '_refuse_fs_error "')"
+  [ "$fs_error_call_count" = 2 ] || { echo "FAIL [CRITICAL]: expected exactly 2 call sites of the shared _refuse_fs_error helper in cmd_task (creating --out-dir, writing the artifact), found $fs_error_call_count -- a new filesystem touch point was added without reusing the shared pattern, or an existing one was duplicated instead of reused"; fails=1; }
 
   # [CONFIRMED finding 2, checker round 3] a step with NO params field at all is a bridge-VALID
   # Plan shape (Step.Params is `map[string]any `json:"params,omitempty"``, and the bridge's own
