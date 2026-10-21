@@ -67,8 +67,8 @@ not the only wall.
 **What they do:** local browser surface for inline annotation of plans/diffs, feedback sent back to
 the agent with one click. Already supports pi, with a "Herdr Annotate" terminal mode.
 
-**Why:** the human's only interaction today is `hold.py answer <id> --a "merge"` on a chat-rendered
-diff.
+**Why:** the human's only interaction today is `hold.py answer <id> --token <tok> --a "merge"` on a
+chat-rendered diff.
 
 **Steal concretely:** hook plannotator into the Hold step when `HERDR_ENV=1` — annotate the
 consolidated plan before the maker spawns (a plan gate this repo doesn't currently have), and annotate

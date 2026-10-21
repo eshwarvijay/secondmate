@@ -442,6 +442,17 @@ EOF
     [ "$rc" -eq "$wrc" ] || bad "exit $rc (wanted $wrc) from: $0 $*"
   }
 
+  # mkhold <hold.py hold args...> -> sets MK_ID/MK_TOK from hold.py's real two-line `hold` stdout
+  # (id, then "token: TOK") -- never a reimplementation of that shape, just reading it like any
+  # real caller would, so $ledger-scoped hold creation below still exercises the genuine CLI output.
+  mkhold() {
+    local out
+    out="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold "$@" 2>/dev/null)" || return 1
+    MK_ID="$(printf '%s\n' "$out" | sed -n '1p')"
+    MK_TOK="$(printf '%s\n' "$out" | sed -n '2p')"
+    MK_TOK="${MK_TOK#token: }"
+  }
+
   ledger="$t/decisions.jsonl"
   # Structural isolation guard, part 2: the round-trip ledger must live inside
   # this selfcheck's own throwaway dir; anything else is a hard failure.
@@ -449,11 +460,11 @@ EOF
     "$t"/*) ;;
     *) printf 'selfcheck FAIL: scratch ledger escaped its scratch dir: %s\n' "$ledger" >&2; exit 4 ;;
   esac
-  hid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task rt-task --q "rt question?" --sha abc123 2>/dev/null)" \
-    || bad "scratch hold creation failed"
+  mkhold --task rt-task --q "rt question?" --sha abc123 || bad "scratch hold creation failed"
+  hid="$MK_ID"; hidtok="$MK_TOK"
 
   rw "$ledger" 0 --timeout 0 --interval 1
-  [ "$(cat "$ofile")" = "[$hid] (rt-task) rt question?" ] \
+  [ "$(cat "$ofile")" = "[$hid] (rt-task) rt question?   token: $hidtok" ] \
     || bad "watch stdout must be the hold's exact rendered anchor line -- got: $(cat "$ofile")"
 
   rw "$ledger" 0 --task rt-task --timeout 0
@@ -463,7 +474,7 @@ EOF
   head -n 1 "$ofile" | grep -q '^NO-HOLD:' \
     || bad "timeout must print one NO-HOLD line on stdout -- got: $(cat "$ofile")"
 
-  SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" answer "$hid" --a ok --sha abc123 >/dev/null 2>&1 \
+  SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" answer "$hid" --token "$hidtok" --a ok --sha abc123 >/dev/null 2>&1 \
     || bad "scratch answer failed"
   rw "$ledger" 3 --timeout 0  # an answered hold is no longer open: ordinary no-match
 
@@ -472,8 +483,8 @@ EOF
   printf '```json\n{"verdict":"pass","findings":[]}\n```\n' >"$vfile"
   entries="$t/entries.json"
   printf '[{"task_id":"batch-x","checked_sha":"sha-x","checker_verdict_path":"%s"}]' "$vfile" >"$entries"
-  bid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task batch-1 --q "merge batch?" --entries-file "$entries" 2>/dev/null)" \
-    || bad "scratch batch hold creation failed"
+  mkhold --task batch-1 --q "merge batch?" --entries-file "$entries" || bad "scratch batch hold creation failed"
+  bid="$MK_ID"
   rw "$ledger" 0 --task batch-1 --timeout 0
   [ "$(wc -l <"$ofile")" -eq 2 ] \
     || bad "batch block must be exactly anchor + 1 sub-line -- got $(wc -l <"$ofile") line(s)"
@@ -483,29 +494,33 @@ EOF
 
   # a real multi-line --q round-trip (round-5 finding 1): hold.py puts --q verbatim into the
   # ledger, so open renders the anchor across lines; the watcher must report the FULL block
-  mlid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task rt-multi --q $'line one\nline two' --sha cc 2>/dev/null)" \
-    || bad "scratch multi-line hold creation failed"
+  mkhold --task rt-multi --q $'line one\nline two' --sha cc || bad "scratch multi-line hold creation failed"
+  mlid="$MK_ID"; mlidtok="$MK_TOK"
   rw "$ledger" 0 --task rt-multi --timeout 0
-  want_rt="[$mlid] (rt-multi) line one"$'\n'"line two"
+  want_rt="[$mlid] (rt-multi) line one"$'\n'"line two   token: $mlidtok"
   [ "$(cat "$ofile")" = "$want_rt" ] \
     || bad "multi-line question round-trip must print the block with its continuation line -- got: $(cat "$ofile")"
 
   # a real WARNING-shaped question continuation round-trip (round-6 finding 1): the hold's own
   # question text that starts a line with WARNING: must stay in the printed block, never be
   # reclassified as fake corruption noise on stderr
-  wqid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task warnq --q $'real question\nWARNING: is this a corruption line?' --sha dd 2>/dev/null)" \
+  mkhold --task warnq --q $'real question\nWARNING: is this a corruption line?' --sha dd \
     || bad "scratch WARNING-question hold creation failed"
+  wqid="$MK_ID"; wqidtok="$MK_TOK"
   rw "$ledger" 0 --task warnq --timeout 0
-  want_wq="[$wqid] (warnq) real question"$'\n'"WARNING: is this a corruption line?"
+  want_wq="[$wqid] (warnq) real question"$'\n'"WARNING: is this a corruption line?   token: $wqidtok"
   [ "$(cat "$ofile")" = "$want_wq" ] \
     || bad "WARNING-shaped continuation round-trip: the full block must include the WARNING question line -- got: $(cat "$ofile")"
   grep -q "is this a corruption line" "$err" \
     && bad "the WARNING-shaped question line must NOT be routed to stderr as fake corruption"
 
   # a real anchor-shaped question continuation round-trip (round-6 finding 1, ACCEPTED
-  # AMBIGUITY): asserted end-to-end per the documented truncation behavior
-  aqid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task anchorq --q $'before the fake\n[fake-hold] (fake-task) still question text' --sha ee 2>/dev/null)" \
+  # AMBIGUITY): asserted end-to-end per the documented truncation behavior. hold.py's token suffix
+  # lands on the LAST physical line it prints (the fake-anchor line itself, here), which this
+  # truncation discards anyway -- the retained "before the fake" line is unaffected by it.
+  mkhold --task anchorq --q $'before the fake\n[fake-hold] (fake-task) still question text' --sha ee \
     || bad "scratch anchor-question hold creation failed"
+  aqid="$MK_ID"
   rw "$ledger" 0 --task anchorq --timeout 0
   [ "$(cat "$ofile")" = "[$aqid] (anchorq) before the fake" ] \
     || bad "anchor-shaped continuation round-trip: documented truncation behavior -- got: $(cat "$ofile")"
@@ -514,10 +529,11 @@ EOF
   # corruption PREFIX but continues as ordinary text must stay in the printed block (round 6's
   # loose prefix shape misrouted it; only the full emission shape incl. the fixed em-dash
   # suffix, end-anchored, is a corruption candidate)
-  wsid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task warning-shape --q $'question begins\nWARNING: 42 malformed line(s) in this is human question text' --sha ff 2>/dev/null)" \
+  mkhold --task warning-shape --q $'question begins\nWARNING: 42 malformed line(s) in this is human question text' --sha ff \
     || bad "scratch warning-shape hold creation failed"
+  wsid="$MK_ID"; wsidtok="$MK_TOK"
   rw "$ledger" 0 --task warning-shape --timeout 0
-  want_ws="[$wsid] (warning-shape) question begins"$'\n'"WARNING: 42 malformed line(s) in this is human question text"
+  want_ws="[$wsid] (warning-shape) question begins"$'\n'"WARNING: 42 malformed line(s) in this is human question text   token: $wsidtok"
   [ "$(cat "$ofile")" = "$want_ws" ] \
     || bad "warning-shape round-trip: the plausible-prefix question line must stay in the block -- got: $(cat "$ofile")"
   grep -q "this is human question text" "$err" \
@@ -525,23 +541,32 @@ EOF
 
   # round-7 position rule: a FULL-shape line that is NOT open's last line is provably question
   # text (hold.py's corruption marker is always the LAST line)
-  fsid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task fullshape --q $'before\nWARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.\nafter' --sha gg 2>/dev/null)" \
+  mkhold --task fullshape --q $'before\nWARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.\nafter' --sha gg \
     || bad "scratch fullshape hold creation failed"
+  fsid="$MK_ID"; fsidtok="$MK_TOK"
   rw "$ledger" 0 --task fullshape --timeout 0
-  want_fs="[$fsid] (fullshape) before"$'\n'"WARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually."$'\n'"after"
+  want_fs="[$fsid] (fullshape) before"$'\n'"WARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually."$'\n'"after   token: $fsidtok"
   [ "$(cat "$ofile")" = "$want_fs" ] \
     || bad "full-shape + NOT-last: position proves question text -- got: $(cat "$ofile")"
 
-  # round-7 RESIDUAL DOCUMENTED AMBIGUITY (same class as the anchor collision): full shape AND
-  # the very last line of the output -- byte- and position-identical to a real corruption
-  # marker; documented behavior: corruption classification wins (stderr, truncated block)
-  lsid="$(SM_HOLD_LEDGER="$ledger" python3 "$HOLD_PY" hold --task lastline --q $'before\nWARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.' --sha hh 2>/dev/null)" \
+  # round-7's RESIDUAL DOCUMENTED AMBIGUITY (full shape AND the very last line of the output,
+  # byte-identical to the real corruption marker) is RESOLVED by the token suffix added in this
+  # change: hold.py's own corruption marker (printed separately by `open`, never carrying a token)
+  # stays byte-exact, but every hold's own anchor/continuation text now always ends in
+  # "   token: ..." -- so a question whose last line reproduces the corruption shape no longer
+  # byte-matches CORRUPT_RE's end anchor, and is unambiguously kept as question text.
+  mkhold --task lastline --q $'before\nWARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.' --sha hh \
     || bad "scratch lastline hold creation failed"
+  lsid="$MK_ID"; lsidtok="$MK_TOK"
   rw "$ledger" 0 --task lastline --timeout 0
-  [ "$(cat "$ofile")" = "[$lsid] (lastline) before" ] \
-    || bad "lastline ambiguity: documented corruption-wins truncation -- got: $(cat "$ofile")"
-  grep -q "ledger may be corrupt" "$err" \
-    || bad "lastline ambiguity: the byte-identical line must be forwarded as corruption"
+  want_ls="[$lsid] (lastline) before"$'\n'"WARNING: 42 malformed line(s) in whatever — ledger may be corrupt; reconcile manually.   token: $lsidtok"
+  # the exact-match stdout assertion above is the full proof here: a misclassified-as-corruption
+  # line would have truncated stdout to just "[$lsid] (lastline) before" and forwarded the WARNING
+  # line to stderr instead -- no separate $err check is needed (and one keyed on this same literal
+  # substring would be confused by the UNRELATED skipped "fullshape" hold's own non-last WARNING
+  # line, which legitimately still hits stderr while its block is skipped by this --task filter).
+  [ "$(cat "$ofile")" = "$want_ls" ] \
+    || bad "lastline: the token suffix breaks the byte-match with the corruption marker, so this must stay in the block as question text -- got: $(cat "$ofile")"
 
   rw "$ledger" 3 --task batch --timeout 0  # substring of the batch task ('batch' vs 'batch-1'): no-match
 

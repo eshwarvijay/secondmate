@@ -33,8 +33,9 @@ Run the mandatory sequence:
    signal) and `[--cost <n>] [--tokens <n>] [--duration-seconds <n>] [--note "..."]` when already at hand
    (optional, same posture as the log-round.sh bullet above — never estimate; omit instead) — then open
    its OWN `bin/hold.py hold --task {{TASK_ID}} --q "..." --sha
-   <checked-sha>` and wait for a genuine human answer — never assume, never auto-answer, never defer that
-   judgment call to the dispatcher.
+   <checked-sha>` (prints the hold's id and its provenance token) and wait for a genuine human answer,
+   supplied as `bin/hold.py answer <id> --token <tok> --a "..."` with that exact printed token — never
+   assume, never auto-answer, never defer that judgment call to the dispatcher.
 5. Only once answered, call `bin/merge-sequencer.sh` itself with its own claimed
    `--branch`/`--worktree`/`--checked-sha` (queueing behind a sibling's concurrent merge on the same
    `--repo` is the singleton lock working as intended, not a bug).

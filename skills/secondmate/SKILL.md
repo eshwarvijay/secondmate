@@ -504,9 +504,12 @@ ponytail as a companion to install; this is not the place to install it. Same ex
    — integrate only on `PASS`. Passing `--checked-sha` is mandatory: it catches a maker pushing commits after the checker approved.
 
 6. **Hold** — every human-gate decision (merge / risky / outward-facing) is durable, not chat memory:
-   `${CLAUDE_PLUGIN_ROOT}/bin/hold.py hold --task <id> --q "..." [--opts "a|b|c"]`, acted on only after
-   `${CLAUDE_PLUGIN_ROOT}/bin/hold.py answer <id> --a "..."`. The plugin's SessionStart hook surfaces open holds
-   each session, so a restart never drops a pending gate — reconcile any it reports before new work.
+   `${CLAUDE_PLUGIN_ROOT}/bin/hold.py hold --task <id> --q "..." [--opts "a|b|c"]` prints the hold's id and
+   its provenance token, acted on only after
+   `${CLAUDE_PLUGIN_ROOT}/bin/hold.py answer <id> --token <tok> --a "..."`. `--token` is REQUIRED — copy it
+   from `hold`/`open`/`next`'s own output; a missing or wrong token is rejected. The plugin's SessionStart
+   hook surfaces open holds (with their tokens) each session, so a restart never drops a pending gate —
+   reconcile any it reports before new work.
 
 8. **Integrate** only after a passing verdict + a `PASS` gate + an answered hold. `scout` tasks stop at a report.
 
@@ -607,8 +610,9 @@ unpolluted one). **Name the Agent-tool call `sm-<task-id>`** — never leave `na
    signal) and `[--cost <n>] [--tokens <n>] [--duration-seconds <n>] [--note "..."]` when already at hand
    (optional, same posture as the log-round.sh bullet above — never estimate; omit instead) — then open
    its OWN `bin/hold.py hold --task <task-id> --q "..." --sha
-   <checked-sha>` and wait for a genuine human answer — never assume, never auto-answer, never defer that
-   judgment call to the dispatcher.
+   <checked-sha>` (prints the hold's id and its provenance token) and wait for a genuine human answer,
+   supplied as `bin/hold.py answer <id> --token <tok> --a "..."` with that exact printed token — never
+   assume, never auto-answer, never defer that judgment call to the dispatcher.
 5. Only once answered, call `bin/merge-sequencer.sh` itself with its own claimed
    `--branch`/`--worktree`/`--checked-sha` (queueing behind a sibling's concurrent merge on the same
    `--repo` is the singleton lock working as intended, not a bug).
@@ -763,7 +767,7 @@ g. **Open ONE consolidated batch hold**, entries built from every task-id `ready
 
 h. **The answer is structured, not freeform prose:**
    ```
-   ${CLAUDE_PLUGIN_ROOT}/bin/hold.py answer <hold-id> --approve "<task-id>,<task-id>,..." --reject "<task-id>,..."
+   ${CLAUDE_PLUGIN_ROOT}/bin/hold.py answer <hold-id> --token <tok> --approve "<task-id>,<task-id>,..." --reject "<task-id>,..."
    # every task-id in the batch's own entries must appear in exactly one of --approve/--reject.
    ```
 

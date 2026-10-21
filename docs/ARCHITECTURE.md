@@ -229,7 +229,11 @@ actually progresses — a same-process tracking aid local to its own run, distin
    `hold.py hold`, resolved only by `hold.py answer`. A SessionStart hook surfaces open holds at the start of
    every session. `hold`/`answer` accept an optional `--sha` that binds a decision (and its id) to the exact
    commit the human was shown; `answer` then must supply a matching `--sha`, so an approval can't be silently
-   reattached to a different, later commit. `hold.py next` hands back exactly one oldest-still-open decision
+   reattached to a different, later commit. Every `hold` also prints a provenance **token** — a deterministic
+   hash of the hold record's own immutable fields (id, ts, task, q, sha/batch entries), re-derivable from the
+   persisted ledger record alone — surfaced again by `open`/`next` next to the hold; `answer` REQUIRES a
+   matching `--token`, so an approval can't be forged from a bare leaked/guessed id, only from the hold a
+   human actually saw. `hold.py next` hands back exactly one oldest-still-open decision
    at a time, for callers (human or future multi-task dispatcher) that need to process holds one at a time,
    in order, without racing each other over the full `open` list. A successful `answer` prints an advisory
    one-line reminder that the decision should represent a genuine human call — it cannot verify who is
@@ -237,7 +241,8 @@ actually progresses — a same-process tracking aid local to its own run, distin
    recorded incident class (`bin/audit-log.py search "self-answered"` finds it in `audit/decision/`).
    *Guards against:* a pending human decision being lost when a session dies (the human, not the agent,
    closes the gate); an approval given for one code state being silently applied to a different one that
-   landed later; multiple concurrently-open holds being answered out of order or by the wrong caller.
+   landed later; multiple concurrently-open holds being answered out of order or by the wrong caller; an
+   answer forged from nothing but a bare hold id that was read or guessed, with no real provenance behind it.
 
 7. **Integrate.** Only after `verdict == pass` and a `PASS` gate and an answered hold. `scout` tasks stop at a
    report and never reach here. When more than one sub-agent-supervisor may finish and try to integrate around
@@ -639,8 +644,9 @@ an opt-in exception. It comes in two sizes, same mechanism:
      entry carrying its own `checked_sha` (the schema EXTENSION described in the component-map row below
      — the original 1:1 `--sha` binding is not dropped, just generalized to per-entry) plus a digest
      `hold.py` itself derives from that entry's own `checker_verdict_path` — never typed fresh.
-  4. Waits for a genuine human answer, structured as `hold.py answer --approve "..." --reject "..."` —
-     every task-id in the batch classified exactly once, never freeform prose.
+  4. Waits for a genuine human answer, structured as `hold.py answer --token <tok> --approve "..."
+     --reject "..."` — the one token this batch hold printed, binding the answer to this exact batch's
+     entries (never per-entry) — every task-id in the batch classified exactly once, never freeform prose.
   5. Sequences `merge-sequencer.sh` for each APPROVED task-id only, one at a time, then tears each down
      (`herdr worktree remove`, branch delete, `claim-ledger.py release`, `teardown-check.sh` confirmation).
      A REJECTED task-id's claim, worktree, and branch are untouched — `claimed, needs rework`, resumed in

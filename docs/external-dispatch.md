@@ -231,6 +231,11 @@ sub-supervisor — that opens the one consolidated hold instead, via `--entries-
 collecting every ready task-id (see SKILL.md's "Batch dispatch" step (g)); `bin/hold.py open` still
 prints it, just shaped as one question covering every task-id in the batch rather than one `--sha`.
 
+Every hold also carries a provenance **token** — a deterministic hash of the hold record's own
+immutable fields, printed by `hold`/`open`/`next` next to the hold itself. `bin/hold.py answer`
+REQUIRES `--token <tok>` (copied from whatever surfaced the hold); a missing or wrong token is
+rejected outright, so an answer can never be forged from a bare leaked/guessed id alone.
+
 ### Hold watchdog (`bin/hold-watch.sh`)
 
 **Committed on sibling branch `sm/add-hold-watch-script`, pending merge.** A detection-only,
