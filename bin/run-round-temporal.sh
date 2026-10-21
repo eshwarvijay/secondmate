@@ -440,8 +440,16 @@ Start every invocation — first round, fix round, or restart — with this chec
 BOILERPLATE_EOF
   local round_state_file="${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"
   local feature_list_file="${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}}/feature-list.json"
-  [ -f "$round_state_file" ] && { echo '--- Previous round handoff ---'; cat "$round_state_file"; }
-  [ -f "$feature_list_file" ] && { echo '--- Feature list ---'; cat "$feature_list_file"; }
+  # [round-1 checker, CONFIRMED] printf '%s\n' <subst>, never a bare `cat` -- the command
+  # substitution strips whatever trailing newlines the source file does or doesn't have, and
+  # printf's own literal \n then guarantees exactly one newline separates this section from
+  # whatever follows (the next header, or the real lesson-lookup.py output below), regardless of
+  # the file's own trailing-newline status. A bare `cat` glues straight into the next section when
+  # the file lacks a final newline -- SKILL.md's own command-substitution template never had this
+  # problem because its `echo` before each `cat` always appended one; this direct-cat conversion
+  # had silently dropped that implicit separator.
+  [ -f "$round_state_file" ] && { echo '--- Previous round handoff ---'; printf '%s\n' "$(cat "$round_state_file")"; }
+  [ -f "$feature_list_file" ] && { echo '--- Feature list ---'; printf '%s\n' "$(cat "$feature_list_file")"; }
   if [ -n "$task_id" ]; then
     "$SCRIPT_DIR/lesson-lookup.py" --task "$goal" --task-id "$task_id"
   else
@@ -612,13 +620,34 @@ cmd_round() {
   # accepts a comma-separated list in one flag; NAME resolves to bin/lenses/<NAME>.md. Lands in
   # checker_goal_full ONLY -- never maker_prompt_full, never the bare checker_goal used verbatim in
   # the commit message (see _commit_round_changes).
-  local _lens_group _lens_names _lens_name _lens_file _lens_content
+  # Real path of bin/lenses itself, resolved once -- the root every candidate lens file must stay
+  # confined under. Same cd+pwd -P idiom this script already uses for the --run-dir vs --bridge-dir
+  # containment check above (not realpath -- staying consistent with this script's own existing
+  # idiom for this exact class of check, not introducing a second one).
+  local _lenses_dir_real
+  _lenses_dir_real="$(cd "$SCRIPT_DIR/lenses" 2>/dev/null && pwd -P)" || _lenses_dir_real=""
+  local _lens_group _lens_names _lens_name _lens_file _lens_content _lens_unknown_msg _lens_file_dir_real
   for _lens_group in "${lenses[@]:-}"; do
     [ -n "$_lens_group" ] || continue
     IFS=',' read -ra _lens_names <<< "$_lens_group"
     for _lens_name in "${_lens_names[@]}"; do
       _lens_file="$SCRIPT_DIR/lenses/$_lens_name.md"
-      [ -f "$_lens_file" ] || { echo "unknown lens: $_lens_name (looked for $_lens_file). Available: $( (cd "$SCRIPT_DIR/lenses" 2>/dev/null && find . -name '*.md' ! -name 'ROUTER.md' | sed 's|^\./||;s|\.md$||') | tr '\n' ' ')" >&2; return 2; }
+      _lens_unknown_msg="unknown lens: $_lens_name (looked for $_lens_file). Available: $( (cd "$SCRIPT_DIR/lenses" 2>/dev/null && find . -name '*.md' ! -name 'ROUTER.md' | sed 's|^\./||;s|\.md$||') | tr '\n' ' ')"
+      [ -f "$_lens_file" ] || { echo "$_lens_unknown_msg" >&2; return 2; }
+      # [round-1 checker, CONFIRMED] a bare [ -f ] existence check alone is bypassable: "..".
+      # segments in $_lens_name walk the STRING path straight out of bin/lenses/ before that check
+      # ever runs, so any file that exists ANYWHERE on disk passes. Resolve the candidate's real
+      # containing directory (through any ".." segments or symlinks) and confirm it is still
+      # actually under the real lenses dir before ever cat-ing it -- mirrors
+      # bin/lesson-lookup.py's own _resolve_lesson_path (.resolve() + .relative_to()), in bash.
+      _lens_file_dir_real="$(cd "$(dirname "$_lens_file")" 2>/dev/null && pwd -P)" || _lens_file_dir_real=""
+      if [ -z "$_lenses_dir_real" ] || [ -z "$_lens_file_dir_real" ]; then
+        echo "$_lens_unknown_msg" >&2; return 2
+      fi
+      case "$_lens_file_dir_real" in
+        "$_lenses_dir_real"|"$_lenses_dir_real"/*) : ;;
+        *) echo "$_lens_unknown_msg" >&2; return 2 ;;
+      esac
       _lens_content="$(cat "$_lens_file")"
       checker_goal_full="$checker_goal_full"$'\n\n'"You are being evaluated against the named lens '$_lens_name'. If your envelope includes a lens_coverage field, report this lens by this exact string."$'\n\n'"$_lens_content"
     done
@@ -901,6 +930,49 @@ assert "QA sub-lens: coverage" in checker_goal, "lens file content missing from 
 assert "named lens" in checker_goal and "qa/coverage" in checker_goal, "lens_coverage instruction missing from checker goal"
 assert "QA sub-lens: coverage" not in maker_prompt, "lens content leaked into maker prompt"
 ' || { echo "FAIL: --lens content/lens_coverage instruction not correctly wired into checker_goal_full (and kept out of maker_prompt)"; fails=1; }
+
+  # --- [Defect 1, round-1 checker, CONFIRMED] a path-traversal --lens must exit 2 as "unknown
+  # lens", never succeed -- checker's exact repro: a real file OUTSIDE bin/lenses/ (here, a fresh
+  # mktemp -d sibling to this repo, not under it) reached via enough "../" segments to escape
+  # bin/lenses/ entirely. A bare [ -f ] existence check alone passed this (any file that exists
+  # ANYWHERE on disk passed); the real fix resolves the candidate's real containing directory and
+  # confirms it is still actually under the real lenses dir. ---
+  local trav_dir; trav_dir="$(mktemp -d)"
+  local trav_marker="TRAVERSAL-PAYLOAD-$$"
+  echo "$trav_marker" > "$trav_dir/evil-lens.md"
+  # Sized dynamically off SCRIPT_DIR's own path depth (plus margin), never a fixed guess -- however
+  # deep this checkout happens to sit, this many "../" is guaranteed to reach the filesystem root
+  # (excess ".." beyond root is simply a no-op), then descend into the real absolute $trav_dir.
+  local _trav_depth=$(( $(echo "$SCRIPT_DIR/lenses" | tr -cd '/' | wc -c) + 5 ))
+  local _trav_dots="" _trav_i
+  for ((_trav_i=0; _trav_i<_trav_depth; _trav_i++)); do _trav_dots="${_trav_dots}../"; done
+  local trav_lens="${_trav_dots}${trav_dir}/evil-lens"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --lens "$trav_lens" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens exit $rc (want 2)"; fails=1; }
+  echo "$out" | grep -q 'unknown lens:' || { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens did not produce the unknown-lens message"; fails=1; }
+  echo "$out" | grep -qF "$trav_marker" && { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens payload landed in the assembled prompt"; fails=1; }
+  rm -rf "$trav_dir"
+
+  # --- [Defect 2, round-1 checker, CONFIRMED] a round-state.md with NO trailing newline must not
+  # glue into whatever follows it (the real bin/lesson-lookup.py output, since no feature-list.json
+  # exists in this fixture) -- checker's exact repro: SM_LOOP_STATE pointing at a dir whose
+  # round-state.md is exactly "HANDOFF-WITHOUT-FINAL-NEWLINE", byte-for-byte, no trailing newline. ---
+  local nl_dir; nl_dir="$(mktemp -d)"
+  printf 'HANDOFF-WITHOUT-FINAL-NEWLINE' > "$nl_dir/round-state.md"
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 SM_LOOP_STATE="$nl_dir" "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" 2>&1)" \
+    || { echo "FAIL: dryrun with a no-trailing-newline round-state.md errored"; fails=1; }
+  echo "$out" | python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines()
+start = lines.index("PLAN:") + 1
+end = next(i for i, l in enumerate(lines) if l.startswith("WOULD RUN:"))
+plan = json.loads("\n".join(lines[start:end]))
+maker_prompt = plan["steps"][0]["params"]["prompt"]
+assert "HANDOFF-WITHOUT-FINAL-NEWLINE## Known failure patterns" not in maker_prompt, "round-state.md content glued directly into the next section with no newline separator"
+assert "HANDOFF-WITHOUT-FINAL-NEWLINE\n" in maker_prompt, "round-state.md content not followed by a newline before the next section"
+' || { echo "FAIL [Defect 2, CRITICAL]: missing-trailing-newline round-state.md was not newline-separated from the following section"; fails=1; }
+  rm -rf "$nl_dir"
 
   # --- SM_TEMPORAL_FETCH_TIMEOUT_SECONDS must be rejected the instant it's read (module scope),
   # same class of bug as --max-seconds/--max-cost-cents: a non-numeric value would silently defeat
