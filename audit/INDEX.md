@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 59 total)
+## Recent flow (orchestration mechanics) entries (15 of 60 total)
 
-- 2026-09-30 — delegate-default-flip: flip secondmate's default so any triggered task dispatches to a fresh sub-agent-supervisor, ne... (`audit/flow/2026-09-30--delegate-default-flip.md`)
 - 2026-09-30 — loop-harness-upgrades: feature-list.json ledger (P1) + premature-victory guard (P2) + startup checklist (P3) in maker... (`audit/flow/2026-09-30--loop-harness-upgrades.md`)
 - 2026-09-30 — maker-prompt-guardrails: test-tampering + git-hygiene guardrails added to Maker prompt closing boilerplate (`audit/flow/2026-09-30--maker-prompt-guardrails.md`)
 - 2026-09-30 — session-staleness-check: wire doctor.sh's staleness detection into a SessionStart hook (`audit/flow/2026-09-30--session-staleness-check.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-12 — pi-maker-thinking-max: flip pi maker --thinking medium -> max, empirically verified, 2 human-driven interventions on... (`audit/flow/2026-10-12--pi-maker-thinking-max.md`)
 - 2026-10-13 — fix-banner-thinking-wording: sync stale pi-maker routing wording in session-activate.sh banner to SKILL.md (`audit/flow/2026-10-13--fix-banner-thinking-wording.md`)
 - 2026-10-21 — temporal-herdr-visible-flag: --herdr-task-id flag threads bridge's herdr-visible mode into run-round-temporal.sh (`audit/flow/2026-10-21--temporal-herdr-visible-flag.md`)
+- 2026-10-21 — temporal-wrapper-prompt-parity: closed gaps 3/5 fully, gap 4 text-parity with an honest headless-ponytail asymmetry (`audit/flow/2026-10-21--temporal-wrapper-prompt-parity.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 57 total)
+## Recent decision (choices, findings, escalations) entries (15 of 58 total)
 
-- 2026-09-30 — Fold fan-out into the standard path; fix a real HERDR_ENV-conditional spawn bug the checker caught in round 1 (`audit/decision/2026-09-30--delegate-default-flip.md`)
 - 2026-09-30 — Reuse round-state.md's write idiom for feature-list.json, decline new bin/script; independently re-verify hold answer... (`audit/decision/2026-09-30--loop-harness-upgrades.md`)
 - 2026-09-30 — Shell-safe prose over the plan's own drop-in draft; no automated enforcement, human-approved merge (`audit/decision/2026-09-30--maker-prompt-guardrails.md`)
 - 2026-09-30 — Advisory-only SessionStart staleness surfacing; reuse doctor.sh detection unchanged (`audit/decision/2026-09-30--session-staleness-check.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-12 — pi-maker-thinking-max: shipped max (not high) per empirical trials; hold answer and merge-permission block both indep... (`audit/decision/2026-10-12--pi-maker-thinking-max.md`)
 - 2026-10-13 — fix-banner-thinking-wording: literal-match selfcheck fix (grep -qF) caught by checker round 1, 2 rounds total (`audit/decision/2026-10-13--fix-banner-thinking-wording.md`)
 - 2026-10-21 — temporal-herdr-visible-flag: 2 legit checker findings fixed, 1 pre-existing out-of-scope; human-approved merge; live-... (`audit/decision/2026-10-21--temporal-herdr-visible-flag.md`)
+- 2026-10-21 — temporal-wrapper-prompt-parity: two real path/symlink-confinement bugs caught+fixed across 3 rounds; merge hold answe... (`audit/decision/2026-10-21--temporal-wrapper-prompt-parity.md`)
