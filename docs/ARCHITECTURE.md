@@ -200,9 +200,18 @@ actually progresses — a same-process tracking aid local to its own run, distin
    replacement — the default headless path (neither flag given) still refuses exactly as before. The
    maker's real edits land in the bridge's own `herdr-task-<ID>` worktree, not necessarily `--repo` —
    only correct when `--repo` IS that same worktree, a dispatcher convention this script documents but
-   does not enforce. See SKILL.md's "Opt-in alternate engine: Temporal" subsection for the full writeup
-   and the named v1 gaps (no round-state.md/feature-list.json/ponytail/lesson-injection parity, no
-   `--lens` support, `--max-cost-cents` is a post-hoc warning only).
+   does not enforce. Every maker prompt this wrapper builds is now unconditionally closed with the same
+   round-state.md/feature-list.json continuity + conduct rules + startup checklist SKILL.md's own
+   "Maker prompt closing boilerplate" documents, plus a ponytail-at-**ultra**-intensity loading
+   instruction (a correction versus that section's own default wording) and this round's real
+   `bin/lesson-lookup.py` output (an optional `--task-id` threads through to that script's own flag).
+   The ponytail instruction is genuinely inert on the plain headless maker branch (no Skill tool there)
+   and only actionable on the herdr-visible branch (`--herdr-task-id` given) — injected uniformly
+   either way. `--lens NAME` now mirrors `launch-checker.sh`'s own `--lens`, landing lens content plus
+   a `lens_coverage`-reporting instruction into the checker step's goal text only. See SKILL.md's
+   "Opt-in alternate engine: Temporal" subsection for the full writeup and the remaining v1 gap:
+   `--max-cost-cents` is still a post-hoc warning only (a model call already in flight can't be
+   preempted from outside the bridge's own activity code).
 
 5. **Gate.** Before anything integrates, `verify-gate.sh` re-derives ground truth from the worktree: clean
    tree, non-empty diff vs base, tests green, and the **exact commit the checker reviewed still equals HEAD**
