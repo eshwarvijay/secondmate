@@ -68,7 +68,7 @@ usage() {
 # that script's real output, exercised directly in --selfcheck below, not reinvented here.
 _build_task_json() {  # _build_task_json <task_id> <rounds_file> <seed_rounds_file>
   python3 -c '
-import json, sys
+import json, math, sys
 
 task_id, rounds_file, seed_rounds_file = sys.argv[1], sys.argv[2], sys.argv[3]
 
@@ -88,13 +88,6 @@ def fail(msg):
 def _reject_nonstandard_json_constant(token):
     raise ValueError(f"non-standard JSON constant {token!r} is not valid JSON -- Go encoding/json rejects it")
 
-def strict_json_load(path, what):
-    try:
-        with open(path) as f:
-            return json.load(f, parse_constant=_reject_nonstandard_json_constant)
-    except ValueError as e:
-        fail(f"could not parse {what} as strict, Go-compatible JSON: {e}")
-
 # [CONFIRMED finding 1, checker round 4] the real bridge Plan.Round/Plan.SchemaVersion fields are
 # Go int -- 64-bit signed on every realistic deployment target -- so a JSON integer outside
 # [-2**63, 2**63-1] (Python int is arbitrary-precision and happily parses it) would validate here
@@ -108,6 +101,51 @@ GO_INT64_MAX = 2 ** 63 - 1
 def is_go_int(value):
     # bool is a subclass of int in Python -- isinstance(True, int) is True -- excluded explicitly.
     return isinstance(value, int) and not isinstance(value, bool) and GO_INT64_MIN <= value <= GO_INT64_MAX
+
+# [CONFIRMED finding 1+2, checker round 5] round 4 only point-fixed two specific spots (schema_
+# version/round for oversized ints; params for the NaN/Infinity CONSTANT TOKENS) -- the SAME class
+# of bug still escapes through any OTHER field: an arbitrarily-nested params value
+# (params.x, params.n.deep, ...), a top-level criteria field, a future field, or anything inside
+# seed_rounds, since none of those were individually enumerated. This ONE generic walker replaces
+# point-fixing a growing list of named fields: it recurses over an ARBITRARY parsed JSON value --
+# dict, list, or scalar, any nesting depth -- and fails on anything the real bridge own Go
+# encoding/json could never actually unmarshal: a non-finite float (NaN/Infinity/-Infinity --
+# reachable not only via the non-standard constant TOKENS parse_constant below already catches, but
+# also via an ordinary JSON float LITERAL like 1e999, which Python own float() silently overflows
+# to inf with no error at all), or an int outside the Go int64 range. bool is deliberately exempted
+# -- isinstance(True, int) is True in Python, but flagging a bool as an oversized int would
+# conflate two unrelated concerns; that distinction is already handled correctly elsewhere
+# (is_go_int above), not this walker job. Folded into strict_json_load itself (below) so BOTH
+# loaders -- rounds-file and seed-rounds-file -- get it from the one call site, automatically, over
+# their ENTIRE parsed content, not as a second scattered check someone has to remember to add.
+def _check_go_compatible_value(value, path):
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            fail(f"{path} is a non-finite number ({value!r}) -- Go encoding/json cannot represent NaN/Infinity/-Infinity")
+        return
+    if isinstance(value, int):
+        if not (GO_INT64_MIN <= value <= GO_INT64_MAX):
+            fail(f"{path} is an integer outside the Go int64 range (got {value!r})")
+        return
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _check_go_compatible_value(v, f"{path}.{k}")
+        return
+    if isinstance(value, list):
+        for idx, v in enumerate(value):
+            _check_go_compatible_value(v, f"{path}[{idx}]")
+        return
+
+def strict_json_load(path, what):
+    try:
+        with open(path) as f:
+            data = json.load(f, parse_constant=_reject_nonstandard_json_constant)
+    except ValueError as e:
+        fail(f"could not parse {what} as strict, Go-compatible JSON: {e}")
+    _check_go_compatible_value(data, what)
+    return data
 
 rounds = strict_json_load(rounds_file, "--rounds-file")
 
@@ -502,6 +540,46 @@ SEED_EOF
   echo '[{"steps":[],"done":true,"cost_usd":NaN}]' > "$nan_seed_file"
   rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$nan_seed_file" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 4]: NaN inside --seed-rounds-file exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 1+2, checker round 5] round 4's fixes only covered two NAMED fields
+  # (schema_version/round for oversized ints, params for the NaN/Infinity constant tokens). The
+  # generic walker (_check_go_compatible_value, folded into strict_json_load) must catch the SAME
+  # class anywhere else in the document -- an arbitrarily-nested params value, a field this
+  # validator never names (criteria), and seed_rounds. These are the checker's own exact repros,
+  # plus two adversarial cases of our own in a spot the checker did not mention (nested inside
+  # seed_rounds.steps) to prove the walker is genuinely generic, not another enumerated list.
+  local nested_oversized_int_file="$t/rounds-nested-oversized-int.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{"x":9223372036854775808}}]}]' > "$nested_oversized_int_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$nested_oversized_int_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 5]: oversized int nested in params.x exit $rc (want 2)"; fails=1; }
+
+  local deeply_nested_oversized_int_file="$t/rounds-deeply-nested-oversized-int.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{"n":{"deep":9223372036854775808}}}]}]' > "$deeply_nested_oversized_int_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$deeply_nested_oversized_int_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 5]: oversized int two levels deep in params.n.deep exit $rc (want 2)"; fails=1; }
+
+  local oversized_int_seed_file="$t/seed-oversized-int.json"
+  echo '[{"steps":[],"done":true,"x":9223372036854775808}]' > "$oversized_int_seed_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$oversized_int_seed_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 5]: oversized int in a seed_rounds field this validator never names exit $rc (want 2)"; fails=1; }
+
+  local scientific_inf_criteria_file="$t/rounds-1e999-criteria.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","criteria":1e999,"steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$scientific_inf_criteria_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$scientific_inf_criteria_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 5]: 1e999 (a float LITERAL overflowing to inf, not the NaN/Infinity constant TOKEN) in criteria exit $rc (want 2)"; fails=1; }
+
+  # adversarial, not named by the checker: nested inside seed_rounds[].steps[], several levels
+  # down, inside an array -- proving the walker is a genuine generic recursion, not a list of
+  # specifically-anticipated field names.
+  local adversarial_seed_nested_int_file="$t/seed-adversarial-nested-int.json"
+  echo '[{"steps":[{"step_id":"s1","nested":{"arr":[1,2,{"x":9223372036854775808}]}}],"done":true}]' > "$adversarial_seed_nested_int_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$adversarial_seed_nested_int_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 5, adversarial]: oversized int nested inside seed_rounds[].steps[].nested.arr[] exit $rc (want 2)"; fails=1; }
+
+  local adversarial_seed_nested_inf_file="$t/seed-adversarial-nested-inf.json"
+  echo '[{"steps":[{"step_id":"s1","cost_breakdown":{"items":[{"amount":1e999}]}}],"done":true}]' > "$adversarial_seed_nested_inf_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$adversarial_seed_nested_inf_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 5, adversarial]: 1e999 nested inside seed_rounds[].steps[].cost_breakdown.items[] exit $rc (want 2)"; fails=1; }
 
   # [CONFIRMED finding 2, checker round 3] a step with NO params field at all is a bridge-VALID
   # Plan shape (Step.Params is `map[string]any `json:"params,omitempty"``, and the bridge's own
