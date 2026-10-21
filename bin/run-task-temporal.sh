@@ -76,11 +76,40 @@ def fail(msg):
     print(msg, file=sys.stderr)
     sys.exit(2)
 
-try:
-    with open(rounds_file) as f:
-        rounds = json.load(f)
-except Exception as e:
-    fail(f"could not parse --rounds-file as JSON: {e}")
+# [CONFIRMED finding 2, checker round 4] Go encoding/json flatly rejects NaN/Infinity/-Infinity as
+# invalid JSON ("invalid character N looking for beginning of value"); Python json module
+# permissively accepts and even round-trips these non-standard tokens through json.dumps. A params
+# value (or anything else, anywhere in the document) containing one of these would validate here
+# and then be unusable -- not even parseable -- by the real bridge. parse_constant intercepts these
+# tokens STRUCTURALLY, at parse time, at every nesting depth in one pass -- not a recursive walk
+# over the result that could miss a level. Shared by BOTH loaders below (rounds-file and
+# seed-rounds-file), the single fix point the checker asked for, so a third sibling "Python accepts
+# more than Go" gap does not need its own scattered fix later.
+def _reject_nonstandard_json_constant(token):
+    raise ValueError(f"non-standard JSON constant {token!r} is not valid JSON -- Go encoding/json rejects it")
+
+def strict_json_load(path, what):
+    try:
+        with open(path) as f:
+            return json.load(f, parse_constant=_reject_nonstandard_json_constant)
+    except ValueError as e:
+        fail(f"could not parse {what} as strict, Go-compatible JSON: {e}")
+
+# [CONFIRMED finding 1, checker round 4] the real bridge Plan.Round/Plan.SchemaVersion fields are
+# Go int -- 64-bit signed on every realistic deployment target -- so a JSON integer outside
+# [-2**63, 2**63-1] (Python int is arbitrary-precision and happily parses it) would validate here
+# and then be rejected by the real bridge own encoding/json unmarshal ("cannot unmarshal number ...
+# into Go struct field"). Shared helper, used for both fields below, so schema_version stays
+# protected even though it is pinned to exactly 1 today -- if that pin is ever loosened, the bound
+# is already there.
+GO_INT64_MIN = -(2 ** 63)
+GO_INT64_MAX = 2 ** 63 - 1
+
+def is_go_int(value):
+    # bool is a subclass of int in Python -- isinstance(True, int) is True -- excluded explicitly.
+    return isinstance(value, int) and not isinstance(value, bool) and GO_INT64_MIN <= value <= GO_INT64_MAX
+
+rounds = strict_json_load(rounds_file, "--rounds-file")
 
 if not isinstance(rounds, list) or len(rounds) == 0:
     fail("--rounds-file must be a non-empty JSON array of Plan objects")
@@ -88,16 +117,16 @@ if not isinstance(rounds, list) or len(rounds) == 0:
 for i, p in enumerate(rounds):
     if not isinstance(p, dict):
         fail(f"rounds[{i}] is not a JSON object")
-    # bool is a subclass of int in Python -- isinstance(True, int) is True -- so every numeric
-    # check below excludes bool explicitly, not just checks isinstance(..., int). schema_version
-    # must be the literal int 1: the only value run-round-temporal own oracle Plan JSON (the
-    # one real, proven producer of this shape in this repo) ever emits.
     sv = p.get("schema_version")
-    if not isinstance(sv, int) or isinstance(sv, bool) or sv != 1:
+    if not is_go_int(sv):
+        fail(f"rounds[{i}].schema_version must be an int within the Go int64 range (got {sv!r})")
+    if sv != 1:
         fail(f"rounds[{i}].schema_version must be the literal int 1 (got {sv!r})")
     rnd = p.get("round")
-    if not isinstance(rnd, int) or isinstance(rnd, bool) or rnd < 1:
-        fail(f"rounds[{i}].round must be a non-bool int >= 1 (got {rnd!r})")
+    if not is_go_int(rnd):
+        fail(f"rounds[{i}].round must be an int within the Go int64 range (got {rnd!r})")
+    if rnd < 1:
+        fail(f"rounds[{i}].round must be >= 1 (got {rnd!r})")
     goal = p.get("goal")
     if not isinstance(goal, str) or goal == "":
         fail(f"rounds[{i}].goal must be a non-empty string (got {goal!r})")
@@ -129,11 +158,7 @@ for i, p in enumerate(rounds):
 task = {"task_id": task_id, "rounds": rounds}
 
 if seed_rounds_file:
-    try:
-        with open(seed_rounds_file) as f:
-            seed_rounds = json.load(f)
-    except Exception as e:
-        fail(f"could not parse --seed-rounds-file as JSON: {e}")
+    seed_rounds = strict_json_load(seed_rounds_file, "--seed-rounds-file")
     if not isinstance(seed_rounds, list):
         fail("--seed-rounds-file must be a JSON array of Evidence objects")
     for i, e in enumerate(seed_rounds):
@@ -424,6 +449,59 @@ SEED_EOF
   echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"dup","kind":"maker","params":{}},{"id":"dup","kind":"checker","params":{}}]}]' > "$dup_id_file"
   rc=0; "$0" task --task-id "x" --rounds-file "$dup_id_file" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: duplicate step ids within one round exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 1, checker round 4] the real bridge Plan.Round field is a Go int (64-bit
+  # signed on every realistic target) -- a round value one past Go's int64 max must be rejected,
+  # not silently accepted and emitted into an artifact the bridge could not actually unmarshal.
+  local oversized_round_file="$t/rounds-oversized-round.json"
+  echo '[{"schema_version":1,"round":9223372036854775808,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$oversized_round_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$oversized_round_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 4]: round one past Go int64 max (2^63) exit $rc (want 2)"; fails=1; }
+
+  # the negative side of the same bound must also be rejected (one past Go int64 min).
+  local undersized_round_file="$t/rounds-undersized-round.json"
+  echo '[{"schema_version":1,"round":-9223372036854775809,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$undersized_round_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$undersized_round_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 4]: round one past Go int64 min (-2^63-1) exit $rc (want 2)"; fails=1; }
+
+  # the exact Go int64 boundary values themselves ARE otherwise-valid magnitudes (schema_version
+  # pins round to >=1 anyway, but the BOUND check itself must not off-by-one reject a value that is
+  # genuinely still in range) -- schema_version given at the exact max must still only fail on the
+  # separate "!= 1" check, never on the range check, proving the range comparison is inclusive.
+  local max_schema_version_file="$t/rounds-max-schema-version.json"
+  echo '[{"schema_version":9223372036854775807,"round":1,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$max_schema_version_file"
+  rc=0; out="$("$0" task --task-id "x" --rounds-file "$max_schema_version_file" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: schema_version at exact Go int64 max exit $rc (want 2)"; fails=1; }
+  echo "$out" | grep -q 'within the Go int64 range' && { echo "FAIL [CONFIRMED finding 1, round 4]: schema_version at the exact Go int64 max boundary was wrongly rejected by the RANGE check (off-by-one) instead of the separate != 1 check"; fails=1; }
+
+  # [CONFIRMED finding 2, checker round 4] NaN/Infinity/-Infinity are non-standard JSON extensions
+  # Python permissively accepts (and round-trips); Go encoding/json flatly rejects them as invalid
+  # JSON -- the validated artifact would not even be parseable by the bridge. Three probe points:
+  # inside params (where the checker's exact repro landed), deeply nested two levels further down
+  # (proving the structural parse-time fix, not a recursive walk that could miss a level), and in a
+  # field this validator does not otherwise even inspect (criteria) -- proving the fix covers the
+  # WHOLE document, not just the fields this script happens to validate.
+  local nan_in_params_file="$t/rounds-nan-params.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{"x":NaN}}]}]' > "$nan_in_params_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$nan_in_params_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 4]: NaN inside params exit $rc (want 2)"; fails=1; }
+
+  local inf_nested_file="$t/rounds-inf-nested.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"maker","params":{"nested":{"deep":[1,2,{"x":Infinity}]}}}]}]' > "$inf_nested_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$inf_nested_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 4]: Infinity two levels deep inside params exit $rc (want 2)"; fails=1; }
+
+  local neg_inf_criteria_file="$t/rounds-neginf-criteria.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","criteria":-Infinity,"steps":[{"id":"s1","kind":"maker","params":{}}]}]' > "$neg_inf_criteria_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$neg_inf_criteria_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 4]: -Infinity in criteria (a field this validator never inspects by name) exit $rc (want 2 -- the fix must cover the whole document, not just validated fields)"; fails=1; }
+
+  # the same NaN rejection must apply to --seed-rounds-file too -- same shared strict-load helper,
+  # not a second, possibly-forgotten copy of the fix.
+  local nan_seed_file="$t/seed-nan.json"
+  echo '[{"steps":[],"done":true,"cost_usd":NaN}]' > "$nan_seed_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$nan_seed_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 4]: NaN inside --seed-rounds-file exit $rc (want 2)"; fails=1; }
 
   # [CONFIRMED finding 2, checker round 3] a step with NO params field at all is a bridge-VALID
   # Plan shape (Step.Params is `map[string]any `json:"params,omitempty"``, and the bridge's own
