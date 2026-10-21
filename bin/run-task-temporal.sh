@@ -115,8 +115,13 @@ for i, p in enumerate(rounds):
             fail(f"rounds[{i}].steps[{j}].id must be a non-empty string (got {sid!r})")
         if not isinstance(kind, str) or kind == "":
             fail(f"rounds[{i}].steps[{j}].kind must be a non-empty string (got {kind!r})")
-        if not isinstance(params, dict):
-            fail(f"rounds[{i}].steps[{j}].params must be an object (got {params!r})")
+        # [CONFIRMED finding 2, checker round 3] the real bridge Step.Params field is
+        # map[string]any with a json omitempty tag -- the bridge own TaskWorkflow test uses a step
+        # with NO params field at all as a valid Plan. An absent key (s.get returns None) or an
+        # explicit JSON null (also None) must be treated as an empty object, not rejected. Only
+        # reject params when it is PRESENT and actually the wrong type (a string, array, or number).
+        if params is not None and not isinstance(params, dict):
+            fail(f"rounds[{i}].steps[{j}].params, when present, must be an object (got {params!r})")
         if sid in seen_ids:
             fail(f"rounds[{i}].steps[{j}].id {sid!r} is a duplicate within this round -- step ids must be unique per round")
         seen_ids.add(sid)
@@ -214,10 +219,27 @@ _selfcheck() {
   # to already exist on disk (e.g. this very repo's own .secondmate/round-state.md), which can itself
   # contain the literal substring "seed_rounds" in ordinary prose -- confirmed live, this leaked into
   # the oracle's maker_prompt and produced a false FAIL on the (e) seed_rounds-absence check below.
+  #
+  # Every SM_TEMPORAL_* var run-round-temporal.sh's own header/module-scope reads is ALSO pinned
+  # here, not just SM_TEMPORAL_DRYRUN (which must stay "1" -- that's what makes this an oracle dry-
+  # run at all). A prior fix only cleared SM_TEMPORAL_DRYRUN and still left this same class of bug
+  # open for its siblings: SM_TEMPORAL_FETCH_TIMEOUT_SECONDS is validated at that script's own
+  # MODULE SCOPE, unconditionally, before cmd_round's dry-run branch ever runs -- so a non-numeric
+  # ambient value (e.g. inherited from a shell that was just debugging the sibling script) made
+  # `_oracle_plan` fail with exit 2 regardless of DRYRUN, confirmed live. SM_TEMPORAL_GO_BIN/
+  # SM_TEMPORAL_GO_DOWNLOAD_CACHE are read later inside cmd_round and never actually reached before
+  # the dry-run branch returns today, but are pinned anyway on the same "don't whack-a-mole one
+  # variable at a time" principle the checker named -- this oracle call's behavior must be fully
+  # independent of the calling shell's ambient env, not just immune to today's one known trigger.
+  # (SM_TEMPORAL_FAKE_BRIDGE_BIN and friends are deliberately excluded: run-round-temporal.sh's own
+  # security hardening proves those names are never read at all, by design -- pinning them here
+  # would be pinning nothing.)
   local oracle_state_dir; oracle_state_dir="$(mktemp -d)"
   _oracle_plan() {  # _oracle_plan <round> <goal>
     local round="$1" goal="$2" oracle_out
-    oracle_out="$(HERDR_ENV="" SM_LOOP_STATE="$oracle_state_dir" SM_TEMPORAL_DRYRUN=1 "$SCRIPT_DIR/run-round-temporal.sh" round --repo "$t" --checker-goal "$goal" --maker-prompt "do it" --round "$round" 2>/dev/null)" || return 1
+    oracle_out="$(HERDR_ENV="" SM_LOOP_STATE="$oracle_state_dir" SM_TEMPORAL_DRYRUN=1 \
+      SM_TEMPORAL_GO_BIN="" SM_TEMPORAL_GO_DOWNLOAD_CACHE="" SM_TEMPORAL_FETCH_TIMEOUT_SECONDS="" \
+      "$SCRIPT_DIR/run-round-temporal.sh" round --repo "$t" --checker-goal "$goal" --maker-prompt "do it" --round "$round" 2>/dev/null)" || return 1
     echo "$oracle_out" | python3 -c '
 import json, sys
 lines = sys.stdin.read().splitlines()
@@ -403,6 +425,27 @@ SEED_EOF
   rc=0; "$0" task --task-id "x" --rounds-file "$dup_id_file" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1]: duplicate step ids within one round exit $rc (want 2)"; fails=1; }
 
+  # [CONFIRMED finding 2, checker round 3] a step with NO params field at all is a bridge-VALID
+  # Plan shape (Step.Params is `map[string]any `json:"params,omitempty"``, and the bridge's own
+  # TaskWorkflow test uses exactly this no-params shape) -- must assemble successfully, exit 0.
+  local no_params_file="$t/rounds-no-params.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"noop"}]}]' > "$no_params_file"
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" task --task-id "x" --rounds-file "$no_params_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL [CONFIRMED finding 2, round 3]: step with no params field at all exit $rc (want 0 -- this is a bridge-valid Plan shape, omitempty)"; fails=1; }
+
+  # explicit JSON null for params must be treated the same as absent -- still valid, exit 0.
+  local null_params_file="$t/rounds-null-params.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"noop","params":null}]}]' > "$null_params_file"
+  rc=0; SM_TEMPORAL_DRYRUN=1 "$0" task --task-id "x" --rounds-file "$null_params_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 0 ] || { echo "FAIL [CONFIRMED finding 2, round 3]: step with params:null exit $rc (want 0, same as absent)"; fails=1; }
+
+  # but params, when PRESENT, must still be rejected if it is the wrong type (e.g. a string) --
+  # the fix only relaxes the absent/null case, it must not have gone too far the other way.
+  local wrong_type_params_file="$t/rounds-wrong-type-params.json"
+  echo '[{"schema_version":1,"round":1,"goal":"g","steps":[{"id":"s1","kind":"noop","params":"not-an-object"}]}]' > "$wrong_type_params_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$wrong_type_params_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2, round 3]: step with params given as a string exit $rc (want 2 -- present-but-wrong-type must still be rejected)"; fails=1; }
+
   # [CONFIRMED finding 2, checker round 1] a seed_rounds[] entry with done given as a non-bool
   # (a Python str, not a real bool) must be rejected, exit 2 -- not echoed straight into TASK_INPUT.
   local bad_done_seed_file="$t/seed-bad-done.json"
@@ -420,6 +463,21 @@ SEED_EOF
     rc=0
     SM_TEMPORAL_DRYRUN=1 _SM_SELFCHECK_NESTED=1 "$0" --selfcheck >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || { echo "FAIL [CONFIRMED finding 3]: --selfcheck run under an inherited SM_TEMPORAL_DRYRUN=1 exited $rc (want 0) -- its own sub-tests must be hermetic against the calling shell's ambient env"; fails=1; }
+  fi
+
+  # [CONFIRMED finding 1, checker round 3] the SM_TEMPORAL_DRYRUN-only fix above was too narrow --
+  # _oracle_plan's own call into run-round-temporal.sh also inherited SIBLING SM_TEMPORAL_* vars
+  # from the calling shell (SM_TEMPORAL_FETCH_TIMEOUT_SECONDS is validated at that script's own
+  # module scope, unconditionally, so a non-numeric ambient value broke the oracle call regardless
+  # of DRYRUN). This exports SEVERAL of them at once (not just the one variable the checker named),
+  # to prove the fix closes the whole class rather than being hammered back into a single-variable
+  # whack-a-mole fix. Same recursion guard as the check above, reused rather than duplicated.
+  if [ "${_SM_SELFCHECK_NESTED:-}" != 1 ]; then
+    rc=0
+    SM_TEMPORAL_FETCH_TIMEOUT_SECONDS="not-a-number" SM_TEMPORAL_GO_BIN="/nonexistent-go-xyz-$$" \
+      SM_TEMPORAL_GO_DOWNLOAD_CACHE="/nonexistent-cache-xyz-$$" _SM_SELFCHECK_NESTED=1 \
+      "$0" --selfcheck >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 0 ] || { echo "FAIL [CONFIRMED finding 1, round 3]: --selfcheck run under several polluted ambient SM_TEMPORAL_* vars (FETCH_TIMEOUT_SECONDS/GO_BIN/GO_DOWNLOAD_CACHE) exited $rc (want 0) -- the oracle call must pin every SM_TEMPORAL_* var run-round-temporal.sh reads, not just SM_TEMPORAL_DRYRUN"; fails=1; }
   fi
 
   rm -rf "$t" "$oracle_state_dir"
