@@ -213,6 +213,32 @@ actually progresses — a same-process tracking aid local to its own run, distin
    `--max-cost-cents` is still a post-hoc warning only (a model call already in flight can't be
    preempted from outside the bridge's own activity code).
 
+   **Whole-task assembly, build-and-validate only (no live submission):** `bin/run-task-temporal.sh
+   task` is a separate, zero-coupled sibling for a WHOLE multi-round task rather than one round. It
+   assembles and validates a `TaskInput` JSON payload (`{task_id, rounds: []Plan, seed_rounds?:
+   []Evidence}`) shaped for the bridge prototype's `internal/planrun.TaskWorkflow` — a child-per-round
+   parent workflow with a deterministic `task-<id>` WorkflowID via `StartTask` and
+   `REJECT_DUPLICATE` conflict policy. `--rounds-file F` takes an array of already-built Plan objects
+   (the same shape `run-round-temporal.sh`'s own dry-run produces — reused here purely as a
+   validation oracle, never rebuilt, so there are two independent sources of the Plan shape only by
+   coincidence, not by design); round order is array position only, with no explicit index field.
+   `--seed-rounds-file F` is optional and Evidence-shaped, omitted from the assembled payload entirely
+   when absent or empty. `--task-id ID` reuses `run-round-temporal.sh`'s own `--herdr-task-id`
+   charset/length rule verbatim. **Live submission into `TaskWorkflow` is a structural impossibility
+   today, not a risk to accept with a flag** — confirmed by direct reading of the read-only bridge
+   dependency: `cmd/bridge/main.go`'s `worker` subcommand registers only `planrun.PlanWorkflow` (never
+   `TaskWorkflow`); its `submit` subcommand hardcodes `c.ExecuteWorkflow(ctx, opts,
+   planrun.PlanWorkflow, plan)` with no flag to target `TaskWorkflow` instead; and `internal/planrun`
+   is Go-`internal`, so nothing outside the bridge module can call `StartTask` directly either. So the
+   real (non-dry-run) path always writes the validated TaskInput JSON to a durable artifact file,
+   prints that path as a hand-off, and then unconditionally refuses with exit `1` — every time, no
+   override, before any subprocess that could resemble a bridge build/worker/submit call (there is
+   none in this script at all). It deliberately does NOT loop N `run-round-temporal.sh`/`PlanWorkflow`
+   calls as a fake stand-in for `TaskWorkflow`: that would silently drop the one thing a parent
+   workflow actually buys — durable grouping of every round under one `task-<id>` workflow — while
+   looking like it works. Closing this gap for real needs `cmd/bridge/main.go` changes in the bridge
+   repo itself, out of scope here.
+
 5. **Gate.** Before anything integrates, `verify-gate.sh` re-derives ground truth from the worktree: clean
    tree, non-empty diff vs base, tests green, and the **exact commit the checker reviewed still equals HEAD**
    (`--checked-sha`).
