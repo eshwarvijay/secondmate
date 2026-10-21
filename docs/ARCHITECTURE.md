@@ -186,18 +186,23 @@ actually progresses — a same-process tracking aid local to its own run, distin
    `launch-checker.sh`'s stdout normally would — no other call site or script changes. This is a
    documented alternate branch, not a new default stage: nothing routes here unless a dispatcher opts in
    per round. **Refuses outright under `HERDR_ENV=1`** unless `--i-accept-headless-autonomous-risk` is
-   explicitly given: the bridge's checker activity has no herdr-observable lifecycle at all (a bare
-   headless subprocess, not a live interruptible session a human could watch or intervene on), and its
-   maker activity auto-accepts Bash commands with zero intervention opportunity — strictly MORE
-   autonomous than this repo's own normal `--permission-mode auto` maker path, not merely less visible.
-   Running the wrapper itself inside a herdr pane does not fix either gap; a known, deliberate
-   limitation of the underlying bridge prototype's own design (bare subprocess calls, not herdr-aware),
-   not something this wrapper can close by itself without editing the read-only bridge dependency —
-   a separate task (task-id `bridge-herdr-visible-activities`) is already targeting the bridge itself
-   for this, so the limitation is pending that work landing, not indefinite. See SKILL.md's "Opt-in
-   alternate engine: Temporal" subsection for the full writeup and the named v1 gaps
-   (no round-state.md/feature-list.json/ponytail/lesson-injection parity, no `--lens` support,
-   `--max-cost-cents` is a post-hoc warning only).
+   explicitly given, OR `--herdr-task-id ID` is given instead: the bridge's checker activity has no
+   herdr-observable lifecycle at all (a bare headless subprocess, not a live interruptible session a
+   human could watch or intervene on), and its maker activity auto-accepts Bash commands with zero
+   intervention opportunity — strictly MORE autonomous than this repo's own normal
+   `--permission-mode auto` maker path, not merely less visible. Running the wrapper itself inside a
+   herdr pane does not fix either gap. The bridge has since landed a real, opt-in herdr-visible mode
+   for its maker/checker activities (`internal/planrun/maker.go`'s `runMakerStepHerdr`, `checker.go`'s
+   `runCheckerStepHerdr`): a plan step's non-empty, validated `params.herdr_task_id` routes it to a
+   real interactive pane instead, closing both gaps for that round. `--herdr-task-id ID` (validated by
+   this script itself against the bridge's own `sanitizeTaskID` charset/length rule, exit 2 on a bad
+   value) threads that id into both plan steps and is an ADDED THIRD BRANCH on the guard, not a
+   replacement — the default headless path (neither flag given) still refuses exactly as before. The
+   maker's real edits land in the bridge's own `herdr-task-<ID>` worktree, not necessarily `--repo` —
+   only correct when `--repo` IS that same worktree, a dispatcher convention this script documents but
+   does not enforce. See SKILL.md's "Opt-in alternate engine: Temporal" subsection for the full writeup
+   and the named v1 gaps (no round-state.md/feature-list.json/ponytail/lesson-injection parity, no
+   `--lens` support, `--max-cost-cents` is a post-hoc warning only).
 
 5. **Gate.** Before anything integrates, `verify-gate.sh` re-derives ground truth from the worktree: clean
    tree, non-empty diff vs base, tests green, and the **exact commit the checker reviewed still equals HEAD**
