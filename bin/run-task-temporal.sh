@@ -182,9 +182,15 @@ _selfcheck() {
   git -C "$t" init -q -b main; git -C "$t" config user.email a@a; git -C "$t" config user.name a
   echo seed > "$t/f"; git -C "$t" add -A; git -C "$t" commit -qm seed
 
+  # SM_LOOP_STATE pinned at an always-empty, freshly-made directory for every oracle call: without
+  # this, run-round-temporal.sh's own _maker_boilerplate splices in whatever round-state.md happens
+  # to already exist on disk (e.g. this very repo's own .secondmate/round-state.md), which can itself
+  # contain the literal substring "seed_rounds" in ordinary prose -- confirmed live, this leaked into
+  # the oracle's maker_prompt and produced a false FAIL on the (e) seed_rounds-absence check below.
+  local oracle_state_dir; oracle_state_dir="$(mktemp -d)"
   _oracle_plan() {  # _oracle_plan <round> <goal>
     local round="$1" goal="$2" oracle_out
-    oracle_out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$SCRIPT_DIR/run-round-temporal.sh" round --repo "$t" --checker-goal "$goal" --maker-prompt "do it" --round "$round" 2>/dev/null)" || return 1
+    oracle_out="$(HERDR_ENV="" SM_LOOP_STATE="$oracle_state_dir" SM_TEMPORAL_DRYRUN=1 "$SCRIPT_DIR/run-round-temporal.sh" round --repo "$t" --checker-goal "$goal" --maker-prompt "do it" --round "$round" 2>/dev/null)" || return 1
     echo "$oracle_out" | python3 -c '
 import json, sys
 lines = sys.stdin.read().splitlines()
@@ -246,14 +252,19 @@ goals = [r["goal"] for r in task["rounds"]]
 assert goals == ["round-C", "round-A", "round-B"], f"rounds[] order not preserved byte-for-byte: {goals}"
 ' || { echo "FAIL [CRITICAL]: rounds[] array order was not preserved byte-for-byte under a shuffled input"; fails=1; }
 
-  # (e) seed_rounds omitted when absent/empty, present + Evidence-shaped when given
+  # (e) seed_rounds omitted when absent/empty, present + Evidence-shaped when given. Matches the
+  # literal JSON KEY form (quoted, with its colon), never a bare substring: a maker prompt embedded
+  # inside a rounds[] entry can legitimately contain the word "seed_rounds" in ordinary prose (e.g.
+  # this very selfcheck's own round-state.md handoff describes this flag) without that meaning the
+  # TaskInput actually carries a seed_rounds KEY -- confirmed live, a bare substring grep false-
+  # failed on exactly that.
   out="$(SM_TEMPORAL_DRYRUN=1 "$0" task --task-id "selfcheck-task" --rounds-file "$rounds_file" 2>&1)"
-  echo "$out" | grep -q 'seed_rounds' && { echo "FAIL: seed_rounds must be omitted entirely when --seed-rounds-file is not given"; fails=1; }
+  echo "$out" | grep -q '"seed_rounds"' && { echo "FAIL: seed_rounds must be omitted entirely when --seed-rounds-file is not given"; fails=1; }
 
   local empty_seed_file="$t/seed-empty.json"
   echo '[]' > "$empty_seed_file"
   out="$(SM_TEMPORAL_DRYRUN=1 "$0" task --task-id "selfcheck-task" --rounds-file "$rounds_file" --seed-rounds-file "$empty_seed_file" 2>&1)"
-  echo "$out" | grep -q 'seed_rounds' && { echo "FAIL: seed_rounds must be omitted entirely when --seed-rounds-file is an empty array"; fails=1; }
+  echo "$out" | grep -q '"seed_rounds"' && { echo "FAIL: seed_rounds must be omitted entirely when --seed-rounds-file is an empty array"; fails=1; }
 
   local seed_file="$t/seed.json"
   cat > "$seed_file" <<'SEED_EOF'
@@ -303,7 +314,7 @@ SEED_EOF
   sed -n '/^cmd_task() {$/,/^_selfcheck() {$/p' "$0" | grep -qE '"\$.*bridge"|bridge submit|bridge worker|bridge fetch' \
     && { echo "FAIL [CRITICAL]: cmd_task contains a literal bridge-binary invocation -- the refusal must be unconditional, with zero code path that could ever call a real bridge binary"; fails=1; }
 
-  rm -rf "$t"
+  rm -rf "$t" "$oracle_state_dir"
 
   # (i) bin/run-round-temporal.sh must remain byte-for-byte unchanged from its committed HEAD -- this
   # task's own success condition, checked structurally against git itself, not a guess.
