@@ -1015,8 +1015,10 @@ membership check (`in_batch=0` for `foreign1`) correctly dropped it while still 
 genuine `mine1`; (3) **first-ever ready task-id, no prior hold at all** — a fresh batch with no
 hold ever opened correctly surfaced its one ready task-id, confirming the switch away from the
 deleted cache didn't regress the ordinary, no-history case; (4) **reject → restart → excluded** —
-opened a real batch hold for `t1@aaa111`, rejected it via the real `hold.py answer --reject`, then
-re-ran this exact filter on a simulated restart: `entries_task_ids` correctly came back empty;
+opened a real batch hold for `t1@aaa111`, rejected it via the real `hold.py answer --reject` (this
+confirmation predates the `--token` requirement added later — see the batch-answer recipe above for
+today's syntax), then re-ran this exact filter on a simulated restart: `entries_task_ids` correctly
+came back empty;
 (5) **reject → rework (new `checked_sha`) → restart → resurfaced** — recorded a NEW
 `verify_gate_pass` row for `t1` at a genuinely different `checked_sha` and re-ran the identical
 filter: `t1` correctly reappeared, confirming the exclusion is scoped to the exact rejected
@@ -1068,17 +1070,21 @@ hold_output=$(bin/hold.py open) || rc_open=$?
   top of an unresolved failure.
 - **`rc_open` is `0`** — `hold.py open` succeeded (confirmed live: it exits `0` even when it finds
   zero open holds, printing `(no open decisions)` to stderr). Only now is it safe to search its
-  captured output for a match. `hold.py open`'s own output format is `[<id>] (<task>) <question>`
-  per open hold — a known, fixed shape (strip the leading `[`, take everything up to the first
-  `]`), simple enough to extract with pure bash parameter expansion instead of an external-tool
-  pipeline (`grep`/`head`/`sed`), eliminating the whole class of "what if `sed`/`head` itself fails
-  unexpectedly" findings rather than adding another `rc=$?` branch for yet another tool:
+  captured output for a match. `hold.py open`'s own output format is `[<id>] (<task>) <question>
+  ... token: <tok>` per open hold — a known, fixed shape (strip the leading `[`, take everything up
+  to the first `]` for the id; take everything after the last `token: ` for the provenance token
+  REQUIRED on the eventual `answer`), simple enough to extract with pure bash parameter expansion
+  instead of an external-tool pipeline (`grep`/`head`/`sed`), eliminating the whole class of "what
+  if `sed`/`head` itself fails unexpectedly" findings rather than adding another `rc=$?` branch for
+  yet another tool:
   ```bash
   existing_id=""
+  existing_tok=""
   while IFS= read -r line; do
     if [[ "$line" == "["*"] (<batch-label>)"* ]]; then
       existing_id="${line#\[}"      # strip the leading "["
       existing_id="${existing_id%%\]*}"  # keep everything before the first "]"
+      existing_tok="${line##*token: }"  # everything after the last "token: " on this anchor line
       break
     fi
   done <<< "$hold_output"
@@ -1086,8 +1092,9 @@ hold_output=$(bin/hold.py open) || rc_open=$?
   No external tool runs in this extraction at all — `[[ ... ]]` and `${...}` are bash builtins, so
   there is no second exit code to capture or classify here; the only exit code that mattered was
   `hold.py open`'s own, already handled above. Confirmed live against the real
-  `[dcfa5ec7] (batch-abc123) merge which of: t1?` output shape: correctly extracted `dcfa5ec7` when
-  the batch label matched, and correctly left `existing_id` empty when no line matched.
+  `[dcfa5ec7] (batch-abc123) merge which of: t1?   token: 9f1c2a7b3e8d4a10` output shape: correctly
+  extracted `dcfa5ec7` and `9f1c2a7b3e8d4a10` when the batch label matched, and correctly left
+  `existing_id`/`existing_tok` empty when no line matched.
 
 - **A matching open hold is found** (`$existing_id` is non-empty) — reuse its id; do NOT call
   `hold.py hold` again. Just keep waiting for a human to answer that existing hold.
@@ -1101,10 +1108,12 @@ hold_output=$(bin/hold.py open) || rc_open=$?
 bin/hold.py hold --task "$batch_id" --q "merge which of: <task-id-1>, <task-id-2>, ...?" \
   --entries-file "$entries_file"
 ```
-Wait for a genuine human answer; never self-answer. The answer is structured, not freeform prose,
+Wait for a genuine human answer; never self-answer. `--token` is REQUIRED on this `answer` call — the
+provenance token `hold.py hold` just printed (or `existing_tok`, if an existing open hold was reused
+above); a missing or wrong token is rejected outright. The answer is structured, not freeform prose,
 and must cover every entry in exactly one list:
 ```bash
-bin/hold.py answer <hold-id> --approve "<id>,<id>,..." --reject "<id>,..."
+bin/hold.py answer <hold-id> --token <tok> --approve "<id>,<id>,..." --reject "<id>,..."
 ```
 
 **Edge case: zero task-ids reached `SM_READY_UNMERGED` (exit 4).** If every task-id in the batch

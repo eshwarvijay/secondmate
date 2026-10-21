@@ -2,7 +2,10 @@
 # ponytail: append-only JSONL ledger. Move to sqlite only if you ever get concurrent supervisor writers.
 """hold.py -- durable human-gate decisions for the maker/checker loop.
 
-  hold.py hold --task T --q "question" [--opts "a|b|c"] [--sha SHA] -> prints new id, records an OPEN decision
+  hold.py hold --task T --q "question" [--opts "a|b|c"] [--sha SHA] -> prints new id + its provenance
+                                                                        token on the next line (see
+                                                                        "Provenance token" below), records
+                                                                        an OPEN decision
   hold.py hold --task T --q "question" --entries-file PATH          -> a CONSOLIDATED BATCH hold: one genuine
                                                                         human decision covering several task-ids
                                                                         at once (see "Batch holds" below), instead
@@ -10,15 +13,30 @@
                                                                         Mutually exclusive with --sha (a batch
                                                                         hold's per-task-id checked-shas live in
                                                                         its own entries instead).
-  hold.py answer ID --a "the decision" [--sha SHA]                  -> closes a single-task hold
-  hold.py answer ID --approve "id1,id2" --reject "id3,id4"          -> closes a BATCH hold: every task-id in the
+  hold.py answer ID --token TOK --a "the decision" [--sha SHA]      -> closes a single-task hold. TOK is this
+                                                                        hold's own provenance token, shown by
+                                                                        `hold`/`open`/`next` next to this exact
+                                                                        hold -- required on every answer.
+  hold.py answer ID --token TOK --approve "id1,id2" --reject "id3,id4"
+                                                                     -> closes a BATCH hold: every task-id in the
                                                                         hold's own entries must appear in exactly
                                                                         one of --approve/--reject (structured, not
                                                                         freeform prose a caller would have to
                                                                         regex out of a decision string)
   hold.py open                                                      -> lists unanswered (RUN AT SUPERVISOR START)
   hold.py next                                                      -> prints only the single oldest open decision
-  hold.py selfcheck                                                 -> asserts the open-fold and SHA-binding are correct
+  hold.py selfcheck                                                 -> asserts the open-fold, SHA-binding, and
+                                                                        provenance-token are correct
+
+Provenance token -- REQUIRED on every `answer`: proves the answer is bound to the specific hold record
+that was actually surfaced to a human (via `hold`/`open`/`next`), not just knowledge of the hold's bare
+id -- anything that can read or guess an 8-char id could otherwise forge an approval today, with no
+audit trail of the forgery. The token is a deterministic hash of the hold record's OWN immutable fields
+already in the ledger at creation time (id, ts, task, q, and sha/batch entries when present) -- never a
+random value stored only in memory or shown once, so it can always be re-derived by reading the
+persisted ledger record alone (zero migration concern: `answer` can recompute the expected token for
+any hold, old or new, on demand). This is NOT an identity check -- it does not prove a specific human
+typed it, only that the answer is bound to the exact record that was surfaced, not a leaked/guessed id.
 
 Ledger path: $SM_HOLD_LEDGER, else ./decisions.jsonl in the CWD (one ledger per orchestration repo).
 Nothing falls through a restart: `hold.py open` reconciles from disk, never from chat memory.
@@ -201,6 +219,36 @@ def _mkid(task, q, ts, sha=""):
     return hashlib.sha1(f"{task}{q}{ts}{sha}{os.urandom(4).hex()}".encode()).hexdigest()[:8]
 
 
+def _token(rec):
+    """Deterministic provenance token for a hold record: a hash of ONLY fields already persisted in
+    the ledger at hold-creation time (id, ts, task, q, sha, and batch entries if present). Never a
+    stored secret -- any process that can read this record's own ledger line can always recompute the
+    same token, so a Temporal retry (or anyone re-deriving it from an old ledger) never needs a
+    separately-stored value, and there is nothing to backfill for pre-existing holds. Not an identity
+    check: it proves the answer is bound to THIS exact persisted record, not that a human typed it."""
+    batch = rec.get("batch")
+    payload = {
+        "id": rec["id"], "ts": rec.get("ts", ""), "task": rec.get("task", ""), "q": rec.get("q", ""),
+        "sha": rec.get("sha", ""),
+        "batch": sorted(
+            ({"task_id": e["task_id"], "checked_sha": e["checked_sha"], "digest": e["digest"]} for e in batch),
+            key=lambda e: e["task_id"]
+        ) if batch else None,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _render_anchor(r):
+    # single rendering path shared by `open` and `next` -- hold-watch.sh's own parsing contract
+    # depends on both emitting byte-identical anchor lines for the same hold.
+    opts = r.get("opts") or []
+    line = f"[{r['id']}] ({r.get('task', '?')}) {r.get('q', '?')}"
+    if opts:
+        line += f"   opts: {', '.join(opts)}"
+    line += f"   token: {_token(r)}"
+    return line
+
+
 def _dupes(items):
     """Items appearing more than once in `items`, preserving nothing about order -- used to reject a
     batch answer's --approve/--reject lists outright rather than silently deduping them via a set."""
@@ -244,43 +292,92 @@ def _selfcheck_live():
     orig_ledger = LEDGER
     tmpdir = tempfile.mkdtemp(prefix="hold-selfcheck-")
     LEDGER = pathlib.Path(tmpdir) / "decisions.jsonl"
+    def mk(argv):
+        # test-only helper: run a real `hold` CLI call and split its own two-line stdout shape
+        # (id, then "token: TOK") into (code, id, token, exc) -- never a reimplementation of what
+        # `hold` prints, just parsing it the same way a real caller reading its stdout would.
+        code, out, exc = _run(argv)
+        if code != 0:
+            return code, None, None, exc
+        lines = out.splitlines()
+        return code, lines[0], lines[1][len("token: "):], exc
+
     try:
         # a hold created with --sha X can be validly answered with --sha X.
-        code, did, _ = _run(["hold", "--task", "t", "--q", "ready to merge?", "--sha", "deadbeef"])
+        code, did, tok, _ = mk(["hold", "--task", "t", "--q", "ready to merge?", "--sha", "deadbeef"])
         assert code == 0, "hold with --sha should succeed"
-        code, out, _ = _run(["answer", did, "--a", "merge", "--sha", "deadbeef"])
-        assert code == 0, "answer with matching --sha should succeed"
+        code, out, _ = _run(["answer", did, "--token", tok, "--a", "merge", "--sha", "deadbeef"])
+        assert code == 0, "answer with matching --sha and a correct token should succeed"
         assert did in {r["id"] for r in _recs() if r["ev"] == "answer"}, "matching-sha answer did not close the hold"
         assert "REMINDER" in out and "human" in out.lower(), "successful answer must print the genuine-human-decision reminder"
 
         # the same hold cannot be answered with a DIFFERENT --sha: must fail, must not append a record.
-        code, did2, _ = _run(["hold", "--task", "t", "--q", "ready to merge (again)?", "--sha", "aaaa111"])
+        code, did2, tok2, _ = mk(["hold", "--task", "t", "--q", "ready to merge (again)?", "--sha", "aaaa111"])
         assert code == 0
         pre_len = len(_recs())
-        code, _, exc = _run(["answer", did2, "--a", "merge", "--sha", "bbbb222"])
+        code, _, exc = _run(["answer", did2, "--token", tok2, "--a", "merge", "--sha", "bbbb222"])
         assert code != 0, "mismatched --sha on answer must fail"
         assert "sha" in str(exc).lower(), "mismatched-sha rejection should explain why in the error"
         assert len(_recs()) == pre_len, "rejected answer must not append any (corrupting) record"
         assert did2 in {r["id"] for r in open_decisions()}, "hold must stay open after a rejected answer"
 
-        # backward compat: a hold created WITHOUT --sha can still be answered with no --sha required.
-        code, did3, _ = _run(["hold", "--task", "t", "--q", "no sha here"])
+        # backward compat: a hold created WITHOUT --sha can still be answered with no --sha required
+        # (a correct --token is still required -- that part is new, not backward-compat-exempt).
+        code, did3, tok3, _ = mk(["hold", "--task", "t", "--q", "no sha here"])
         assert code == 0
-        code, _, _ = _run(["answer", did3, "--a", "ok"])
+        code, _, _ = _run(["answer", did3, "--token", tok3, "--a", "ok"])
         assert code == 0, "answering a no-sha hold with no --sha must still work (backward compat)"
+
+        # ---- provenance token: required, deterministic, re-derivable from the ledger alone ----
+        code, tk_id, tk_tok, _ = mk(["hold", "--task", "t", "--q", "token test?"])
+        assert code == 0
+
+        # (d) the token must be independently re-derivable from the PERSISTED ledger record ALONE --
+        # read the ledger fresh off disk (never relying on any in-memory state carried across the
+        # hold/answer calls) and recompute; it must match exactly what `hold` printed.
+        persisted = next(r for r in _recs() if r["ev"] == "hold" and r["id"] == tk_id)
+        assert _token(persisted) == tk_tok, "the token must be re-derivable from the persisted ledger record alone"
+
+        # (a) a correct, re-derived token is accepted.
+        code, _, _ = _run(["answer", tk_id, "--token", tk_tok, "--a", "ok"])
+        assert code == 0, "a correct, re-derived token must be accepted"
+
+        # (b) a missing token must be rejected with a clear, distinct error -- never silently accepted,
+        # never silently falls back to the old no-token behavior.
+        code, tk_id2, _tk_tok2, _ = mk(["hold", "--task", "t", "--q", "token test 2?"])
+        assert code == 0
+        pre_len = len(_recs())
+        code, _, exc = _run(["answer", tk_id2, "--a", "ok"])
+        assert code != 0, "a missing --token must be rejected"
+        assert "token" in str(exc).lower(), "the missing-token rejection should name the problem"
+        assert len(_recs()) == pre_len, "a rejected missing-token answer must not append any record"
+
+        # (c) a token derived from a DIFFERENT hold's own fields (not just any wrong string) must be
+        # rejected, and the mismatch error must never echo the expected token value (no guessing oracle).
+        code, tk_id3, _tk_tok3, _ = mk(["hold", "--task", "t", "--q", "token test 3?"])
+        assert code == 0
+        real_tok3 = _token(next(r for r in _recs() if r["ev"] == "hold" and r["id"] == tk_id3))
+        pre_len = len(_recs())
+        code, _, exc = _run(["answer", tk_id3, "--token", tk_tok, "--a", "ok"])  # tk_tok belongs to tk_id, not tk_id3
+        assert code != 0, "a token derived from a different hold's own fields must be rejected"
+        assert "token" in str(exc).lower(), "the wrong-token rejection should name the problem"
+        assert real_tok3 not in str(exc), "a mismatch error must never echo the expected token (no guessing oracle)"
+        assert len(_recs()) == pre_len, "a rejected wrong-token answer must not append any record"
 
         # `next` returns exactly the single oldest still-open hold when several are open, and reports
         # "(no open decisions)" once none remain.
         LEDGER.write_text("")  # clean ledger for a controlled `next` scenario
         _append({"ev": "hold", "id": "n1", "ts": "2024-01-01T00:00:00", "task": "t", "q": "first", "opts": []})
         _append({"ev": "hold", "id": "n2", "ts": "2024-01-02T00:00:00", "task": "t", "q": "second", "opts": []})
+        tok_n1 = _token(next(r for r in _recs() if r["id"] == "n1"))
+        tok_n2 = _token(next(r for r in _recs() if r["id"] == "n2"))
         code, out, _ = _run(["next"])
         assert code == 0 and out.startswith("[n1]"), "next must return the single oldest open hold"
-        code, _, _ = _run(["answer", "n1", "--a", "done"])
+        code, _, _ = _run(["answer", "n1", "--token", tok_n1, "--a", "done"])
         assert code == 0
         code, out, _ = _run(["next"])
         assert code == 0 and out.startswith("[n2]"), "next must advance once the oldest hold is answered"
-        code, _, _ = _run(["answer", "n2", "--a", "done"])
+        code, _, _ = _run(["answer", "n2", "--token", tok_n2, "--a", "done"])
         assert code == 0
         code, out, _ = _run(["next"])
         assert code != 0, "next with no open holds must exit nonzero (no open decisions)"
@@ -300,8 +397,8 @@ def _selfcheck_live():
             {"task_id": "batch-a", "checked_sha": "sha-a", "checker_verdict_path": str(v_pass)},
             {"task_id": "batch-b", "checked_sha": "sha-b", "checker_verdict_path": str(v_fail)},
         ]))
-        code, bdid, _ = _run(["hold", "--task", "batch-1", "--q", "merge batch?",
-                               "--entries-file", str(entries_file)])
+        code, bdid, bdid_tok, _ = mk(["hold", "--task", "batch-1", "--q", "merge batch?",
+                                      "--entries-file", str(entries_file)])
         assert code == 0, "a well-formed --entries-file batch hold should succeed"
         brec = next(r for r in _recs() if r["ev"] == "hold" and r["id"] == bdid)
         assert "sha" not in brec, "a batch hold must not carry a single top-level sha"
@@ -324,8 +421,8 @@ def _selfcheck_live():
         entries_lens.write_text(json.dumps([
             {"task_id": "batch-lens", "checked_sha": "sha-lens", "checker_verdict_path": str(v_lens)},
         ]))
-        code, bdid_lens, _ = _run(["hold", "--task", "batch-lens-1", "--q", "merge?",
-                                    "--entries-file", str(entries_lens)])
+        code, bdid_lens, _bdid_lens_tok, _ = mk(["hold", "--task", "batch-lens-1", "--q", "merge?",
+                                                  "--entries-file", str(entries_lens)])
         assert code == 0
         brec_lens = next(r for r in _recs() if r["ev"] == "hold" and r["id"] == bdid_lens)
         assert brec_lens["batch"][0]["digest"] == (
@@ -427,34 +524,34 @@ def _selfcheck_live():
 
         # a batch hold cannot be answered with --a.
         pre_len = len(_recs())
-        code, _, exc = _run(["answer", bdid, "--a", "yes"])
+        code, _, exc = _run(["answer", bdid, "--token", bdid_tok, "--a", "yes"])
         assert code != 0, "a batch hold must reject --a"
         assert len(_recs()) == pre_len, "a rejected batch answer must not append any record"
 
         # a batch hold's answer must classify EVERY entry -- missing one is rejected.
-        code, _, exc = _run(["answer", bdid, "--approve", "batch-a"])
+        code, _, exc = _run(["answer", bdid, "--token", bdid_tok, "--approve", "batch-a"])
         assert code != 0, "an incomplete batch classification (missing batch-b) must be rejected"
         assert "batch-b" in str(exc), "the rejection should name the unclassified task-id"
 
         # an unknown task-id in --approve/--reject must be rejected.
-        code, _, exc = _run(["answer", bdid, "--approve", "batch-a,batch-b,not-in-batch"])
+        code, _, exc = _run(["answer", bdid, "--token", bdid_tok, "--approve", "batch-a,batch-b,not-in-batch"])
         assert code != 0, "an unknown task-id in --approve must be rejected"
 
         # a task-id in BOTH --approve and --reject must be rejected.
-        code, _, exc = _run(["answer", bdid, "--approve", "batch-a,batch-b", "--reject", "batch-a"])
+        code, _, exc = _run(["answer", bdid, "--token", bdid_tok, "--approve", "batch-a,batch-b", "--reject", "batch-a"])
         assert code != 0, "a task-id classified in both --approve and --reject must be rejected"
 
         # a DUPLICATE task-id WITHIN a single --approve (or --reject) list must be rejected outright --
         # never silently deduped via a set, which would corrupt an otherwise-auditable classification.
-        code, _, exc = _run(["answer", bdid, "--approve", "batch-a,batch-a", "--reject", "batch-b"])
+        code, _, exc = _run(["answer", bdid, "--token", bdid_tok, "--approve", "batch-a,batch-a", "--reject", "batch-b"])
         assert code != 0, "a duplicate task-id within --approve must be rejected"
         assert "batch-a" in str(exc), "the rejection should name the duplicated task-id"
-        code, _, exc = _run(["answer", bdid, "--approve", "batch-a", "--reject", "batch-b,batch-b"])
+        code, _, exc = _run(["answer", bdid, "--token", bdid_tok, "--approve", "batch-a", "--reject", "batch-b,batch-b"])
         assert code != 0, "a duplicate task-id within --reject must be rejected"
         assert "batch-b" in str(exc), "the rejection should name the duplicated task-id"
 
         # the real, complete classification succeeds and records structured approved/rejected lists.
-        code, out, _ = _run(["answer", bdid, "--approve", "batch-a", "--reject", "batch-b"])
+        code, out, _ = _run(["answer", bdid, "--token", bdid_tok, "--approve", "batch-a", "--reject", "batch-b"])
         assert code == 0, "a complete, non-overlapping batch classification must succeed"
         assert "1 approved" in out and "1 rejected" in out, "the reminder should summarize the split"
         arec = next(r for r in _recs() if r["ev"] == "answer" and r["id"] == bdid)
@@ -463,9 +560,9 @@ def _selfcheck_live():
         assert bdid not in {r["id"] for r in open_decisions()}, "an answered batch hold must no longer be open"
 
         # a SINGLE-task hold must reject --approve/--reject.
-        code, did4, _ = _run(["hold", "--task", "t", "--q", "single again"])
+        code, did4, did4_tok, _ = mk(["hold", "--task", "t", "--q", "single again"])
         assert code == 0
-        code, _, exc = _run(["answer", did4, "--approve", "whatever"])
+        code, _, exc = _run(["answer", did4, "--token", did4_tok, "--approve", "whatever"])
         assert code != 0, "a single-task hold must reject --approve/--reject"
 
         # `open` must render a batch hold's per-task-id entries (task-id, checked_sha, digest), not just
@@ -482,7 +579,7 @@ def main(argv):
     p = argparse.ArgumentParser(description="durable human-gate decisions")
     sub = p.add_subparsers(dest="cmd", required=True)
     h = sub.add_parser("hold"); h.add_argument("--task", required=True); h.add_argument("--q", required=True); h.add_argument("--opts", default=""); h.add_argument("--sha", default=""); h.add_argument("--entries-file", default="")
-    a = sub.add_parser("answer"); a.add_argument("id"); a.add_argument("--a", default=None); a.add_argument("--sha", default=""); a.add_argument("--approve", default=None); a.add_argument("--reject", default=None)
+    a = sub.add_parser("answer"); a.add_argument("id"); a.add_argument("--token", default=None); a.add_argument("--a", default=None); a.add_argument("--sha", default=""); a.add_argument("--approve", default=None); a.add_argument("--reject", default=None)
     sub.add_parser("open"); sub.add_parser("next"); sub.add_parser("selfcheck")
     args = p.parse_args(argv)
 
@@ -553,6 +650,7 @@ def main(argv):
                 rec["batch"] = batch
             _append(rec)
         print(did)
+        print(f"token: {_token(rec)}")
     elif args.cmd == "answer":
         with _ledger_lock():   # C-fix: read-check-append is atomic vs concurrent answers
             recs = _recs()
@@ -563,6 +661,18 @@ def main(argv):
             if args.id in answered:  # finding #12: don't append a contradictory answer to a closed decision
                 sys.exit(f"decision {args.id} is already answered")
             hold_rec = hold_by_id[args.id]
+            # the provenance token proves this answer is bound to the exact hold record that was
+            # actually surfaced (via hold/open/next) -- never silently accepted missing, never
+            # silently falls back to the old no-token behavior. The mismatch error deliberately does
+            # NOT echo the expected token (that would turn the error into a guessing oracle).
+            if not args.token:
+                sys.exit(f"decision {args.id} requires --token (printed by `hold`, `open`, and `next` "
+                          f"next to this exact hold) -- a bare id is not proof the answer is bound to "
+                          f"the hold actually surfaced")
+            if args.token != _token(hold_rec):
+                sys.exit(f"decision {args.id}: --token does not match this hold's own record -- "
+                          f"refusing to attach an answer that wasn't derived from the hold actually "
+                          f"surfaced to a human")
             batch = hold_rec.get("batch")
             if batch is not None:
                 if args.a is not None:
@@ -634,8 +744,7 @@ def main(argv):
         if not rows and _BAD == 0:
             print("(no open decisions)", file=sys.stderr)  # stderr: keeps SessionStart-hook stdout clean when empty
         for r in rows:
-            opts = r.get("opts") or []
-            print(f"[{r['id']}] ({r.get('task', '?')}) {r.get('q', '?')}" + (f"   opts: {', '.join(opts)}" if opts else ""))
+            print(_render_anchor(r))
             for e in (r.get("batch") or []):
                 print(f"    - {e['task_id']} (checked_sha={e['checked_sha']}) {e['digest']}")
         if _BAD:  # surface corruption on stdout so the SessionStart hook shows it — never fail open
@@ -647,8 +756,7 @@ def main(argv):
         if row is None:
             print("(no open decisions)", file=sys.stderr)  # same convention as `open`'s empty case
             sys.exit(1)
-        opts = row.get("opts") or []
-        print(f"[{row['id']}] ({row.get('task', '?')}) {row.get('q', '?')}" + (f"   opts: {', '.join(opts)}" if opts else ""))
+        print(_render_anchor(row))
         for e in (row.get("batch") or []):
             print(f"    - {e['task_id']} (checked_sha={e['checked_sha']}) {e['digest']}")
     elif args.cmd == "selfcheck":
