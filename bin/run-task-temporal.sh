@@ -229,8 +229,28 @@ def _run():
         for i, e in enumerate(seed_rounds):
             if not isinstance(e, dict):
                 fail(f"seed_rounds[{i}] is not a JSON object")
-            if not isinstance(e.get("steps"), list):
+            # [CONFIRMED finding 1, checker round 9] this validation only checked steps/done,
+            # the same shallow-coverage gap round 1 had for Plan before it got fixed properly --
+            # the real bridge Evidence struct also declares schema_version/round (int) and goal
+            # (string), and each steps[] element must itself be a StepResult object, not null or
+            # a bare scalar. Reuses the SAME is_go_int helper Plan validation already uses for
+            # schema_version/round (non-bool int, within the Go int64 range) -- one shared
+            # numeric-type check, not a second reimplementation of it for Evidence.
+            ev_sv = e.get("schema_version")
+            if not is_go_int(ev_sv):
+                fail(f"seed_rounds[{i}].schema_version must be an int within the Go int64 range (got {ev_sv!r})")
+            ev_round = e.get("round")
+            if not is_go_int(ev_round):
+                fail(f"seed_rounds[{i}].round must be an int within the Go int64 range (got {ev_round!r})")
+            ev_goal = e.get("goal")
+            if not isinstance(ev_goal, str):
+                fail(f"seed_rounds[{i}].goal must be a string (got {ev_goal!r})")
+            ev_steps = e.get("steps")
+            if not isinstance(ev_steps, list):
                 fail(f"seed_rounds[{i}].steps must be an array (Evidence shape)")
+            for j, step in enumerate(ev_steps):
+                if not isinstance(step, dict):
+                    fail(f"seed_rounds[{i}].steps[{j}] must be a StepResult object, not {type(step).__name__} (got {step!r})")
             done = e.get("done")
             # isinstance(done, bool) correctly excludes str/int/None (bool is NOT a superclass of
             # int -- isinstance(1, bool) is False) -- a truthy non-bool like "not-a-boolean" fails.
@@ -814,6 +834,15 @@ echo "$out" | grep -qi 'too deep' || { echo "FAIL [CONFIRMED finding 1, round 6]
   echo '[{"steps":[],"done":"not-a-boolean"}]' > "$bad_done_seed_file"
   rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$bad_done_seed_file" >/dev/null 2>&1 || rc=$?
   [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 2]: seed_rounds[].done as a non-bool string exit $rc (want 2)"; fails=1; }
+
+  # [CONFIRMED finding 1, checker round 9] seed_rounds validation only checked steps/done --
+  # the same shallow-coverage gap round 1 had for Plan before it got fixed properly. The checker's
+  # own exact repro: schema_version/round/goal given with the wrong types, and a null inside
+  # steps[] (not a proper StepResult object) -- must now be rejected, exit 2, not silently accepted.
+  local malformed_evidence_file="$t/seed-malformed-evidence.json"
+  echo '[{"schema_version":"not-an-int","round":false,"goal":7,"steps":[null],"done":true}]' > "$malformed_evidence_file"
+  rc=0; "$0" task --task-id "x" --rounds-file "$rounds_file" --seed-rounds-file "$malformed_evidence_file" >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [CONFIRMED finding 1, round 9]: malformed Evidence shape (checker's exact repro: schema_version/round/goal wrong types + null in steps[]) exit $rc (want 2)"; fails=1; }
 
   # [CONFIRMED finding 3, checker round 1] --selfcheck's own result must not depend on whatever
   # SM_TEMPORAL_DRYRUN the calling shell already has exported -- the real-path refusal sub-test
