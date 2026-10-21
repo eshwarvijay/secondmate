@@ -1015,8 +1015,10 @@ membership check (`in_batch=0` for `foreign1`) correctly dropped it while still 
 genuine `mine1`; (3) **first-ever ready task-id, no prior hold at all** — a fresh batch with no
 hold ever opened correctly surfaced its one ready task-id, confirming the switch away from the
 deleted cache didn't regress the ordinary, no-history case; (4) **reject → restart → excluded** —
-opened a real batch hold for `t1@aaa111`, rejected it via the real `hold.py answer --reject`, then
-re-ran this exact filter on a simulated restart: `entries_task_ids` correctly came back empty;
+opened a real batch hold for `t1@aaa111`, rejected it via the real `hold.py answer --reject` (this
+confirmation predates the `--token` requirement added later — see the batch-answer recipe above for
+today's syntax), then re-ran this exact filter on a simulated restart: `entries_task_ids` correctly
+came back empty;
 (5) **reject → rework (new `checked_sha`) → restart → resurfaced** — recorded a NEW
 `verify_gate_pass` row for `t1` at a genuinely different `checked_sha` and re-ran the identical
 filter: `t1` correctly reappeared, confirming the exclusion is scoped to the exact rejected
