@@ -252,13 +252,31 @@ It cannot be fixed by editing `maker.go`/`checker.go` further here, since that w
 the read-only bridge dependency — any further changes to the bridge's own herdr-visible mechanics are
 out of scope for this script.
 
-**Named gaps for v1 (deliberately not ported into this path):** no `round-state.md`/
-`feature-list.json` continuity, no ponytail context injection, no lesson-injection — a dispatcher
-using this engine gets a single, self-contained round with no cross-round maker memory. No `--lens`
-support (the bridge's checker activity has no lens concept). `--max-cost-cents` is a POST-HOC warning
-only, never a mid-flight preemption, since a model call already in flight can't be stopped from
-outside the bridge's own activity code. These are accepted scope boundaries for this increment, not
-bugs — see `docs/ARCHITECTURE.md` for the full rationale.
+**Prompt parity closed (round-state.md/feature-list.json continuity, ponytail, lesson-injection,
+`--lens`):** `bin/run-round-temporal.sh round` now appends the same round-state.md/feature-list.json
+continuity instructions, the two conduct rules, and the startup checklist that this file's own "Maker
+prompt closing boilerplate" section documents — copied verbatim from that section — to EVERY maker
+prompt it builds, unconditionally, plus a ponytail-skill-loading instruction and this round's real
+`bin/lesson-lookup.py` output (an optional `--task-id ID` threads through to that script's own
+`--task-id`, for its injection-ledger logging). **One correction versus the normal path's own
+ponytail wording:** this path's injected instruction asks for ponytail at **ultra** intensity
+specifically (invoke the ponytail skill with the `ultra` argument, or run `/ponytail ultra`), not the
+skill's bare default — this task's own dispatching instruction, not (yet) this file's own convention
+for the normal path. **A real platform asymmetry, not a bug:** the plain headless maker activity (no
+`--herdr-task-id` given) runs `claude -p ... --allowedTools Read,Edit,Write,Bash` — no Skill tool at
+all, so the ponytail-loading instruction is genuinely inert text on that branch. Only the
+herdr-visible maker activity (`--herdr-task-id` given), which drives a real interactive `claude`
+agent with normal tool access, can actually act on it. The instruction is still injected uniformly
+either way, matching this file's own "every maker prompt" universality — the asymmetry is about
+whether the maker can act on it, not whether it's sent. `--lens NAME` (repeatable, also accepts a
+comma-separated list) now mirrors `launch-checker.sh`'s own `--lens`: it resolves `bin/lenses/<NAME>.md`,
+fails loud on an unknown name, and lands the lens file's content plus a `lens_coverage`-reporting
+instruction into the checker step's goal text — the only per-round text channel into the bridge's
+checker prompt (`params.goal`), never the maker prompt and never the bare goal used verbatim in the
+commit message. `--max-cost-cents` remains a POST-HOC warning only, never a mid-flight preemption,
+since a model call already in flight can't be stopped from outside the bridge's own activity code —
+not something a wrapper-side prompt change can close, and still out of scope for this increment. See
+`docs/ARCHITECTURE.md` for the full rationale.
 
 **`BASH_ENV`/`DEBUG`-trap hardening — one specific technique closed, not a general shell sandbox.**
 `run-round-temporal.sh` clears any inherited `DEBUG` trap and disables function tracing (`set +T`) as

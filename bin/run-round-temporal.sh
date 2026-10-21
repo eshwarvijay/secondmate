@@ -34,6 +34,20 @@
 #                                        charset/length rule the bridge's own sanitizeTaskID enforces
 #                                        (internal/planrun/herdr.go) -- a bad value fails fast, exit 2,
 #                                        before anything else runs)
+#     [--lens NAME]...                 (repeatable; also accepts a comma-separated list in one flag,
+#                                        same shape as launch-checker.sh's own --lens. NAME looks up
+#                                        bin/lenses/<NAME>.md (e.g. --lens qa/coverage); unknown NAME
+#                                        fails fast, exit 2, with the same "unknown lens" message shape
+#                                        launch-checker.sh uses. Each lens's file content, plus an
+#                                        instruction to report that lens by name in a lens_coverage
+#                                        field, is appended into the CHECKER's goal text only
+#                                        (checker_goal_full) -- never the maker prompt, never the bare
+#                                        checker_goal used verbatim in the commit message)
+#     [--task-id ID]                   (opt-in: passed through to bin/lesson-lookup.py's own
+#                                        --task-id, for its injection-ledger logging. Independent of
+#                                        --herdr-task-id -- this id need not match a herdr task/branch
+#                                        at all. Omitted entirely from the lesson-lookup.py call when
+#                                        not given, matching that script's own "task-id unknown" path)
 #   run-round-temporal.sh --selfcheck
 #
 # Env: SM_TEMPORAL_DRYRUN=1          -- print the assembled plan JSON + the commands this would run,
@@ -96,8 +110,20 @@
 #   --repo's own branch does not corrupt anything, but likely surfaces as a spurious
 #   ZERO_COMMIT_ROUND: the maker's real work would land in a different worktree this wrapper never
 #   looks at. Not enforced here -- this is a caller/dispatcher contract, not a new config knob.
-# - No round-state.md/feature-list.json/ponytail/lesson-injection parity on this path (v1 scope).
-# - No --lens support (the bridge's checker.go has no lens concept).
+# - Every maker prompt on this path is now unconditionally appended with the same round-state.md/
+#   feature-list.json continuity instructions, the two conduct rules, and the startup checklist that
+#   skills/secondmate/SKILL.md's own "Maker prompt closing boilerplate" section documents for the
+#   normal path (see _maker_boilerplate below), plus a ponytail-at-ultra-intensity loading
+#   instruction and this round's real bin/lesson-lookup.py output -- mirroring the normal path's own
+#   "every maker prompt in this file" universality. One real platform asymmetry, not a bug: the plain
+#   headless maker activity (no --herdr-task-id given) runs `claude -p ... --allowedTools
+#   Read,Edit,Write,Bash` with no Skill tool at all, so the ponytail-loading sentence is inert text on
+#   that branch -- only the herdr-visible maker activity (--herdr-task-id given), which drives a real
+#   interactive claude agent with normal tool access, can actually act on it. Injected uniformly
+#   either way, same as the rest of this block.
+# - --lens support: see --lens in the usage block above. Lens content lands in the checker's goal
+#   text only (checker_goal_full), never the maker prompt or the bare checker_goal used in the commit
+#   message.
 # - Process cleanup uses a PID+start-time fingerprint sidecar (see _fingerprint below); a `kill -9` on
 #   THIS script itself defeats its own EXIT trap by definition -- a residual gap, not a bug.
 # - Port allocation binds to port 0 and scrapes the OS-assigned port, same as the bridge's own
@@ -390,6 +416,47 @@ _prepare_bridge_cli() {  # _prepare_bridge_cli <bridge_dir> <server_bin> <go_bin
   )
 }
 
+# --- parity with skills/secondmate/SKILL.md's "Maker prompt closing boilerplate" section: round-
+# state.md/feature-list.json continuity instructions + the two conduct rules + the startup checklist,
+# copied verbatim (byte-for-byte, not paraphrased) from that section, plus a ponytail-at-ultra
+# loading instruction (this path's own addition -- not part of that shared section, since it's used
+# by paths with different maker shapes) and this round's real bin/lesson-lookup.py output. Appended,
+# unconditionally, to every maker prompt this script builds -- see the NAMED LIMITATIONS note above
+# for the herdr-visible-vs-headless ponytail-actionability asymmetry.
+_maker_boilerplate() {  # _maker_boilerplate <goal> [<task_id>]
+  local goal="$1" task_id="${2:-}"
+  cat <<'BOILERPLATE_EOF'
+Operate under ponytail at ultra intensity for this task — if it is not already active this session, invoke the ponytail skill via the Skill tool with the ultra argument (or run /ponytail ultra) before writing any code.
+
+Before you reply DONE, write or update the round-state handoff file: `${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}`. Write it atomically. Write to a temp file in the same directory, then `mv` the temp file over the real path. Never write the file directly — a direct write can leave a partial file. Write the four prose sections you know directly: Objective, Active, Blocked, Next Move. The supervisor adds the Completed and Relevant Files sections later, from git history, when it synthesizes a restart. You may leave a placeholder for Completed and Relevant Files, or omit them.
+
+If the task breaks into checkable sub-goals, also maintain `${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}}/feature-list.json`. This file holds a JSON array of `{id, description, status: "pending"|"pass"|"fail", verified_by, round}`. The array is cumulative: it reflects the current state, not an append-only log. Write it atomically too, with the same temp-file-then-mv idiom as round-state.md. Never write it directly, to avoid a partial file. `verified_by` must name the concrete command, test, or check and its actual result whenever status is pass or fail. It may be null only when status is pending. This file is optional. A single-round task never needs to create it.
+
+Before you reply DONE, run something — a test, a build, or a live check that fits the task. Show the result in what you write. Code inspection alone is never sufficient; do not just claim "I read it and it looks right". If feature-list.json exists, its pass/fail sub-goals' `verified_by` citations serve as that evidence. If feature-list.json does not exist, name what you ran and what it showed in round-state.md's Active or Next Move section.
+
+Two conduct rules apply to every round. Rule one: never tamper with a test to force it to pass. Do not weaken, delete, skip, comment out, or rewrite a test or an assertion, directly or indirectly. A mock, a stub, or a fixture that stops a test from exercising real behavior also counts as tampering. The only exception is a task that itself asks for a test change. If a test will not pass, suspect the code under test first. Rule two: keep git hygiene tight. Stage only the exact files that belong to the change, by explicit path. Never use git add with a dot, -A, or -u. Never use git commit -a. Never force-push in any form, including --force-with-lease. If the same approach fails twice in a row, stop. Record the failure in round-state.md's Blocked section instead of trying a third time silently.
+
+Start every invocation — first round, fix round, or restart — with this checklist, in order, before you touch any code. First, read round-state.md and feature-list.json below, if present; both are already injected just below this line. Second, check `git log` for prior committed work the handoff might not mention. Third, run `git status`, and re-run this project's test or build command if the handoff doesn't already show a fresh result. Both files' claims are self-reported; git log and a fresh test run are what corroborate them. Fourth, only then start new work. On a discrepancy — uncommitted work, an untested claim, or git log showing work the handoff omits — reconcile it in round-state.md's Active or Blocked section. Do not invent a new escalation signal.
+BOILERPLATE_EOF
+  local round_state_file="${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}/round-state.md}"
+  local feature_list_file="${SM_ROUND_STATE:-${SM_LOOP_STATE:-.secondmate}}/feature-list.json"
+  # [round-1 checker, CONFIRMED] printf '%s\n' <subst>, never a bare `cat` -- the command
+  # substitution strips whatever trailing newlines the source file does or doesn't have, and
+  # printf's own literal \n then guarantees exactly one newline separates this section from
+  # whatever follows (the next header, or the real lesson-lookup.py output below), regardless of
+  # the file's own trailing-newline status. A bare `cat` glues straight into the next section when
+  # the file lacks a final newline -- SKILL.md's own command-substitution template never had this
+  # problem because its `echo` before each `cat` always appended one; this direct-cat conversion
+  # had silently dropped that implicit separator.
+  [ -f "$round_state_file" ] && { echo '--- Previous round handoff ---'; printf '%s\n' "$(cat "$round_state_file")"; }
+  [ -f "$feature_list_file" ] && { echo '--- Feature list ---'; printf '%s\n' "$(cat "$feature_list_file")"; }
+  if [ -n "$task_id" ]; then
+    "$SCRIPT_DIR/lesson-lookup.py" --task "$goal" --task-id "$task_id"
+  else
+    "$SCRIPT_DIR/lesson-lookup.py" --task "$goal"
+  fi
+}
+
 _build_plan_json() {  # _build_plan_json <round> <goal> <criteria> <maker_prompt> <checker_goal> [<herdr_task_id>]
   python3 -c '
 import json, sys
@@ -454,10 +521,13 @@ cleanup() {
 cmd_round() {
   local repo="" round=1 goal="" criteria="" maker_prompt_file="" maker_prompt="" checker_goal="" prior_verdict_file=""
   local bridge_dir="$DEFAULT_BRIDGE_DIR" max_seconds=900 max_cost_cents=200 accept_headless_risk=0 herdr_task_id="" herdr_task_id_given=0
+  local task_id="" lenses=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --i-accept-headless-autonomous-risk) accept_headless_risk=1; shift 1;;
       --herdr-task-id) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; herdr_task_id="$2"; herdr_task_id_given=1; shift 2;;
+      --task-id) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; task_id="$2"; shift 2;;
+      --lens) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; lenses+=("$2"); shift 2;;
       --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; repo="$2"; shift 2;;
       --round) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; round="$2"; shift 2;;
       --goal) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; return 2; }; goal="$2"; shift 2;;
@@ -534,6 +604,11 @@ cmd_round() {
     maker_prompt="$(cat "$maker_prompt_file")"
   fi
 
+  # Unconditional on every round, regardless of any flag -- mirrors the normal path's own "every
+  # maker prompt in this file" boilerplate universality. Never touches checker_goal/checker_goal_full.
+  local maker_prompt_full
+  maker_prompt_full="$maker_prompt"$'\n\n'"$(_maker_boilerplate "$goal" "$task_id")"
+
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "--repo $repo is not a git worktree" >&2; return 2; }
   repo="$(cd "$repo" && pwd)"
 
@@ -541,13 +616,52 @@ cmd_round() {
   local go_cache="${SM_TEMPORAL_GO_DOWNLOAD_CACHE:-$DEFAULT_GO_DOWNLOAD_CACHE}"
 
   local checker_goal_full="$checker_goal"
+  # Optional --lens support, mirroring launch-checker.sh's own --lens shape: repeatable, also
+  # accepts a comma-separated list in one flag; NAME resolves to bin/lenses/<NAME>.md. Lands in
+  # checker_goal_full ONLY -- never maker_prompt_full, never the bare checker_goal used verbatim in
+  # the commit message (see _commit_round_changes).
+  local _lens_group _lens_names _lens_name _lens_file _lens_content _lens_unknown_msg _lens_file_real
+  for _lens_group in "${lenses[@]:-}"; do
+    [ -n "$_lens_group" ] || continue
+    IFS=',' read -ra _lens_names <<< "$_lens_group"
+    for _lens_name in "${_lens_names[@]}"; do
+      _lens_file="$SCRIPT_DIR/lenses/$_lens_name.md"
+      _lens_unknown_msg="unknown lens: $_lens_name (looked for $_lens_file). Available: $( (cd "$SCRIPT_DIR/lenses" 2>/dev/null && find . -name '*.md' ! -name 'ROUTER.md' | sed 's|^\./||;s|\.md$||') | tr '\n' ' ')"
+      [ -f "$_lens_file" ] || { echo "$_lens_unknown_msg" >&2; return 2; }
+      # [round-1 checker, CONFIRMED] a bare [ -f ] existence check alone is bypassable: "..".
+      # segments in $_lens_name walk the STRING path straight out of bin/lenses/ before that check
+      # ever runs, so any file that exists ANYWHERE on disk passes.
+      # [round-2 checker, CONFIRMED] a `cd "$(dirname ...)" && pwd -P` containment check only
+      # resolves symlinks in the PARENT directory components -- it structurally cannot resolve a
+      # symlink on the FINAL path component itself, since you can't `cd` into a file. A lens file
+      # that is itself a symlink (parent dir genuinely under bin/lenses/, leaf symlinked elsewhere)
+      # passed that check and then `cat` followed the symlink straight through it. Fixed the same
+      # way bin/lesson-lookup.py's own _resolve_lesson_path actually avoids this exact class of bug:
+      # resolve the FULL candidate path (not just its parent) via Python's .resolve(), which follows
+      # every symlink in the chain including the leaf, then require .relative_to() the real,
+      # fully-resolved lenses root to succeed.
+      _lens_file_real="$(python3 -c '
+import pathlib, sys
+lenses_dir = pathlib.Path(sys.argv[1]).resolve()
+candidate = pathlib.Path(sys.argv[2]).resolve()
+try:
+    candidate.relative_to(lenses_dir)
+except ValueError:
+    sys.exit(1)
+print(candidate)
+' "$SCRIPT_DIR/lenses" "$_lens_file" 2>/dev/null)" || _lens_file_real=""
+      [ -n "$_lens_file_real" ] || { echo "$_lens_unknown_msg" >&2; return 2; }
+      _lens_content="$(cat "$_lens_file_real")"
+      checker_goal_full="$checker_goal_full"$'\n\n'"You are being evaluated against the named lens '$_lens_name'. If your envelope includes a lens_coverage field, report this lens by this exact string."$'\n\n'"$_lens_content"
+    done
+  done
   if [ -n "$prior_verdict_file" ]; then
     [ -f "$prior_verdict_file" ] || { echo "prior-verdict-file not found: $prior_verdict_file" >&2; return 2; }
-    checker_goal_full="$checker_goal"$'\n\n'"Prior round verdict (resolve or re-confirm; don't re-litigate settled items):"$'\n'"$(cat "$prior_verdict_file")"
+    checker_goal_full="$checker_goal_full"$'\n\n'"Prior round verdict (resolve or re-confirm; don't re-litigate settled items):"$'\n'"$(cat "$prior_verdict_file")"
   fi
 
   local plan_json
-  plan_json="$(_build_plan_json "$round" "$goal" "$criteria" "$maker_prompt" "$checker_goal_full" "$herdr_task_id")"
+  plan_json="$(_build_plan_json "$round" "$goal" "$criteria" "$maker_prompt_full" "$checker_goal_full" "$herdr_task_id")"
 
   if [ "${SM_TEMPORAL_DRYRUN:-}" = 1 ]; then
     echo "PLAN:"
@@ -773,6 +887,117 @@ _selfcheck() {
   # --- absent --herdr-task-id: the key must not appear at all (zero-behavior-change default path). ---
   out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" 2>&1)"
   echo "$out" | grep -q 'herdr_task_id' && { echo "FAIL: dryrun plan must not mention herdr_task_id when --herdr-task-id is not given"; fails=1; }
+
+  # --- [Gap 4/5] the maker-prompt closing boilerplate (round-state.md/feature-list.json continuity +
+  # conduct rules + startup checklist, parity with SKILL.md's own section) plus a real
+  # bin/lesson-lookup.py output must land in maker_prompt on EVERY dry-run invocation, flags or not --
+  # reuses the plain no-flags dry-run output above. ---
+  echo "$out" | grep -q 'Before you reply DONE' || { echo "FAIL: maker-prompt boilerplate (round-state/feature-list instructions) missing from maker_prompt"; fails=1; }
+  echo "$out" | grep -q 'Known failure patterns' || { echo "FAIL: real bin/lesson-lookup.py output missing from maker_prompt"; fails=1; }
+  echo "$out" | grep -q 'ponytail at ultra intensity' || { echo "FAIL: ponytail-at-ultra loading instruction missing from maker_prompt"; fails=1; }
+
+  # --- [Gap 5] --task-id must reach bin/lesson-lookup.py's own --task-id flag -- proved via its real
+  # injection ledger (SM_LESSON_LEDGER), not a reimplementation: lesson-lookup.py only logs when given
+  # a non-empty task-id, so a matching ledger record is direct evidence the flag was actually passed
+  # through, not just accepted and dropped. ---
+  local ll_ledger_dir; ll_ledger_dir="$(mktemp -d)"
+  local ll_ledger="$ll_ledger_dir/ledger.jsonl"
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 SM_LESSON_LEDGER="$ll_ledger" "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" --task-id "selfcheck-task-123" 2>&1)" \
+    || { echo "FAIL: dryrun with --task-id errored"; fails=1; }
+  grep -q '"task_id": "selfcheck-task-123"' "$ll_ledger" 2>/dev/null \
+    || { echo "FAIL: --task-id did not reach lesson-lookup.py's own --task-id (injection ledger missing the record)"; fails=1; }
+  rm -rf "$ll_ledger_dir"
+
+  # --- [Gap 3] an unknown --lens must exit 2 with a helpful message, mirroring launch-checker.sh's
+  # own "unknown lens" wording. ---
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --lens __nope__ 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL: unknown --lens exit $rc (want 2)"; fails=1; }
+  echo "$out" | grep -q 'unknown lens: __nope__' || { echo "FAIL: unknown-lens message not found"; fails=1; }
+
+  # --- [Gap 3] a VALID --lens must land its real file content + the lens_coverage-reporting
+  # instruction in the CHECKER's goal text (checker_goal_full) -- and must NEVER appear in the
+  # maker's own prompt. Parses the dry-run plan JSON directly (not a reimplementation of the lens
+  # lookup) against a real shipped lens file, bin/lenses/qa/coverage.md. ---
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" --lens qa/coverage 2>&1)" \
+    || { echo "FAIL: dryrun with --lens errored"; fails=1; }
+  echo "$out" | python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines()
+start = lines.index("PLAN:") + 1
+end = next(i for i, l in enumerate(lines) if l.startswith("WOULD RUN:"))
+plan = json.loads("\n".join(lines[start:end]))
+maker_prompt = plan["steps"][0]["params"]["prompt"]
+checker_goal = plan["steps"][1]["params"]["goal"]
+assert "QA sub-lens: coverage" in checker_goal, "lens file content missing from checker goal"
+assert "named lens" in checker_goal and "qa/coverage" in checker_goal, "lens_coverage instruction missing from checker goal"
+assert "QA sub-lens: coverage" not in maker_prompt, "lens content leaked into maker prompt"
+' || { echo "FAIL: --lens content/lens_coverage instruction not correctly wired into checker_goal_full (and kept out of maker_prompt)"; fails=1; }
+
+  # --- [Defect 1, round-1 checker, CONFIRMED] a path-traversal --lens must exit 2 as "unknown
+  # lens", never succeed -- checker's exact repro: a real file OUTSIDE bin/lenses/ (here, a fresh
+  # mktemp -d sibling to this repo, not under it) reached via enough "../" segments to escape
+  # bin/lenses/ entirely. A bare [ -f ] existence check alone passed this (any file that exists
+  # ANYWHERE on disk passed); the real fix resolves the candidate's real containing directory and
+  # confirms it is still actually under the real lenses dir. ---
+  local trav_dir; trav_dir="$(mktemp -d)"
+  local trav_marker="TRAVERSAL-PAYLOAD-$$"
+  echo "$trav_marker" > "$trav_dir/evil-lens.md"
+  # Sized dynamically off SCRIPT_DIR's own path depth (plus margin), never a fixed guess -- however
+  # deep this checkout happens to sit, this many "../" is guaranteed to reach the filesystem root
+  # (excess ".." beyond root is simply a no-op), then descend into the real absolute $trav_dir.
+  local _trav_depth=$(( $(echo "$SCRIPT_DIR/lenses" | tr -cd '/' | wc -c) + 5 ))
+  local _trav_dots="" _trav_i
+  for ((_trav_i=0; _trav_i<_trav_depth; _trav_i++)); do _trav_dots="${_trav_dots}../"; done
+  local trav_lens="${_trav_dots}${trav_dir}/evil-lens"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --lens "$trav_lens" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens exit $rc (want 2)"; fails=1; }
+  echo "$out" | grep -q 'unknown lens:' || { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens did not produce the unknown-lens message"; fails=1; }
+  echo "$out" | grep -qF "$trav_marker" && { echo "FAIL [Defect 1, SECURITY, CRITICAL]: path-traversal --lens payload landed in the assembled prompt"; fails=1; }
+  rm -rf "$trav_dir"
+
+  # --- [Defect 1 follow-up, round-2 checker, CONFIRMED] a --lens whose PARENT directory is
+  # genuinely under bin/lenses/ but whose FINAL path component is itself a symlink to an external
+  # file must ALSO be rejected -- round 1's fix only resolved the parent directory via
+  # `cd "$(dirname ...)" && pwd -P`, which cannot resolve a symlink on the final component (you
+  # can't `cd` into a file). Checker's exact repro: a real symlink living directly inside this
+  # repo's own bin/lenses/qa/ pointing at an external payload file -- the only way to genuinely
+  # exercise "parent dir really is under bin/lenses/", since SCRIPT_DIR/lenses isn't parameterized.
+  # Uses a $$-qualified unique name and always cleans up its own symlink + payload dir below. ---
+  local symlink_payload_dir; symlink_payload_dir="$(mktemp -d)"
+  local symlink_marker="FINAL-COMPONENT-SYMLINK-PAYLOAD-$$"
+  echo "$symlink_marker" > "$symlink_payload_dir/outside-target.md"
+  local symlink_lens_name="selfcheck-final-component-escape-$$"
+  local symlink_lens_file="$SCRIPT_DIR/lenses/qa/${symlink_lens_name}.md"
+  ln -s "$symlink_payload_dir/outside-target.md" "$symlink_lens_file"
+  rc=0
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 "$0" round --repo "$t" --checker-goal x --maker-prompt y --lens "qa/$symlink_lens_name" 2>&1)" || rc=$?
+  [ "$rc" = 2 ] || { echo "FAIL [Defect 1 follow-up, SECURITY, CRITICAL]: final-component-symlink --lens exit $rc (want 2)"; fails=1; }
+  echo "$out" | grep -q 'unknown lens:' || { echo "FAIL [Defect 1 follow-up, SECURITY, CRITICAL]: final-component-symlink --lens did not produce the unknown-lens message"; fails=1; }
+  echo "$out" | grep -qF "$symlink_marker" && { echo "FAIL [Defect 1 follow-up, SECURITY, CRITICAL]: final-component-symlink --lens payload landed in the assembled prompt"; fails=1; }
+  rm -f "$symlink_lens_file"
+  rm -rf "$symlink_payload_dir"
+
+  # --- [Defect 2, round-1 checker, CONFIRMED] a round-state.md with NO trailing newline must not
+  # glue into whatever follows it (the real bin/lesson-lookup.py output, since no feature-list.json
+  # exists in this fixture) -- checker's exact repro: SM_LOOP_STATE pointing at a dir whose
+  # round-state.md is exactly "HANDOFF-WITHOUT-FINAL-NEWLINE", byte-for-byte, no trailing newline. ---
+  local nl_dir; nl_dir="$(mktemp -d)"
+  printf 'HANDOFF-WITHOUT-FINAL-NEWLINE' > "$nl_dir/round-state.md"
+  out="$(HERDR_ENV="" SM_TEMPORAL_DRYRUN=1 SM_LOOP_STATE="$nl_dir" "$0" round --repo "$t" --checker-goal "check it" --maker-prompt "do it" 2>&1)" \
+    || { echo "FAIL: dryrun with a no-trailing-newline round-state.md errored"; fails=1; }
+  echo "$out" | python3 -c '
+import json, sys
+lines = sys.stdin.read().splitlines()
+start = lines.index("PLAN:") + 1
+end = next(i for i, l in enumerate(lines) if l.startswith("WOULD RUN:"))
+plan = json.loads("\n".join(lines[start:end]))
+maker_prompt = plan["steps"][0]["params"]["prompt"]
+assert "HANDOFF-WITHOUT-FINAL-NEWLINE## Known failure patterns" not in maker_prompt, "round-state.md content glued directly into the next section with no newline separator"
+assert "HANDOFF-WITHOUT-FINAL-NEWLINE\n" in maker_prompt, "round-state.md content not followed by a newline before the next section"
+' || { echo "FAIL [Defect 2, CRITICAL]: missing-trailing-newline round-state.md was not newline-separated from the following section"; fails=1; }
+  rm -rf "$nl_dir"
 
   # --- SM_TEMPORAL_FETCH_TIMEOUT_SECONDS must be rejected the instant it's read (module scope),
   # same class of bug as --max-seconds/--max-cost-cents: a non-numeric value would silently defeat
