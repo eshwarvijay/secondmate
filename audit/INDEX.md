@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 61 total)
+## Recent flow (orchestration mechanics) entries (15 of 62 total)
 
-- 2026-09-30 — maker-prompt-guardrails: test-tampering + git-hygiene guardrails added to Maker prompt closing boilerplate (`audit/flow/2026-09-30--maker-prompt-guardrails.md`)
 - 2026-09-30 — session-staleness-check: wire doctor.sh's staleness detection into a SessionStart hook (`audit/flow/2026-09-30--session-staleness-check.md`)
 - 2026-10-02 — sub-supervisor-todo-list: require dispatched sub-supervisors to self-track SOP steps via TodoWrite (`audit/flow/2026-10-02--sub-supervisor-todo-list.md`)
 - 2026-10-04 — STE-style sentence pass on maker boilerplate + checker prompts (cross-model clarity) (`audit/flow/2026-10-04--ste-style-cross-model-prompts.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-21 — hold-answer-token: provenance token on hold.py answer + permission-classifier-enforced human gate incident (`audit/flow/2026-10-21--hold-answer-token.md`)
 - 2026-10-21 — temporal-herdr-visible-flag: --herdr-task-id flag threads bridge's herdr-visible mode into run-round-temporal.sh (`audit/flow/2026-10-21--temporal-herdr-visible-flag.md`)
 - 2026-10-21 — temporal-wrapper-prompt-parity: closed gaps 3/5 fully, gap 4 text-parity with an honest headless-ponytail asymmetry (`audit/flow/2026-10-21--temporal-wrapper-prompt-parity.md`)
+- 2026-10-22 — run-task-temporal.sh: new whole-task TaskWorkflow validate-and-refuse CLI, 10 rounds (1 build + 9 fix), unanimous pla... (`audit/flow/2026-10-22--run-round-temporal-wiring.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 59 total)
+## Recent decision (choices, findings, escalations) entries (15 of 60 total)
 
-- 2026-09-30 — Shell-safe prose over the plan's own drop-in draft; no automated enforcement, human-approved merge (`audit/decision/2026-09-30--maker-prompt-guardrails.md`)
 - 2026-09-30 — Advisory-only SessionStart staleness surfacing; reuse doctor.sh detection unchanged (`audit/decision/2026-09-30--session-staleness-check.md`)
 - 2026-10-02 — Single insertion point at 'The loop' header; non-conflation with progress-ledger.py verified by checker (`audit/decision/2026-10-02--sub-supervisor-todo-list.md`)
 - 2026-10-04 — STE rewrite preserves all rules/guardrails verbatim; checker side-by-side diff confirms, human-approved merge (`audit/decision/2026-10-04--ste-style-cross-model-prompts.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-21 — Deterministic sha256 token (not identity secret), 3 rounds closing real pre-existing doc bugs too; chat-relayed appro... (`audit/decision/2026-10-21--hold-answer-token.md`)
 - 2026-10-21 — temporal-herdr-visible-flag: 2 legit checker findings fixed, 1 pre-existing out-of-scope; human-approved merge; live-... (`audit/decision/2026-10-21--temporal-herdr-visible-flag.md`)
 - 2026-10-21 — temporal-wrapper-prompt-parity: two real path/symlink-confinement bugs caught+fixed across 3 rounds; merge hold answe... (`audit/decision/2026-10-21--temporal-wrapper-prompt-parity.md`)
+- 2026-10-22 — New separate script + unconditional real-path refusal (bridge CLI gap confirmed structural); 3 recurring point-fix-vs... (`audit/decision/2026-10-22--run-round-temporal-wiring.md`)
