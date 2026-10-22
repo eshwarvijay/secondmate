@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 63 total)
+## Recent flow (orchestration mechanics) entries (15 of 64 total)
 
-- 2026-10-02 — sub-supervisor-todo-list: require dispatched sub-supervisors to self-track SOP steps via TodoWrite (`audit/flow/2026-10-02--sub-supervisor-todo-list.md`)
 - 2026-10-04 — STE-style sentence pass on maker boilerplate + checker prompts (cross-model clarity) (`audit/flow/2026-10-04--ste-style-cross-model-prompts.md`)
 - 2026-10-04 — use-default-todo-tool: generic check-then-use task-tracking tool wording for sub-agent-supervisors (`audit/flow/2026-10-04--use-default-todo-tool.md`)
 - 2026-10-08 — adhd-skip-marker: aborted after 5 non-converging real-bug checker fails (`audit/flow/2026-10-08--adhd-skip-marker.md`)
@@ -25,11 +24,11 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-21 — temporal-herdr-visible-flag: --herdr-task-id flag threads bridge's herdr-visible mode into run-round-temporal.sh (`audit/flow/2026-10-21--temporal-herdr-visible-flag.md`)
 - 2026-10-21 — temporal-wrapper-prompt-parity: closed gaps 3/5 fully, gap 4 text-parity with an honest headless-ponytail asymmetry (`audit/flow/2026-10-21--temporal-wrapper-prompt-parity.md`)
 - 2026-10-22 — Durable claim/release inside TaskWorkflow; fork-collision incident caught and corrected before a destructive reset (`audit/flow/2026-10-22--bridge-claim-step.md`)
+- 2026-10-22 — bridge-register-taskworkflow: new submit-task CLI subcommand to actually submit TaskWorkflow via StartTask (`audit/flow/2026-10-22--bridge-register-taskworkflow.md`)
 - 2026-10-22 — run-task-temporal.sh: new whole-task TaskWorkflow validate-and-refuse CLI, 10 rounds (1 build + 9 fix), unanimous pla... (`audit/flow/2026-10-22--run-round-temporal-wiring.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 61 total)
+## Recent decision (choices, findings, escalations) entries (15 of 62 total)
 
-- 2026-10-02 — Single insertion point at 'The loop' header; non-conflation with progress-ledger.py verified by checker (`audit/decision/2026-10-02--sub-supervisor-todo-list.md`)
 - 2026-10-04 — STE rewrite preserves all rules/guardrails verbatim; checker side-by-side diff confirms, human-approved merge (`audit/decision/2026-10-04--ste-style-cross-model-prompts.md`)
 - 2026-10-04 — Generic tool-detection wording, decline partial-availability branching and version bump (`audit/decision/2026-10-04--use-default-todo-tool.md`)
 - 2026-10-08 — Abort + full teardown chosen over preserving the branch for inspection (`audit/decision/2026-10-08--adhd-skip-marker.md`)
@@ -43,4 +42,5 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-21 — temporal-herdr-visible-flag: 2 legit checker findings fixed, 1 pre-existing out-of-scope; human-approved merge; live-... (`audit/decision/2026-10-21--temporal-herdr-visible-flag.md`)
 - 2026-10-21 — temporal-wrapper-prompt-parity: two real path/symlink-confinement bugs caught+fixed across 3 rounds; merge hold answe... (`audit/decision/2026-10-21--temporal-wrapper-prompt-parity.md`)
 - 2026-10-22 — claim-ledger.py wrapped not reimplemented; residual race documented not chased; fork-collision escalated and self-cor... (`audit/decision/2026-10-22--bridge-claim-step.md`)
+- 2026-10-22 — submit-task subcommand design + scoped-down coverage ruling, checker-corroborated; 2 process gaps surfaced (claim/hol... (`audit/decision/2026-10-22--bridge-register-taskworkflow.md`)
 - 2026-10-22 — New separate script + unconditional real-path refusal (bridge CLI gap confirmed structural); 3 recurring point-fix-vs... (`audit/decision/2026-10-22--run-round-temporal-wiring.md`)
