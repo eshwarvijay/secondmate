@@ -291,6 +291,44 @@ replaced `bash`/`git`/`claude`/`pi` binary, a malicious `PATH` entry, or a compr
 no-multi-tenant-auth trust model — not a gap unique to this script, and not something to chase
 further here.
 
+### Whole-task assembly only, no live submission: `run-task-temporal.sh`
+
+`bin/run-task-temporal.sh task` is a separate, zero-coupled sibling to `run-round-temporal.sh` above
+(no sourcing, no shared functions, nothing exported between them) for a WHOLE multi-round task
+instead of one round. Use `run-round-temporal.sh` for one maker+checker round; use this script only
+to prepare a hand-off artifact for a future multi-round submission — it never talks to Temporal or
+the bridge at all.
+
+It assembles and validates a `TaskInput` JSON payload (`{task_id, rounds: []Plan, seed_rounds?:
+[]Evidence}`) shaped for the bridge prototype's `internal/planrun.TaskWorkflow` — a child-per-round
+parent workflow keyed by a deterministic `task-<id>` WorkflowID via `StartTask` with a
+`REJECT_DUPLICATE` conflict/reuse policy. `--rounds-file F` is a JSON array of already-built Plan
+objects, one per round, in round order (array position only — there is no index field); build each
+entry the same way `run-round-temporal.sh`'s own `SM_TEMPORAL_DRYRUN=1` path already does, since that
+shape is reused here purely as a validation oracle and never rebuilt. `--seed-rounds-file F` is
+optional and Evidence-shaped (the same shape `bridge fetch` already returns under its own `evidence`
+key), omitted from the assembled payload entirely when absent or an empty array. `--task-id ID`
+reuses `run-round-temporal.sh`'s own `--herdr-task-id` charset/length rule
+(`^[a-z0-9][a-z0-9_-]{0,19}$`) verbatim. `SM_TEMPORAL_DRYRUN=1` prints the assembled TaskInput JSON to
+stdout, mirroring the sibling's own dry-run convention.
+
+**Confirmed current limitation — live submission is blocked, unconditionally, pending bridge-side
+CLI/worker wiring that is explicitly out of scope for this task.** `cmd/bridge/main.go`'s `worker`
+subcommand registers only `planrun.PlanWorkflow` via its one `w.RegisterWorkflow` call — never
+`TaskWorkflow`; its `submit` subcommand hardcodes `c.ExecuteWorkflow(ctx, opts, planrun.PlanWorkflow,
+plan)` with no flag to target `TaskWorkflow` instead; and `internal/planrun` is Go-`internal`, so
+nothing outside the bridge module can call `StartTask` directly either. This is a structural
+impossibility today, not a risk to accept with a flag — there is no `--i-accept-...`-style override.
+So the real (non-dry-run) path always writes the validated TaskInput JSON to a durable artifact file,
+prints that path as a ready hand-off for whenever the bridge gains `TaskWorkflow` wiring, and then
+unconditionally refuses with exit `1` — every time, before any subprocess that could resemble a
+bridge build/worker/submit call (there is none in this script's own code at all, by construction).
+It deliberately does not loop N `run-round-temporal.sh`/`PlanWorkflow` calls as a fake stand-in for
+`TaskWorkflow`: that would silently drop the one thing a parent workflow actually buys — durable
+grouping of every round under one `task-<id>` workflow — while looking like it works when it does
+not. Closing this gap for real needs changes to `cmd/bridge/main.go` in the bridge repo itself, which
+is out of scope here.
+
 ## The loop (executed inside the dispatched sub-supervisor's own context — steps 1-11)
 
 Immediately after claiming and recording the `claimed` progress-ledger checkpoint, and before

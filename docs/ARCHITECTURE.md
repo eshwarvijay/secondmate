@@ -213,6 +213,32 @@ actually progresses — a same-process tracking aid local to its own run, distin
    `--max-cost-cents` is still a post-hoc warning only (a model call already in flight can't be
    preempted from outside the bridge's own activity code).
 
+   **Whole-task assembly, build-and-validate only (no live submission):** `bin/run-task-temporal.sh
+   task` is a separate, zero-coupled sibling for a WHOLE multi-round task rather than one round. It
+   assembles and validates a `TaskInput` JSON payload (`{task_id, rounds: []Plan, seed_rounds?:
+   []Evidence}`) shaped for the bridge prototype's `internal/planrun.TaskWorkflow` — a child-per-round
+   parent workflow with a deterministic `task-<id>` WorkflowID via `StartTask` and
+   `REJECT_DUPLICATE` conflict policy. `--rounds-file F` takes an array of already-built Plan objects
+   (the same shape `run-round-temporal.sh`'s own dry-run produces — reused here purely as a
+   validation oracle, never rebuilt, so there are two independent sources of the Plan shape only by
+   coincidence, not by design); round order is array position only, with no explicit index field.
+   `--seed-rounds-file F` is optional and Evidence-shaped, omitted from the assembled payload entirely
+   when absent or empty. `--task-id ID` reuses `run-round-temporal.sh`'s own `--herdr-task-id`
+   charset/length rule verbatim. **Live submission into `TaskWorkflow` is a structural impossibility
+   today, not a risk to accept with a flag** — confirmed by direct reading of the read-only bridge
+   dependency: `cmd/bridge/main.go`'s `worker` subcommand registers only `planrun.PlanWorkflow` (never
+   `TaskWorkflow`); its `submit` subcommand hardcodes `c.ExecuteWorkflow(ctx, opts,
+   planrun.PlanWorkflow, plan)` with no flag to target `TaskWorkflow` instead; and `internal/planrun`
+   is Go-`internal`, so nothing outside the bridge module can call `StartTask` directly either. So the
+   real (non-dry-run) path always writes the validated TaskInput JSON to a durable artifact file,
+   prints that path as a hand-off, and then unconditionally refuses with exit `1` — every time, no
+   override, before any subprocess that could resemble a bridge build/worker/submit call (there is
+   none in this script at all). It deliberately does NOT loop N `run-round-temporal.sh`/`PlanWorkflow`
+   calls as a fake stand-in for `TaskWorkflow`: that would silently drop the one thing a parent
+   workflow actually buys — durable grouping of every round under one `task-<id>` workflow — while
+   looking like it works. Closing this gap for real needs `cmd/bridge/main.go` changes in the bridge
+   repo itself, out of scope here.
+
 5. **Gate.** Before anything integrates, `verify-gate.sh` re-derives ground truth from the worktree: clean
    tree, non-empty diff vs base, tests green, and the **exact commit the checker reviewed still equals HEAD**
    (`--checked-sha`).
@@ -723,5 +749,6 @@ dead, and it never auto-releases or auto-tears-down anything on its own.
 | `bin/lessons/workflow/` | subdirectory for workflow-related lessons |
 | `bin/teardown-check.sh` | advisory post-teardown scan: worktree / `sm/<id>` branch / herdr pane-agent / claim-ledger.py entry for a task-id — exit 0 clean, nonzero if anything's still present; degrades an unreachable herdr check to its own "unknown" line rather than a false "clean", without blocking a genuinely clean headless teardown. Accepted limitation: the herdr check covers maker agents only, never a leaked checker pane (no task-id-derived pane identity exists in this repo's current herdr integration) |
 | `bin/close-out.sh` | mechanical post-integration teardown for one task, from the primary checkout — the SOP teardown step as ONE fail-closed command instead of a manual checklist: verifies the `sm/<task-id>` branch is merged into the integration base (default `origin/main`) and the worktree clean before destroying anything; worktree removed via `herdr worktree remove` (panes close with the workspace) or plain `git worktree remove` fallback, never `--force` over a dirty tree; branch deleted with plain `-d` (refuses unmerged tips); claim released via `claim-ledger.py release --token` and kept open while the branch is unmerged (unmerged work is still owned work); exit 0 = torn down or nothing left, exit 1 = REFUSE listing every failing condition (mirrors `verify-gate.sh` reporting); identical invocation for a supervisor or an operator who took over mid-loop; `--selfcheck` proves merged-teardown, wrong-token-refused, unmerged-kept, dirty-refused paths hermetically in a throwaway fixture repo |
+| `bin/run-task-temporal.sh` | assembles + validates a `TaskInput` JSON payload (`{task_id, rounds: []Plan, seed_rounds?: []Evidence}`) for a WHOLE multi-round task destined for the Temporal bridge prototype's `internal/planrun.TaskWorkflow` — validation/artifact-assembly ONLY, never a live submission: the real (non-dry-run) path always writes the validated payload to a durable artifact file and then unconditionally refuses, exit 1, since live submission into `TaskWorkflow` is a structural impossibility today pending bridge-side CLI/worker wiring (out of scope here). Zero-coupled sibling to `bin/run-round-temporal.sh` (one round only, via `PlanWorkflow`) — see that script's own stage-4 writeup above for the full rationale and current limitation |
 
 Everything is parameterized via `SM_*` env vars, so the maker and checker models are swappable per environment.
