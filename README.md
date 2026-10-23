@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Claude_Code-plugin-6E56CF?style=flat-square" alt="Claude Code plugin" />
-  <img src="https://img.shields.io/badge/version-0.1.50-4C8BF5?style=flat-square" alt="version 0.1.50" />
+  <img src="https://img.shields.io/badge/version-0.1.51-4C8BF5?style=flat-square" alt="version 0.1.51" />
   <img src="https://img.shields.io/badge/bash_+_python-informational?style=flat-square" alt="bash + python" />
   <img src="https://img.shields.io/badge/license-MIT-3FB950?style=flat-square" alt="MIT" />
   <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/eshwarvijay/secondmate/main/.github/badge-clones.json&style=flat-square" alt="clones" />
@@ -88,6 +88,7 @@ flowchart LR
 | Component | What it does |
 |---|---|
 | `secondmate` skill | The full SOP: plan-committee → triage → spawn → check → gate → hold → integrate |
+| `drift-report` skill | Read-only, on-demand check of this repo's own README/ARCHITECTURE/SKILL.md docs against its own `bin/` scripts (flags, defaults, selfcheck forms) — catches a doc claim that no longer matches reality before `git push`; reports only, never wired into the SOP loop |
 | `bin/plan-committee.sh` | 6 open-weight pi planners in parallel, one dimension each → outputs for Sonnet to synthesize; JSON-aware output validation rejects tool-call-shaped garbage, retries once with a changed prompt, marks self-healed planners, preserves failed raw output, and refuses to overwrite a different task's planning directory |
 | `bin/committee-output.py` | Extracts final planner prose from pi's JSON event stream and classifies empty, tool-call-shaped, or structurally invalid responses |
 | SessionStart hook | Surfaces durable open decisions each session so a restart never drops a pending gate |

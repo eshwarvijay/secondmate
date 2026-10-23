@@ -25,3 +25,5 @@ Specifically keep current:
 - ARCHITECTURE roles table, flowchart, stage-by-stage descriptions, component map
 
 **Never push without checking these.** If a bin script changed, the README table must reflect it. If the skill changed, the ARCHITECTURE stages must reflect it.
+
+Before relying on memory for this check, run the `drift-report` skill (`skills/drift-report/SKILL.md`) — it checks these same docs against the real `bin/` scripts for you.
