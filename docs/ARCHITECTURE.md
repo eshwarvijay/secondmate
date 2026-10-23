@@ -650,6 +650,7 @@ dead, and it never auto-releases or auto-tears-down anything on its own.
 | Path | Guarantee |
 |---|---|
 | `skills/secondmate/SKILL.md` | the SOP the supervisor follows |
+| `skills/drift-report/SKILL.md` | read-only, on-demand check of this repo's own README/ARCHITECTURE/SKILL.md docs against its own `bin/` scripts (flags, subcommand-vs-flag form, defaults, selfcheck invocations); reports verbatim-cited divergences or a provenance-stamped "no drift found"; standalone, never wired into the SOP loop |
 | `hooks/hooks.json` | SessionStart hold-surfacing + plugin-staleness-surfacing + PreToolUse scope guard |
 | `bin/scope-guard.py` | confines a marker-activated maker session to its own worktree; denies credential-store commands and common Bash evasions |
 | `bin/mark-maker.sh` | the one shared call that drops the scope-guard marker (outside the worktree) — called by every maker-launch site; same convention for Claude and pi |
