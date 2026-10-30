@@ -506,6 +506,12 @@ button {
   gap: 1rem;
 }
 
+/* Same grid-blowout guard as .docs-layout: a card's min-content must not
+   force its track (and the page) wider than a narrow viewport. */
+.roles-grid > * {
+  min-width: 0;
+}
+
 .role-card {
   background: var(--bg-subtle);
   border: 1px solid var(--border);
@@ -567,6 +573,10 @@ button {
   transition: border-color var(--dur-hover) var(--ease-out);
 }
 
+.stage > * {
+  min-width: 0;
+}
+
 .stage:hover {
   border-color: var(--border-strong);
 }
@@ -626,6 +636,10 @@ button {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 1rem;
+}
+
+.components-grid > * {
+  min-width: 0;
 }
 
 .component-card {
