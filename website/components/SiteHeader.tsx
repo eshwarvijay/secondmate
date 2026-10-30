@@ -1,12 +1,24 @@
 import Image from "next/image";
 import Link from "next/link";
 
+// next/image's basePath auto-prefixing doesn't reach the unoptimized
+// static-export path, so it ships bare "/secondmate.png" on a GitHub
+// Pages project page where the real path is "/secondmate/secondmate.png".
+// Same manual-prefix pattern lib/markdown.ts already uses for doc links.
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+
 export function SiteHeader({ githubUrl }: { githubUrl: string }) {
   return (
     <header className="site-header">
       <div className="container">
         <Link href="/" className="wordmark">
-          <Image src="/secondmate.png" alt="" width={28} height={28} className="wordmark-logo" />
+          <Image
+            src={`${BASE_PATH}/secondmate.png`}
+            alt=""
+            width={28}
+            height={28}
+            className="wordmark-logo"
+          />
           secondmate
         </Link>
         <nav className="site-nav" aria-label="Site">
