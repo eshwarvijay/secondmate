@@ -9,9 +9,8 @@ entries per type -- it is NOT the full history. Look up older entries with:
   bin/audit-log.py show --type flow|decision --task <task-id>
   plain grep -r / ls over audit/flow/ and audit/decision/
 
-## Recent flow (orchestration mechanics) entries (15 of 65 total)
+## Recent flow (orchestration mechanics) entries (15 of 66 total)
 
-- 2026-10-04 — use-default-todo-tool: generic check-then-use task-tracking tool wording for sub-agent-supervisors (`audit/flow/2026-10-04--use-default-todo-tool.md`)
 - 2026-10-08 — adhd-skip-marker: aborted after 5 non-converging real-bug checker fails (`audit/flow/2026-10-08--adhd-skip-marker.md`)
 - 2026-10-08 — budget-aware-checkpoints: 9-round checkpoint-hardening task + fork-collision process incident (`audit/flow/2026-10-08--budget-aware-checkpoints.md`)
 - 2026-10-08 — session-banner-todo-mention: close the deferred follow-up from 2026-10-02 by mentioning task-tracking-checklist seedi... (`audit/flow/2026-10-08--session-banner-todo-mention.md`)
@@ -26,10 +25,10 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-22 — Final lifecycle activities (Gate/Merge/Teardown/Audit/Lesson-feedback) wired into TaskWorkflow; critical herdr-flag b... (`audit/flow/2026-10-22--bridge-lifecycle-activities.md`)
 - 2026-10-22 — bridge-register-taskworkflow: new submit-task CLI subcommand to actually submit TaskWorkflow via StartTask (`audit/flow/2026-10-22--bridge-register-taskworkflow.md`)
 - 2026-10-22 — run-task-temporal.sh: new whole-task TaskWorkflow validate-and-refuse CLI, 10 rounds (1 build + 9 fix), unanimous pla... (`audit/flow/2026-10-22--run-round-temporal-wiring.md`)
+- 2026-10-23 — drift-report-skill: new skill checks README/ARCHITECTURE.md against bin/ for drift, adapted from egm-drift-report (`audit/flow/2026-10-23--drift-report-skill.md`)
 
-## Recent decision (choices, findings, escalations) entries (15 of 63 total)
+## Recent decision (choices, findings, escalations) entries (15 of 64 total)
 
-- 2026-10-04 — Generic tool-detection wording, decline partial-availability branching and version bump (`audit/decision/2026-10-04--use-default-todo-tool.md`)
 - 2026-10-08 — Abort + full teardown chosen over preserving the branch for inspection (`audit/decision/2026-10-08--adhd-skip-marker.md`)
 - 2026-10-08 — Ship additive-only budget fields + detection-only pane reaper; decline learned predictor/auto-kill; stop whack-a-mole... (`audit/decision/2026-10-08--budget-aware-checkpoints.md`)
 - 2026-10-08 — Insert a new "0." banner item (not a trailing bullet), closed by two checker-driven precision fixes; three process re... (`audit/decision/2026-10-08--session-banner-todo-mention.md`)
@@ -44,3 +43,4 @@ entries per type -- it is NOT the full history. Look up older entries with:
 - 2026-10-22 — Merge scoped as not-classifier-blocked (verified structurally); Judgment-Agent probe overridden to observe-only; Test... (`audit/decision/2026-10-22--bridge-lifecycle-activities.md`)
 - 2026-10-22 — submit-task subcommand design + scoped-down coverage ruling, checker-corroborated; 2 process gaps surfaced (claim/hol... (`audit/decision/2026-10-22--bridge-register-taskworkflow.md`)
 - 2026-10-22 — New separate script + unconditional real-path refusal (bridge CLI gap confirmed structural); 3 recurring point-fix-vs... (`audit/decision/2026-10-22--run-round-temporal-wiring.md`)
+- 2026-10-23 — drift-report-skill: scoped to 1-of-7 EGM skills; honest stale-brief correction accepted; teardown owner-flag fix (`audit/decision/2026-10-23--drift-report-skill.md`)
