@@ -2,7 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 
-export function CopyButton({ text, label = "Copy to clipboard" }: { text: string; label?: string }) {
+export function CopyButton({
+  text,
+  label = "Copy to clipboard",
+  variant,
+  copiedText = "Copied",
+}: {
+  text: string;
+  label?: string;
+  /** "primary" renders a full labelled button (hero CTA); omit for the small icon-only button. */
+  variant?: "primary";
+  copiedText?: string;
+}) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -24,6 +35,29 @@ export function CopyButton({ text, label = "Copy to clipboard" }: { text: string
     if (timer.current) clearTimeout(timer.current);
     timer.current = setTimeout(() => setCopied(false), 1600);
   };
+
+  if (variant === "primary") {
+    return (
+      <button
+        type="button"
+        className="button button-primary copy-button-primary"
+        data-copied={copied}
+        onClick={onClick}
+      >
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+          {copied ? (
+            <path d="m3 8.5 3.5 3.5L13 4.5" />
+          ) : (
+            <>
+              <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+              <path d="M10.5 3.5v-1a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 2.5v5A1.5 1.5 0 0 0 4 9h1" />
+            </>
+          )}
+        </svg>
+        {copied ? copiedText : label}
+      </button>
+    );
+  }
 
   return (
     <button

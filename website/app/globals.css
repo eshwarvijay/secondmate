@@ -387,32 +387,6 @@ button {
   }
 }
 
-.hero-meta {
-  display: flex;
-  align-items: center;
-  gap: 0.625rem;
-  margin-bottom: 1.75rem;
-}
-
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.45rem;
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 0.28rem 0.75rem;
-}
-
-.pill .dot {
-  width: 0.45rem;
-  height: 0.45rem;
-  border-radius: 50%;
-  background: var(--green);
-}
-
 .hero-title {
   font-size: clamp(2.35rem, 5.2vw + 1rem, 3.85rem);
   line-height: 1.06;
@@ -500,6 +474,12 @@ button {
   color: var(--text);
 }
 
+.copy-button-primary svg {
+  width: 1rem;
+  height: 1rem;
+  flex-shrink: 0;
+}
+
 @media (hover: hover) and (pointer: fine) {
   .button-ghost:hover {
     border-color: rgba(0, 0, 0, 0.28);
@@ -552,16 +532,6 @@ button {
      install one-liner) is wider than a phone viewport and pushes the whole
      page into horizontal overflow. */
   overflow-wrap: anywhere;
-}
-
-/* install block with copy button */
-.install-block {
-  position: relative;
-  max-width: 42rem;
-}
-
-.install-block .codeblock pre {
-  padding-right: 3.5rem;
 }
 
 .copy-button {

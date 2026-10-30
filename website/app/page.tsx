@@ -91,12 +91,6 @@ export default function Home() {
       {/* ------------------------------ hero ------------------------------ */}
       <section className="hero container">
         <Spotlight />
-        <div className="hero-meta rise">
-          <span className="pill">
-            <span className="dot" aria-hidden />v{plugin.version}
-          </span>
-          <span className="pill">Claude Code plugin</span>
-        </div>
         <h1 className="hero-title rise rise-1">
           {taglineMain}
           {taglineRest.length > 0 && (
@@ -110,28 +104,21 @@ export default function Home() {
           className="hero-lede rise rise-2"
           dangerouslySetInnerHTML={{ __html: renderInline(heroLede) }}
         />
-        <div className="rise rise-3">
-          <div className="install-block">
-            <div className="codeblock" data-lang="sh">
-              <pre>
-                <code>{readme.installCommand}</code>
-              </pre>
-            </div>
-            <CopyButton text={readme.installCommand} label="Copy install commands" />
-          </div>
-          <div className="hero-actions">
-            <Link className="button button-primary" href="/architecture/">
-              Read the architecture
-            </Link>
-            <a
-              className="hero-github-link"
-              href={plugin.homepage}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              View on GitHub →
-            </a>
-          </div>
+        <div className="hero-actions rise rise-3">
+          <CopyButton
+            text={readme.installCommand}
+            variant="primary"
+            label="Copy install command"
+            copiedText="Copied — paste it into Claude Code"
+          />
+          <a
+            className="hero-github-link"
+            href={plugin.homepage}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            View on GitHub →
+          </a>
         </div>
       </section>
 
