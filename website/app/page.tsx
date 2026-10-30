@@ -2,7 +2,7 @@ import Link from "next/link";
 import { CopyButton } from "@/components/CopyButton";
 import { GlowingEffect } from "@/components/GlowingEffect";
 import { Spotlight } from "@/components/Spotlight";
-import { getReadme, getArchitecture, getHighlightedScripts } from "@/lib/parse";
+import { getReadme, getArchitecture } from "@/lib/parse";
 import { getPluginMeta } from "@/lib/repo";
 import { renderMarkdown, renderInline } from "@/lib/markdown";
 
@@ -12,7 +12,6 @@ import { renderMarkdown, renderInline } from "@/lib/markdown";
 const plugin = getPluginMeta();
 const readme = getReadme();
 const arch = getArchitecture();
-const { highlighted, totalCount } = getHighlightedScripts();
 
 const introParagraphs = readme.intro.split(/\n\n+/);
 const heroLede = introParagraphs[0];
@@ -83,22 +82,38 @@ function RoleIcon({ role }: { role: string }) {
   );
 }
 
-export default function Home() {
-  const [taglineMain, ...taglineRest] = readme.taglineLines;
+/* Hand-drawn "not equal" mark for the hero -- a plain Unicode "≠" glyph
+   renders thin and inconsistently across fonts at this scale next to an
+   800-weight headline; a custom shape gives full, deliberate control over
+   its stroke weight so it actually matches the surrounding text. */
+function NotEqualIcon() {
+  return (
+    <svg
+      className="hero-equation-symbol"
+      viewBox="0 0 64 64"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="9"
+      strokeLinecap="round"
+      aria-hidden
+    >
+      <path d="M8 24h48" />
+      <path d="M8 40h48" />
+      <path d="M44 8 20 56" />
+    </svg>
+  );
+}
 
+export default function Home() {
   return (
     <>
       {/* ------------------------------ hero ------------------------------ */}
       <section className="hero container">
         <Spotlight />
-        <h1 className="hero-title rise rise-1">
-          {taglineMain}
-          {taglineRest.length > 0 && (
-            <>
-              <br />
-              <span className="dim">{taglineRest.join(" ")}</span>
-            </>
-          )}
+        <h1 className="hero-equation rise">
+          Maker
+          <NotEqualIcon />
+          Checker
         </h1>
         <p
           className="hero-lede rise rise-2"
@@ -178,42 +193,6 @@ export default function Home() {
           <p className="components-note">
             …plus {arch.stages.length - 5} more stages (gate, hold, integrate, teardown, audit) in
             the <Link href="/architecture/">full architecture doc</Link>.
-          </p>
-        </div>
-      </section>
-
-      {/* --------------------------- components --------------------------- */}
-      <section className="section" id="components">
-        <div className="container">
-          <p className="eyebrow">Components</p>
-          <h2 className="section-title">Scripts own mechanics, agents own judgment</h2>
-          <p className="section-lede">
-            Every guard in the loop is a real, deterministic script in <code>bin/</code> — the
-            descriptions below are parsed from each script&rsquo;s own header at build time, so they
-            can&rsquo;t drift from reality.
-          </p>
-          <div className="components-grid">
-            {highlighted.map((script) => (
-              <a
-                className="component-card"
-                key={script.file}
-                href={`${plugin.homepage}/blob/main/bin/${script.file}`}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <GlowingEffect />
-                <p className="component-name">bin/{script.file}</p>
-                <p className="component-desc">{script.description}.</p>
-              </a>
-            ))}
-          </div>
-          <p className="components-note">
-            …plus {totalCount - highlighted.length} more scripts in{" "}
-            <a href={`${plugin.homepage}/tree/main/bin`} target="_blank" rel="noopener noreferrer">
-              bin/
-            </a>{" "}
-            — the full component map lives in the{" "}
-            <Link href="/architecture/">architecture doc</Link>.
           </p>
         </div>
       </section>

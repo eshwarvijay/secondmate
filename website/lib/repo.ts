@@ -49,6 +49,44 @@ export interface PluginMeta {
   homepage: string;
 }
 
+/**
+ * Live GitHub star count, fetched at build time from the public,
+ * unauthenticated repos API. Build-time network calls can fail (offline CI,
+ * rate limits), so this never fails the build -- it returns null and the
+ * caller just omits the stat rather than showing a fabricated number.
+ */
+export async function getGithubStars(homepage: string): Promise<number | null> {
+  const match = homepage.match(/github\.com\/([^/]+)\/([^/]+?)\/?$/);
+  if (!match) return null;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${match[1]}/${match[2]}`, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { stargazers_count?: unknown };
+    return typeof data.stargazers_count === "number" ? data.stargazers_count : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Real clone count, tracked in the repo itself by .github/workflows/
+ * clone-count.yml (runs weekly, Mondays -- GitHub's traffic API only
+ * retains 14 days, so this file is the accumulated persistent total).
+ * Same badge data README.md already renders; never a fabricated number.
+ */
+export function getCloneCount(): number | null {
+  try {
+    const raw = readRepoFile(".github", "badge-clones.json");
+    const parsed = JSON.parse(raw) as { message?: unknown };
+    const n = Number(parsed.message);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 export function getPluginMeta(): PluginMeta {
   const raw = readRepoFile(".claude-plugin", "plugin.json");
   const parsed = JSON.parse(raw) as Partial<PluginMeta>;

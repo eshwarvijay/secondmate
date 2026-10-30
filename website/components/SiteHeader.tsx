@@ -11,7 +11,7 @@ export function SiteHeader({ githubUrl }: { githubUrl: string }) {
   return (
     <header className="site-header">
       <div className="container">
-        <Link href="/" className="wordmark">
+        <Link href="/" className="header-logo" aria-label="secondmate home">
           <Image
             src={`${BASE_PATH}/secondmate.svg`}
             alt=""
@@ -19,6 +19,8 @@ export function SiteHeader({ githubUrl }: { githubUrl: string }) {
             height={28}
             className="wordmark-logo"
           />
+        </Link>
+        <Link href="/" className="wordmark">
           secondmate
         </Link>
         <nav className="site-nav" aria-label="Site">

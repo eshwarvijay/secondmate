@@ -3,24 +3,27 @@
 /* ------------------------------------------------------------------ */
 
 :root {
-  /* color — dark theme. Neutrals (background/text/muted-text) are the
-     exact computed values measured live from egm.dev's own page via
-     CDP (rgb(15,16,19), rgb(232,234,237), rgb(154,160,166)) -- colors
-     aren't creative/copyrightable the way specific art or prose is, so
-     reusing them directly is fine. The amber accent stays ours; egm's
-     blue/orange pairing is tied to their own elephant/goldfish brand. */
-  --bg: #0f1013;
-  --bg-elevated: #15171b;
-  --bg-subtle: #15171b;
-  --text: #e8eaed;
-  --text-muted: #9aa0a6;
-  --text-faint: #7f868d;
-  --border: rgba(255, 255, 255, 0.09);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --accent: #e8b339;
-  --accent-strong: #f5c65c;
-  --accent-dim: rgba(232, 179, 57, 0.12);
-  --green: #3fb950;
+  /* color — warm beige page, with an explicit dark "floating header
+     island" (see .site-header/.stats-ticker) that stays dark regardless
+     of the page theme -- the two are intentionally decoupled. */
+  --bg: #f3ede0;
+  --bg-elevated: #fbf8f1;
+  --bg-subtle: #ece2cd;
+  --text: #211c14;
+  --text-muted: #6b6356;
+  --text-faint: #6a6252;
+  --border: #ddd3bf;
+  --border-strong: #c9bca0;
+  --accent: #c2760a;
+  --accent-strong: #8a4e06;
+  --accent-dim: rgba(194, 118, 10, 0.1);
+  --green: #16a34a;
+
+  /* the floating header island stays dark independent of --bg above */
+  --header-bg: #14151a;
+  --header-bg-elevated: #1c1e24;
+  --header-text: #e8eaed;
+  --header-border: rgba(255, 255, 255, 0.1);
 
   /* type */
   --font-sans:
@@ -37,7 +40,10 @@
 
   /* layout */
   --container: 72rem;
-  --header-h: 4.75rem;
+  --header-h: 4.5rem;
+  --ticker-h: 1.875rem;
+  --header-gap: 1rem;
+  --ticker-gap: 0.5rem;
 }
 
 /* ------------------------------------------------------------------ */
@@ -56,7 +62,9 @@ html {
   font: 100%/1.65 var(--font-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  scroll-padding-top: calc(var(--header-h) + 1.5rem);
+  scroll-padding-top: calc(
+    var(--header-h) + var(--ticker-h) + var(--header-gap) + var(--ticker-gap) + 1.5rem
+  );
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -66,14 +74,7 @@ html {
 }
 
 body {
-  /* Subtle dot-grid texture (Aceternity's "Dot Background" pattern,
-     reimplemented in plain CSS — a repeating radial-gradient dot grid is
-     generic CSS, not worth a dependency): warm dots at low opacity over
-     the beige page color, fixed so it doesn't scroll with content. */
   background-color: var(--bg);
-  background-image: radial-gradient(var(--border-strong) 1px, transparent 1px);
-  background-size: 22px 22px;
-  background-attachment: fixed;
   color: var(--text);
   font-size: 1.0625rem;
   text-rendering: optimizeLegibility;
@@ -135,7 +136,7 @@ button {
 }
 
 .section {
-  padding-block: clamp(3.5rem, 7vw, 6rem);
+  padding-block: clamp(4.5rem, 8vw, 7rem);
 }
 
 .section + .section {
@@ -188,15 +189,32 @@ button {
 /* header                                                               */
 /* ------------------------------------------------------------------ */
 
+/* Floating header island: a narrower, rounded, opaque dark card inset from
+   the page edges -- deliberately NOT edge-to-edge and NOT translucent.
+   Per apple-design's materials guidance, a solid card floating over a
+   lighter page reads correctly as opaque with real depth (shadow), not as
+   a blurred glass layer (translucency is for chrome sitting over scrolling
+   content of the SAME surface, not a contrasting floating island). */
 .site-header {
   position: sticky;
-  top: 0;
+  top: var(--header-gap);
   z-index: 50;
   height: var(--header-h);
-  background: rgba(15, 16, 19, 0.72);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-  backdrop-filter: blur(20px) saturate(180%);
-  border-bottom: 1px solid var(--border);
+  max-width: 60rem;
+  margin-inline: auto;
+  width: calc(100% - 2rem);
+  background: var(--header-bg);
+  color: var(--header-text);
+  border-radius: 20px;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.12),
+    0 12px 28px rgba(0, 0, 0, 0.22);
+}
+
+.site-header .wordmark,
+.site-header .site-nav a,
+.site-header .nav-github {
+  color: var(--header-text);
 }
 
 @media (prefers-reduced-transparency: reduce) {
@@ -208,19 +226,37 @@ button {
 }
 
 .site-header .container {
+  max-width: none;
+  padding-inline: 1.25rem;
   height: 100%;
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  gap: 2rem;
+}
+
+.header-logo {
+  grid-column: 1;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+}
+
+.site-header .wordmark {
+  grid-column: 2;
+  justify-self: center;
+}
+
+.site-header .site-nav {
+  grid-column: 3;
 }
 
 .wordmark {
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
-  font-weight: 650;
-  font-size: 1rem;
-  letter-spacing: -0.01em;
+  font-weight: 900;
+  font-size: 3rem;
+  line-height: 1;
+  letter-spacing: -0.07em;
   text-decoration: none;
 }
 
@@ -393,14 +429,38 @@ button {
   }
 }
 
-.hero-title {
-  font-size: clamp(2.35rem, 5.2vw + 1rem, 3.85rem);
-  line-height: 1.06;
+.hero-equation {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1.25rem;
+  font-size: clamp(3.5rem, 10vw + 1rem, 9rem);
+  line-height: 1;
+  font-weight: 800;
   letter-spacing: -0.03em;
-  font-weight: 700;
-  max-width: 20ch;
-  margin-inline: auto;
   margin-bottom: 1.5rem;
+}
+
+.hero-equation-symbol {
+  color: #7c5cff;
+  width: 0.62em;
+  height: 0.62em;
+  flex-shrink: 0;
+}
+
+.hero-title {
+  font-size: 1.125rem;
+  line-height: 1.5;
+  letter-spacing: normal;
+  font-weight: 500;
+  max-width: 32ch;
+  margin-inline: auto;
+  margin-bottom: 1rem;
+}
+
+.hero-title .dim {
+  color: var(--text-faint);
+  font-weight: 500;
 }
 
 .hero-title .dim {
@@ -450,12 +510,12 @@ button {
 .button {
   display: inline-flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.45rem;
   font-size: 0.9375rem;
-  font-weight: 550;
+  font-weight: 600;
   text-decoration: none;
-  border-radius: 10px;
-  padding: 0.6rem 1.1rem;
+  border-radius: 999px;
+  padding: 0.7rem 1.4rem;
   transition:
     transform var(--dur-press) var(--ease-out),
     background-color var(--dur-press) var(--ease-out),
@@ -491,8 +551,8 @@ button {
 
 @media (hover: hover) and (pointer: fine) {
   .button-ghost:hover {
-    border-color: rgba(255, 255, 255, 0.32);
-    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(0, 0, 0, 0.28);
+    background: rgba(0, 0, 0, 0.035);
   }
 }
 
@@ -513,7 +573,7 @@ button {
   overflow-x: auto;
   font-size: 0.875rem;
   line-height: 1.7;
-  color: #d6d8db;
+  color: #3f3f46;
 }
 
 .codeblock[data-lang]::after {
@@ -533,8 +593,8 @@ button {
 .prose td code,
 .section-lede code {
   font-size: 0.85em;
-  background: rgba(255, 255, 255, 0.055);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(0, 0, 0, 0.045);
+  border: 1px solid rgba(0, 0, 0, 0.07);
   border-radius: 6px;
   padding: 0.12em 0.38em;
   /* Inline code must wrap when it has to: a nowrap long command (e.g. the
@@ -554,7 +614,7 @@ button {
   height: 2rem;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(0, 0, 0, 0.025);
   color: var(--text-muted);
   transition:
     transform var(--dur-press) var(--ease-out),
@@ -567,7 +627,7 @@ button {
   .copy-button:hover {
     color: var(--text);
     border-color: var(--border-strong);
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(0, 0, 0, 0.045);
   }
 }
 
@@ -680,8 +740,8 @@ button {
   justify-content: center;
   width: 2.25rem;
   height: 2.25rem;
-  border-radius: 10px;
-  background: var(--accent-dim);
+  border-radius: 50%;
+  background: var(--bg-elevated);
   color: var(--accent-strong);
   margin-bottom: 0.75rem;
 }
@@ -996,11 +1056,74 @@ button {
   min-width: 0;
 }
 
+/* stats ticker -- scrolling strip under the header. Real build-time data
+   only (version, license, live GitHub stars); content is duplicated 3x in
+   the markup so the 33.333% translateX loop wraps with no visible seam. */
+.stats-ticker {
+  position: sticky;
+  top: calc(var(--header-h) + var(--header-gap) + var(--ticker-gap));
+  z-index: 40;
+  height: var(--ticker-h);
+  max-width: 60rem;
+  margin-inline: auto;
+  width: calc(100% - 2rem);
+  overflow: hidden;
+  /* sampled directly from the reference screenshot: rgb(160,255,110) */
+  background: #a0ff6e;
+  border-radius: 14px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.18);
+}
+
+.stats-ticker-track {
+  display: flex;
+  width: max-content;
+  height: 100%;
+  align-items: center;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .stats-ticker-track {
+    animation: ticker-scroll 28s linear infinite;
+  }
+}
+
+@keyframes ticker-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    /* exactly one of the three duplicated copies */
+    transform: translateX(-33.3333%);
+  }
+}
+
+.stats-ticker-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding-inline: 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #211e1d;
+  white-space: nowrap;
+}
+
+.stats-ticker-sep {
+  opacity: 0.55;
+}
+
 .docs-toc {
   position: sticky;
-  top: calc(var(--header-h) + 2rem);
+  top: calc(
+    var(--header-h) + var(--ticker-h) + var(--header-gap) + var(--ticker-gap) + 2rem
+  );
   font-size: 0.875rem;
-  max-height: calc(100vh - var(--header-h) - 4rem);
+  max-height: calc(
+    100vh - var(--header-h) - var(--ticker-h) - var(--header-gap) - var(--ticker-gap) - 4rem
+  );
   overflow-y: auto;
 }
 

@@ -2,12 +2,15 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { SiteHeader } from "@/components/SiteHeader";
 import { SiteFooter } from "@/components/SiteFooter";
-import { getPluginMeta } from "@/lib/repo";
+import { StatsTicker } from "@/components/StatsTicker";
+import { getPluginMeta, getGithubStars, getCloneCount } from "@/lib/repo";
 import { getReadme } from "@/lib/parse";
 
 const plugin = getPluginMeta();
 const readme = getReadme();
 const description = readme.taglineLines.join(" ");
+const stars = await getGithubStars(plugin.homepage);
+const clones = getCloneCount();
 
 export const metadata: Metadata = {
   metadataBase: new URL(plugin.homepage),
@@ -26,7 +29,7 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#ffffff",
+  themeColor: "#0f1013",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -34,6 +37,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <SiteHeader githubUrl={plugin.homepage} />
+        <StatsTicker
+          version={plugin.version}
+          mitLicensed={readme.mitLicensed}
+          stars={stars}
+          clones={clones}
+        />
         <main>{children}</main>
         <SiteFooter
           githubUrl={plugin.homepage}
