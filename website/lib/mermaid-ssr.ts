@@ -164,8 +164,11 @@ async function createRenderer(): Promise<RenderFn> {
       fontSize: `${FONT_SIZE}px`,
     },
     // htmlLabels must stay off for SSR: foreignObject labels are measured via
-    // DOM layout (offsetWidth), which jsdom reports as 0.
-    flowchart: { htmlLabels: false, useMaxWidth: true },
+    // DOM layout (getBoundingClientRect), which jsdom reports as 0 — nodes
+    // render as empty boxes. Must be set at the TOP LEVEL: mermaid v11
+    // deprecated flowchart.htmlLabels and no longer honors it.
+    htmlLabels: false,
+    flowchart: { useMaxWidth: true },
   });
 
   return async (id, source) => inflateViewBox((await mermaid.render(id, source)).svg);
