@@ -221,9 +221,8 @@ button {
   text-decoration: none;
 }
 
-.wordmark .paw {
-  font-size: 1.125rem;
-  line-height: 1;
+.wordmark-logo {
+  border-radius: 6px;
 }
 
 .site-nav {

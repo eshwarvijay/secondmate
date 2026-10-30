@@ -1,3 +1,4 @@
+import Image from "next/image";
 import Link from "next/link";
 
 export function SiteHeader({ githubUrl }: { githubUrl: string }) {
@@ -5,9 +6,7 @@ export function SiteHeader({ githubUrl }: { githubUrl: string }) {
     <header className="site-header">
       <div className="container">
         <Link href="/" className="wordmark">
-          <span className="paw" aria-hidden>
-            🐾
-          </span>
+          <Image src="/secondmate.png" alt="" width={28} height={28} className="wordmark-logo" />
           secondmate
         </Link>
         <nav className="site-nav" aria-label="Site">
