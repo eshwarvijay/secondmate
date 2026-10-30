@@ -18,6 +18,9 @@ const nextConfig = {
   // Trailing slashes keep every route a real directory with an index.html,
   // which is what GitHub Pages serves most reliably.
   trailingSlash: true,
+  // Mermaid runs only at build time (lib/mermaid-ssr.ts); keep it and jsdom
+  // out of the server bundle so nothing from them reaches the client.
+  serverExternalPackages: ["mermaid", "jsdom"],
 };
 
 export default nextConfig;

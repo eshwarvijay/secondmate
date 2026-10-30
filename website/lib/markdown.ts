@@ -1,10 +1,11 @@
 import MarkdownIt from "markdown-it";
+import { renderMermaidToSvg } from "./mermaid-ssr";
 
 /**
  * markdown-it configuration for rendering the repo's own docs at build time.
  * - Headings get stable slug ids (and are collected for the docs-page TOC).
- * - ```mermaid fences become <div class="mermaid"> placeholders that a client
- *   component hydrates into SVGs after load.
+ * - ```mermaid fences become placeholder comments that renderMarkdown
+ *   replaces with build-time-rendered inline SVG (lib/mermaid-ssr.ts).
  * - Fences get a small language label; tables get a horizontal-scroll wrapper.
  * - Relative links into the repo (docs/…) are rewritten to site routes and
  *   internal links are prefixed with the export base path.
@@ -50,8 +51,9 @@ function rewriteHref(href: string): { href: string; external: boolean } {
   };
 }
 
-export function createMd(collectToc = false): { md: MarkdownIt; toc: TocEntry[] } {
+export function createMd(collectToc = false): { md: MarkdownIt; toc: TocEntry[]; mermaidBlocks: string[] } {
   const toc: TocEntry[] = [];
+  const mermaidBlocks: string[] = [];
   const md = new MarkdownIt({
     html: false,
     linkify: true,
@@ -74,11 +76,9 @@ export function createMd(collectToc = false): { md: MarkdownIt; toc: TocEntry[] 
     const token = tokens[idx];
     const lang = token.info.trim().split(/\s+/)[0] ?? "";
     if (lang === "mermaid") {
-      const encoded = Buffer.from(token.content, "utf8").toString("base64");
-      return (
-        `<div class="mermaid" data-source="${encoded}">` +
-        `<pre class="mermaid-source"><code>${escapeHtml(token.content)}</code></pre></div>`
-      );
+      // Marker replaced with the rendered SVG by renderMarkdown below.
+      const idx = mermaidBlocks.push(token.content) - 1;
+      return `<div class="mermaid"><!--mermaid-block-${idx}--></div>`;
     }
     return (
       `<div class="codeblock"${lang ? ` data-lang="${escapeHtml(lang)}"` : ""}>` +
@@ -106,12 +106,21 @@ export function createMd(collectToc = false): { md: MarkdownIt; toc: TocEntry[] 
     return defaultLinkOpen(tokens, idx, options, env, self);
   };
 
-  return { md, toc };
+  return { md, toc, mermaidBlocks };
 }
 
-export function renderMarkdown(source: string): { html: string; toc: TocEntry[] } {
-  const { md, toc } = createMd(true);
-  return { html: md.render(source), toc };
+/** Unique id for every diagram on the site, so embedded <style> stays scoped. */
+let mermaidSeq = 0;
+
+export async function renderMarkdown(source: string): Promise<{ html: string; toc: TocEntry[] }> {
+  const { md, toc, mermaidBlocks } = createMd(true);
+  let html = md.render(source);
+  for (const [i, blockSource] of mermaidBlocks.entries()) {
+    const svg = await renderMermaidToSvg(`mermaid-diagram-${mermaidSeq++}`, blockSource);
+    const fallback = `<pre class="mermaid-source"><code>${escapeHtml(blockSource)}</code></pre>`;
+    html = html.replace(`<!--mermaid-block-${i}-->`, svg ?? fallback);
+  }
+  return { html, toc };
 }
 
 export function renderInline(source: string): string {

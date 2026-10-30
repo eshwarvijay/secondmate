@@ -16,8 +16,9 @@ const introParagraphs = readme.intro.split(/\n\n+/);
 const heroLede = introParagraphs[0];
 const howItWorksLede = introParagraphs.slice(1).join("\n\n");
 
-const quickStart = renderMarkdown(readme.quickStart).html;
-const requirements = renderMarkdown(readme.requirements).html;
+const quickStart = (await renderMarkdown(readme.quickStart)).html;
+const requirements = (await renderMarkdown(readme.requirements)).html;
+const howItWorksLedeHtml = (await renderMarkdown(howItWorksLede)).html;
 
 function ShieldIcon() {
   return (
@@ -86,7 +87,7 @@ export default function Home() {
           <h2 className="section-title">Maker is not checker</h2>
           <div
             className="section-lede prose"
-            dangerouslySetInnerHTML={{ __html: renderMarkdown(howItWorksLede).html }}
+            dangerouslySetInnerHTML={{ __html: howItWorksLedeHtml }}
           />
 
           <div className="roles-grid">

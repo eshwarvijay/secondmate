@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { DocsToc } from "@/components/DocsToc";
-import { MermaidHydrator } from "@/components/MermaidHydrator";
 import { getArchitecture } from "@/lib/parse";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -12,7 +11,7 @@ export const metadata: Metadata = {
 /* The whole page below is docs/ARCHITECTURE.md rendered at build time. */
 
 const arch = getArchitecture();
-const { html, toc } = renderMarkdown(arch.markdown);
+const { html, toc } = await renderMarkdown(arch.markdown);
 
 export default function ArchitecturePage() {
   return (
@@ -21,7 +20,6 @@ export default function ArchitecturePage() {
         <DocsToc entries={toc} />
       </aside>
       <article className="prose" dangerouslySetInnerHTML={{ __html: html }} />
-      <MermaidHydrator />
     </div>
   );
 }
