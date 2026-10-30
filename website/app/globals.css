@@ -298,6 +298,26 @@ button {
   }
 }
 
+/* hero mascot — original illustration, hidden below desktop widths so it
+   never competes with the headline on narrow viewports. */
+.hero-mascot {
+  display: none;
+}
+
+@media (min-width: 1024px) {
+  .hero-mascot {
+    display: block;
+    position: absolute;
+    top: 50%;
+    right: 0;
+    width: 200px;
+    height: auto;
+    transform: translateY(-50%);
+    opacity: 0.9;
+    pointer-events: none;
+  }
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .spotlight {
     animation: spotlight-drift 2.6s var(--ease-out) 0.9s 1 forwards;

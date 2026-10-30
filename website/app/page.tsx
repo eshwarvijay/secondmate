@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { CopyButton } from "@/components/CopyButton";
 import { GlowingEffect } from "@/components/GlowingEffect";
+import { MascotIllustration } from "@/components/MascotIllustration";
 import { Spotlight } from "@/components/Spotlight";
 import { getReadme, getArchitecture, getHighlightedScripts } from "@/lib/parse";
 import { getPluginMeta } from "@/lib/repo";
@@ -39,6 +40,7 @@ export default function Home() {
       {/* ------------------------------ hero ------------------------------ */}
       <section className="hero container">
         <Spotlight />
+        <MascotIllustration className="hero-mascot rise rise-3" />
         <div className="hero-meta rise">
           <span className="pill">
             <span className="dot" aria-hidden />v{plugin.version}
