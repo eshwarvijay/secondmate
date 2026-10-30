@@ -265,6 +265,10 @@ button {
 .hero {
   padding-block: clamp(4.5rem, 10vw, 8rem) clamp(3.5rem, 7vw, 5.5rem);
   position: relative;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 
 /* ambient glow -- two soft blurred color blobs that drift very slowly
@@ -392,6 +396,7 @@ button {
   letter-spacing: -0.03em;
   font-weight: 700;
   max-width: 20ch;
+  margin-inline: auto;
   margin-bottom: 1.5rem;
 }
 
@@ -401,6 +406,7 @@ button {
 
 .hero-lede {
   max-width: 42rem;
+  margin-inline: auto;
   color: var(--text-muted);
   font-size: 1.125rem;
   margin-bottom: 2.5rem;
@@ -414,6 +420,7 @@ button {
 .hero-actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: center;
   align-items: center;
   gap: 1.25rem;
   margin-top: 1.75rem;
