@@ -165,9 +165,11 @@ button {
   transition: text-decoration-color var(--dur-hover) var(--ease-out);
 }
 
-.section-lede a:hover,
-.prose a:hover {
-  text-decoration-color: currentColor;
+@media (hover: hover) and (pointer: fine) {
+  .section-lede a:hover,
+  .prose a:hover {
+    text-decoration-color: currentColor;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -229,8 +231,10 @@ button {
   transition: color var(--dur-press) var(--ease-out);
 }
 
-.site-nav a:hover {
-  color: var(--text);
+@media (hover: hover) and (pointer: fine) {
+  .site-nav a:hover {
+    color: var(--text);
+  }
 }
 
 .site-nav .nav-github {
@@ -428,8 +432,10 @@ button {
   color: #1a1405;
 }
 
-.button-primary:hover {
-  background: var(--accent-strong);
+@media (hover: hover) and (pointer: fine) {
+  .button-primary:hover {
+    background: var(--accent-strong);
+  }
 }
 
 .button-ghost {
@@ -437,9 +443,11 @@ button {
   color: var(--text);
 }
 
-.button-ghost:hover {
-  border-color: rgba(255, 255, 255, 0.32);
-  background: rgba(255, 255, 255, 0.04);
+@media (hover: hover) and (pointer: fine) {
+  .button-ghost:hover {
+    border-color: rgba(255, 255, 255, 0.32);
+    background: rgba(255, 255, 255, 0.04);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -519,10 +527,12 @@ button {
     background-color var(--dur-press) var(--ease-out);
 }
 
-.copy-button:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: rgba(255, 255, 255, 0.06);
+@media (hover: hover) and (pointer: fine) {
+  .copy-button:hover {
+    color: var(--text);
+    border-color: var(--border-strong);
+    background: rgba(255, 255, 255, 0.06);
+  }
 }
 
 .copy-button:active {
@@ -622,8 +632,10 @@ button {
   transition: border-color var(--dur-hover) var(--ease-out);
 }
 
-.role-card:hover {
-  border-color: var(--border-strong);
+@media (hover: hover) and (pointer: fine) {
+  .role-card:hover {
+    border-color: var(--border-strong);
+  }
 }
 
 .role-card h3 {
@@ -679,8 +691,10 @@ button {
   min-width: 0;
 }
 
-.stage:hover {
-  border-color: var(--border-strong);
+@media (hover: hover) and (pointer: fine) {
+  .stage:hover {
+    border-color: var(--border-strong);
+  }
 }
 
 .stage-num {
@@ -753,8 +767,10 @@ button {
   transition: border-color var(--dur-hover) var(--ease-out);
 }
 
-.component-card:hover {
-  border-color: var(--border-strong);
+@media (hover: hover) and (pointer: fine) {
+  .component-card:hover {
+    border-color: var(--border-strong);
+  }
 }
 
 .component-card .component-name {
@@ -961,8 +977,10 @@ button {
     border-color var(--dur-press) var(--ease-out);
 }
 
-.docs-toc a:hover {
-  color: var(--text);
+@media (hover: hover) and (pointer: fine) {
+  .docs-toc a:hover {
+    color: var(--text);
+  }
 }
 
 .docs-toc a[data-active="true"] {
@@ -1009,8 +1027,10 @@ button {
   transition: color var(--dur-press) var(--ease-out);
 }
 
-.site-footer a:hover {
-  color: var(--text);
+@media (hover: hover) and (pointer: fine) {
+  .site-footer a:hover {
+    color: var(--text);
+  }
 }
 
 .site-footer .footer-links {
