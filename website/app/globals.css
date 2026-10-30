@@ -3,16 +3,17 @@
 /* ------------------------------------------------------------------ */
 
 :root {
-  /* color — light theme, Geist/shadcn-style neutral grays (never stark
-     black/white) with a deepened amber accent that holds contrast on white */
-  --bg: #ffffff;
-  --bg-elevated: #fafafa;
-  --bg-subtle: #f4f4f5;
-  --text: #18181b;
-  --text-muted: #52525b;
-  --text-faint: #a1a1aa;
-  --border: #e4e4e7;
-  --border-strong: #d4d4d8;
+  /* color — warm beige theme (Tailwind "stone" neutrals, not "zinc" —
+     warm grays read as a mismatch against a tinted beige background)
+     with a deepened amber accent that holds contrast on the page */
+  --bg: #f3ede0;
+  --bg-elevated: #fbf8f1;
+  --bg-subtle: #ece2cd;
+  --text: #211c14;
+  --text-muted: #6b6356;
+  --text-faint: #a39a89;
+  --border: #ddd3bf;
+  --border-strong: #c9bca0;
   --accent: #c2760a;
   --accent-strong: #a35e08;
   --accent-dim: rgba(194, 118, 10, 0.1);
@@ -62,7 +63,14 @@ html {
 }
 
 body {
-  background: var(--bg);
+  /* Subtle dot-grid texture (Aceternity's "Dot Background" pattern,
+     reimplemented in plain CSS — a repeating radial-gradient dot grid is
+     generic CSS, not worth a dependency): warm dots at low opacity over
+     the beige page color, fixed so it doesn't scroll with content. */
+  background-color: var(--bg);
+  background-image: radial-gradient(var(--border-strong) 1px, transparent 1px);
+  background-size: 22px 22px;
+  background-attachment: fixed;
   color: var(--text);
   font-size: 1.0625rem;
   text-rendering: optimizeLegibility;
