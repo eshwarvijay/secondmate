@@ -277,6 +277,49 @@ button {
   }
 }
 
+/* aceternity spotlight (adapted): warm glow above the hero headline.    */
+/* One slow one-shot entrance; static afterwards.                        */
+.spotlight {
+  position: absolute;
+  top: -22%;
+  left: 50%;
+  z-index: -1; /* behind the hero text, above the page background */
+  width: 138%;
+  max-width: 100%; /* never widen the page on narrow viewports */
+  height: 169%;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, -40%);
+}
+
+@media (min-width: 1024px) {
+  .spotlight {
+    width: 84%;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .spotlight {
+    animation: spotlight-drift 2.6s var(--ease-out) 0.9s 1 forwards;
+  }
+  @keyframes spotlight-drift {
+    0% {
+      opacity: 0;
+      transform: translate(-72%, -62%) scale(0.5);
+    }
+    100% {
+      opacity: 1;
+      transform: translate(-50%, -40%) scale(1);
+    }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spotlight {
+    opacity: 1;
+  }
+}
+
 .hero-meta {
   display: flex;
   align-items: center;
@@ -512,7 +555,46 @@ button {
   min-width: 0;
 }
 
+/* aceternity glowing-effect (adapted): pointer-following border glow    */
+/* for cards. The element renders an aria-hidden overlay whose           */
+/* --active/--start custom properties are driven from JS.                */
+.glow-effect {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+}
+
+.glow-effect::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid transparent;
+  background:
+    radial-gradient(circle, rgba(232, 179, 57, 0.5) 10%, rgba(232, 179, 57, 0) 25%),
+    repeating-conic-gradient(
+      from 236.84deg at 50% 50%,
+      rgba(232, 179, 57, 0.65) 0%,
+      rgba(232, 179, 57, 0.08) 5%
+    );
+  background-attachment: fixed;
+  opacity: var(--active, 0);
+  transition: opacity 300ms;
+  mask-clip: padding-box, border-box;
+  mask-composite: intersect;
+  mask-image:
+    linear-gradient(#0000, #0000),
+    conic-gradient(
+      from calc((var(--start, 0) - var(--spread)) * 1deg),
+      #00000000 0deg,
+      #fff,
+      #00000000 calc(var(--spread) * 2deg)
+    );
+}
+
 .role-card {
+  position: relative;
   background: var(--bg-subtle);
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -643,6 +725,7 @@ button {
 }
 
 .component-card {
+  position: relative;
   background: var(--bg-subtle);
   border: 1px solid var(--border);
   border-radius: 14px;

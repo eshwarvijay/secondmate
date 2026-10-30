@@ -1,5 +1,7 @@
 import Link from "next/link";
 import { CopyButton } from "@/components/CopyButton";
+import { GlowingEffect } from "@/components/GlowingEffect";
+import { Spotlight } from "@/components/Spotlight";
 import { getReadme, getArchitecture, getHighlightedScripts } from "@/lib/parse";
 import { getPluginMeta } from "@/lib/repo";
 import { renderMarkdown, renderInline } from "@/lib/markdown";
@@ -36,6 +38,7 @@ export default function Home() {
     <>
       {/* ------------------------------ hero ------------------------------ */}
       <section className="hero container">
+        <Spotlight />
         <div className="hero-meta rise">
           <span className="pill">
             <span className="dot" aria-hidden />v{plugin.version}
@@ -93,6 +96,7 @@ export default function Home() {
           <div className="roles-grid">
             {arch.roles.map((role) => (
               <div className="role-card" key={role.role}>
+                <GlowingEffect />
                 <h3 dangerouslySetInnerHTML={{ __html: renderInline(role.role) }} />
                 <p
                   className="role-who"
@@ -162,6 +166,7 @@ export default function Home() {
                 target="_blank"
                 rel="noopener noreferrer"
               >
+                <GlowingEffect />
                 <p className="component-name">bin/{script.file}</p>
                 <p className="component-desc">{script.description}.</p>
               </a>
