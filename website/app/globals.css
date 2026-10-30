@@ -268,6 +268,60 @@ button {
   position: relative;
 }
 
+/* ambient glow -- two soft blurred color blobs that drift very slowly
+   behind the hero, a plain-CSS original take on the "shader" background
+   category (23rd.dev's components, which has no license file so its own
+   code isn't reused -- this is a from-scratch radial-gradient + blur). */
+.hero::before,
+.hero::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  width: 32rem;
+  height: 32rem;
+  border-radius: 50%;
+  filter: blur(64px);
+  pointer-events: none;
+  opacity: 0.16;
+}
+
+.hero::before {
+  top: -8rem;
+  left: 55%;
+  background: radial-gradient(circle, var(--accent) 0%, transparent 70%);
+}
+
+.hero::after {
+  top: 6rem;
+  left: 78%;
+  background: radial-gradient(circle, #b5531f 0%, transparent 70%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .hero::before {
+    animation: glow-drift-a 48s ease-in-out infinite alternate;
+  }
+  .hero::after {
+    animation: glow-drift-b 56s ease-in-out infinite alternate;
+  }
+  @keyframes glow-drift-a {
+    from {
+      transform: translate(0, 0) scale(1);
+    }
+    to {
+      transform: translate(-6%, 8%) scale(1.15);
+    }
+  }
+  @keyframes glow-drift-b {
+    from {
+      transform: translate(0, 0) scale(1);
+    }
+    to {
+      transform: translate(8%, -6%) scale(0.9);
+    }
+  }
+}
+
 /* One restrained entrance on first paint: fast, small travel, ease-out. */
 @media (prefers-reduced-motion: no-preference) {
   .hero .rise {
