@@ -25,10 +25,6 @@ export function SiteFooter({
             README
           </a>
         </nav>
-        <p className="footer-note">
-          Every word of documentation on this site is read from this repo&rsquo;s own README.md,
-          docs/ARCHITECTURE.md and bin/ scripts at build time — never a hand-maintained copy.
-        </p>
       </div>
     </footer>
   );

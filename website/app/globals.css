@@ -364,26 +364,48 @@ button {
   }
 }
 
-/* One restrained entrance on first paint: fast, small travel, ease-out. */
-@media (prefers-reduced-motion: no-preference) {
-  .hero .rise {
-    animation: hero-rise 480ms var(--ease-out) both;
-  }
-  .hero .rise-1 {
-    animation-delay: 70ms;
-  }
-  .hero .rise-2 {
-    animation-delay: 140ms;
-  }
-  .hero .rise-3 {
-    animation-delay: 210ms;
-  }
-  @keyframes hero-rise {
-    from {
-      opacity: 0;
-      transform: translateY(10px);
-    }
-  }
+/* Masked word reveal: the mask clips each headline word while GSAP
+   raises it into view. The small bottom padding guarantees descenders
+   are never clipped mid-animation. */
+.hero-word-mask {
+  display: inline-flex;
+  overflow: hidden;
+  padding-bottom: 0.06em;
+  margin-bottom: -0.06em;
+}
+
+/* Hairline grid the entrance draws in -- decorative vertical rules at
+   the container edges and quarter points, in the site's border color. */
+.hero-lines {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+}
+
+.hero-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+  opacity: 0.55;
+}
+
+.hero-line:nth-child(1) {
+  left: 0;
+}
+.hero-line:nth-child(2) {
+  left: 25%;
+}
+.hero-line:nth-child(3) {
+  left: 50%;
+}
+.hero-line:nth-child(4) {
+  left: 75%;
+}
+.hero-line:nth-child(5) {
+  right: 0;
 }
 
 /* aceternity spotlight (adapted): warm glow above the hero headline.    */
@@ -475,9 +497,15 @@ button {
   margin-bottom: 2.5rem;
 }
 
+/* Pill highlight on emphasized words in the lede. */
 .hero-lede strong {
-  color: var(--text);
+  color: var(--accent-strong);
   font-weight: 600;
+  background: var(--accent-dim);
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 999px;
+  padding: 0.08em 0.5em;
+  white-space: nowrap;
 }
 
 .hero-actions {
@@ -669,16 +697,64 @@ button {
 /* roles grid                                                           */
 /* ------------------------------------------------------------------ */
 
-.roles-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
-  gap: 1rem;
+/* Roles as minimal numbered rows: type does the work, hairlines divide.
+   Index number in mono anchors the left; identity and detail sit in two
+   quiet columns. No cards, no fills, no glow. */
+.roles-list {
+  list-style: none;
+  max-width: 56rem;
+  border-top: 1px solid var(--border);
 }
 
-/* Same grid-blowout guard as .docs-layout: a card's min-content must not
-   force its track (and the page) wider than a narrow viewport. */
-.roles-grid > * {
+.role-row {
+  display: grid;
+  grid-template-columns: 3rem minmax(0, 15rem) minmax(0, 1fr);
+  gap: 1.5rem;
+  padding-block: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.role-row > * {
   min-width: 0;
+}
+
+.role-index {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--text-faint);
+  padding-top: 0.25em;
+}
+
+.role-id h3 {
+  font-size: 1.25rem;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.25rem;
+}
+
+.role-row .role-who {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--accent-strong);
+}
+
+.role-row .role-job {
+  font-size: 0.9375rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+.role-row .role-constraint {
+  font-size: 0.8125rem;
+  color: var(--text-faint);
+}
+
+@media (max-width: 700px) {
+  .role-row {
+    grid-template-columns: 2.25rem minmax(0, 1fr);
+  }
+  .role-detail {
+    grid-column: 2;
+  }
 }
 
 /* aceternity glowing-effect (adapted): pointer-following border glow    */
@@ -781,47 +857,31 @@ button {
 /* stage rail                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Stage rail as a quiet stepper: hairline-divided rows, mono numbers,
+   no card chrome. Same de-boxed language as the roles list. */
 .stage-rail {
   list-style: none;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
   max-width: 52rem;
+  border-top: 1px solid var(--border);
 }
 
 .stage {
   display: grid;
-  grid-template-columns: 2.5rem 1fr;
+  grid-template-columns: 3rem 1fr;
   gap: 1.125rem;
-  background: var(--bg-subtle);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 1.125rem 1.375rem;
-  transition: border-color var(--dur-hover) var(--ease-out);
+  padding-block: 1.25rem;
+  border-bottom: 1px solid var(--border);
 }
 
 .stage > * {
   min-width: 0;
 }
 
-@media (hover: hover) and (pointer: fine) {
-  .stage:hover {
-    border-color: var(--border-strong);
-  }
-}
-
 .stage-num {
   font-family: var(--font-mono);
   font-size: 0.8125rem;
   color: var(--accent-strong);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  height: 2rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--accent-dim);
-  border-color: rgba(194, 118, 10, 0.22);
+  padding-top: 0.2em;
 }
 
 .stage h3 {
@@ -855,6 +915,142 @@ button {
   position: relative;
   top: 0.08em;
   color: var(--green);
+}
+
+/* ------------------------------------------------------------------ */
+/* loop timeline -- pinned horizontal scrub on desktop, list fallback   */
+/* ------------------------------------------------------------------ */
+
+.loop-section {
+  overflow: hidden;
+  /* Generous air below the timeline before the next section starts. */
+  padding-bottom: clamp(4.5rem, 9vw, 8rem);
+}
+
+/* The section content grows into place as it approaches the viewport
+   center (from either scroll direction) -- transform driven by
+   ScrollTrigger on this wrapper. */
+.loop-scale {
+  transform-origin: center center;
+}
+
+.loop-track {
+  list-style: none;
+  display: flex;
+  width: max-content;
+  padding-right: 4rem;
+}
+
+.loop-stage {
+  flex: none;
+  width: clamp(22rem, 32vw, 30rem);
+  /* Asymmetric room: the focused stage scales from its left edge, so all
+     growth travels right -- the extra right padding is where it lands,
+     keeping text clear of the next stage's hairline divider. */
+  padding-inline: 3rem 4.5rem;
+  padding-block: 1rem;
+}
+
+.loop-stage:first-child {
+  padding-left: 0;
+}
+
+.loop-stage + .loop-stage {
+  border-left: 1px solid var(--border);
+}
+
+/* Scroll focus: the stage nearest the viewport center enlarges and comes
+   to full density; the rest recede. ScrollTrigger toggles .is-focused and
+   adds .focus-active when the effect engages -- without JS, or with
+   reduced motion, every stage simply stays fully readable. */
+@media (prefers-reduced-motion: no-preference) {
+  /* Recede stays gentle (0.7): a passing stage must still be readable
+     while the user is reading it -- scale and density together mark the
+     focus; legibility is never the price. */
+  .loop-section.focus-active .loop-stage {
+    opacity: 0.7;
+    transform-origin: left center;
+    transition:
+      transform 300ms var(--ease-out),
+      opacity 300ms var(--ease-out);
+  }
+
+  .loop-section.focus-active .loop-stage.is-focused {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+
+  /* Focused stage reads at full text density, not muted. */
+  .loop-section.focus-active .loop-stage.is-focused .stage-summary {
+    color: var(--text);
+  }
+}
+
+.loop-viewport .components-note {
+  margin-top: 2rem;
+}
+
+.loop-glyph {
+  display: block;
+  color: var(--accent-strong);
+  margin-bottom: 0.875rem;
+}
+
+.loop-glyph svg {
+  display: block;
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.loop-stage h3 {
+  font-size: 1.35rem;
+  letter-spacing: -0.02em;
+  margin-block: 0.625rem 0.4rem;
+}
+
+.loop-stage .stage-num {
+  font-size: 0.9375rem;
+}
+
+.loop-stage .stage-summary {
+  font-size: 1.0625rem;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.loop-progress {
+  height: 1px;
+  background: var(--border);
+  margin-top: 4rem;
+}
+
+.loop-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+/* Vertical list fallback: small screens and reduced motion get the same
+   content as a quiet stacked list; the pinned scrub never engages. */
+@media (max-width: 767px), (prefers-reduced-motion: reduce) {
+  .loop-track {
+    flex-direction: column;
+    width: auto;
+    padding-right: 0;
+  }
+  .loop-stage {
+    width: auto;
+    padding-inline: 0;
+    padding-block: 1.75rem;
+  }
+  .loop-stage + .loop-stage {
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+  .loop-progress {
+    display: none;
+  }
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { CopyButton } from "@/components/CopyButton";
-import { GlowingEffect } from "@/components/GlowingEffect";
+import { HomeHero } from "@/components/HomeHero";
+import { LoopTimeline } from "@/components/LoopTimeline";
+import { RevealOnScroll } from "@/components/RevealOnScroll";
 import { Spotlight } from "@/components/Spotlight";
 import { getReadme, getArchitecture } from "@/lib/parse";
 import { getPluginMeta } from "@/lib/repo";
@@ -21,66 +23,54 @@ const quickStart = (await renderMarkdown(readme.quickStart)).html;
 const requirements = (await renderMarkdown(readme.requirements)).html;
 const howItWorksLedeHtml = (await renderMarkdown(howItWorksLede)).html;
 
-/* One glyph per role -- plain geometric pictograms (wheel, eye, fork,
-   stacked bars, pencil, magnifying glass), same 16x16/stroke-1.5 language
-   as the rest of the icon set. Generic iconography, not any specific
-   product's mark. */
-function RoleIcon({ role }: { role: string }) {
-  const common = {
-    viewBox: "0 0 16 16",
-    fill: "none",
-    stroke: "currentColor",
-    strokeWidth: 1.5,
-    strokeLinecap: "round" as const,
-    strokeLinejoin: "round" as const,
-    "aria-hidden": true,
-  };
-  if (role.includes("Captain")) {
-    return (
-      <svg {...common}>
-        <circle cx="8" cy="8" r="5.5" />
-        <circle cx="8" cy="8" r="1.1" fill="currentColor" stroke="none" />
-        <path d="M8 2.5v2.3M8 13.2v-2.3M2.5 8h2.3M13.2 8h-2.3" />
-      </svg>
-    );
-  }
-  if (role.includes("Top-level")) {
-    return (
-      <svg {...common}>
-        <path d="M1.5 8c1.8-3 4-4.5 6.5-4.5s4.7 1.5 6.5 4.5c-1.8 3-4 4.5-6.5 4.5S3.3 11 1.5 8Z" />
-        <circle cx="8" cy="8" r="1.7" />
-      </svg>
-    );
-  }
-  if (role.includes("Sub-agent")) {
-    return (
-      <svg {...common}>
-        <path d="M8 2v3.5M8 5.5 4.5 9v3.5M8 5.5 11.5 9v3.5" />
-      </svg>
-    );
-  }
-  if (role.includes("Planners")) {
-    return (
-      <svg {...common}>
-        <path d="M3 4.5h10M3 8h7M3 11.5h10" />
-      </svg>
-    );
-  }
-  if (role.includes("Maker")) {
-    return (
-      <svg {...common}>
-        <path d="M3 13 3.8 9.8 10.3 3.3c.5-.5 1.3-.5 1.8 0l.6.6c.5.5.5 1.3 0 1.8L6.2 12.2 3 13Z" />
-        <path d="M9 5l2 2" />
-      </svg>
-    );
-  }
-  return (
-    <svg {...common}>
-      <circle cx="6.8" cy="6.8" r="4.3" />
-      <path d="M10.2 10.2 14 14" />
-    </svg>
-  );
-}
+/* Human-readable one-liners for the loop timeline, in stage order. The
+   parsed summaries from docs/ARCHITECTURE.md are written for agents (flags,
+   script names, verdict enums); these are the same stages told for humans.
+   Ordered by stage number -- if a stage is added or reordered in the doc,
+   entries fall back to the technical summary rather than showing the wrong
+   copy, so keep this list in sync when the stage list changes. */
+const stageTaglines = [
+  "Six AI models look at your task from different angles, and one merges it all into a single plan.",
+  "The task gets sorted: code to ship or a question to answer -- and how careful we need to be.",
+  "The maker gets its own isolated workspace. Your main project is never touched.",
+  "The maker writes the code, with automatic guards watching every edit.",
+  "A different AI model -- one that didn't write the code -- tries its best to break it.",
+  "An automated gate re-checks the facts: clean workspace, real tests, actually passing.",
+  "Anything risky -- merging, deploying, deleting -- stops here and waits for your explicit yes.",
+  "Only a passing review, a green gate, and your approval let the change land.",
+  "The temporary workspace is closed and cleaned up, with proof nothing was left behind.",
+  "Every decision, verdict, and approval is written to a permanent log you can replay.",
+  "What this run learned is fed back, so the next task starts smarter.",
+];
+
+/* Animated line icons for the loop stages, in stage order -- the
+   heroicons-animated set (MIT), vendored from the shadcn registry into
+   components/icons/. They animate subtly on hover. */
+import { UserGroupIcon } from "@/components/icons/user-group";
+import { ArrowsRightLeftIcon } from "@/components/icons/arrows-right-left";
+import { PlusCircleIcon } from "@/components/icons/plus-circle";
+import { ShieldCheckIcon } from "@/components/icons/shield-check";
+import { CheckCircleIcon } from "@/components/icons/check-circle";
+import { LockClosedIcon } from "@/components/icons/lock-closed";
+import { PauseCircleIcon } from "@/components/icons/pause-circle";
+import { LinkIcon } from "@/components/icons/link";
+import { XCircleIcon } from "@/components/icons/x-circle";
+import { DocumentTextIcon } from "@/components/icons/document-text";
+import { ArrowPathIcon } from "@/components/icons/arrow-path";
+
+const LOOP_ICONS = [
+  UserGroupIcon, // 00 plan committee -- many voices
+  ArrowsRightLeftIcon, // 01 triage -- the fork
+  PlusCircleIcon, // 02 spawn -- a fresh workspace
+  ShieldCheckIcon, // 03 implement, guarded
+  CheckCircleIcon, // 04 check -- the review
+  LockClosedIcon, // 05 gate -- nothing slips through
+  PauseCircleIcon, // 06 hold -- waits for a human
+  LinkIcon, // 07 integrate -- the merge
+  XCircleIcon, // 08 teardown -- closed out
+  DocumentTextIcon, // 09 audit trail -- the record
+  ArrowPathIcon, // 10 lesson feedback -- the loop closes
+];
 
 /* Hand-drawn "not equal" mark for the hero -- a plain Unicode "≠" glyph
    renders thin and inconsistently across fonts at this scale next to an
@@ -108,18 +98,22 @@ export default function Home() {
   return (
     <>
       {/* ------------------------------ hero ------------------------------ */}
-      <section className="hero container">
+      <HomeHero>
         <Spotlight />
-        <h1 className="hero-equation rise">
-          Maker
+        <h1 className="hero-equation">
+          <span className="hero-word-mask">
+            <span data-hero-word>Maker</span>
+          </span>
           <NotEqualIcon />
-          Checker
+          <span className="hero-word-mask">
+            <span data-hero-word>Checker</span>
+          </span>
         </h1>
         <p
-          className="hero-lede rise rise-2"
+          className="hero-lede"
           dangerouslySetInnerHTML={{ __html: renderInline(heroLede) }}
         />
-        <div className="hero-actions rise rise-3">
+        <div className="hero-actions">
           <CopyButton
             text={readme.installCommand}
             variant="primary"
@@ -135,10 +129,10 @@ export default function Home() {
             View on GitHub →
           </a>
         </div>
-      </section>
+      </HomeHero>
 
       {/* ------------------------- how it works --------------------------- */}
-      <section className="section" id="how-it-works">
+      <RevealOnScroll className="section" id="how-it-works">
         <div className="container">
           <p className="eyebrow">The SOP</p>
           <h2 className="section-title">Maker is not checker</h2>
@@ -147,55 +141,69 @@ export default function Home() {
             dangerouslySetInnerHTML={{ __html: howItWorksLedeHtml }}
           />
 
-          <div className="roles-grid">
-            {arch.roles.map((role) => (
-              <div className="role-card" key={role.role}>
-                <GlowingEffect />
-                <span className="role-icon">
-                  <RoleIcon role={role.role} />
-                </span>
-                <h3 dangerouslySetInnerHTML={{ __html: renderInline(role.role) }} />
-                <p
-                  className="role-who"
-                  dangerouslySetInnerHTML={{ __html: renderInline(role.who) }}
-                />
-                <p
-                  className="role-job"
-                  dangerouslySetInnerHTML={{ __html: renderInline(role.job) }}
-                />
-                <p
-                  className="role-constraint"
-                  dangerouslySetInnerHTML={{ __html: renderInline(role.constraint) }}
-                />
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="container" style={{ marginTop: "4rem" }}>
-          <h3 className="section-title" style={{ fontSize: "1.35rem" }}>
-            The loop, stage by stage
-          </h3>
-          <ol className="stage-rail">
-            {arch.stages.slice(0, 5).map((stage) => (
-              <li className="stage" key={stage.num}>
-                <span className="stage-num">{String(stage.num).padStart(2, "0")}</span>
-                <div>
-                  <h3 dangerouslySetInnerHTML={{ __html: renderInline(stage.title) }} />
+          <ol className="roles-list">
+            {arch.roles.map((role, i) => (
+              <li className="role-row" key={role.role} data-reveal>
+                <span className="role-index">{String(i + 1).padStart(2, "0")}</span>
+                <div className="role-id">
+                  <h3 dangerouslySetInnerHTML={{ __html: renderInline(role.role) }} />
                   <p
-                    className="stage-summary"
-                    dangerouslySetInnerHTML={{ __html: renderInline(stage.summary) }}
+                    className="role-who"
+                    dangerouslySetInnerHTML={{ __html: renderInline(role.who) }}
+                  />
+                </div>
+                <div className="role-detail">
+                  <p
+                    className="role-job"
+                    dangerouslySetInnerHTML={{ __html: renderInline(role.job) }}
+                  />
+                  <p
+                    className="role-constraint"
+                    dangerouslySetInnerHTML={{ __html: renderInline(role.constraint) }}
                   />
                 </div>
               </li>
             ))}
           </ol>
+        </div>
+
+      </RevealOnScroll>
+
+      {/* ---------------------------- the loop ---------------------------- */}
+      <LoopTimeline>
+        <div className="container">
+          <p className="eyebrow">The loop</p>
+          <h2 className="section-title">Stage by stage</h2>
+        </div>
+        <div className="loop-viewport container">
+          <ol className="loop-track">
+            {arch.stages.map((stage) => {
+              const Icon = LOOP_ICONS[stage.num] ?? ArrowPathIcon;
+              return (
+                <li className="loop-stage" key={stage.num}>
+                  <span className="loop-glyph">
+                    <Icon size={28} />
+                  </span>
+                  <span className="stage-num">{String(stage.num).padStart(2, "0")}</span>
+                  <h3 dangerouslySetInnerHTML={{ __html: renderInline(stage.title) }} />
+                  <p
+                    className="stage-summary"
+                    dangerouslySetInnerHTML={{
+                      __html: renderInline(stageTaglines[stage.num] ?? stage.summary),
+                    }}
+                  />
+                </li>
+              );
+            })}
+          </ol>
+          <div className="loop-progress" aria-hidden="true">
+            <div className="loop-progress-fill" />
+          </div>
           <p className="components-note">
-            …plus {arch.stages.length - 5} more stages (gate, hold, integrate, teardown, audit) in
-            the <Link href="/architecture/">full architecture doc</Link>.
+            Full detail in the <Link href="/architecture/">architecture doc</Link>.
           </p>
         </div>
-      </section>
+      </LoopTimeline>
 
       {/* --------------------------- quick start --------------------------- */}
       <section className="section" id="quickstart">
