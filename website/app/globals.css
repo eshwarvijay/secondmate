@@ -65,6 +65,11 @@ body {
   color: var(--text);
   font-size: 1.0625rem;
   text-rendering: optimizeLegibility;
+  /* Safety net: nothing may ever push the page wider than the viewport.
+     `clip` (unlike `hidden`) doesn't create a scroll container, so the
+     sticky site header keeps working. */
+  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 ::selection {
@@ -415,7 +420,10 @@ button {
   border: 1px solid rgba(255, 255, 255, 0.07);
   border-radius: 6px;
   padding: 0.12em 0.38em;
-  white-space: nowrap;
+  /* Inline code must wrap when it has to: a nowrap long command (e.g. the
+     install one-liner) is wider than a phone viewport and pushes the whole
+     page into horizontal overflow. */
+  overflow-wrap: anywhere;
 }
 
 /* install block with copy button */
@@ -693,6 +701,7 @@ button {
 .prose p,
 .prose li {
   color: #c6c9cd;
+  overflow-wrap: break-word;
 }
 
 .prose strong {
@@ -790,6 +799,15 @@ button {
   gap: clamp(2rem, 5vw, 5rem);
   padding-block: clamp(2.5rem, 6vw, 4.5rem);
   align-items: start;
+}
+
+/* Grid blowout guard: a grid item's automatic minimum is its min-content
+   width, and the article's min-content is huge (tables, wide code blocks,
+   the diagram), which forces the track — and the whole page — wider than a
+   phone viewport. Letting items shrink makes the inner scroll wrappers
+   (table-wrap, codeblock pre, .mermaid) do their job instead. */
+.docs-layout > * {
+  min-width: 0;
 }
 
 .docs-toc {
