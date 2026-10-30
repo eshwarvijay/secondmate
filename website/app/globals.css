@@ -11,11 +11,11 @@
   --bg-subtle: #ece2cd;
   --text: #211c14;
   --text-muted: #6b6356;
-  --text-faint: #a39a89;
+  --text-faint: #6a6252;
   --border: #ddd3bf;
   --border-strong: #c9bca0;
   --accent: #c2760a;
-  --accent-strong: #a35e08;
+  --accent-strong: #8a4e06;
   --accent-dim: rgba(194, 118, 10, 0.1);
   --green: #16a34a;
 
@@ -144,7 +144,7 @@ button {
   font-size: 0.75rem;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--accent);
+  color: var(--accent-strong);
   margin-bottom: 0.875rem;
 }
 
@@ -690,7 +690,7 @@ button {
 .role-card .role-who {
   font-family: var(--font-mono);
   font-size: 0.75rem;
-  color: var(--accent);
+  color: var(--accent-strong);
   margin-bottom: 0.75rem;
 }
 
@@ -743,7 +743,7 @@ button {
 .stage-num {
   font-family: var(--font-mono);
   font-size: 0.8125rem;
-  color: var(--accent);
+  color: var(--accent-strong);
   border: 1px solid var(--border);
   border-radius: 8px;
   height: 2rem;
