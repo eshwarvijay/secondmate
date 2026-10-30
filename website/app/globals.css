@@ -442,8 +442,22 @@ button {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 0.875rem;
+  gap: 1.25rem;
   margin-top: 1.75rem;
+}
+
+.hero-github-link {
+  font-size: 0.9375rem;
+  font-weight: 550;
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: color var(--dur-press) var(--ease-out);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .hero-github-link:hover {
+    color: var(--text);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -679,6 +693,23 @@ button {
   .role-card:hover {
     border-color: var(--border-strong);
   }
+}
+
+.role-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 10px;
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  margin-bottom: 0.75rem;
+}
+
+.role-icon svg {
+  width: 1.1rem;
+  height: 1.1rem;
 }
 
 .role-card h3 {
