@@ -13,7 +13,7 @@ export function SiteHeader({ githubUrl }: { githubUrl: string }) {
       <div className="container">
         <Link href="/" className="wordmark">
           <Image
-            src={`${BASE_PATH}/secondmate.png`}
+            src={`${BASE_PATH}/secondmate.svg`}
             alt=""
             width={28}
             height={28}

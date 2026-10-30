@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/secondmate.png" alt="secondmate" width="240" />
+  <img src="assets/secondmate.svg" alt="secondmate" width="240" />
 </p>
 
 <h1 align="center">secondmate</h1>
