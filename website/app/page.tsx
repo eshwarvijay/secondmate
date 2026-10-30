@@ -22,15 +22,6 @@ const quickStart = (await renderMarkdown(readme.quickStart)).html;
 const requirements = (await renderMarkdown(readme.requirements)).html;
 const howItWorksLedeHtml = (await renderMarkdown(howItWorksLede)).html;
 
-function ShieldIcon() {
-  return (
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M8 1.5 13 3.5v4c0 3.2-2.1 5.4-5 6.5-2.9-1.1-5-3.3-5-6.5v-4L8 1.5Z" />
-      <path d="m5.75 8 1.75 1.75 3-3.25" />
-    </svg>
-  );
-}
-
 export default function Home() {
   const [taglineMain, ...taglineRest] = readme.taglineLines;
 
@@ -120,7 +111,7 @@ export default function Home() {
             The loop, stage by stage
           </h3>
           <ol className="stage-rail">
-            {arch.stages.map((stage) => (
+            {arch.stages.slice(0, 5).map((stage) => (
               <li className="stage" key={stage.num}>
                 <span className="stage-num">{String(stage.num).padStart(2, "0")}</span>
                 <div>
@@ -129,21 +120,14 @@ export default function Home() {
                     className="stage-summary"
                     dangerouslySetInnerHTML={{ __html: renderInline(stage.summary) }}
                   />
-                  {stage.guardsAgainst && (
-                    <p className="stage-guards">
-                      <ShieldIcon />
-                      <span>
-                        Guards against:{" "}
-                        <span
-                          dangerouslySetInnerHTML={{ __html: renderInline(stage.guardsAgainst) }}
-                        />
-                      </span>
-                    </p>
-                  )}
                 </div>
               </li>
             ))}
           </ol>
+          <p className="components-note">
+            …plus {arch.stages.length - 5} more stages (gate, hold, integrate, teardown, audit) in
+            the <Link href="/architecture/">full architecture doc</Link>.
+          </p>
         </div>
       </section>
 
