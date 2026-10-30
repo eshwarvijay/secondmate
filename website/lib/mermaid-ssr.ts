@@ -149,16 +149,16 @@ async function createRenderer(): Promise<RenderFn> {
   mermaid.initialize({
     startOnLoad: false,
     securityLevel: "loose", // content is this repo's own trusted docs
-    theme: "base",
+    theme: "dark",
     themeVariables: {
-      background: "#ffffff",
-      primaryColor: "#fafafa",
-      primaryTextColor: "#18181b",
-      primaryBorderColor: "rgba(0,0,0,0.22)",
-      secondaryColor: "#f4f4f5",
-      tertiaryColor: "#f4f4f5",
-      lineColor: "#71717a",
-      textColor: "#18181b",
+      background: "#0f1013",
+      primaryColor: "#15171b",
+      primaryTextColor: "#e8eaed",
+      primaryBorderColor: "rgba(255,255,255,0.25)",
+      secondaryColor: "#0f1013",
+      tertiaryColor: "#0f1013",
+      lineColor: "#9aa0a6",
+      textColor: "#e8eaed",
       fontFamily:
         '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif',
       fontSize: `${FONT_SIZE}px`,

@@ -3,21 +3,24 @@
 /* ------------------------------------------------------------------ */
 
 :root {
-  /* color — warm beige theme (Tailwind "stone" neutrals, not "zinc" —
-     warm grays read as a mismatch against a tinted beige background)
-     with a deepened amber accent that holds contrast on the page */
-  --bg: #f3ede0;
-  --bg-elevated: #fbf8f1;
-  --bg-subtle: #ece2cd;
-  --text: #211c14;
-  --text-muted: #6b6356;
-  --text-faint: #6a6252;
-  --border: #ddd3bf;
-  --border-strong: #c9bca0;
-  --accent: #c2760a;
-  --accent-strong: #8a4e06;
-  --accent-dim: rgba(194, 118, 10, 0.1);
-  --green: #16a34a;
+  /* color — dark theme. Neutrals (background/text/muted-text) are the
+     exact computed values measured live from egm.dev's own page via
+     CDP (rgb(15,16,19), rgb(232,234,237), rgb(154,160,166)) -- colors
+     aren't creative/copyrightable the way specific art or prose is, so
+     reusing them directly is fine. The amber accent stays ours; egm's
+     blue/orange pairing is tied to their own elephant/goldfish brand. */
+  --bg: #0f1013;
+  --bg-elevated: #15171b;
+  --bg-subtle: #15171b;
+  --text: #e8eaed;
+  --text-muted: #9aa0a6;
+  --text-faint: #7f868d;
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --accent: #e8b339;
+  --accent-strong: #f5c65c;
+  --accent-dim: rgba(232, 179, 57, 0.12);
+  --green: #3fb950;
 
   /* type */
   --font-sans:
@@ -190,7 +193,7 @@ button {
   top: 0;
   z-index: 50;
   height: var(--header-h);
-  background: rgba(255, 255, 255, 0.72);
+  background: rgba(15, 16, 19, 0.72);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   backdrop-filter: blur(20px) saturate(180%);
   border-bottom: 1px solid var(--border);
@@ -488,8 +491,8 @@ button {
 
 @media (hover: hover) and (pointer: fine) {
   .button-ghost:hover {
-    border-color: rgba(0, 0, 0, 0.28);
-    background: rgba(0, 0, 0, 0.035);
+    border-color: rgba(255, 255, 255, 0.32);
+    background: rgba(255, 255, 255, 0.04);
   }
 }
 
@@ -510,7 +513,7 @@ button {
   overflow-x: auto;
   font-size: 0.875rem;
   line-height: 1.7;
-  color: #3f3f46;
+  color: #d6d8db;
 }
 
 .codeblock[data-lang]::after {
@@ -530,8 +533,8 @@ button {
 .prose td code,
 .section-lede code {
   font-size: 0.85em;
-  background: rgba(0, 0, 0, 0.045);
-  border: 1px solid rgba(0, 0, 0, 0.07);
+  background: rgba(255, 255, 255, 0.055);
+  border: 1px solid rgba(255, 255, 255, 0.07);
   border-radius: 6px;
   padding: 0.12em 0.38em;
   /* Inline code must wrap when it has to: a nowrap long command (e.g. the
@@ -551,7 +554,7 @@ button {
   height: 2rem;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: rgba(0, 0, 0, 0.025);
+  background: rgba(255, 255, 255, 0.03);
   color: var(--text-muted);
   transition:
     transform var(--dur-press) var(--ease-out),
@@ -564,7 +567,7 @@ button {
   .copy-button:hover {
     color: var(--text);
     border-color: var(--border-strong);
-    background: rgba(0, 0, 0, 0.045);
+    background: rgba(255, 255, 255, 0.06);
   }
 }
 
