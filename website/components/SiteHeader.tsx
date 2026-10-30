@@ -22,9 +22,6 @@ export function SiteHeader({ githubUrl }: { githubUrl: string }) {
           secondmate
         </Link>
         <nav className="site-nav" aria-label="Site">
-          <Link href="/#how-it-works">How it works</Link>
-          <Link href="/#components">Components</Link>
-          <Link href="/architecture/">Architecture</Link>
           <a
             className="nav-github"
             href={githubUrl}
