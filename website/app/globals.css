@@ -3,19 +3,20 @@
 /* ------------------------------------------------------------------ */
 
 :root {
-  /* color */
-  --bg: #0a0b0d;
-  --bg-elevated: #121418;
-  --bg-subtle: #0e1013;
-  --text: #ebebed;
-  --text-muted: #9ba1a8;
-  --text-faint: #6e747b;
-  --border: rgba(255, 255, 255, 0.09);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --accent: #e8b339;
-  --accent-strong: #f5c65c;
-  --accent-dim: rgba(232, 179, 57, 0.12);
-  --green: #3fb950;
+  /* color — light theme, Geist/shadcn-style neutral grays (never stark
+     black/white) with a deepened amber accent that holds contrast on white */
+  --bg: #ffffff;
+  --bg-elevated: #fafafa;
+  --bg-subtle: #f4f4f5;
+  --text: #18181b;
+  --text-muted: #52525b;
+  --text-faint: #a1a1aa;
+  --border: #e4e4e7;
+  --border-strong: #d4d4d8;
+  --accent: #c2760a;
+  --accent-strong: #a35e08;
+  --accent-dim: rgba(194, 118, 10, 0.1);
+  --green: #16a34a;
 
   /* type */
   --font-sans:
@@ -73,7 +74,7 @@ body {
 }
 
 ::selection {
-  background: rgba(232, 179, 57, 0.28);
+  background: rgba(194, 118, 10, 0.28);
   color: var(--text);
 }
 
@@ -181,7 +182,7 @@ button {
   top: 0;
   z-index: 50;
   height: var(--header-h);
-  background: rgba(10, 11, 13, 0.72);
+  background: rgba(255, 255, 255, 0.72);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   backdrop-filter: blur(20px) saturate(180%);
   border-bottom: 1px solid var(--border);
@@ -445,8 +446,8 @@ button {
 
 @media (hover: hover) and (pointer: fine) {
   .button-ghost:hover {
-    border-color: rgba(255, 255, 255, 0.32);
-    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(0, 0, 0, 0.28);
+    background: rgba(0, 0, 0, 0.035);
   }
 }
 
@@ -467,7 +468,7 @@ button {
   overflow-x: auto;
   font-size: 0.875rem;
   line-height: 1.7;
-  color: #d6d8db;
+  color: #3f3f46;
 }
 
 .codeblock[data-lang]::after {
@@ -487,8 +488,8 @@ button {
 .prose td code,
 .section-lede code {
   font-size: 0.85em;
-  background: rgba(255, 255, 255, 0.055);
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(0, 0, 0, 0.045);
+  border: 1px solid rgba(0, 0, 0, 0.07);
   border-radius: 6px;
   padding: 0.12em 0.38em;
   /* Inline code must wrap when it has to: a nowrap long command (e.g. the
@@ -518,7 +519,7 @@ button {
   height: 2rem;
   border-radius: 8px;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(0, 0, 0, 0.025);
   color: var(--text-muted);
   transition:
     transform var(--dur-press) var(--ease-out),
@@ -531,7 +532,7 @@ button {
   .copy-button:hover {
     color: var(--text);
     border-color: var(--border-strong);
-    background: rgba(255, 255, 255, 0.06);
+    background: rgba(0, 0, 0, 0.045);
   }
 }
 
@@ -602,11 +603,11 @@ button {
   border-radius: inherit;
   border: 1px solid transparent;
   background:
-    radial-gradient(circle, rgba(232, 179, 57, 0.5) 10%, rgba(232, 179, 57, 0) 25%),
+    radial-gradient(circle, rgba(194, 118, 10, 0.5) 10%, rgba(194, 118, 10, 0) 25%),
     repeating-conic-gradient(
       from 236.84deg at 50% 50%,
-      rgba(232, 179, 57, 0.65) 0%,
-      rgba(232, 179, 57, 0.08) 5%
+      rgba(194, 118, 10, 0.65) 0%,
+      rgba(194, 118, 10, 0.08) 5%
     );
   background-attachment: fixed;
   opacity: var(--active, 0);
@@ -708,7 +709,7 @@ button {
   align-items: center;
   justify-content: center;
   background: var(--accent-dim);
-  border-color: rgba(232, 179, 57, 0.22);
+  border-color: rgba(194, 118, 10, 0.22);
 }
 
 .stage h3 {
@@ -833,7 +834,7 @@ button {
 
 .prose p,
 .prose li {
-  color: #c6c9cd;
+  color: var(--text-muted);
   overflow-wrap: break-word;
 }
 
