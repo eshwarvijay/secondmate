@@ -364,6 +364,26 @@ button {
   }
 }
 
+/* Display headline: the README tagline set large. Tight leading and
+   negative tracking scale with size (large text reads too loose
+   otherwise); the second line is dimmed -- hierarchy from color and
+   weight, not decoration. */
+.hero-display {
+  font-size: clamp(2.25rem, 5.5vw, 4.5rem);
+  line-height: 1.08;
+  letter-spacing: -0.03em;
+  font-weight: 800;
+  margin-bottom: 1.5rem;
+}
+
+.hero-line {
+  display: block;
+}
+
+.hero-line-dim {
+  color: var(--text-muted);
+}
+
 /* Masked word reveal: the mask clips each headline word while GSAP
    raises it into view. The small bottom padding guarantees descenders
    are never clipped mid-animation. */

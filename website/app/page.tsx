@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { Fragment } from "react";
 import { CopyButton } from "@/components/CopyButton";
 import { HomeHero } from "@/components/HomeHero";
 import { LoopTimeline } from "@/components/LoopTimeline";
@@ -16,7 +17,6 @@ const readme = getReadme();
 const arch = getArchitecture();
 
 const introParagraphs = readme.intro.split(/\n\n+/);
-const heroLede = introParagraphs[0];
 const howItWorksLede = introParagraphs.slice(1).join("\n\n");
 
 const quickStart = (await renderMarkdown(readme.quickStart)).html;
@@ -72,46 +72,31 @@ const LOOP_ICONS = [
   ArrowPathIcon, // 10 lesson feedback -- the loop closes
 ];
 
-/* Hand-drawn "not equal" mark for the hero -- a plain Unicode "≠" glyph
-   renders thin and inconsistently across fonts at this scale next to an
-   800-weight headline; a custom shape gives full, deliberate control over
-   its stroke weight so it actually matches the surrounding text. */
-function NotEqualIcon() {
-  return (
-    <svg
-      className="hero-equation-symbol"
-      viewBox="0 0 64 64"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="9"
-      strokeLinecap="round"
-      aria-hidden
-    >
-      <path d="M8 24h48" />
-      <path d="M8 40h48" />
-      <path d="M44 8 20 56" />
-    </svg>
-  );
-}
-
 export default function Home() {
   return (
     <>
       {/* ------------------------------ hero ------------------------------ */}
       <HomeHero>
         <Spotlight />
-        <h1 className="hero-equation">
-          <span className="hero-word-mask">
-            <span data-hero-word>Maker</span>
-          </span>
-          <NotEqualIcon />
-          <span className="hero-word-mask">
-            <span data-hero-word>Checker</span>
-          </span>
+        <p className="eyebrow">A Claude Code plugin</p>
+        {/* The README tagline is the headline -- two lines, the second
+            dimmed: hierarchy from color and weight, not decoration. */}
+        <h1 className="hero-display">
+          {[readme.taglineLines[0], readme.taglineLines[1]].map((line, li) => (
+            <span className={li === 1 ? "hero-line hero-line-dim" : "hero-line"} key={li}>
+              {line.split(/\s+/).map((word, wi) => (
+                <Fragment key={wi}>
+                  <span className="hero-word-mask">
+                    <span data-hero-word>{word}</span>
+                  </span>{" "}
+                </Fragment>
+              ))}
+            </span>
+          ))}
         </h1>
         <p
           className="hero-lede"
-          dangerouslySetInnerHTML={{ __html: renderInline(heroLede) }}
+          dangerouslySetInnerHTML={{ __html: renderInline(readme.taglineLines[2] ?? "") }}
         />
         <div className="hero-actions">
           <CopyButton

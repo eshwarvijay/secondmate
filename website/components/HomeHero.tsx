@@ -49,14 +49,6 @@ export function HomeHero({ children }: { children: React.ReactNode }) {
           },
           0.2,
         )
-        // The ≠ mark fades in at near-full scale -- never scale(0):
-        // nothing in the real world appears from nothing.
-        .fromTo(
-          ".hero-equation-symbol",
-          { scale: 0.9, opacity: 0 },
-          { scale: 1, opacity: 1, duration: 0.5 },
-          0.55,
-        )
         // Lede and actions follow: small travel, opacity + transform only.
         .fromTo(
           ".hero-lede",
