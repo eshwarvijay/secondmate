@@ -1,11 +1,18 @@
 name: clone-count
 
 # GitHub only keeps 14 days of clone traffic. This merges the API response
-# into a persisted history file so the total keeps accumulating. Runs weekly:
-# safe because 7-day cadence < 14-day window, so no day is ever missed.
+# into a persisted history file so the total keeps accumulating.
+#
+# GitHub gives no SLA for scheduled (cron) triggers -- they can be silently
+# delayed or dropped during periods of load, with no error or log left
+# behind (confirmed: Monday 2026-11-02's run never fired at all). The job
+# is idempotent (merge by date key, "fresh wins for overlapping days"), so
+# running it twice a week is a free safety net: even if one trigger gets
+# dropped, the other one catches it well within the 14-day window.
 on:
   schedule:
-    - cron: "17 3 * * 1"   # weekly, Mondays 03:17 UTC
+    - cron: "17 3 * * 1"   # Mondays 03:17 UTC
+    - cron: "17 3 * * 4"   # Thursdays 03:17 UTC -- redundant catch-up run
   workflow_dispatch:
 
 permissions:
