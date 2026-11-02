@@ -455,8 +455,8 @@ button {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 1.25rem;
-  font-size: clamp(3.5rem, 10vw + 1rem, 9rem);
+  gap: clamp(0.75rem, 2.5vw, 1.25rem);
+  font-size: clamp(2.5rem, 11vw, 9rem);
   line-height: 1;
   font-weight: 800;
   letter-spacing: -0.03em;
@@ -983,6 +983,15 @@ button {
   /* Focused stage reads at full text density, not muted. */
   .loop-section.focus-active .loop-stage.is-focused .stage-summary {
     color: var(--text);
+  }
+}
+
+/* Mobile: rows are full-width, so a 1.12 scale would overflow and get
+   clipped by the section's overflow:hidden. Keep the focus cue but at a
+   scale that fits the viewport. */
+@media (max-width: 767px) and (prefers-reduced-motion: no-preference) {
+  .loop-section.focus-active .loop-stage.is-focused {
+    transform: scale(1.03);
   }
 }
 
