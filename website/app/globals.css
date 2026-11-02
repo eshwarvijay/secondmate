@@ -403,7 +403,7 @@ button {
   pointer-events: none;
 }
 
-.hero-line {
+.hero-hairline {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -412,19 +412,19 @@ button {
   opacity: 0.55;
 }
 
-.hero-line:nth-child(1) {
+.hero-hairline:nth-child(1) {
   left: 0;
 }
-.hero-line:nth-child(2) {
+.hero-hairline:nth-child(2) {
   left: 25%;
 }
-.hero-line:nth-child(3) {
+.hero-hairline:nth-child(3) {
   left: 50%;
 }
-.hero-line:nth-child(4) {
+.hero-hairline:nth-child(4) {
   left: 75%;
 }
-.hero-line:nth-child(5) {
+.hero-hairline:nth-child(5) {
   right: 0;
 }
 

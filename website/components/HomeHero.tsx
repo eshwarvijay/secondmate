@@ -30,7 +30,7 @@ export function HomeHero({ children }: { children: React.ReactNode }) {
       tl
         // Hairlines draw themselves in from the top, one after another.
         .fromTo(
-          ".hero-line",
+          ".hero-hairline",
           { scaleY: 0 },
           { scaleY: 1, duration: 1.1, stagger: 0.08, transformOrigin: "top center" },
           0,
@@ -69,11 +69,11 @@ export function HomeHero({ children }: { children: React.ReactNode }) {
   return (
     <section ref={root} className="hero container">
       <div className="hero-lines" aria-hidden="true">
-        <span className="hero-line" />
-        <span className="hero-line" />
-        <span className="hero-line" />
-        <span className="hero-line" />
-        <span className="hero-line" />
+        <span className="hero-hairline" />
+        <span className="hero-hairline" />
+        <span className="hero-hairline" />
+        <span className="hero-hairline" />
+        <span className="hero-hairline" />
       </div>
       {children}
     </section>

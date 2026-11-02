@@ -96,7 +96,7 @@ export default function Home() {
         </h1>
         <p
           className="hero-lede"
-          dangerouslySetInnerHTML={{ __html: renderInline(readme.taglineLines[2] ?? "") }}
+          dangerouslySetInnerHTML={{ __html: renderInline(introParagraphs[0]) }}
         />
         <div className="hero-actions">
           <CopyButton
