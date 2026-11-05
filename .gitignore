@@ -6,3 +6,4 @@ audit/metrics.jsonl
 audit/lens-coverage.jsonl
 audit/lens-coverage.jsonl.lock
 bin/lessons/**/*.lock
+todo.md
