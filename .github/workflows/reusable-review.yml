@@ -158,7 +158,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" > "$RUNNER_TEMP/comments.json"
+          printf '[]\n' > "$RUNNER_TEMP/comments.json"
+          url="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments?per_page=100"
+          while [ -n "$url" ]; do
+            headers="$RUNNER_TEMP/comments.headers"
+            page="$RUNNER_TEMP/comments.page.json"
+            curl --fail --silent --show-error --location \
+              -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+              -D "$headers" -o "$page" "$url"
+            jq -s '.[0] + .[1]' "$RUNNER_TEMP/comments.json" "$page" > "$RUNNER_TEMP/comments.next.json"
+            mv "$RUNNER_TEMP/comments.next.json" "$RUNNER_TEMP/comments.json"
+            url="$(python3 -c 'import re, sys; match = re.search(r"<([^>]+)>;\\s*rel=\\\"next\\\"", open(sys.argv[1]).read(), re.I); print(match.group(1) if match else "")' "$headers")"
+          done
           python3 .secondmate-tools/bin/pr-review-state.py select \
             --comments "$RUNNER_TEMP/comments.json" --repository "$GITHUB_REPOSITORY" \
             --pr "${{ github.event.pull_request.number }}" --head-sha "${{ steps.context.outputs.head_sha }}" \
@@ -270,8 +281,12 @@ jobs:
             --tests "$TEST_STATUS: $TEST_COMMAND" \
             --workflow-run-id "$GITHUB_RUN_ID" --check-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --out "$RUNNER_TEMP/comment.md"
-          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
-            -f body="$(cat "$RUNNER_TEMP/comment.md")" >/dev/null
+          payload="$RUNNER_TEMP/comment.json"
+          jq --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' > "$payload"
+          curl --fail --silent --show-error --location --request POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            -H 'Content-Type: application/json' --data-binary "@$payload" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" >/dev/null
 
       - name: Publish checker report artifact
         uses: actions/upload-artifact@v4
