@@ -262,9 +262,8 @@ jobs:
           case "$verdict_rc" in 0) verdict=pass ;; 1) verdict=fail ;; *) verdict=error ;; esac
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
 
-      - name: Publish append-only review comment
+      - name: Render append-only review comment
         env:
-          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ steps.context.outputs.head_sha }}
           BASE_SHA: ${{ steps.context.outputs.base_sha }}
@@ -282,18 +281,25 @@ jobs:
             --tests "$TEST_STATUS: $TEST_COMMAND" \
             --workflow-run-id "$GITHUB_RUN_ID" --check-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --out "$RUNNER_TEMP/comment.md"
-          payload="$RUNNER_TEMP/comment.json"
-          jq --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' > "$payload"
-          response="$RUNNER_TEMP/comment-response.json"
-          status="$(curl --silent --show-error --location --request POST \
-            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-            -H 'Content-Type: application/json' --data-binary "@$payload" \
-            --output "$response" --write-out '%{http_code}' \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments")"
-          if [ "$status" != 201 ]; then
-            jq -r '.message // "GitHub did not return an error message"' "$response" >&2
-            exit 1
-          fi
+
+      - name: Publish append-only review comment
+        # GitHub's maintained Octokit client avoids the self-hosted runner's malformed
+        # raw-curl comment request (HTTP 422: links/0/schema), while using the same
+        # job-scoped GITHUB_TOKEN and its explicit issues: write permission.
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7.0.1
+        env:
+          COMMENT_FILE: ${{ runner.temp }}/comment.md
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync(process.env.COMMENT_FILE, 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
 
       - name: Publish checker report artifact
         uses: actions/upload-artifact@v4
