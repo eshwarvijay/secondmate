@@ -185,7 +185,8 @@ jobs:
 ```
 
 The caller must grant `contents: read`, `pull-requests: write`, and `checks: write`, configure
-`JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` as secrets, and run on a runner with `pi`,
+`JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` as secrets. The workflow installs the
+pinned [PiG](https://pi-in-go.dev/) release and uses its `pig` binary; the runner still needs
 `jq`, `gh`, Python 3, Git, and approved Bedrock inference-profile access. The workflow creates an
 append-only v1/v2/... comment conversation; only a trusted bot's latest ancestor-SHA state is used
 as the next review's memory. It skips fork PRs rather than exposing secrets. Set the workflow's

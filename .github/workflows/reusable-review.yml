@@ -20,6 +20,11 @@ on:
         description: Repository-owned deterministic test/lint/build command.
         required: true
         type: string
+      pig-version:
+        description: PiG version to install from the verified upstream release archive.
+        required: false
+        type: string
+        default: 0.7.0
       trusted-bot-login:
         description: Login allowed to supply prior hidden review state.
         required: false
@@ -71,6 +76,16 @@ jobs:
           ref: ${{ inputs.secondmate-ref }}
           path: .secondmate-tools
           fetch-depth: 1
+
+      - name: Install PiG
+        env:
+          PIG_VERSION: ${{ inputs.pig-version }}
+          PIG_INSTALL_DIR: ${{ runner.temp }}/pig-bin
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location https://pi-in-go.dev/install.sh | sh
+          "$PIG_INSTALL_DIR/pig" --version
+          echo "$PIG_INSTALL_DIR" >> "$GITHUB_PATH"
 
       - name: Read PR identity and Jira requirements
         id: context
@@ -152,6 +167,7 @@ jobs:
         id: checker
         env:
           SM_LAST_VERDICT: ${{ runner.temp }}/prior.md
+          SM_CHECKER_HARNESS: pig
           TEST_STATUS: ${{ steps.tests.outputs.status }}
           REVIEW_MODE: ${{ steps.mode.outputs.value }}
           REVIEW_BASE_SHA: ${{ steps.context.outputs.base_sha }}
