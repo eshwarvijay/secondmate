@@ -376,6 +376,19 @@ ponytail as a companion to install; this is not the place to install it. Same ex
      for the same reason step 11 later reads the injection ledger: to know which lessons appeared. `--cost`/
      `--duration` are optional, only if already at hand (e.g. from a herdr pane's own cost/elapsed display) —
      never scrape or parse for them.
+   - **Preserve every review conclusion for a future GitHub check.** Keep every per-round checker output until
+     task close. Once the final round passed and `verify-gate` has accepted its exact `checked_sha`, create the
+     compact, git-versioned attestation in the primary checkout:
+     `${CLAUDE_PLUGIN_ROOT}/bin/review-attestation.py create --task <id> --jira-key <KEY> --base-sha <base-sha> --checked-sha <checked-sha> --checker-harness pi --checker-provider amazon-bedrock --checker-model <model-or-profile-arn> --round-output 1:<round-1-output> [--round-output N:<round-N-output> ...] [--test "<actual test command>"] [--flow <flow-path>] [--decision <decision-path>]`.
+     It captures every round's verdict, concrete findings, diagnostics, lens coverage, final checked SHA and
+     test commands, but deliberately does NOT commit raw model transcripts. The output defaults to
+     `audit/reviews/<jira-key>--<task-id>.json`; commit it with the flow/decision audit files. Run
+     `review-attestation.py validate <file>` before commit. A final non-pass cannot produce an attestation.
+     `.secondmate/` remains local-only: it includes transient locks, absolute paths, and large raw planning
+     transcripts. **Current merge-sequencer invariant:** it requires the merged branch to resolve exactly to
+     `checked_sha`; therefore generate this attestation in the primary checkout as part of the existing post-
+     integration audit commit, not as a post-check commit on the maker branch. This is durable prior-work
+     evidence and CI context, not by itself a bypass of an untrusted PR's required GitHub Check Run.
 
 5. **Gate** — before integrating anything:
    `${CLAUDE_PLUGIN_ROOT}/bin/verify-gate.sh --worktree <wt> --base <branch> --checked-sha <the exact sha the checker reviewed> [--test "<cmd>"]`

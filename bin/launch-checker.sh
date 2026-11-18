@@ -5,7 +5,9 @@
 #   4. your per-task addendum (the standing spec)     5. the LIVE layer for THIS round (auto-fresh, can't go stale)
 # The LIVE layer auto-gathers `git diff <base>..HEAD` (pruned) + a prior-round verdict file, plus your focus note.
 #   launch-checker.sh --addendum-text "..." [--lens redteam,qa] [--diff-base REF [--repo DIR]] [--live-text "..."] [--model M] [--thinking L] -- [extra args]
-# Env: SM_CHECKER_HARNESS(pi) SM_CHECKER_PROVIDER(amazon-bedrock) SM_CHECKER_MODEL(global.openai.gpt-5.6-terra)
+# Env: SM_CHECKER_HARNESS(pi) SM_CHECKER_PROVIDER(amazon-bedrock) SM_CHECKER_MODEL(profile ARN)
+#      SM_CHECKER_TERRA_MODEL / SM_CHECKER_SOL_MODEL / SM_CHECKER_LUNA_MODEL override the Bedrock
+#      application-inference-profile ARNs used by the default and --model terra|sol|luna shortcuts.
 #      SM_CHECKER_THINKING(high) SM_CHECKER_PROMPT(<plugin>/bin/checker-prompt.md)
 #      SM_LAST_VERDICT (default $SM_LOOP_STATE/last-verdict.md) -- prior round's checker output, auto-injected if present
 #      SM_CHECKER_DRYRUN=1 -- print the assembled harness command instead of running it (inspection / --selfcheck)
@@ -32,6 +34,15 @@ if [ "${1:-}" = "--selfcheck" ]; then
   echo "$out" | grep -aq 'focus verify boundary'      || { echo "FAIL: focus note not injected"; fails=1; }
   echo "$out" | grep -aq 'THIS review round'          || { echo "FAIL: live header missing"; fails=1; }
   rm -rf "$t"
+  # Bedrock account access is constrained to application inference profiles: bare/global model IDs
+  # are explicitly denied. Check the default and every shortcut resolve to the intended configurable ARN.
+  out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec -- -p q 2>&1)" || { echo "FAIL: dryrun errored for model check"; fails=1; }
+  echo "$out" | grep -q 'application-inference-profile/ix4wy5mwpdbw' || { echo "FAIL: default Terra profile ARN missing"; fails=1; }
+  for _pair in 'terra:ix4wy5mwpdbw' 'sol:kjh30pazebx9' 'luna:q2fductrhi5w'; do
+    _shortcut="${_pair%%:*}"; _suffix="${_pair#*:}"
+    out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec --model "$_shortcut" -- -p q 2>&1)" || { echo "FAIL: dryrun errored for $_shortcut shortcut"; fails=1; }
+    echo "$out" | grep -q "application-inference-profile/$_suffix" || { echo "FAIL: $_shortcut profile ARN missing"; fails=1; }
+  done
   # Verify --mode json is included (required for progress filter) and checker-progress.py is used
   out="$(SM_CHECKER_DRYRUN=1 "$0" --addendum-text spec -- -p q 2>&1)" || { echo "FAIL: dryrun errored for mode check"; fails=1; }
   # args are printed one per line, so --mode and json are on separate lines
@@ -66,7 +77,13 @@ fi
 
 harness="${SM_CHECKER_HARNESS:-pi}"
 provider="${SM_CHECKER_PROVIDER:-amazon-bedrock}"
-model="${SM_CHECKER_MODEL:-global.openai.gpt-5.6-terra}"
+# This account's bedrock-access-guard policy allows only these application inference profiles;
+# it explicitly denies foundation-model and global inference-profile IDs. Keep each deployment
+# configurable because these ARNs are account- and region-specific.
+terra_model="${SM_CHECKER_TERRA_MODEL:-arn:aws:bedrock:us-east-1:164980860022:application-inference-profile/ix4wy5mwpdbw}"  # gpt-5.6-terra
+sol_model="${SM_CHECKER_SOL_MODEL:-arn:aws:bedrock:us-east-1:164980860022:application-inference-profile/kjh30pazebx9}"      # gpt-6.1-sol
+luna_model="${SM_CHECKER_LUNA_MODEL:-arn:aws:bedrock:us-east-1:164980860022:application-inference-profile/q2fductrhi5w}"    # gpt-6-luna
+model="${SM_CHECKER_MODEL:-$terra_model}"
 thinking="${SM_CHECKER_THINKING:-high}"
 base_prompt="${SM_CHECKER_PROMPT:-$SCRIPT_DIR/checker-prompt.md}"
 addendum_file="" addendum_text=""; lenses=()
@@ -80,7 +97,7 @@ while [ $# -gt 0 ]; do
     --repo) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; repo_dir="$2"; shift 2;;
     --live-text) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; live_text="$2"; shift 2;;
     --live-file) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; live_file="$2"; shift 2;;
-    --model) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; case "$2" in terra|sol|luna) model="global.openai.gpt-5.6-$2";; *) model="$2";; esac; shift 2;;
+    --model) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; case "$2" in terra) model="$terra_model";; sol) model="$sol_model";; luna) model="$luna_model";; *) model="$2";; esac; shift 2;;
     --thinking) [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }; thinking="$2"; shift 2;;
     --) shift; break;;
     *) echo "unknown arg: $1" >&2; exit 2;;
