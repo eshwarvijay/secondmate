@@ -178,7 +178,10 @@ jobs:
     with:
       runner: self-hosted
       test-command: pytest -q
-    secrets: inherit
+    secrets:
+      JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+      JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
 ```
 
 The caller must grant `contents: read`, `pull-requests: write`, and `checks: write`, configure
