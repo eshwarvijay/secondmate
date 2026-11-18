@@ -35,6 +35,11 @@ on:
         required: false
         type: string
         default: ""
+      ponytail-version:
+        description: Optional exact npm version of the upstream Ponytail skill to load into PiG.
+        required: false
+        type: string
+        default: ""
       jira-base-url:
         description: Jira Cloud base URL, without a trailing slash.
         required: false
@@ -117,6 +122,17 @@ jobs:
           curl --fail --silent --show-error --location https://pi-in-go.dev/install.sh | sh
           "$PIG_INSTALL_DIR/pig" --version
           echo "$PIG_INSTALL_DIR" >> "$GITHUB_PATH"
+
+      - name: Install upstream Ponytail skill
+        if: inputs.ponytail-version != ''
+        env:
+          PONYTAIL_VERSION: ${{ inputs.ponytail-version }}
+          PONYTAIL_DIR: ${{ runner.temp }}/ponytail
+        run: |
+          set -euo pipefail
+          # No lifecycle scripts run in the credential-bearing review job.
+          npm install --ignore-scripts --no-save --prefix "$PONYTAIL_DIR" "opencode-ponytail@$PONYTAIL_VERSION"
+          test -f "$PONYTAIL_DIR/node_modules/opencode-ponytail/skills/ponytail/SKILL.md"
 
       - name: Read PR identity and Jira requirements
         id: context
@@ -235,6 +251,7 @@ jobs:
           SM_CHECKER_HARNESS: pig
           SM_CHECKER_MODEL: ${{ inputs.checker-model }}
           AWS_REGION: ${{ inputs.aws-region }}
+          PONYTAIL_VERSION: ${{ inputs.ponytail-version }}
           TEST_STATUS: ${{ steps.tests.outputs.status }}
           REVIEW_MODE: ${{ steps.mode.outputs.value }}
           REVIEW_BASE_SHA: ${{ steps.context.outputs.base_sha }}
@@ -257,8 +274,12 @@ jobs:
             [ -n "$ATTESTED_SHA" ] && base="$ATTESTED_SHA"
             cat "$RUNNER_TEMP/jira.md" > "$RUNNER_TEMP/addendum.md"
             printf '\n\nCI review mode: %s. Review the current checkout and this live diff.\n' "$REVIEW_MODE" >> "$RUNNER_TEMP/addendum.md"
+            skill_args=()
+            if [ -n "$PONYTAIL_VERSION" ]; then
+              skill_args=(--skill "$RUNNER_TEMP/ponytail/node_modules/opencode-ponytail/skills/ponytail/SKILL.md")
+            fi
             set +e
-            .secondmate-tools/bin/launch-checker.sh --addendum "$RUNNER_TEMP/addendum.md" --lens "$REVIEW_LENSES" --diff-base "$base" --repo "$GITHUB_WORKSPACE" -- -p 'Perform the PR review and return the required checker envelope.' > "$RUNNER_TEMP/checker.md"
+            .secondmate-tools/bin/launch-checker.sh --addendum "$RUNNER_TEMP/addendum.md" --lens "$REVIEW_LENSES" --diff-base "$base" --repo "$GITHUB_WORKSPACE" -- "${skill_args[@]}" -p 'Perform the PR review and return the required checker envelope.' > "$RUNNER_TEMP/checker.md"
             rc=$?
             set -e
             if [ "$rc" -ne 0 ] && [ ! -s "$RUNNER_TEMP/checker.md" ]; then
