@@ -284,10 +284,16 @@ jobs:
             --out "$RUNNER_TEMP/comment.md"
           payload="$RUNNER_TEMP/comment.json"
           jq --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' > "$payload"
-          curl --fail --silent --show-error --location --request POST \
+          response="$RUNNER_TEMP/comment-response.json"
+          status="$(curl --silent --show-error --location --request POST \
             -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
             -H 'Content-Type: application/json' --data-binary "@$payload" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" >/dev/null
+            --output "$response" --write-out '%{http_code}' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments")"
+          if [ "$status" != 201 ]; then
+            jq -r '.message // "GitHub did not return an error message"' "$response" >&2
+            exit 1
+          fi
 
       - name: Publish checker report artifact
         uses: actions/upload-artifact@v4
