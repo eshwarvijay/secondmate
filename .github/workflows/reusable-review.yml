@@ -25,6 +25,16 @@ on:
         required: false
         type: string
         default: 0.7.0
+      checker-model:
+        description: Optional approved Bedrock application inference-profile ARN for the checker.
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        description: Optional AWS region for the checker Bedrock client.
+        required: false
+        type: string
+        default: ""
       jira-base-url:
         description: Jira Cloud base URL, without a trailing slash.
         required: false
@@ -223,6 +233,8 @@ jobs:
         env:
           SM_LAST_VERDICT: ${{ runner.temp }}/prior.md
           SM_CHECKER_HARNESS: pig
+          SM_CHECKER_MODEL: ${{ inputs.checker-model }}
+          AWS_REGION: ${{ inputs.aws-region }}
           TEST_STATUS: ${{ steps.tests.outputs.status }}
           REVIEW_MODE: ${{ steps.mode.outputs.value }}
           REVIEW_BASE_SHA: ${{ steps.context.outputs.base_sha }}
