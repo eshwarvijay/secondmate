@@ -40,6 +40,21 @@ on:
         required: false
         type: string
         default: ""
+      bedrock-gcp-project:
+        description: GCP project containing the optional AWS shared-credentials secret for PiG.
+        required: false
+        type: string
+        default: ""
+      bedrock-credentials-secret:
+        description: Secret Manager secret containing the AWS named-profile credentials for PiG.
+        required: false
+        type: string
+        default: ""
+      aws-profile:
+        description: AWS named profile in the Bedrock credentials secret.
+        required: false
+        type: string
+        default: default
       jira-base-url:
         description: Jira Cloud base URL, without a trailing slash.
         required: false
@@ -257,8 +272,15 @@ jobs:
           REVIEW_BASE_SHA: ${{ steps.context.outputs.base_sha }}
           ATTESTED_SHA: ${{ steps.mode.outputs.checked_sha }}
           REVIEW_LENSES: ${{ inputs.lenses }}
+          BEDROCK_GCP_PROJECT: ${{ inputs.bedrock-gcp-project }}
+          BEDROCK_CREDENTIALS_SECRET: ${{ inputs.bedrock-credentials-secret }}
+          AWS_PROFILE_NAME: ${{ inputs.aws-profile }}
+          PONYTAIL_SKILL: ${{ runner.temp }}/ponytail/node_modules/opencode-ponytail/skills/ponytail/SKILL.md
+          SUPERVISOR_PROMPT: .secondmate-tools/bin/supervisor-prompt.md
+          SUPERVISOR_VALIDATOR: .secondmate-tools/bin/supervisor-review.py
         run: |
           set -euo pipefail
+          if false; then
           cat > "$RUNNER_TEMP/prior.jq" <<JQ
           if (.review_version // 0) > 0 then
             "Prior CI review v\(.review_version), SHA \(.head_sha). Resolve every listed ID exactly once.\n\nOpen findings:\n" + ([.open_findings[]? | "- \(.id): \(.text)"] | join("\n"))
@@ -286,6 +308,12 @@ jobs:
               printf 'Checker could not run.\n```json\n{"verdict":"error","findings":[],"diagnostic":"checker launcher exit %s","lens_coverage":{}}\n```\n' "$rc" > "$RUNNER_TEMP/checker.md"
             fi
           fi
+          fi
+          test -n "$BEDROCK_GCP_PROJECT" && test -n "$BEDROCK_CREDENTIALS_SECRET" && test -n "$PONYTAIL_VERSION" || {
+            echo 'Supervisor requires Bedrock GCP project, credentials secret, and pinned Ponytail version.' >&2
+            exit 2
+          }
+          .secondmate-tools/bin/run-supervised-review.sh
           # Do not ask verdict.py to record a lens ledger in the checked-out PR repository.
           # Preserve fail (exit 1) rather than collapsing every nonzero exit into error.
           set +e
@@ -310,7 +338,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
             --head-sha "$HEAD_SHA" --base-sha "$BASE_SHA" \
             --jira-key "$JIRA_KEY" --mode "$REVIEW_MODE" \
-            --report "$RUNNER_TEMP/checker.md" --prior "$RUNNER_TEMP/prior.json" \
+            --report "$RUNNER_TEMP/checker.md" --prior "$RUNNER_TEMP/prior.json" --supervisor "$RUNNER_TEMP/supervisor.md" \
             --tests "$TEST_STATUS: $TEST_COMMAND" \
             --workflow-run-id "$GITHUB_RUN_ID" --check-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --out "$RUNNER_TEMP/comment.md"

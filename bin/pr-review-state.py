@@ -86,7 +86,8 @@ def render(args):
              "lens_coverage": envelope.get("lens_coverage", {}), "tests": args.tests,
              "workflow_run_id": args.workflow_run_id, "findings_truncated": False,
              "reviewed_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")}
-    body = f"## Secondmate Review v{version} — {args.jira_key}\n\n**Status:** {status}  \n**Mode:** {args.mode}  \n**Reviewed SHA:** `{args.head_sha[:12]}` · **Base:** `{args.base_sha[:12]}`  \n**Prior review:** {prior_link}  \n**Tests:** {args.tests}  \n**Check:** {args.check_url}\n\n### Prior-finding resolution\n{resolution}\n\n### Findings in this review\n{listed}\n\n**Diagnostic:** {envelope.get('diagnostic', '') or 'None.'}\n\n<!-- secondmate-review-state:v1\n{json.dumps(state, separators=(',', ':'))}\n-->\n"
+    supervisor = pathlib.Path(args.supervisor).read_text(encoding="utf-8").strip() if args.supervisor else ""
+    body = f"## Secondmate Review v{version} — {args.jira_key}\n\n**Status:** {status}  \n**Mode:** {args.mode}  \n**Reviewed SHA:** `{args.head_sha[:12]}` · **Base:** `{args.base_sha[:12]}`  \n**Prior review:** {prior_link}  \n**Tests:** {args.tests}  \n**Check:** {args.check_url}\n\n### Prior-finding resolution\n{resolution}\n\n### Findings in this review\n{listed}\n\n**Diagnostic:** {envelope.get('diagnostic', '') or 'None.'}\n\n{supervisor}\n\n<!-- secondmate-review-state:v1\n{json.dumps(state, separators=(',', ':'))}\n-->\n"
     pathlib.Path(args.out).write_text(body, encoding="utf-8")
 
 def main(argv):
@@ -96,7 +97,7 @@ def main(argv):
     s.add_argument("--pr", type=int, required=True)
     r = sub.add_parser("render")
     for n in ("repository", "head_sha", "base_sha", "jira_key", "mode", "report", "check_url", "out"): r.add_argument("--" + n.replace("_", "-"), required=True)
-    r.add_argument("--pr", type=int, required=True); r.add_argument("--prior"); r.add_argument("--tests", default="not configured"); r.add_argument("--workflow-run-id", default="")
+    r.add_argument("--pr", type=int, required=True); r.add_argument("--prior"); r.add_argument("--supervisor"); r.add_argument("--tests", default="not configured"); r.add_argument("--workflow-run-id", default="")
     args = p.parse_args(argv)
     try:
         if args.cmd == "select": select(args)
