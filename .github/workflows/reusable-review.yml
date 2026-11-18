@@ -134,8 +134,6 @@ jobs:
               echo 'Provide GitHub Jira secrets or the GCP Secret Manager project and both secret names.' >&2
               exit 2
             }
-            # Same least-privilege pattern as Archie's CI: this self-hosted runner's
-            # service account reads only named Secret Manager versions.
             JIRA_EMAIL="$(gcloud secrets versions access latest --secret="$JIRA_EMAIL_SECRET" --project="$JIRA_GCP_PROJECT")"
             JIRA_API_TOKEN="$(gcloud secrets versions access latest --secret="$JIRA_API_TOKEN_SECRET" --project="$JIRA_GCP_PROJECT")"
           fi
