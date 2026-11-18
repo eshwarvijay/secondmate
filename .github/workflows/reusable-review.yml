@@ -1,0 +1,227 @@
+name: Secondmate PR review
+
+on:
+  workflow_call:
+    inputs:
+      secondmate-repository:
+        description: Repository containing the Secondmate checker tools.
+        required: false
+        type: string
+        default: eshwarvijay/secondmate
+      secondmate-ref:
+        required: false
+        type: string
+        default: main
+      runner:
+        required: false
+        type: string
+        default: self-hosted
+      test-command:
+        description: Repository-owned deterministic test/lint/build command.
+        required: true
+        type: string
+      trusted-bot-login:
+        description: Login allowed to supply prior hidden review state.
+        required: false
+        type: string
+        default: github-actions[bot]
+      lenses:
+        required: false
+        type: string
+        default: qa/coverage
+      sensitive-paths:
+        description: Space-separated git pathspecs that always force a full review.
+        required: false
+        type: string
+        default: .github infra terraform
+    secrets:
+      JIRA_BASE_URL:
+        required: true
+      JIRA_EMAIL:
+        required: true
+      JIRA_API_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: secondmate-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # Secrets must never be made available to untrusted fork code.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout reviewed PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Checkout Secondmate tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.secondmate-repository }}
+          ref: ${{ inputs.secondmate-ref }}
+          path: .secondmate-tools
+          fetch-depth: 1
+
+      - name: Read PR identity and Jira requirements
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          key="$(printf '%s\n%s\n' "$PR_BRANCH" "$PR_TITLE" | grep -Eo '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)"
+          test -n "$key" || { echo 'Missing Jira key in PR branch or title.' >&2; exit 2; }
+          printf 'jira_key=%s\nbase_sha=%s\nhead_sha=%s\n' "$key" "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # Credentials are used only as curl options. Do not print curl's request or response headers.
+          curl --fail --silent --show-error -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H 'Accept: application/json' "$JIRA_BASE_URL/rest/api/3/issue/$key?fields=summary,description&expand=renderedFields" \
+            | jq -r --arg key "$key" '. as $issue | ($issue.renderedFields.description // $issue.fields.description // "") as $body | "# Jira " + $key + ": " + $issue.fields.summary + "\n\n" + (if $body | type == "string" then $body else ($body | tojson) end)' \
+            > "$RUNNER_TEMP/jira.md"
+
+      - name: Load only the latest trusted prior review state
+        id: prior
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" > "$RUNNER_TEMP/comments.json"
+          python3 .secondmate-tools/bin/pr-review-state.py select \
+            --comments "$RUNNER_TEMP/comments.json" --repository "$GITHUB_REPOSITORY" \
+            --pr "${{ github.event.pull_request.number }}" --head-sha "${{ steps.context.outputs.head_sha }}" \
+            --trusted-login '${{ inputs.trusted-bot-login }}' --out "$RUNNER_TEMP/prior.json"
+          jq -r '.review_version // 0' "$RUNNER_TEMP/prior.json" | xargs -I{} echo "prior_version={}" >> "$GITHUB_OUTPUT"
+
+      - name: Select review mode
+        id: mode
+        run: |
+          set -euo pipefail
+          mode=full-ci-review
+          checked=""
+          attestation=""
+          if [ -d audit/reviews ]; then
+            for candidate in audit/reviews/*.json; do
+              [ -f "$candidate" ] || continue
+              [ "$(jq -r '.jira_key // empty' "$candidate")" = '${{ steps.context.outputs.jira_key }}' ] && { attestation="$candidate"; break; }
+            done
+          fi
+          if [ -n "$attestation" ] && python3 .secondmate-tools/bin/review-attestation.py validate "$attestation" >/dev/null && \
+             git merge-base --is-ancestor "$(jq -r .checked_sha "$attestation")" HEAD; then
+            checked="$(jq -r .checked_sha "$attestation")"
+            # A policy-sensitive path cannot use the local-review shortcut.
+            if git diff --name-only "$checked"..HEAD | grep -Eq '(^\.github/|^infra/|^terraform/|(^|/)(auth|security)/|secret|credential|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Gemfile\.lock)$)'; then
+              mode=full-ci-review-sensitive
+            elif ! git diff --quiet "$checked"..HEAD; then
+              mode=secondmate-attestation-delta
+            else
+              mode=secondmate-attestation-covered
+            fi
+          elif [ "${{ steps.prior.outputs.prior_version }}" != 0 ]; then
+            mode=incremental-ci-review
+          fi
+          echo "value=$mode" >> "$GITHUB_OUTPUT"
+          echo "checked_sha=$checked" >> "$GITHUB_OUTPUT"
+
+      - name: Run deterministic checks
+        id: tests
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set +e
+          bash -o pipefail -c "$TEST_COMMAND" 2>&1 | tee "$RUNNER_TEMP/tests.log"
+          rc=${PIPESTATUS[0]}
+          echo "status=$([ "$rc" -eq 0 ] && echo pass || echo fail)" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run checker or attest covered work
+        id: checker
+        env:
+          SM_LAST_VERDICT: ${{ runner.temp }}/prior.md
+          TEST_STATUS: ${{ steps.tests.outputs.status }}
+          REVIEW_MODE: ${{ steps.mode.outputs.value }}
+          REVIEW_BASE_SHA: ${{ steps.context.outputs.base_sha }}
+          ATTESTED_SHA: ${{ steps.mode.outputs.checked_sha }}
+          REVIEW_LENSES: ${{ inputs.lenses }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/prior.jq" <<JQ
+          if (.review_version // 0) > 0 then
+            "Prior CI review v\(.review_version), SHA \(.head_sha). Resolve every listed ID exactly once.\n\nOpen findings:\n" + ([.open_findings[]? | "- \(.id): \(.text)"] | join("\n"))
+          else "No trusted prior CI review state exists." end
+          JQ
+          jq -r -f "$RUNNER_TEMP/prior.jq" "$RUNNER_TEMP/prior.json" > "$RUNNER_TEMP/prior.md"
+          if [ "$TEST_STATUS" != pass ]; then
+            printf 'Deterministic checks failed.\n```json\n{"verdict":"error","findings":[],"diagnostic":"Configured deterministic checks failed","lens_coverage":{}}\n```\n' > "$RUNNER_TEMP/checker.md"
+          elif [ "$REVIEW_MODE" = secondmate-attestation-covered ]; then
+            printf 'Validated Secondmate attestation covers this SHA; deterministic checks passed.\n```json\n{"verdict":"pass","findings":[],"diagnostic":"","lens_coverage":{}}\n```\n' > "$RUNNER_TEMP/checker.md"
+          else
+            base="$REVIEW_BASE_SHA"
+            [ -n "$ATTESTED_SHA" ] && base="$ATTESTED_SHA"
+            cat "$RUNNER_TEMP/jira.md" > "$RUNNER_TEMP/addendum.md"
+            printf '\n\nCI review mode: %s. Review the current checkout and this live diff.\n' "$REVIEW_MODE" >> "$RUNNER_TEMP/addendum.md"
+            set +e
+            .secondmate-tools/bin/launch-checker.sh --addendum "$RUNNER_TEMP/addendum.md" --lens "$REVIEW_LENSES" --diff-base "$base" --repo "$GITHUB_WORKSPACE" -- -p 'Perform the PR review and return the required checker envelope.' > "$RUNNER_TEMP/checker.md"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ] && [ ! -s "$RUNNER_TEMP/checker.md" ]; then
+              printf 'Checker could not run.\n```json\n{"verdict":"error","findings":[],"diagnostic":"checker launcher exit %s","lens_coverage":{}}\n```\n' "$rc" > "$RUNNER_TEMP/checker.md"
+            fi
+          fi
+          # Do not ask verdict.py to record a lens ledger in the checked-out PR repository.
+          # Preserve fail (exit 1) rather than collapsing every nonzero exit into error.
+          set +e
+          verdict="$(python3 .secondmate-tools/bin/verdict.py "$RUNNER_TEMP/checker.md" 2>/dev/null)"
+          verdict_rc=$?
+          set -e
+          case "$verdict_rc" in 0) verdict=pass ;; 1) verdict=fail ;; *) verdict=error ;; esac
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+
+      - name: Publish append-only review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ steps.context.outputs.head_sha }}
+          BASE_SHA: ${{ steps.context.outputs.base_sha }}
+          JIRA_KEY: ${{ steps.context.outputs.jira_key }}
+          REVIEW_MODE: ${{ steps.mode.outputs.value }}
+          TEST_STATUS: ${{ steps.tests.outputs.status }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          python3 .secondmate-tools/bin/pr-review-state.py render \
+            --repository "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" --base-sha "$BASE_SHA" \
+            --jira-key "$JIRA_KEY" --mode "$REVIEW_MODE" \
+            --report "$RUNNER_TEMP/checker.md" --prior "$RUNNER_TEMP/prior.json" \
+            --tests "$TEST_STATUS: $TEST_COMMAND" \
+            --workflow-run-id "$GITHUB_RUN_ID" --check-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --out "$RUNNER_TEMP/comment.md"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+            -f body="$(cat "$RUNNER_TEMP/comment.md")" >/dev/null
+
+      - name: Publish checker report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: secondmate-review-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/checker.md
+          retention-days: 30
+
+      - name: Enforce review result
+        run: |
+          test '${{ steps.tests.outputs.status }}' = pass
+          test '${{ steps.checker.outputs.verdict }}' = pass

@@ -4,7 +4,7 @@
 End every review with a fenced JSON block. Output it on its own, as the final output:
 
 ```json
-{"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"...","lens_coverage":{"...":true,...}}
+{"verdict":"pass|fail|error|refused","findings":["..."],"diagnostic":"...","lens_coverage":{"...":true,...},"resolved_finding_ids":["F-..."],"still_open_finding_ids":["F-..."],"superseded_finding_ids":["F-..."]}
 ```
 
 - `verdict`: `pass` means no CONFIRMED defects. `fail` means at least one CONFIRMED defect.
@@ -21,6 +21,10 @@ End every review with a fenced JSON block. Output it on its own, as the final ou
   one or more lenses were injected for this review, you are told their exact names; include
   `"lens_coverage": {"<lens‑name>": true, ...}` reporting every lens you considered. Omit it
   when no lenses were used.
+- `resolved_finding_ids`, `still_open_finding_ids`, and `superseded_finding_ids`: **REQUIRED
+  only when the LIVE context supplies prior finding IDs.** Classify every prior ID exactly once;
+  use empty arrays where appropriate. These arrays let the CI reviewer preserve a compact,
+  append-only review conversation without asking the next checker to infer resolution from prose.
 
 The supervisor branches on `verdict` mechanically. It must be exact, valid JSON, and last.
 
