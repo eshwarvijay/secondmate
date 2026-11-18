@@ -25,6 +25,26 @@ on:
         required: false
         type: string
         default: 0.7.0
+      jira-base-url:
+        description: Jira Cloud base URL, without a trailing slash.
+        required: false
+        type: string
+        default: ""
+      jira-gcp-project:
+        description: GCP project containing the optional Jira credentials in Secret Manager.
+        required: false
+        type: string
+        default: ""
+      jira-email-secret:
+        description: Secret Manager secret containing the Jira service-account email.
+        required: false
+        type: string
+        default: ""
+      jira-api-token-secret:
+        description: Secret Manager secret containing the Jira service-account API token.
+        required: false
+        type: string
+        default: ""
       trusted-bot-login:
         description: Login allowed to supply prior hidden review state.
         required: false
@@ -41,11 +61,11 @@ on:
         default: .github infra terraform
     secrets:
       JIRA_BASE_URL:
-        required: true
+        required: false
       JIRA_EMAIL:
-        required: true
+        required: false
       JIRA_API_TOKEN:
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -87,13 +107,46 @@ jobs:
           "$PIG_INSTALL_DIR/pig" --version
           echo "$PIG_INSTALL_DIR" >> "$GITHUB_PATH"
 
+      - name: Resolve read-only Jira credentials
+        env:
+          JIRA_BASE_URL_INPUT: ${{ inputs.jira-base-url }}
+          JIRA_GCP_PROJECT: ${{ inputs.jira-gcp-project }}
+          JIRA_EMAIL_SECRET: ${{ inputs.jira-email-secret }}
+          JIRA_API_TOKEN_SECRET: ${{ inputs.jira-api-token-secret }}
+          JIRA_BASE_URL_SECRET: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL_SECRET_VALUE: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN_SECRET_VALUE: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          base_url="${JIRA_BASE_URL_SECRET:-$JIRA_BASE_URL_INPUT}"
+          email="${JIRA_EMAIL_SECRET_VALUE:-}"
+          token="${JIRA_API_TOKEN_SECRET_VALUE:-}"
+          if [ -z "$email" ] || [ -z "$token" ]; then
+            test -n "$JIRA_GCP_PROJECT" && test -n "$JIRA_EMAIL_SECRET" && test -n "$JIRA_API_TOKEN_SECRET" || {
+              echo 'Provide GitHub Jira secrets or the GCP Secret Manager project and both secret names.' >&2
+              exit 2
+            }
+            # Same least-privilege pattern as Archie's CI: this self-hosted runner's
+            # service account reads only named Secret Manager versions.
+            email="$(gcloud secrets versions access latest --secret="$JIRA_EMAIL_SECRET" --project="$JIRA_GCP_PROJECT")"
+            token="$(gcloud secrets versions access latest --secret="$JIRA_API_TOKEN_SECRET" --project="$JIRA_GCP_PROJECT")"
+          fi
+          test -n "$base_url" && test -n "$email" && test -n "$token" || {
+            echo 'Jira base URL, email, and token must all be non-empty.' >&2
+            exit 2
+          }
+          echo "::add-mask::$email"
+          echo "::add-mask::$token"
+          {
+            echo "JIRA_BASE_URL=$base_url"
+            echo "JIRA_EMAIL=$email"
+            echo "JIRA_API_TOKEN=$token"
+          } >> "$GITHUB_ENV"
+
       - name: Read PR identity and Jira requirements
         id: context
         env:
           GH_TOKEN: ${{ github.token }}
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
