@@ -107,8 +107,10 @@ jobs:
           "$PIG_INSTALL_DIR/pig" --version
           echo "$PIG_INSTALL_DIR" >> "$GITHUB_PATH"
 
-      - name: Resolve read-only Jira credentials
+      - name: Read PR identity and Jira requirements
+        id: context
         env:
+          GH_TOKEN: ${{ github.token }}
           JIRA_BASE_URL_INPUT: ${{ inputs.jira-base-url }}
           JIRA_GCP_PROJECT: ${{ inputs.jira-gcp-project }}
           JIRA_EMAIL_SECRET: ${{ inputs.jira-email-secret }}
@@ -116,43 +118,33 @@ jobs:
           JIRA_BASE_URL_SECRET: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL_SECRET_VALUE: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN_SECRET_VALUE: ${{ secrets.JIRA_API_TOKEN }}
-        run: |
-          set -euo pipefail
-          base_url="${JIRA_BASE_URL_SECRET:-$JIRA_BASE_URL_INPUT}"
-          email="${JIRA_EMAIL_SECRET_VALUE:-}"
-          token="${JIRA_API_TOKEN_SECRET_VALUE:-}"
-          if [ -z "$email" ] || [ -z "$token" ]; then
-            test -n "$JIRA_GCP_PROJECT" && test -n "$JIRA_EMAIL_SECRET" && test -n "$JIRA_API_TOKEN_SECRET" || {
-              echo 'Provide GitHub Jira secrets or the GCP Secret Manager project and both secret names.' >&2
-              exit 2
-            }
-            # Same least-privilege pattern as Archie's CI: this self-hosted runner's
-            # service account reads only named Secret Manager versions.
-            email="$(gcloud secrets versions access latest --secret="$JIRA_EMAIL_SECRET" --project="$JIRA_GCP_PROJECT")"
-            token="$(gcloud secrets versions access latest --secret="$JIRA_API_TOKEN_SECRET" --project="$JIRA_GCP_PROJECT")"
-          fi
-          test -n "$base_url" && test -n "$email" && test -n "$token" || {
-            echo 'Jira base URL, email, and token must all be non-empty.' >&2
-            exit 2
-          }
-          echo "::add-mask::$email"
-          echo "::add-mask::$token"
-          {
-            echo "JIRA_BASE_URL=$base_url"
-            echo "JIRA_EMAIL=$email"
-            echo "JIRA_API_TOKEN=$token"
-          } >> "$GITHUB_ENV"
-
-      - name: Read PR identity and Jira requirements
-        id: context
-        env:
-          GH_TOKEN: ${{ github.token }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BRANCH: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # Keep credentials step-local: never write them to GITHUB_ENV, artifacts,
+          # checker prompts, PR comments, or any later PR-controlled command.
+          JIRA_BASE_URL="${JIRA_BASE_URL_SECRET:-$JIRA_BASE_URL_INPUT}"
+          JIRA_EMAIL="${JIRA_EMAIL_SECRET_VALUE:-}"
+          JIRA_API_TOKEN="${JIRA_API_TOKEN_SECRET_VALUE:-}"
+          if [ -z "$JIRA_EMAIL" ] || [ -z "$JIRA_API_TOKEN" ]; then
+            test -n "$JIRA_GCP_PROJECT" && test -n "$JIRA_EMAIL_SECRET" && test -n "$JIRA_API_TOKEN_SECRET" || {
+              echo 'Provide GitHub Jira secrets or the GCP Secret Manager project and both secret names.' >&2
+              exit 2
+            }
+            # Same least-privilege pattern as Archie's CI: this self-hosted runner's
+            # service account reads only named Secret Manager versions.
+            JIRA_EMAIL="$(gcloud secrets versions access latest --secret="$JIRA_EMAIL_SECRET" --project="$JIRA_GCP_PROJECT")"
+            JIRA_API_TOKEN="$(gcloud secrets versions access latest --secret="$JIRA_API_TOKEN_SECRET" --project="$JIRA_GCP_PROJECT")"
+          fi
+          test -n "$JIRA_BASE_URL" && test -n "$JIRA_EMAIL" && test -n "$JIRA_API_TOKEN" || {
+            echo 'Jira base URL, email, and token must all be non-empty.' >&2
+            exit 2
+          }
+          echo "::add-mask::$JIRA_EMAIL"
+          echo "::add-mask::$JIRA_API_TOKEN"
           key="$(printf '%s\n%s\n' "$PR_BRANCH" "$PR_TITLE" | grep -Eo '[A-Z][A-Z0-9]+-[0-9]+' | head -1 || true)"
           test -n "$key" || { echo 'Missing Jira key in PR branch or title.' >&2; exit 2; }
           printf 'jira_key=%s\nbase_sha=%s\nhead_sha=%s\n' "$key" "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
