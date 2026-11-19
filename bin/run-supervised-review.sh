@@ -2,7 +2,7 @@
 # Run the read-only Supervisor -> Checker -> Supervisor PR-review loop.
 set -euo pipefail
 
-: "${RUNNER_TEMP:?}" "${GITHUB_WORKSPACE:?}" "${SM_CHECKER_MODEL:?}" "${AWS_REGION:?}"
+: "${RUNNER_TEMP:?}" "${GITHUB_WORKSPACE:?}" "${SM_CHECKER_MODEL:?}" "${SUPERVISOR_MODEL:?}" "${AWS_REGION:?}"
 : "${BEDROCK_GCP_PROJECT:?}" "${BEDROCK_CREDENTIALS_SECRET:?}" "${AWS_PROFILE_NAME:?}"
 
 credentials="$RUNNER_TEMP/secondmate-bedrock-credentials"
@@ -36,14 +36,15 @@ if grep -Eqi '(^|/)(prompt|agent|llm)' <<<"$paths"; then mandatory+=(redteam/llm
 mandatory_csv="$(IFS=,; echo "${mandatory[*]}")"
 
 run_supervisor() {
+  local model="$1" context_file="$2" request="$3"
   AWS_SHARED_CREDENTIALS_FILE="$credentials" AWS_PROFILE="$AWS_PROFILE_NAME" AWS_REGION="$AWS_REGION" \
-    pig --provider amazon-bedrock --model "$SM_CHECKER_MODEL" --thinking minimal --no-session --no-tools \
+    pig --provider amazon-bedrock --model "$model" --thinking minimal --no-session --no-tools \
       --skill "$PONYTAIL_SKILL" --append-system-prompt "$(cat "$SUPERVISOR_PROMPT")" \
-      --append-system-prompt "$(cat "$1")" --print "$2"
+      --append-system-prompt "$(cat "$context_file")" --print "$request"
 }
 
 allowed="$REVIEW_LENSES"
-if ! run_supervisor "$context" "SELECT_LENSES. Allowed lenses: $allowed. Mandatory lenses: $mandatory_csv." > "$RUNNER_TEMP/supervisor-plan.raw.md"; then
+if ! run_supervisor "$SUPERVISOR_MODEL" "$context" "SELECT_LENSES. Allowed lenses: $allowed. Mandatory lenses: $mandatory_csv." > "$RUNNER_TEMP/supervisor-plan.raw.md"; then
   printf 'Supervisor lens selection failed.\n' > "$RUNNER_TEMP/supervisor.md"
   printf 'Checker could not run.\n```json\n{"verdict":"error","findings":[],"diagnostic":"supervisor lens selection failed","lens_coverage":{}}\n```\n' > "$RUNNER_TEMP/checker.md"
   exit 0
@@ -75,7 +76,8 @@ fi
 cp "$context" "$RUNNER_TEMP/supervisor-triage-context.md"
 printf '\n## Supervisor-selected lens plan\n%s\n## Checker report\n' "$(cat "$RUNNER_TEMP/supervisor-plan.json")" >> "$RUNNER_TEMP/supervisor-triage-context.md"
 cat "$RUNNER_TEMP/checker.md" >> "$RUNNER_TEMP/supervisor-triage-context.md"
-if ! run_supervisor "$RUNNER_TEMP/supervisor-triage-context.md" 'TRIAGE_REPORT. Validate the checker report through the selected lenses and return the prioritized decision.' > "$RUNNER_TEMP/supervisor-triage.raw.md" || \
+final_supervisor_model="${FINAL_SUPERVISOR_MODEL:-$SM_CHECKER_MODEL}"
+if ! run_supervisor "$final_supervisor_model" "$RUNNER_TEMP/supervisor-triage-context.md" 'TRIAGE_REPORT. Validate the checker report through the selected lenses and return the prioritized decision.' > "$RUNNER_TEMP/supervisor-triage.raw.md" || \
    ! python3 "$SUPERVISOR_VALIDATOR" triage --report "$RUNNER_TEMP/supervisor-triage.raw.md" --out "$RUNNER_TEMP/supervisor.md"; then
   printf '### Supervisor decision — Ponytail\n\nSupervisor triage was unavailable; use the checker findings and mandatory policy as the review result.\n' > "$RUNNER_TEMP/supervisor.md"
 fi

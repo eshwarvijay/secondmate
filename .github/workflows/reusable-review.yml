@@ -30,6 +30,16 @@ on:
         required: false
         type: string
         default: ""
+      supervisor-model:
+        description: Optional approved Bedrock application inference-profile ARN for initial lens selection.
+        required: false
+        type: string
+        default: ""
+      final-supervisor-model:
+        description: Optional model for final triage; defaults to checker-model when empty.
+        required: false
+        type: string
+        default: ""
       aws-region:
         description: Optional AWS region for the checker Bedrock client.
         required: false
@@ -265,6 +275,8 @@ jobs:
           SM_LAST_VERDICT: ${{ runner.temp }}/prior.md
           SM_CHECKER_HARNESS: pig
           SM_CHECKER_MODEL: ${{ inputs.checker-model }}
+          SUPERVISOR_MODEL: ${{ inputs.supervisor-model }}
+          FINAL_SUPERVISOR_MODEL: ${{ inputs.final-supervisor-model }}
           AWS_REGION: ${{ inputs.aws-region }}
           PONYTAIL_VERSION: ${{ inputs.ponytail-version }}
           TEST_STATUS: ${{ steps.tests.outputs.status }}
@@ -309,7 +321,7 @@ jobs:
             fi
           fi
           fi
-          test -n "$BEDROCK_GCP_PROJECT" && test -n "$BEDROCK_CREDENTIALS_SECRET" && test -n "$PONYTAIL_VERSION" || {
+          test -n "$BEDROCK_GCP_PROJECT" && test -n "$BEDROCK_CREDENTIALS_SECRET" && test -n "$PONYTAIL_VERSION" && test -n "$SUPERVISOR_MODEL" && test -n "$SM_CHECKER_MODEL" || {
             echo 'Supervisor requires Bedrock GCP project, credentials secret, and pinned Ponytail version.' >&2
             exit 2
           }
